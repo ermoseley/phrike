@@ -1,0 +1,45 @@
+problem: gaussian_collision
+
+grid:
+  N: 1024
+  Lx: 1.0
+  dealias: true
+
+physics:
+  gamma: 1.4
+
+integration:
+  t0: 0.0
+  t_end: 0.5
+  cfl: 0.6
+  scheme: rk4
+  output_interval: 0.005
+  spectral_filter:
+    enabled: true
+    p: 16
+    alpha: 36.0
+
+initial_conditions:
+  acoustic:
+    rho0: 1.0
+    p0: 1.0
+    u0: 0.0
+    amplitude: 5e-5
+    fractional: true
+    mode_m: 1
+    direction: right
+  gaussians:
+    center_left: 0.25
+    center_right: 0.75
+    sigma: 0.03
+
+io:
+  outdir: outputs/gaussian_collision
+
+video:
+  fps: 30
+  codec: libx264
+  crf: 18
+  pix_fmt: yuv420p
+
+

@@ -1,0 +1,49 @@
+problem: gaussian_modulated
+
+grid:
+  N: 2048
+  Lx: 1.0
+  dealias: true
+
+physics:
+  gamma: 1.4
+
+integration:
+  t0: 0.0
+  t_end: 5.0
+  cfl: 0.2
+  scheme: rk4
+  output_interval: 0.0025
+  spectral_filter:
+    enabled: true
+    p: 16
+    alpha: 36.0
+
+initial_conditions:
+  acoustic:
+    rho0: 1.0
+    p0: 1.0
+    u0: 0.0
+    amplitude: 2e-2
+    fractional: true
+  gaussians:
+    center_left: 0.45
+    center_right: 0.55
+    sigma: 0.015
+    carrier_m: 32
+    phase_left: 0.0
+    phase_right: 0.0
+    same_direction: right
+    amp_left_factor: 5.0
+    amp_right_factor: 1.0
+
+io:
+  outdir: outputs/gaussian_modulated
+
+video:
+  fps: 30
+  codec: h264_videotoolbox
+  crf: 18
+  pix_fmt: yuv420p
+
+

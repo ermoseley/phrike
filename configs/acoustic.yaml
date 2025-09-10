@@ -1,0 +1,35 @@
+problem: acoustic
+
+grid:
+  N: 512
+  Lx: 1.0
+  dealias: true
+
+physics:
+  gamma: 1.4
+
+integration:
+  t0: 0.0
+  t_end: 1.0
+  cfl: 0.6
+  scheme: rk4
+  output_interval: 0.1
+  spectral_filter:
+    enabled: true
+    p: 16
+    alpha: 36.0
+
+initial_conditions:
+  acoustic:
+    rho0: 1.0
+    p0: 1.0
+    u0: 0.0
+    amplitude: 1e-6
+    fractional: true
+    direction: right
+    mode_m: 3
+
+io:
+  outdir: outputs/acoustic
+
+

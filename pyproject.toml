@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spectralhydro"
+version = "0.1.0"
+description = "Pseudo-spectral hydrodynamics solver (1D, extendable to 2D/3D)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+  {name = "Your Name", email = "you@example.com"}
+]
+dependencies = [
+  "numpy>=1.22",
+  "scipy>=1.10",
+  "matplotlib>=3.5",
+  "PyYAML>=6.0"
+]
+
+[project.optional-dependencies]
+fastfft = ["pyfftw>=0.13"]
+dev = ["pytest>=7.0", "ruff>=0.3.0"]
+
+[tool.setuptools.package-data]
+spectralhydro = ["py.typed"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+exclude = ["tests", "examples", "configs"]
+
+
