@@ -5,6 +5,55 @@ from typing import Dict, Tuple
 
 import numpy as np
 
+try:
+    from numba import njit, prange
+    _NUMBA_AVAILABLE = True
+except Exception:
+    _NUMBA_AVAILABLE = False
+    def njit(*args, **kwargs):  # type: ignore
+        def inner(func):
+            return func
+        return inner
+    def prange(*args, **kwargs):  # type: ignore
+        return range(*args, **kwargs)
+
+
+# --- Numba-accelerated kernels ---
+
+@njit(cache=True, fastmath=True)
+def _primitive_kernel(U: np.ndarray, gamma: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    rho = U[0]
+    mom = U[1]
+    E = U[2]
+    u = mom / rho
+    kinetic = 0.5 * rho * u * u
+    p = (gamma - 1.0) * (E - kinetic)
+    a = np.sqrt(gamma * p / rho)
+    return rho, u, p, a
+
+
+@njit(cache=True, fastmath=True)
+def _flux_kernel(U: np.ndarray, gamma: float) -> np.ndarray:
+    rho, u, p, _ = _primitive_kernel(U, gamma)
+    mom = rho * u
+    F = np.empty_like(U)
+    F[0] = mom
+    F[1] = mom * u + p
+    F[2] = (U[2] + p) * u
+    return F
+
+
+@njit(cache=True, fastmath=True)
+def _max_wave_speed_kernel(U: np.ndarray, gamma: float) -> float:
+    # U shape (3, N)
+    rho, u, p, a = _primitive_kernel(U, gamma)
+    c = np.abs(u) + a
+    max_c = 0.0
+    for i in range(c.shape[0]):
+        if c[i] > max_c:
+            max_c = c[i]
+    return max_c
+
 
 Array = np.ndarray
 
@@ -22,14 +71,7 @@ class EulerEquations1D:
     gamma: float = 1.4
 
     def primitive(self, U: Array) -> Tuple[Array, Array, Array, Array]:
-        rho = U[0]
-        mom = U[1]
-        E = U[2]
-        u = mom / rho
-        kinetic = 0.5 * rho * u * u
-        p = (self.gamma - 1.0) * (E - kinetic)
-        a = np.sqrt(self.gamma * p / rho)
-        return rho, u, p, a
+        return _primitive_kernel(U, self.gamma)
 
     def conservative(self, rho: Array, u: Array, p: Array) -> Array:
         mom = rho * u
@@ -37,16 +79,10 @@ class EulerEquations1D:
         return np.array([rho, mom, E])
 
     def flux(self, U: Array) -> Array:
-        rho, u, p, _ = self.primitive(U)
-        mom = rho * u
-        F1 = mom
-        F2 = mom * u + p
-        F3 = (U[2] + p) * u
-        return np.array([F1, F2, F3])
+        return _flux_kernel(U, self.gamma)
 
     def max_wave_speed(self, U: Array) -> float:
-        _, u, _, a = self.primitive(U)
-        return float(np.max(np.abs(u) + a))
+        return float(_max_wave_speed_kernel(U, self.gamma))
 
     def conserved_quantities(self, U: Array) -> Dict[str, float]:
         rho, u, p, _ = self.primitive(U)

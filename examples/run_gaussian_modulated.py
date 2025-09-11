@@ -29,7 +29,8 @@ def main() -> None:
     dealias = bool(cfg["grid"].get("dealias", True))
     gamma = float(cfg["physics"]["gamma"]) 
 
-    grid = Grid1D(N=N, Lx=Lx, dealias=dealias, filter_params=cfg["integration"].get("spectral_filter", {"enabled": False}))
+    fft_workers = int(cfg["grid"].get("fft_workers", os.cpu_count() or 1))
+    grid = Grid1D(N=N, Lx=Lx, dealias=dealias, filter_params=cfg["integration"].get("spectral_filter", {"enabled": False}), fft_workers=fft_workers)
     eqs = EulerEquations1D(gamma=gamma)
 
     acfg = cfg["initial_conditions"]["acoustic"]

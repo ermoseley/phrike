@@ -16,8 +16,8 @@ integration:
   output_interval: 0.0025
   spectral_filter:
     enabled: true
-    p: 16
-    alpha: 36.0
+    p: 8
+    alpha: 50.0
 
 initial_conditions:
   acoustic:
@@ -30,7 +30,7 @@ initial_conditions:
     center_left: 0.45
     center_right: 0.55
     sigma: 0.015
-    carrier_m: 32
+    carrier_m: 8
     phase_left: 0.0
     phase_right: 0.0
     same_direction: right

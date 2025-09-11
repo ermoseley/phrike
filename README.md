@@ -31,6 +31,6 @@ Project structure
 License
 -------
 
-MIT
+Stanford University
 
 

@@ -32,7 +32,8 @@ def main() -> None:
     checkpoint_interval = float(cfg["integration"].get("checkpoint_interval", 0.0))
     filt_cfg = cfg["integration"].get("spectral_filter", {"enabled": False})
 
-    grid = Grid1D(N=N, Lx=Lx, dealias=dealias, filter_params=filt_cfg)
+    fft_workers = int(cfg["grid"].get("fft_workers", os.cpu_count() or 1))
+    grid = Grid1D(N=N, Lx=Lx, dealias=dealias, filter_params=filt_cfg, fft_workers=fft_workers)
     eqs = EulerEquations1D(gamma=gamma)
 
     x0 = float(cfg["grid"].get("x0", 0.5 * Lx))

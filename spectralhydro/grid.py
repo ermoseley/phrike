@@ -7,10 +7,12 @@ import numpy as np
 
 try:  # Prefer pyfftw if available for performance
     import pyfftw.interfaces.scipy_fft as scipy_fft  # type: ignore
+    from pyfftw.interfaces import cache as fftw_cache  # type: ignore
     scipy_fft_cache_enabled = True
 except Exception:  # Fallback to SciPy's FFT
     from scipy import fft as scipy_fft  # type: ignore
     scipy_fft_cache_enabled = False
+    fftw_cache = None  # type: ignore
 
 
 def _build_filter_mask(N: int, dealias: bool) -> np.ndarray:
@@ -55,6 +57,7 @@ class Grid1D:
     Lx: float
     dealias: bool = True
     filter_params: Optional[Dict[str, float]] = None
+    fft_workers: int = 1
 
     def __post_init__(self) -> None:
         self.dx = self.Lx / self.N
@@ -73,15 +76,32 @@ class Grid1D:
             alpha = float(self.filter_params.get("alpha", 36.0))
             self.filter_sigma = _build_exponential_filter(self.N, p=p, alpha=alpha)
 
+        # Enable FFTW planning cache if available (no-op with SciPy backend)
+        if scipy_fft_cache_enabled and fftw_cache is not None:
+            try:
+                fftw_cache.enable()
+                # Use a reasonable cache size to avoid repeated planning
+                fftw_cache.set_keepalive_time(60.0)
+            except Exception:
+                pass
+
     # FFT wrappers
     def rfft(self, f: np.ndarray) -> np.ndarray:
-        return scipy_fft.fft(f)
+        # FFT along the last axis to support batched inputs (..., N)
+        try:
+            return scipy_fft.fft(f, axis=-1, workers=self.fft_workers)  # type: ignore[call-arg]
+        except TypeError:
+            return scipy_fft.fft(f, axis=-1)
 
     def irfft(self, F: np.ndarray) -> np.ndarray:
-        return scipy_fft.ifft(F).real
+        try:
+            return scipy_fft.ifft(F, axis=-1, workers=self.fft_workers).real  # type: ignore[call-arg]
+        except TypeError:
+            return scipy_fft.ifft(F, axis=-1).real
 
     # Spectral derivative
     def dx1(self, f: np.ndarray) -> np.ndarray:
+        # Supports f with shape (..., N)
         F = self.rfft(f)
         F *= self.dealias_mask
         F *= self.filter_sigma
@@ -89,6 +109,7 @@ class Grid1D:
         return self.irfft(dF)
 
     def apply_spectral_filter(self, f: np.ndarray) -> np.ndarray:
+        # Supports f with shape (..., N)
         F = self.rfft(f)
         F *= self.dealias_mask
         F *= self.filter_sigma

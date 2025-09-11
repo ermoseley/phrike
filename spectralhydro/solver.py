@@ -15,7 +15,8 @@ Array = np.ndarray
 def _compute_rhs(grid: Grid1D, eqs: EulerEquations1D, U: Array) -> Array:
     # Pseudo-spectral: compute flux in physical space, then differentiate spectrally
     F = eqs.flux(U)
-    dFdx = np.vstack([grid.dx1(F[i]) for i in range(3)])
+    # Batched spectral derivative across components (shape (3, N))
+    dFdx = grid.dx1(F)
     # Euler in conservation form: dU/dt = - dF/dx
     return -dFdx
 
@@ -40,7 +41,7 @@ def _rk4_step(grid: Grid1D, eqs: EulerEquations1D, U: Array, dt: float) -> Array
 
 def _apply_physical_filters(grid: Grid1D, U: Array) -> Array:
     # Apply optional spectral filter to each component to suppress Gibbs/aliasing
-    return np.vstack([grid.apply_spectral_filter(U[i]) for i in range(U.shape[0])])
+    return grid.apply_spectral_filter(U)
 
 
 @dataclass
