@@ -32,18 +32,39 @@ def save_solution_snapshot(
     if tag:
         ts = f"{ts}_{tag}"
     filename = os.path.join(outdir, f"snapshot_{ts}.npz")
-    rho, u, p, _ = equations.primitive(U)
-    np.savez(
-        filename,
-        t=t,
-        U=U,
-        x=grid.x,
-        rho=rho,
-        u=u,
-        p=p,
-        meta={"N": grid.N, "Lx": grid.Lx, "gamma": equations.gamma},
-        created=str(datetime.utcnow()),
-    )
+
+    # Support both 1D and 2D grids/equations
+    is_2d = hasattr(grid, "Ny") and hasattr(grid, "y")
+    if is_2d:
+        rho, ux, uy, p = equations.primitive(U)
+        meta: Dict[str, Any] = {"Nx": grid.Nx, "Ny": grid.Ny, "Lx": grid.Lx, "Ly": grid.Ly, "gamma": equations.gamma}
+        np.savez(
+            filename,
+            t=t,
+            U=U,
+            x=grid.x,
+            y=grid.y,
+            rho=rho,
+            ux=ux,
+            uy=uy,
+            p=p,
+            meta=meta,
+            created=str(datetime.utcnow()),
+        )
+    else:
+        rho, u, p, _ = equations.primitive(U)
+        meta = {"N": grid.N, "Lx": grid.Lx, "gamma": equations.gamma}
+        np.savez(
+            filename,
+            t=t,
+            U=U,
+            x=grid.x,
+            rho=rho,
+            u=u,
+            p=p,
+            meta=meta,
+            created=str(datetime.utcnow()),
+        )
     return filename
 
 

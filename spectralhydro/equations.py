@@ -18,7 +18,7 @@ except Exception:
         return range(*args, **kwargs)
 
 
-# --- Numba-accelerated kernels ---
+# --- Numba-accelerated kernels (1D) ---
 
 @njit(cache=True, fastmath=True)
 def _primitive_kernel(U: np.ndarray, gamma: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -55,6 +55,53 @@ def _max_wave_speed_kernel(U: np.ndarray, gamma: float) -> float:
     return max_c
 
 
+# --- 2D Euler kernels ---
+
+@njit(cache=True, fastmath=True)
+def _primitive2d_kernel(U: np.ndarray, gamma: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    rho = U[0]
+    momx = U[1]
+    momy = U[2]
+    E = U[3]
+    ux = momx / rho
+    uy = momy / rho
+    kinetic = 0.5 * rho * (ux * ux + uy * uy)
+    p = (gamma - 1.0) * (E - kinetic)
+    a = np.sqrt(gamma * p / rho)
+    return rho, ux, uy, p
+
+
+@njit(cache=True, fastmath=True)
+def _flux2d_kernel(U: np.ndarray, gamma: float) -> Tuple[np.ndarray, np.ndarray]:
+    rho, ux, uy, p = _primitive2d_kernel(U, gamma)
+    momx = rho * ux
+    momy = rho * uy
+    Fx = np.empty((4, U.shape[-2], U.shape[-1]), dtype=U.dtype)
+    Fy = np.empty_like(Fx)
+    Fx[0] = momx
+    Fx[1] = momx * ux + p
+    Fx[2] = momx * uy
+    Fx[3] = (U[3] + p) * ux
+    Fy[0] = momy
+    Fy[1] = momy * ux
+    Fy[2] = momy * uy + p
+    Fy[3] = (U[3] + p) * uy
+    return Fx, Fy
+
+
+@njit(cache=True, fastmath=True)
+def _max_wave_speed2d_kernel(U: np.ndarray, gamma: float) -> float:
+    rho, ux, uy, p = _primitive2d_kernel(U, gamma)
+    a = np.sqrt(gamma * p / rho)
+    c = np.abs(ux) + a
+    max_c = 0.0
+    for j in range(c.shape[0]):
+        for i in range(c.shape[1]):
+            if c[j, i] > max_c:
+                max_c = c[j, i]
+    return max_c
+
+
 Array = np.ndarray
 
 
@@ -83,6 +130,26 @@ class EulerEquations1D:
 
     def max_wave_speed(self, U: Array) -> float:
         return float(_max_wave_speed_kernel(U, self.gamma))
+
+
+@dataclass
+class EulerEquations2D:
+    gamma: float = 1.4
+
+    def primitive(self, U: Array) -> Tuple[Array, Array, Array, Array]:
+        return _primitive2d_kernel(U, self.gamma)
+
+    def conservative(self, rho: Array, ux: Array, uy: Array, p: Array) -> Array:
+        momx = rho * ux
+        momy = rho * uy
+        E = p / (self.gamma - 1.0) + 0.5 * rho * (ux * ux + uy * uy)
+        return np.array([rho, momx, momy, E])
+
+    def flux(self, U: Array) -> Tuple[Array, Array]:
+        return _flux2d_kernel(U, self.gamma)
+
+    def max_wave_speed(self, U: Array) -> float:
+        return float(_max_wave_speed2d_kernel(U, self.gamma))
 
     def conserved_quantities(self, U: Array) -> Dict[str, float]:
         rho, u, p, _ = self.primitive(U)

@@ -1,0 +1,44 @@
+problem: khi2d
+
+grid:
+  Nx: 256
+  Ny: 256
+  Lx: 1.0
+  Ly: 1.0
+  dealias: true
+  fft_workers: 4
+
+physics:
+  gamma: 1.4
+
+integration:
+  t0: 0.0
+  t_end: 3.0
+  cfl: 0.25
+  scheme: rk4
+  output_interval: 0.02
+  spectral_filter:
+    enabled: true
+    p: 8
+    alpha: 36.0
+
+initial_conditions:
+  rho_outer: 1.0
+  rho_inner: 2.0
+  u0: 1.0
+  shear_thickness: 0.02
+  pressure_outer: 1.0
+  pressure_inner: 1.0
+  perturb_eps: 0.01
+  perturb_sigma: 0.02
+
+io:
+  outdir: outputs/khi2d
+
+video:
+  fps: 30
+  codec: h264_videotoolbox
+  crf: 18
+  pix_fmt: yuv420p
+
+
