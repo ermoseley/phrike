@@ -20,6 +20,19 @@ def ensure_outdir(outdir: str) -> None:
     os.makedirs(outdir, exist_ok=True)
 
 
+def _to_numpy(a: Any) -> Any:
+    try:
+        import torch  # type: ignore
+    except Exception:
+        torch = None  # type: ignore
+    if 'torch' in str(type(a)):
+        try:
+            return a.detach().cpu().numpy()
+        except Exception:
+            pass
+    return a
+
+
 def save_solution_snapshot(
     outdir: str,
     t: float,
@@ -37,17 +50,17 @@ def save_solution_snapshot(
     is_2d = hasattr(grid, "Ny") and hasattr(grid, "y")
     if is_2d:
         rho, ux, uy, p = equations.primitive(U)
-        meta: Dict[str, Any] = {"Nx": grid.Nx, "Ny": grid.Ny, "Lx": grid.Lx, "Ly": grid.Ly, "gamma": equations.gamma}
+        meta: Dict[str, Any] = {"Nx": getattr(grid, 'Nx', None), "Ny": getattr(grid, 'Ny', None), "Lx": grid.Lx, "Ly": grid.Ly, "gamma": equations.gamma}
         np.savez(
             filename,
             t=t,
-            U=U,
-            x=grid.x,
-            y=grid.y,
-            rho=rho,
-            ux=ux,
-            uy=uy,
-            p=p,
+            U=_to_numpy(U),
+            x=_to_numpy(grid.x),
+            y=_to_numpy(grid.y),
+            rho=_to_numpy(rho),
+            ux=_to_numpy(ux),
+            uy=_to_numpy(uy),
+            p=_to_numpy(p),
             meta=meta,
             created=str(datetime.utcnow()),
         )
@@ -57,11 +70,11 @@ def save_solution_snapshot(
         np.savez(
             filename,
             t=t,
-            U=U,
-            x=grid.x,
-            rho=rho,
-            u=u,
-            p=p,
+            U=_to_numpy(U),
+            x=_to_numpy(grid.x),
+            rho=_to_numpy(rho),
+            u=_to_numpy(u),
+            p=_to_numpy(p),
             meta=meta,
             created=str(datetime.utcnow()),
         )

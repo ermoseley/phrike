@@ -14,6 +14,42 @@ Quick start
 
    python examples/run_sod.py --config configs/sod.yaml
 
+Backends (NumPy vs Torch)
+-------------------------
+
+SpectralHydro supports two array/FFT backends:
+
+- NumPy/SciPy (CPU, default)
+- Torch (CPU, Apple Silicon via MPS, or CUDA if available)
+
+Install Torch (optional):
+
+```
+pip install torch torchvision torchaudio
+```
+
+Use the `--backend` flag in examples to select the backend, and optionally `--device` for Torch:
+
+```
+# NumPy (default)
+python examples/run_khi2d.py --config configs/khi2d.yaml --backend numpy
+
+# Torch on CPU
+python examples/run_khi2d.py --config configs/khi2d.yaml --backend torch --device cpu
+
+# Torch on Apple Silicon GPU (MPS)
+python examples/run_khi2d.py --config configs/khi2d.yaml --backend torch --device mps
+
+# Torch on CUDA (Linux/NVIDIA)
+python examples/run_khi2d.py --config configs/khi2d.yaml --backend torch --device cuda
+```
+
+Notes:
+
+- Torch backend uses `torch.fft` and vectorized ops. No numba is used on Torch.
+- On macOS, CuPy is not supported for GPU; Torch via MPS is the recommended GPU path.
+- If Torch is not installed or the requested device is unavailable, use the NumPy backend.
+
 Project structure
 -----------------
 

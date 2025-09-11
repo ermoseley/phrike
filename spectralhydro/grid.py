@@ -5,6 +5,13 @@ from typing import Dict, Optional
 
 import numpy as np
 
+try:
+    import torch  # type: ignore
+    _TORCH_AVAILABLE = True
+except Exception:  # pragma: no cover - torch may not be installed
+    _TORCH_AVAILABLE = False
+    torch = None  # type: ignore
+
 try:  # Prefer pyfftw if available for performance
     import pyfftw.interfaces.scipy_fft as scipy_fft  # type: ignore
     from pyfftw.interfaces import cache as fftw_cache  # type: ignore
@@ -82,6 +89,8 @@ class Grid1D:
     dealias: bool = True
     filter_params: Optional[Dict[str, float]] = None
     fft_workers: int = 1
+    backend: str = "numpy"  # "numpy" or "torch"
+    torch_device: Optional[str] = None
 
     def __post_init__(self) -> None:
         self.dx = self.Lx / self.N
@@ -109,15 +118,49 @@ class Grid1D:
             except Exception:
                 pass
 
+        # Torch backend setup
+        self._use_torch = (self.backend.lower() == "torch") and _TORCH_AVAILABLE
+        if self._use_torch:
+            # Choose device if not provided
+            if self.torch_device is None:
+                dev = "cpu"
+                try:
+                    if torch is not None and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                        dev = "mps"
+                    elif torch is not None and torch.cuda.is_available():
+                        dev = "cuda"
+                except Exception:
+                    dev = "cpu"
+                self.torch_device = dev
+
+            # Choose dtype based on device (MPS only supports float32)
+            torch_dtype = torch.float32 if self.torch_device == "mps" else torch.float64
+            torch_cdtype = torch.complex64 if self.torch_device == "mps" else torch.complex128
+
+            # Move arrays to torch
+            assert torch is not None
+            self.x = torch.from_numpy(np.asarray(self.x)).to(dtype=torch_dtype, device=self.torch_device)
+            k_t = torch.from_numpy(np.asarray(self.k)).to(dtype=torch_dtype, device=self.torch_device)
+            self.k = k_t
+            self.ik = k_t.to(dtype=torch_cdtype) * (1j)
+            self.dealias_mask = torch.from_numpy(np.asarray(self.dealias_mask)).to(dtype=torch_dtype, device=self.torch_device)
+            self.filter_sigma = torch.from_numpy(np.asarray(self.filter_sigma)).to(dtype=torch_dtype, device=self.torch_device)
+
     # FFT wrappers
     def rfft(self, f: np.ndarray) -> np.ndarray:
         # FFT along the last axis to support batched inputs (..., N)
+        if getattr(self, "_use_torch", False):
+            assert torch is not None
+            return torch.fft.fft(f, dim=-1)
         try:
             return scipy_fft.fft(f, axis=-1, workers=self.fft_workers)  # type: ignore[call-arg]
         except TypeError:
             return scipy_fft.fft(f, axis=-1)
 
     def irfft(self, F: np.ndarray) -> np.ndarray:
+        if getattr(self, "_use_torch", False):
+            assert torch is not None
+            return torch.fft.ifft(F, dim=-1).real
         try:
             return scipy_fft.ifft(F, axis=-1, workers=self.fft_workers).real  # type: ignore[call-arg]
         except TypeError:
@@ -163,6 +206,8 @@ class Grid2D:
     dealias: bool = True
     filter_params: Optional[Dict[str, float]] = None
     fft_workers: int = 1
+    backend: str = "numpy"  # "numpy" or "torch"
+    torch_device: Optional[str] = None
 
     def __post_init__(self) -> None:
         self.dx = self.Lx / self.Nx
@@ -193,14 +238,51 @@ class Grid2D:
             except Exception:
                 pass
 
+        # Torch backend setup
+        self._use_torch = (self.backend.lower() == "torch") and _TORCH_AVAILABLE
+        if self._use_torch:
+            assert torch is not None
+            if self.torch_device is None:
+                dev = "cpu"
+                try:
+                    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                        dev = "mps"
+                    elif torch.cuda.is_available():
+                        dev = "cuda"
+                except Exception:
+                    dev = "cpu"
+                self.torch_device = dev
+
+            # Choose dtype based on device (MPS only supports float32)
+            torch_dtype = torch.float32 if self.torch_device == "mps" else torch.float64
+            torch_cdtype = torch.complex64 if self.torch_device == "mps" else torch.complex128
+
+            self.x = torch.from_numpy(np.asarray(self.x)).to(dtype=torch_dtype, device=self.torch_device)
+            self.y = torch.from_numpy(np.asarray(self.y)).to(dtype=torch_dtype, device=self.torch_device)
+
+            kx_t = torch.from_numpy(np.asarray(self.kx)).to(dtype=torch_dtype, device=self.torch_device)
+            ky_t = torch.from_numpy(np.asarray(self.ky)).to(dtype=torch_dtype, device=self.torch_device)
+            self.kx = kx_t
+            self.ky = ky_t
+            self.ikx = kx_t.to(dtype=torch_cdtype)[None, :] * (1j)
+            self.iky = ky_t.to(dtype=torch_cdtype)[:, None] * (1j)
+            self.dealias_mask = torch.from_numpy(np.asarray(self.dealias_mask)).to(dtype=torch_dtype, device=self.torch_device)
+            self.filter_sigma = torch.from_numpy(np.asarray(self.filter_sigma)).to(dtype=torch_dtype, device=self.torch_device)
+
     # 2D FFT wrappers
     def fft2(self, f: np.ndarray) -> np.ndarray:
+        if getattr(self, "_use_torch", False):
+            assert torch is not None
+            return torch.fft.fft2(f, dim=(-2, -1))
         try:
             return scipy_fft.fft2(f, axes=(-2, -1), workers=self.fft_workers)  # type: ignore[call-arg]
         except TypeError:
             return scipy_fft.fft2(f, axes=(-2, -1))
 
     def ifft2(self, F: np.ndarray) -> np.ndarray:
+        if getattr(self, "_use_torch", False):
+            assert torch is not None
+            return torch.fft.ifft2(F, dim=(-2, -1)).real
         try:
             return scipy_fft.ifft2(F, axes=(-2, -1), workers=self.fft_workers).real  # type: ignore[call-arg]
         except TypeError:
@@ -231,6 +313,18 @@ class Grid2D:
         return self.ifft2(F)
 
     def xy_mesh(self) -> tuple[np.ndarray, np.ndarray]:
-        X, Y = np.meshgrid(self.x, self.y, indexing="xy")
-        return X, Y
+        if getattr(self, "_use_torch", False):
+            assert torch is not None
+            # Convert to numpy for meshgrid, then back to torch
+            x_np = self.x.detach().cpu().numpy()
+            y_np = self.y.detach().cpu().numpy()
+            X_np, Y_np = np.meshgrid(x_np, y_np, indexing="xy")
+            # Convert back to torch with same dtype and device
+            torch_dtype = torch.float32 if self.torch_device == "mps" else torch.float64
+            X = torch.from_numpy(X_np).to(dtype=torch_dtype, device=self.torch_device)
+            Y = torch.from_numpy(Y_np).to(dtype=torch_dtype, device=self.torch_device)
+            return X, Y
+        else:
+            X, Y = np.meshgrid(self.x, self.y, indexing="xy")
+            return X, Y
 

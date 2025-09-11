@@ -15,6 +15,8 @@ from spectralhydro.solver import SpectralSolver2D
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run 2D Kelvin-Helmholtz instability")
     parser.add_argument("--config", type=str, default="configs/khi2d.yaml")
+    parser.add_argument("--backend", type=str, default="numpy", choices=["numpy", "torch"], help="Array backend")
+    parser.add_argument("--device", type=str, default=None, help="Torch device: cpu|mps|cuda (if backend=torch)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -37,7 +39,7 @@ def main() -> None:
     output_interval = float(cfg["integration"].get("output_interval", 0.1))
     filt_cfg = cfg["integration"].get("spectral_filter", {"enabled": False})
 
-    grid = Grid2D(Nx=Nx, Ny=Ny, Lx=Lx, Ly=Ly, dealias=dealias, filter_params=filt_cfg, fft_workers=fft_workers)
+    grid = Grid2D(Nx=Nx, Ny=Ny, Lx=Lx, Ly=Ly, dealias=dealias, filter_params=filt_cfg, fft_workers=fft_workers, backend=args.backend, torch_device=args.device)
     eqs = EulerEquations2D(gamma=gamma)
 
     X, Y = grid.xy_mesh()
@@ -50,11 +52,13 @@ def main() -> None:
     pressure_inner = float(icfg.get("pressure_inner", 1.0))
     perturb_eps = float(icfg.get("perturb_eps", 0.01))
     perturb_sigma = float(icfg.get("perturb_sigma", 0.02))
+    perturb_kx = int(icfg.get("perturb_kx", 2))
 
     U0 = kelvin_helmholtz_2d(X, Y, rho_outer=rho_outer, rho_inner=rho_inner, 
                               u0=u0, shear_thickness=shear_thickness, 
                               pressure_outer=pressure_outer, pressure_inner=pressure_inner,
-                              perturb_eps=perturb_eps, perturb_sigma=perturb_sigma, gamma=gamma)
+                              perturb_eps=perturb_eps, perturb_sigma=perturb_sigma, 
+                              perturb_kx=perturb_kx, gamma=gamma)
 
     solver = SpectralSolver2D(grid=grid, equations=eqs, scheme=scheme, cfl=cfl)
 
@@ -65,11 +69,20 @@ def main() -> None:
     fig, axs = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
     def render(t: float, U):
         rho, ux, uy, p = eqs.primitive(U)
+        # Convert torch tensors to numpy for plotting
+        try:
+            import torch  # type: ignore
+            if isinstance(rho, (torch.Tensor,)):
+                rho = rho.detach().cpu().numpy()
+                uy = uy.detach().cpu().numpy()
+        except Exception:
+            pass
+        
         axs[0].cla(); axs[1].cla()
         axs[0].imshow(rho, origin='lower', extent=[0, Lx, 0, Ly], aspect='auto')
         axs[0].set_title(f"rho t={t:.3f}")
-        axs[1].imshow(ux, origin='lower', extent=[0, Lx, 0, Ly], aspect='auto')
-        axs[1].set_title("ux")
+        axs[1].imshow(uy, origin='lower', extent=[0, Lx, 0, Ly], aspect='auto')
+        axs[1].set_title("uy")
         for ax in axs:
             ax.set_xlabel('x'); ax.set_ylabel('y')
         fig.canvas.draw(); fig.canvas.flush_events()
@@ -83,9 +96,18 @@ def main() -> None:
     print(f"Saved final snapshot: {snapshot_path}")
     
     rho, ux, uy, p = eqs.primitive(solver.U)
+    # Convert torch tensors to numpy for plotting
+    try:
+        import torch  # type: ignore
+        if isinstance(rho, (torch.Tensor,)):
+            rho = rho.detach().cpu().numpy()
+            uy = uy.detach().cpu().numpy()
+    except Exception:
+        pass
+    
     plt.figure(figsize=(10,4))
     plt.subplot(1,2,1); plt.imshow(rho, origin='lower', extent=[0, Lx, 0, Ly], aspect='auto'); plt.title(f"rho t={solver.t:.3f}")
-    plt.subplot(1,2,2); plt.imshow(ux, origin='lower', extent=[0, Lx, 0, Ly], aspect='auto'); plt.title("ux")
+    plt.subplot(1,2,2); plt.imshow(uy, origin='lower', extent=[0, Lx, 0, Ly], aspect='auto'); plt.title("uy")
     plt.tight_layout()
     plt.savefig(os.path.join(outdir, f"khi2d_t{solver.t:.3f}.png"), dpi=150)
     plt.close()

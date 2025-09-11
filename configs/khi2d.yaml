@@ -1,8 +1,8 @@
 problem: khi2d
 
 grid:
-  Nx: 256
-  Ny: 256
+  Nx: 512
+  Ny: 512
   Lx: 1.0
   Ly: 1.0
   dealias: true
@@ -13,7 +13,7 @@ physics:
 
 integration:
   t0: 0.0
-  t_end: 3.0
+  t_end: 5.0
   cfl: 0.25
   scheme: rk4
   output_interval: 0.02
@@ -31,6 +31,7 @@ initial_conditions:
   pressure_inner: 1.0
   perturb_eps: 0.01
   perturb_sigma: 0.02
+  perturb_kx: 2  # wavenumber for sinusoidal modulation in x
 
 io:
   outdir: outputs/khi2d

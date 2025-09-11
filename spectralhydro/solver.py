@@ -4,6 +4,12 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
+try:
+    import torch  # type: ignore
+    _TORCH_AVAILABLE = True
+except Exception:
+    _TORCH_AVAILABLE = False
+    torch = None  # type: ignore
 
 from .grid import Grid1D, Grid2D
 from .equations import EulerEquations1D, EulerEquations2D
@@ -191,7 +197,10 @@ class SpectralSolver2D:
     ) -> Dict[str, List[float]]:
         from .io import save_solution_snapshot
 
-        self.U = U0.copy()
+        if _TORCH_AVAILABLE and isinstance(U0, (torch.Tensor,)):
+            self.U = U0.clone()
+        else:
+            self.U = U0.copy()
         self.t = float(t0)
         next_output = self.t + output_interval
         next_checkpoint = self.t + checkpoint_interval if checkpoint_interval and checkpoint_interval > 0 else np.inf
@@ -200,10 +209,16 @@ class SpectralSolver2D:
 
         def record() -> None:
             rho, ux, uy, p = self.equations.primitive(self.U)  # type: ignore[arg-type]
-            mass = float(np.sum(rho))
-            momx = float(np.sum(rho * ux))
-            momy = float(np.sum(rho * uy))
-            energy = float(np.sum(p / (self.equations.gamma - 1.0) + 0.5 * rho * (ux * ux + uy * uy)))
+            if _TORCH_AVAILABLE and isinstance(rho, (torch.Tensor,)):
+                mass = float(torch.sum(rho).item())
+                momx = float(torch.sum(rho * ux).item())
+                momy = float(torch.sum(rho * uy).item())
+                energy = float(torch.sum(p / (self.equations.gamma - 1.0) + 0.5 * rho * (ux * ux + uy * uy)).item())
+            else:
+                mass = float(np.sum(rho))
+                momx = float(np.sum(rho * ux))
+                momy = float(np.sum(rho * uy))
+                energy = float(np.sum(p / (self.equations.gamma - 1.0) + 0.5 * rho * (ux * ux + uy * uy)))
             history["time"].append(self.t)
             history["mass"].append(mass)
             history["momentum_x"].append(momx)

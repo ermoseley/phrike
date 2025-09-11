@@ -4,6 +4,12 @@ from dataclasses import dataclass
 from typing import Dict, Tuple
 
 import numpy as np
+try:
+    import torch  # type: ignore
+    _TORCH_AVAILABLE = True
+except Exception:
+    _TORCH_AVAILABLE = False
+    torch = None  # type: ignore
 
 try:
     from numba import njit, prange
@@ -118,17 +124,40 @@ class EulerEquations1D:
     gamma: float = 1.4
 
     def primitive(self, U: Array) -> Tuple[Array, Array, Array, Array]:
+        if _TORCH_AVAILABLE and isinstance(U, (torch.Tensor,)):
+            rho = U[0]
+            mom = U[1]
+            E = U[2]
+            u = mom / rho
+            kinetic = 0.5 * rho * u * u
+            p = (self.gamma - 1.0) * (E - kinetic)
+            a = torch.sqrt(self.gamma * p / rho)
+            return rho, u, p, a
         return _primitive_kernel(U, self.gamma)
 
     def conservative(self, rho: Array, u: Array, p: Array) -> Array:
         mom = rho * u
-        E = p / (self.gamma - 1.0) + 0.5 * rho * u * u
-        return np.array([rho, mom, E])
+        if _TORCH_AVAILABLE and isinstance(rho, (torch.Tensor,)):
+            E = p / (self.gamma - 1.0) + 0.5 * rho * u * u
+            return torch.stack([rho, mom, E], dim=0)
+        else:
+            E = p / (self.gamma - 1.0) + 0.5 * rho * u * u
+            return np.array([rho, mom, E])
 
     def flux(self, U: Array) -> Array:
+        if _TORCH_AVAILABLE and isinstance(U, (torch.Tensor,)):
+            rho, u, p, _ = self.primitive(U)
+            mom = rho * u
+            F1 = mom
+            F2 = mom * u + p
+            F3 = (U[2] + p) * u
+            return torch.stack([F1, F2, F3], dim=0)
         return _flux_kernel(U, self.gamma)
 
     def max_wave_speed(self, U: Array) -> float:
+        if _TORCH_AVAILABLE and isinstance(U, (torch.Tensor,)):
+            _, u, _, a = self.primitive(U)
+            return float(torch.max(torch.abs(u) + a).item())
         return float(_max_wave_speed_kernel(U, self.gamma))
 
 
@@ -137,18 +166,49 @@ class EulerEquations2D:
     gamma: float = 1.4
 
     def primitive(self, U: Array) -> Tuple[Array, Array, Array, Array]:
+        if _TORCH_AVAILABLE and isinstance(U, (torch.Tensor,)):
+            rho = U[0]
+            momx = U[1]
+            momy = U[2]
+            E = U[3]
+            ux = momx / rho
+            uy = momy / rho
+            kinetic = 0.5 * rho * (ux * ux + uy * uy)
+            p = (self.gamma - 1.0) * (E - kinetic)
+            return rho, ux, uy, p
         return _primitive2d_kernel(U, self.gamma)
 
     def conservative(self, rho: Array, ux: Array, uy: Array, p: Array) -> Array:
         momx = rho * ux
         momy = rho * uy
         E = p / (self.gamma - 1.0) + 0.5 * rho * (ux * ux + uy * uy)
+        if _TORCH_AVAILABLE and isinstance(rho, (torch.Tensor,)):
+            return torch.stack([rho, momx, momy, E], dim=0)
         return np.array([rho, momx, momy, E])
 
     def flux(self, U: Array) -> Tuple[Array, Array]:
+        if _TORCH_AVAILABLE and isinstance(U, (torch.Tensor,)):
+            rho, ux, uy, p = self.primitive(U)
+            momx = rho * ux
+            momy = rho * uy
+            Fx0 = momx
+            Fx1 = momx * ux + p
+            Fx2 = momx * uy
+            Fx3 = (U[3] + p) * ux
+            Fy0 = momy
+            Fy1 = momy * ux
+            Fy2 = momy * uy + p
+            Fy3 = (U[3] + p) * uy
+            Fx = torch.stack([Fx0, Fx1, Fx2, Fx3], dim=0)
+            Fy = torch.stack([Fy0, Fy1, Fy2, Fy3], dim=0)
+            return Fx, Fy
         return _flux2d_kernel(U, self.gamma)
 
     def max_wave_speed(self, U: Array) -> float:
+        if _TORCH_AVAILABLE and isinstance(U, (torch.Tensor,)):
+            rho, ux, uy, p = self.primitive(U)
+            a = torch.sqrt(self.gamma * p / rho)
+            return float(torch.max(torch.abs(ux) + a).item())
         return float(_max_wave_speed2d_kernel(U, self.gamma))
 
     def conserved_quantities(self, U: Array) -> Dict[str, float]:
