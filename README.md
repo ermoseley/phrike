@@ -1,7 +1,7 @@
-SpectralHydro: Pseudo-spectral Hydrodynamics (1D core)
+HYDRA (HYDRodynamics GPU-Accelerated solver)
 =====================================================
 
-SpectralHydro is a modular pseudo-spectral solver for compressible flows. The initial release implements a 1D solver for the Euler equations using FFT-based spatial derivatives with RK2/RK4 time integration. The design is dimension-agnostic and intended to be extended to 2D/3D with MPI support.
+HYDRA is a modular pseudo-spectral solver for compressible flows. The initial release implements a 1D solver for the Euler equations using FFT-based spatial derivatives with RK2/RK4 time integration. The design is dimension-agnostic and intended to be extended to 2D/3D with MPI support.
 
 Quick start
 -----------
@@ -17,7 +17,7 @@ Quick start
 Project structure
 -----------------
 
-- spectralhydro/
+- hydro/
   - grid.py: spatial grids and FFT transforms
   - equations.py: Euler equations in conservative form
   - solver.py: time integration (RK2/RK4), CFL control
