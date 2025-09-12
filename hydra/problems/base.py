@@ -186,6 +186,9 @@ class BaseProblem(ABC):
         # Run simulation
         if hasattr(solver, 'run'):
             # New solver interface
+            def visualization_callback(t, U):
+                self.create_visualization(solver, t, U)
+            
             history = solver.run(
                 U0, 
                 t0=self.t0, 
@@ -193,7 +196,7 @@ class BaseProblem(ABC):
                 output_interval=self.output_interval,
                 checkpoint_interval=self.checkpoint_interval,
                 outdir=self.outdir,
-                on_output=self.create_visualization if generate_video else None
+                on_output=visualization_callback if generate_video else None
             )
         else:
             # Legacy solver interface

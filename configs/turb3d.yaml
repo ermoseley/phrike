@@ -16,10 +16,10 @@ physics:
 
 integration:
   t0: 0.0
-  t_end: 1.0
+  t_end: 2.0
   cfl: 0.8  # Matching RAMSES courant_factor
   scheme: rk4
-  output_interval: 0.1
+  output_interval: 0.02
   spectral_filter:
     enabled: true
     p: 8
@@ -28,7 +28,7 @@ integration:
 initial_conditions:
   rho0: 1.0
   p0: 1.0
-  vrms: 0.1  # Target RMS velocity magnitude
+  vrms: 0.5  # Target RMS velocity magnitude
   kmin: 1.0  # Minimum wavenumber for band-pass
   kmax: 5.0  # Maximum wavenumber for band-pass (modes 1-5)
   alpha: 0.3333  # Compressive fraction (matching RAMSES comp_frac)
