@@ -320,26 +320,26 @@ class BaseProblem(ABC):
                 if len(rho.shape) == 1:  # 1D: rho, u, p, a
                     rho, u, p, a = primitive_vars
                     current_cons = {
-                        "mass": float(np.sum(rho)),
-                        "momentum": float(np.sum(rho * u)),
-                        "energy": float(np.sum(p / (solver.equations.gamma - 1.0) + 0.5 * rho * u**2))
+                        "mass": float(rho.sum()),
+                        "momentum": float((rho * u).sum()),
+                        "energy": float((p / (solver.equations.gamma - 1.0) + 0.5 * rho * u**2).sum())
                     }
                 else:  # 2D: rho, ux, uy, p
                     rho, ux, uy, p = primitive_vars
                     current_cons = {
-                        "mass": float(np.sum(rho)),
-                        "momentum_x": float(np.sum(rho * ux)),
-                        "momentum_y": float(np.sum(rho * uy)),
-                        "energy": float(np.sum(p / (solver.equations.gamma - 1.0) + 0.5 * rho * (ux**2 + uy**2)))
+                        "mass": float(rho.sum()),
+                        "momentum_x": float((rho * ux).sum()),
+                        "momentum_y": float((rho * uy).sum()),
+                        "energy": float((p / (solver.equations.gamma - 1.0) + 0.5 * rho * (ux**2 + uy**2)).sum())
                     }
             elif len(primitive_vars) == 5:  # 3D: rho, ux, uy, uz, p
                 rho, ux, uy, uz, p = primitive_vars
                 current_cons = {
-                    "mass": float(np.sum(rho)),
-                    "momentum_x": float(np.sum(rho * ux)),
-                    "momentum_y": float(np.sum(rho * uy)),
-                    "momentum_z": float(np.sum(rho * uz)),
-                    "energy": float(np.sum(p / (solver.equations.gamma - 1.0) + 0.5 * rho * (ux**2 + uy**2 + uz**2)))
+                    "mass": float(rho.sum()),
+                    "momentum_x": float((rho * ux).sum()),
+                    "momentum_y": float((rho * uy).sum()),
+                    "momentum_z": float((rho * uz).sum()),
+                    "energy": float((p / (solver.equations.gamma - 1.0) + 0.5 * rho * (ux**2 + uy**2 + uz**2)).sum())
                 }
             else:
                 raise ValueError(f"Unexpected number of primitive variables: {len(primitive_vars)}")
@@ -375,11 +375,11 @@ class BaseProblem(ABC):
             raise ValueError(f"Unexpected number of primitive variables: {len(primitive_vars)}")
         
         # Compute density-weighted statistics
-        total_mass = np.sum(rho)
+        total_mass = rho.sum()
         if total_mass > 0:
-            v_rms = np.sqrt(np.sum(rho * v_mag**2) / total_mass)
-            v_max = np.max(v_mag)
-            v_min = np.min(v_mag)
+            v_rms = np.sqrt((rho * v_mag**2).sum() / total_mass)
+            v_max = v_mag.max()
+            v_min = v_mag.min()
         else:
             v_rms = v_max = v_min = 0.0
         
@@ -463,26 +463,26 @@ class BaseProblem(ABC):
                 if len(rho.shape) == 1:  # 1D: rho, u, p, a
                     rho, u, p, a = primitive_vars
                     self.monitoring_initial_values = {
-                        "mass": float(np.sum(rho)),
-                        "momentum": float(np.sum(rho * u)),
-                        "energy": float(np.sum(p / (solver.equations.gamma - 1.0) + 0.5 * rho * u**2))
+                        "mass": float(rho.sum()),
+                        "momentum": float((rho * u).sum()),
+                        "energy": float((p / (solver.equations.gamma - 1.0) + 0.5 * rho * u**2).sum())
                     }
                 else:  # 2D: rho, ux, uy, p
                     rho, ux, uy, p = primitive_vars
                     self.monitoring_initial_values = {
-                        "mass": float(np.sum(rho)),
-                        "momentum_x": float(np.sum(rho * ux)),
-                        "momentum_y": float(np.sum(rho * uy)),
-                        "energy": float(np.sum(p / (solver.equations.gamma - 1.0) + 0.5 * rho * (ux**2 + uy**2)))
+                        "mass": float(rho.sum()),
+                        "momentum_x": float((rho * ux).sum()),
+                        "momentum_y": float((rho * uy).sum()),
+                        "energy": float((p / (solver.equations.gamma - 1.0) + 0.5 * rho * (ux**2 + uy**2)).sum())
                     }
             elif len(primitive_vars) == 5:  # 3D: rho, ux, uy, uz, p
                 rho, ux, uy, uz, p = primitive_vars
                 self.monitoring_initial_values = {
-                    "mass": float(np.sum(rho)),
-                    "momentum_x": float(np.sum(rho * ux)),
-                    "momentum_y": float(np.sum(rho * uy)),
-                    "momentum_z": float(np.sum(rho * uz)),
-                    "energy": float(np.sum(p / (solver.equations.gamma - 1.0) + 0.5 * rho * (ux**2 + uy**2 + uz**2)))
+                    "mass": float(rho.sum()),
+                    "momentum_x": float((rho * ux).sum()),
+                    "momentum_y": float((rho * uy).sum()),
+                    "momentum_z": float((rho * uz).sum()),
+                    "energy": float((p / (solver.equations.gamma - 1.0) + 0.5 * rho * (ux**2 + uy**2 + uz**2)).sum())
                 }
             else:
                 raise ValueError(f"Unexpected number of primitive variables: {len(primitive_vars)}")

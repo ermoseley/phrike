@@ -227,9 +227,9 @@ class EulerEquations1D:
             total_momentum = float(torch.sum(rho * u).item())
             total_energy = float(torch.sum(p / (self.gamma - 1.0) + 0.5 * rho * u * u).item())
         else:
-            total_mass = float(np.sum(rho))
-            total_momentum = float(np.sum(rho * u))
-            total_energy = float(np.sum(p / (self.gamma - 1.0) + 0.5 * rho * u * u))
+            total_mass = float(rho.sum())
+            total_momentum = float((rho * u).sum())
+            total_energy = float((p / (self.gamma - 1.0) + 0.5 * rho * u * u).sum())
         return {
             "mass": total_mass,
             "momentum": total_momentum,
@@ -289,9 +289,9 @@ class EulerEquations2D:
 
     def conserved_quantities(self, U: Array) -> Dict[str, float]:
         rho, u, p, _ = self.primitive(U)
-        total_mass = float(np.sum(rho))
-        total_momentum = float(np.sum(rho * u))
-        total_energy = float(np.sum(p / (self.gamma - 1.0) + 0.5 * rho * u * u))
+        total_mass = float(rho.sum())
+        total_momentum = float((rho * u).sum())
+        total_energy = float((p / (self.gamma - 1.0) + 0.5 * rho * u * u).sum())
         return {
             "mass": total_mass,
             "momentum": total_momentum,
@@ -364,11 +364,11 @@ class EulerEquations3D:
 
     def conserved_quantities(self, U: Array) -> Dict[str, float]:
         rho, ux, uy, uz, p = self.primitive(U)
-        total_mass = float(np.sum(rho))
-        momx = float(np.sum(rho * ux))
-        momy = float(np.sum(rho * uy))
-        momz = float(np.sum(rho * uz))
-        total_energy = float(np.sum(p / (self.gamma - 1.0) + 0.5 * rho * (ux * ux + uy * uy + uz * uz)))
+        total_mass = float(rho.sum())
+        momx = float((rho * ux).sum())
+        momy = float((rho * uy).sum())
+        momz = float((rho * uz).sum())
+        total_energy = float((p / (self.gamma - 1.0) + 0.5 * rho * (ux * ux + uy * uy + uz * uz)).sum())
         return {
             "mass": total_mass,
             "momentum_x": momx,
