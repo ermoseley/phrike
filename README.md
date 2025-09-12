@@ -26,6 +26,9 @@ Quick start
    
    # 3D turbulent simulation with monitoring (monitoring enabled by default)
    python examples/run_turb3d_with_monitoring.py
+   
+   # Restart from checkpoint
+   python -m hydra sod --config configs/sod.yaml --restart-from outputs/sod/snapshot_t0.100000.npz
 
 Backends (NumPy vs Torch)
 -------------------------
@@ -91,6 +94,7 @@ python -m hydra sod --config configs/sod.yaml --backend torch --device mps --no-
 - `--device DEVICE` - Torch device: cpu|mps|cuda (if backend=torch)
 - `--no-video` - Skip video generation
 - `--outdir OUTDIR` - Override output directory
+- `--restart-from CHECKPOINT` - Restart simulation from checkpoint file
 - `-v, --verbose` - Verbose output
 
 Programmatic API
@@ -116,6 +120,55 @@ config = {
 }
 solver, history = run_simulation("sod", config=config)
 ```
+
+Restart Capabilities
+-------------------
+
+Hydra supports restarting simulations from checkpoint files, which is useful for:
+- Resuming long-running simulations that were interrupted
+- Continuing simulations with different parameters
+- Debugging and analysis of intermediate states
+
+**Using Restart:**
+
+```bash
+# Run a simulation with checkpointing enabled
+python -m hydra sod --config configs/sod.yaml
+
+# Restart from a specific checkpoint
+python -m hydra sod --config configs/sod.yaml --restart-from outputs/sod/snapshot_t0.100000.npz
+```
+
+**Checkpoint Configuration:**
+
+Enable checkpointing in your YAML config:
+
+```yaml
+integration:
+  checkpoint_interval: 0.1  # Save checkpoint every 0.1 time units
+```
+
+**Programmatic Restart:**
+
+```python
+from hydra.problems import ProblemRegistry
+
+# Create problem with restart
+problem = ProblemRegistry.create_problem(
+    "sod", 
+    config_path="configs/sod.yaml",
+    restart_from="outputs/sod/snapshot_t0.100000.npz"
+)
+
+solver, history = problem.run()
+```
+
+**Restart Validation:**
+
+The restart system automatically validates:
+- Grid dimensions compatibility
+- Physics parameters (gamma, etc.)
+- File format and data integrity
 
 Architecture
 ------------

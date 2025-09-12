@@ -39,19 +39,20 @@ class ProblemRegistry:
     
     @classmethod
     def create_problem(cls, name: str, config_path: Optional[str] = None, 
-                      config: Optional[dict] = None) -> BaseProblem:
+                      config: Optional[dict] = None, restart_from: Optional[str] = None) -> BaseProblem:
         """Create a problem instance.
         
         Args:
             name: Problem name
             config_path: Path to YAML configuration file
             config: Configuration dictionary
+            restart_from: Path to checkpoint file for restart
             
         Returns:
             Problem instance
         """
         problem_class = cls.get_problem_class(name)
-        return problem_class(config_path=config_path, config=config)
+        return problem_class(config_path=config_path, config=config, restart_from=restart_from)
     
     @classmethod
     def list_problems(cls) -> List[str]:

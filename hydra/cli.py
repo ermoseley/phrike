@@ -63,6 +63,13 @@ Examples:
         help="Override output directory"
     )
     
+    # Restart options
+    parser.add_argument(
+        "--restart-from", 
+        type=str, 
+        help="Restart simulation from checkpoint file (e.g., snapshot_t0.100000.npz)"
+    )
+    
     # Cache management
     parser.add_argument(
         "--clear-cache", 
@@ -90,7 +97,8 @@ Examples:
         # Create problem instance
         problem = ProblemRegistry.create_problem(
             name=args.problem,
-            config_path=args.config
+            config_path=args.config,
+            restart_from=args.restart_from
         )
         
         # Override output directory if specified

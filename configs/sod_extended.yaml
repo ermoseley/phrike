@@ -1,0 +1,40 @@
+# Configuration for 1D Sod shock tube
+problem: sod
+
+grid:
+  N: 1024           # number of points (power of 2 recommended)
+  Lx: 1.0           # domain length
+  x0: 0.5           # discontinuity location
+  dealias: true     # apply 2/3-rule dealiasing
+
+physics:
+  gamma: 1.4
+
+integration:
+  t0: 0.0
+  t_end: 0.4        # Extended from 0.2 to 0.4
+  cfl: 0.4
+  scheme: rk4       # rk2 or rk4
+  output_interval: 0.02
+  checkpoint_interval: 0.1
+  spectral_filter:
+    enabled: true
+    p: 8            # even integer >= 2
+    alpha: 36.0     # filter strength
+
+
+initial_conditions:
+  left:
+    rho: 1.0
+    u: 0.0
+    p: 1.0
+  right:
+    rho: 0.125
+    u: 0.0
+    p: 0.1
+
+io:
+  outdir: outputs/sod
+  save_spectra: true
+
+

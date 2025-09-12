@@ -39,13 +39,17 @@ class BaseProblem(ABC):
             # Silently fail if cache clearing doesn't work
             pass
     
-    def __init__(self, config_path: Optional[str] = None, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config_path: Optional[str] = None, config: Optional[Dict[str, Any]] = None, 
+                 restart_from: Optional[str] = None):
         """Initialize problem with configuration.
         
         Args:
             config_path: Path to YAML configuration file
             config: Configuration dictionary (takes precedence over config_path)
+            restart_from: Path to checkpoint file for restart
         """
+        self.restart_from = restart_from
+        
         if config is not None:
             self.config = config
         elif config_path is not None:
@@ -55,6 +59,10 @@ class BaseProblem(ABC):
         
         self.setup_output_directory()
         self.setup_common_parameters()
+        
+        # Load restart data if specified
+        if self.restart_from is not None:
+            self.load_restart_data()
     
     def setup_output_directory(self) -> None:
         """Setup output directory from configuration."""
@@ -97,6 +105,53 @@ class BaseProblem(ABC):
         # Initialize monitoring state
         self.monitoring_step_count = 0
         self.monitoring_initial_values = None
+        
+        # Initialize restart data
+        self.restart_data = None
+    
+    def load_restart_data(self) -> None:
+        """Load restart data from checkpoint file."""
+        from hydra.io import load_checkpoint
+        
+        if self.restart_from is None:
+            return
+            
+        print(f"Loading restart data from: {self.restart_from}")
+        self.restart_data = load_checkpoint(self.restart_from)
+        
+        # Update configuration with restart time
+        if "integration" not in self.config:
+            self.config["integration"] = {}
+        self.config["integration"]["t0"] = self.restart_data["t"]
+        
+        # Update common parameters
+        self.t0 = self.restart_data["t"]
+        
+        print(f"Restarting simulation at t = {self.t0:.6f}")
+    
+    def validate_restart_data(self, grid, equations) -> None:
+        """Validate that restart data is compatible with current problem configuration."""
+        if self.restart_data is None:
+            return
+            
+        # Check gamma parameter
+        if "gamma" in self.restart_data["meta"]:
+            restart_gamma = self.restart_data["meta"]["gamma"]
+            if abs(restart_gamma - equations.gamma) > 1e-10:
+                print(f"Warning: Gamma mismatch - restart: {restart_gamma}, current: {equations.gamma}")
+        
+        # Check grid dimensions
+        restart_meta = self.restart_data["meta"]
+        if "N" in restart_meta:  # 1D case
+            if restart_meta["N"] != grid.N:
+                raise ValueError(f"Grid size mismatch - restart: {restart_meta['N']}, current: {grid.N}")
+        elif "Nx" in restart_meta:  # 2D/3D case
+            if restart_meta["Nx"] != grid.Nx:
+                raise ValueError(f"Grid Nx mismatch - restart: {restart_meta['Nx']}, current: {grid.Nx}")
+            if "Ny" in restart_meta and restart_meta["Ny"] != grid.Ny:
+                raise ValueError(f"Grid Ny mismatch - restart: {restart_meta['Ny']}, current: {grid.Ny}")
+            if "Nz" in restart_meta and restart_meta["Nz"] != grid.Nz:
+                raise ValueError(f"Grid Nz mismatch - restart: {restart_meta['Nz']}, current: {grid.Nz}")
     
     @abstractmethod
     def create_grid(self, backend: str = "numpy", device: Optional[str] = None):
@@ -441,7 +496,16 @@ class BaseProblem(ABC):
         # Create components
         grid = self.create_grid(backend, device)
         equations = self.create_equations()
-        U0 = self.create_initial_conditions(grid)
+        
+        # Create initial conditions (use restart data if available)
+        if self.restart_data is not None:
+            U0 = self.restart_data["U"]
+            print(f"Using restart data for initial conditions (shape: {U0.shape})")
+        else:
+            U0 = self.create_initial_conditions(grid)
+        
+        # Validate restart data compatibility
+        self.validate_restart_data(grid, equations)
         
         # Create solver
         solver_class = self.get_solver_class()

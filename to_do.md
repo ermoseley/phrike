@@ -1,4 +1,4 @@
-Add restart capabilities
+✅ Add restart capabilities
 rename spectralhydro directory to hydra
 Add turbulent driving
 Add new basis functions
