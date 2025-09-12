@@ -1,3 +1,4 @@
+# Configuration for 3D Taylor-Green vortex
 problem: tgv3d
 
 grid:
@@ -19,11 +20,48 @@ integration:
   cfl: 0.2
   scheme: rk4
   output_interval: 0.02
+  checkpoint_interval: 0.2
   spectral_filter:
     enabled: true
     p: 8
     alpha: 36.0
 
+# Initial conditions smoothing (optional)
+initial_conditions_smoothing:
+  enabled: false        # Disabled by default for TGV3D
+  kernel_size: 0.01     # 1% of domain length
+  mode: "wrap"          # Periodic boundary conditions
+  variables: ["density", "velocity", "pressure"]
+  diagnostic_output: false
+
+# Adaptive time-stepping configuration
+adaptive:
+  enabled: true
+  scheme: rk45          # rk23, rk45, rk78
+  rtol: 1e-5            # Slightly relaxed for 3D complexity
+  atol: 1e-7            # Absolute tolerance
+  safety_factor: 0.9
+  min_dt_factor: 0.1
+  max_dt_factor: 5.0
+  max_rejections: 10
+  fallback_scheme: rk4
+
+# Artificial viscosity configuration
+artificial_viscosity:
+  enabled: true
+  nu_max: 2e-4          # Lower viscosity for 3D
+  s_ref: 0.3            # Lower reference smoothness
+  s_min: 0.02           # Lower minimum threshold
+  p: 1.0                # Linear scaling
+  epsilon: 1e-12
+  sensor_variable: "velocity_magnitude"  # Use velocity for 3D
+  diagnostic_output: true
+  variable_weights:
+    density: 1.0
+    momentum_x: 0.6
+    momentum_y: 0.6
+    momentum_z: 0.6
+    energy: 1.0
 
 initial_conditions:
   rho0: 1.0
@@ -33,3 +71,21 @@ initial_conditions:
 
 io:
   outdir: outputs/tgv3d
+
+video:
+  fps: 30
+  width: 1920
+  height: 1080
+  scale: 2.0
+  frame_dpi: 150
+  codec: libopenh264
+  crf: 18
+  preset: medium
+  pix_fmt: yuv420p
+
+monitoring:
+  enabled: true
+  step_interval: 25
+  include_conservation: true
+  include_timestep: true
+  include_velocity_stats: true

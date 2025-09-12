@@ -1,26 +1,61 @@
-# Shu-Osher 1D Test Problem Configuration
-# Tests shock-capturing and wave propagation in a high-order solver
+# Configuration for 1D Shu-Osher problem with strong smoothing
 problem: shu_osher1d
 
 grid:
-  N: 256            # number of points
-  Lx: 1.0           # domain length [0, Lx) with periodic BCs
-  dealias: true     # apply 2/3-rule dealiasing
+  N: 4096
+  Lx: 1.0
+  dealias: true
 
 physics:
-  gamma: 1.4        # adiabatic index
+  gamma: 1.4
 
 integration:
   t0: 0.0
-  t_end: 0.2        # very short time for testing
-  cfl: 0.1          # much more conservative CFL number for shock stability
-  scheme: rk4       # 4th-order Runge-Kutta
-  output_interval: 0.005
+  t_end: 0.02
+  cfl: 0.1
+  scheme: rk45
+  rtol: 1e-6
+  atol: 1e-8
+  output_interval: 0.00025
   checkpoint_interval: 0.05
   spectral_filter:
     enabled: true
-    p: 8            # even integer >= 2
-    alpha: 72.0     # stronger filter for shock stability
+    p: 8
+    alpha: 36.0
+
+# Strong initial conditions smoothing
+initial_conditions_smoothing:
+  enabled: true
+  kernel_size: 0.01  # 5% of domain length - stronger smoothing
+  mode: "wrap"       # Periodic boundary conditions
+  variables: ["density", "velocity", "pressure"]
+  diagnostic_output: true
+
+# Adaptive time-stepping configuration
+adaptive:
+  enabled: true
+  scheme: rk45    # rk23, rk45, rk78
+  rtol: 1e-5      # Slightly relaxed for 2D complexity
+  atol: 1e-7      # Absolute tolerance
+  safety_factor: 0.1
+  min_dt_factor: 0.1
+  max_dt_factor: 5.0
+  max_rejections: 10
+  fallback_scheme: rk4
+
+artificial_viscosity:
+  enabled: true
+  nu_max: 1.0
+  s_ref: 1.0
+  s_min: 0.1
+  p: 0.5
+  epsilon: 1e-12
+  variable_weights:
+    density: 3.0
+    momentum_x: 2.0
+    energy: 1.5 
+  sensor_variable: "density"
+  diagnostic_output: true
 
 io:
   outdir: outputs/shu_osher1d
@@ -28,9 +63,33 @@ io:
 
 monitoring:
   enabled: true
-  step_interval: 100  # Monitor every 100 steps
+  step_interval: 1000
   include_conservation: true
   include_timestep: true
   include_time: true
   include_velocity_stats: true
   include_density_stats: true
+
+video:
+  # Video generation parameters
+  fps: 30                    # Frames per second
+  width: 1920                # Output video width (0 = auto from frames)
+  height: 1080               # Output video height (0 = auto from frames)
+  scale: 2.0                 # Scale factor for frames (1.0 = original size)
+  frame_dpi: 150             # DPI for frame generation (higher = better quality)
+
+  # FFmpeg encoding parameters
+  codec: h264_videotoolbox   # Video codec (h264_videotoolbox, libx264, libopenh264, etc.)
+  crf: 18                    # Constant Rate Factor (0-51, lower = better quality)
+  preset: medium             # Encoding preset (ultrafast, fast, medium, slow, veryslow)
+  pix_fmt: yuv420p           # Pixel format (yuv420p, yuv444p, etc.)
+  
+  # Additional FFmpeg options
+  bitrate: null              # Target bitrate (e.g., "2M" for 2 Mbps, null = use CRF)
+  maxrate: null              # Maximum bitrate (e.g., "4M")
+  bufsize: null              # Buffer size (e.g., "8M")
+  
+  # Quality settings
+  tune: null                 # Tune for specific content (film, animation, grain, etc.)
+  profile: high              # H.264 profile (baseline, main, high, high10, etc.)
+  level: 4.1                 # H.264 level (3.0, 3.1, 4.0, 4.1, etc.)

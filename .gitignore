@@ -10,6 +10,7 @@ outputs/
 *.png
 .ruff_cache/
 .DS_Store
+.venv/
 
 # Additional files and directories
 frames/

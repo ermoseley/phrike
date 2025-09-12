@@ -113,6 +113,42 @@ class BaseProblem(ABC):
             }
         else:
             self.adaptive_config = None
+        
+        # Artificial viscosity parameters
+        artificial_viscosity_raw = self.config.get("artificial_viscosity", None)
+        if artificial_viscosity_raw:
+            self.artificial_viscosity_config = {
+                "enabled": bool(artificial_viscosity_raw.get("enabled", False)),
+                "nu_max": float(artificial_viscosity_raw.get("nu_max", 1e-3)),
+                "s_ref": float(artificial_viscosity_raw.get("s_ref", 1.0)),
+                "s_min": float(artificial_viscosity_raw.get("s_min", 0.1)),
+                "p": float(artificial_viscosity_raw.get("p", 2.0)),
+                "epsilon": float(artificial_viscosity_raw.get("epsilon", 1e-12)),
+                "variable_weights": artificial_viscosity_raw.get("variable_weights", {
+                    "density": 1.0,
+                    "momentum_x": 1.0,
+                    "momentum_y": 1.0,
+                    "momentum_z": 1.0,
+                    "energy": 1.0
+                }),
+                "sensor_variable": str(artificial_viscosity_raw.get("sensor_variable", "density")),
+                "diagnostic_output": bool(artificial_viscosity_raw.get("diagnostic_output", False))
+            }
+        else:
+            self.artificial_viscosity_config = None
+
+        # Initial conditions smoothing parameters
+        ic_smoothing_raw = self.config.get("initial_conditions_smoothing", None)
+        if ic_smoothing_raw:
+            self.ic_smoothing_config = {
+                "enabled": bool(ic_smoothing_raw.get("enabled", False)),
+                "kernel_size": float(ic_smoothing_raw.get("kernel_size", 0.0)),
+                "mode": str(ic_smoothing_raw.get("mode", "wrap")),  # 'wrap' for periodic, 'constant' for non-periodic
+                "variables": ic_smoothing_raw.get("variables", ["density", "velocity", "pressure"]),
+                "diagnostic_output": bool(ic_smoothing_raw.get("diagnostic_output", False))
+            }
+        else:
+            self.ic_smoothing_config = None
 
         # FFT workers
         self.fft_workers = int(
@@ -264,6 +300,7 @@ class BaseProblem(ABC):
                 if f.startswith("frame_") and f.endswith(".png")
             ]
         )
+        
         for i, fname in enumerate(frames):
             src = os.path.join(frames_dir, fname)
             dst = os.path.join(frames_dir, f"frame_{i:08d}.png")
@@ -677,6 +714,83 @@ class BaseProblem(ABC):
             self.generate_video(frames_dir, problem_name)
 
         return solver, history
+
+    def apply_initial_conditions_smoothing(self, rho, u, p, grid):
+        """Apply smoothing to initial conditions if configured.
+        
+        Args:
+            rho: Density array
+            u: Velocity array (can be 1D, 2D, or 3D)
+            p: Pressure array
+            grid: Grid object containing spatial coordinates
+            
+        Returns:
+            Tuple of (rho_smooth, u_smooth, p_smooth)
+        """
+        if not self.ic_smoothing_config or not self.ic_smoothing_config["enabled"]:
+            return rho, u, p
+        
+        kernel_size = self.ic_smoothing_config["kernel_size"]
+        if kernel_size <= 0:
+            return rho, u, p
+        
+        mode = self.ic_smoothing_config["mode"]
+        variables = self.ic_smoothing_config["variables"]
+        diagnostic = self.ic_smoothing_config["diagnostic_output"]
+        
+        # Import scipy here to avoid dependency issues
+        try:
+            from scipy import ndimage
+        except ImportError:
+            print("Warning: scipy not available for initial conditions smoothing")
+            return rho, u, p
+        
+        # Calculate sigma in grid points
+        if hasattr(grid, 'N'):
+            # 1D case
+            sigma = kernel_size * grid.N / grid.Lx
+        elif hasattr(grid, 'Nx'):
+            # 2D case
+            sigma = kernel_size * grid.Nx / grid.Lx
+        elif hasattr(grid, 'Nx') and hasattr(grid, 'Ny'):
+            # 3D case - use average
+            sigma = kernel_size * (grid.Nx + grid.Ny + grid.Nz) / (grid.Lx + grid.Ly + grid.Lz) / 3
+        else:
+            print("Warning: Cannot determine grid size for smoothing")
+            return rho, u, p
+        
+        if diagnostic:
+            print(f"Applying initial conditions smoothing: kernel_size={kernel_size:.4f}, sigma={sigma:.2f} grid points, mode='{mode}'")
+        
+        # Apply smoothing to specified variables
+        rho_smooth = rho.copy()
+        u_smooth = u.copy()
+        p_smooth = p.copy()
+        
+        if "density" in variables:
+            rho_smooth = ndimage.gaussian_filter1d(rho, sigma=sigma, mode=mode)
+        
+        if "velocity" in variables:
+            if len(u.shape) == 1:
+                # 1D velocity
+                u_smooth = ndimage.gaussian_filter1d(u, sigma=sigma, mode=mode)
+            elif len(u.shape) == 2:
+                # 2D velocity (u, v)
+                u_smooth[0] = ndimage.gaussian_filter1d(u[0], sigma=sigma, mode=mode)
+                u_smooth[1] = ndimage.gaussian_filter1d(u[1], sigma=sigma, mode=mode)
+            elif len(u.shape) == 3:
+                # 3D velocity (u, v, w)
+                u_smooth[0] = ndimage.gaussian_filter1d(u[0], sigma=sigma, mode=mode)
+                u_smooth[1] = ndimage.gaussian_filter1d(u[1], sigma=sigma, mode=mode)
+                u_smooth[2] = ndimage.gaussian_filter1d(u[2], sigma=sigma, mode=mode)
+        
+        if "pressure" in variables:
+            p_smooth = ndimage.gaussian_filter1d(p, sigma=sigma, mode=mode)
+        
+        if diagnostic:
+            print(f"Initial conditions smoothing applied to: {variables}")
+        
+        return rho_smooth, u_smooth, p_smooth
 
     @abstractmethod
     def get_solver_class(self):

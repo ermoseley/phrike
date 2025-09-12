@@ -129,6 +129,9 @@ class ShuOsher1DProblem(BaseProblem):
         u[sinusoidal_mask] = self.u_R
         p[sinusoidal_mask] = self.p_R
         
+        # Apply initial conditions smoothing if configured
+        rho, u, p = self.apply_initial_conditions_smoothing(rho, u, p, grid)
+        
         # Convert to conservative variables
         equations = self.create_equations()
         return equations.conservative(rho, u, p)
@@ -246,8 +249,11 @@ class ShuOsher1DProblem(BaseProblem):
         plt.suptitle(f'Shu-Osher 1D Problem - t = {t:.3f}')
         plt.tight_layout()
         
-        # Save frame
-        frame_path = f"frames/shu_osher1d_frame_{int(t*1000):04d}.png"
+        # Save frame to the correct output directory
+        import os
+        frames_dir = os.path.join(self.outdir, "frames")
+        os.makedirs(frames_dir, exist_ok=True)
+        frame_path = os.path.join(frames_dir, f"frame_{t:08.3f}.png")
         plt.savefig(frame_path, dpi=150, bbox_inches='tight')
         plt.close()
     
