@@ -85,6 +85,7 @@ class SpectralSolver1D:
         checkpoint_interval: float = 0.0,
         outdir: Optional[str] = None,
         on_output: Optional[Callable[[float, Array], None]] = None,
+        on_step: Optional[Callable[[int, float, Array], None]] = None,
     ) -> Dict[str, List[float]]:
         from .io import save_solution_snapshot
 
@@ -94,6 +95,7 @@ class SpectralSolver1D:
         next_checkpoint = self.t + checkpoint_interval if checkpoint_interval and checkpoint_interval > 0 else np.inf
 
         history: Dict[str, List[float]] = {"time": [], "mass": [], "momentum": [], "energy": []}
+        step_count = 0
 
         def record() -> None:
             cons = self.equations.conserved_quantities(self.U)  # type: ignore[arg-type]
@@ -110,6 +112,11 @@ class SpectralSolver1D:
             dt = min(self.compute_dt(self.U), t_end - self.t)  # type: ignore[arg-type]
             self.U = self.step(self.U, dt)  # type: ignore[arg-type]
             self.t += dt
+            step_count += 1
+
+            # Call step monitoring callback
+            if on_step is not None:
+                on_step(step_count, dt, self.U)
 
             if self.t + 1e-12 >= next_output:
                 record()
@@ -194,6 +201,7 @@ class SpectralSolver2D:
         checkpoint_interval: float = 0.0,
         outdir: Optional[str] = None,
         on_output: Optional[Callable[[float, Array], None]] = None,
+        on_step: Optional[Callable[[int, float, Array], None]] = None,
     ) -> Dict[str, List[float]]:
         from .io import save_solution_snapshot
 
@@ -206,6 +214,7 @@ class SpectralSolver2D:
         next_checkpoint = self.t + checkpoint_interval if checkpoint_interval and checkpoint_interval > 0 else np.inf
 
         history: Dict[str, List[float]] = {"time": [], "mass": [], "momentum_x": [], "momentum_y": [], "energy": []}
+        step_count = 0
 
         def record() -> None:
             rho, ux, uy, p = self.equations.primitive(self.U)  # type: ignore[arg-type]
@@ -233,6 +242,11 @@ class SpectralSolver2D:
             dt = min(self.compute_dt(self.U), t_end - self.t)  # type: ignore[arg-type]
             self.U = self.step(self.U, dt)  # type: ignore[arg-type]
             self.t += dt
+            step_count += 1
+
+            # Call step monitoring callback
+            if on_step is not None:
+                on_step(step_count, dt, self.U)
 
             if self.t + 1e-12 >= next_output:
                 record()
@@ -313,6 +327,7 @@ class SpectralSolver3D:
         checkpoint_interval: float = 0.0,
         outdir: Optional[str] = None,
         on_output: Optional[Callable[[float, Array], None]] = None,
+        on_step: Optional[Callable[[int, float, Array], None]] = None,
     ) -> Dict[str, List[float]]:
         from .io import save_solution_snapshot
 
@@ -332,6 +347,7 @@ class SpectralSolver3D:
         next_checkpoint = self.t + checkpoint_interval if checkpoint_interval and checkpoint_interval > 0 else np.inf
 
         history: Dict[str, List[float]] = {"time": [], "mass": [], "momentum_x": [], "momentum_y": [], "momentum_z": [], "energy": []}
+        step_count = 0
 
         def record() -> None:
             rho, ux, uy, uz, p = self.equations.primitive(self.U)  # type: ignore[arg-type]
@@ -362,6 +378,11 @@ class SpectralSolver3D:
             dt = min(self.compute_dt(self.U), t_end - self.t)  # type: ignore[arg-type]
             self.U = self.step(self.U, dt)  # type: ignore[arg-type]
             self.t += dt
+            step_count += 1
+
+            # Call step monitoring callback
+            if on_step is not None:
+                on_step(step_count, dt, self.U)
 
             if self.t + 1e-12 >= next_output:
                 record()

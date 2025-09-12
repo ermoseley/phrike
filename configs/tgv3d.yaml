@@ -24,6 +24,7 @@ integration:
     p: 8
     alpha: 36.0
 
+
 initial_conditions:
   rho0: 1.0
   p0: 100.0

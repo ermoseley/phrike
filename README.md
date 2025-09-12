@@ -23,6 +23,9 @@ Quick start
    
    # 3D turbulent velocity field
    python -m hydra turb3d --config configs/turb3d.yaml
+   
+   # 3D turbulent simulation with monitoring (monitoring enabled by default)
+   python examples/run_turb3d_with_monitoring.py
 
 Backends (NumPy vs Torch)
 -------------------------
