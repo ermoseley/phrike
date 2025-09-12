@@ -4,7 +4,7 @@
 import argparse
 import os
 
-from hydra.problems.turb3d import Turb3DProblem
+from phrike.problems.turb3d import Turb3DProblem
 
 
 def main() -> None:

@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "hydra"
+name = "phrike"
 version = "0.1.0"
 description = "Pseudo-spectral hydrodynamics solver (1D, extendable to 2D/3D)"
 readme = "README.md"
@@ -21,14 +21,14 @@ dependencies = [
 ]
 
 [project.scripts]
-hydra = "hydra.cli:main"
+phrike = "phrike.cli:main"
 
 [project.optional-dependencies]
 fastfft = ["pyfftw>=0.13"]
 dev = ["pytest>=7.0", "ruff>=0.3.0"]
 
 [tool.setuptools.package-data]
-hydra = ["py.typed"]
+phrike = ["py.typed"]
 
 [tool.setuptools.packages.find]
 where = ["."]

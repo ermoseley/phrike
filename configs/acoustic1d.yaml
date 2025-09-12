@@ -1,0 +1,34 @@
+# Configuration for 1D periodic acoustic wave problem
+# Designed for comprehensive testing of the 1D spectral solver
+problem: acoustic1d
+
+grid:
+  N: 256            # number of points (power of 2 recommended for spectral methods)
+  Lx: 2.0           # domain length [0, Lx) with periodic BCs
+  dealias: true     # apply 2/3-rule dealiasing
+
+physics:
+  gamma: 1.4        # adiabatic index
+
+integration:
+  t0: 0.0
+  t_end: 1.0        # short time for testing
+  cfl: 0.4          # conservative CFL number
+  scheme: rk4       # 4th-order Runge-Kutta
+  output_interval: 0.1
+  checkpoint_interval: 0.5
+  spectral_filter:
+    enabled: true
+    p: 8            # even integer >= 2
+    alpha: 36.0     # filter strength
+
+initial_conditions:
+  rho0: 1.0         # background density
+  u0: 0.0           # background velocity (zero for pure acoustic test)
+  p0: 1.0           # background pressure
+  amplitude: 1.0e-3 # small amplitude for linear regime testing
+  k: 1              # fundamental mode (one wavelength in domain)
+
+io:
+  outdir: outputs/acoustic1d
+  save_spectra: true

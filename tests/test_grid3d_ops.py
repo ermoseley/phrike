@@ -1,9 +1,9 @@
 import numpy as np
 
-from hydra.grid import Grid3D
-from hydra.equations import EulerEquations3D
-from hydra.initial_conditions import taylor_green_vortex_3d
-from hydra.solver import SpectralSolver3D
+from phrike.grid import Grid3D
+from phrike.equations import EulerEquations3D
+from phrike.initial_conditions import taylor_green_vortex_3d
+from phrike.solver import SpectralSolver3D
 
 
 def test_grid3d_dx_matches_analytic():

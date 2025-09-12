@@ -1,0 +1,36 @@
+# Configuration for 1D Gaussian wave packet - Stationary version
+# Tests conservation and long-time stability
+problem: gaussian_wave1d
+
+grid:
+  N: 512            # number of points (power of 2 recommended for spectral methods)
+  Lx: 6.283185307179586  # domain length 2π for periodic BCs
+  dealias: true     # apply 2/3-rule dealiasing
+
+physics:
+  gamma: 1.4        # adiabatic index
+
+integration:
+  t0: 0.0
+  t_end: 10.0       # long time for stability testing
+  cfl: 0.4          # conservative CFL number
+  scheme: rk4       # 4th-order Runge-Kutta
+  output_interval: 1.0
+  checkpoint_interval: 2.0
+  spectral_filter:
+    enabled: true
+    p: 8            # even integer >= 2
+    alpha: 36.0     # filter strength
+
+initial_conditions:
+  wave_type: stationary  # stationary wave packet
+  rho0: 1.0         # background density
+  u0: 0.0           # background velocity (will be set to sound speed)
+  p0: 1.0           # background pressure
+  amplitude: 1e-6   # Gaussian amplitude (same as acoustic test)
+  sigma: 0.2        # Gaussian width
+  x0: 3.141592653589793  # center at π (middle of domain)
+
+io:
+  outdir: outputs/gaussian_wave_stationary
+  save_spectra: true

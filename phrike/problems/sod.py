@@ -5,12 +5,12 @@ from typing import Optional, Dict, Any
 
 import matplotlib.pyplot as plt
 
-from hydra.grid import Grid1D
-from hydra.equations import EulerEquations1D
-from hydra.initial_conditions import sod_shock_tube
-from hydra.solver import SpectralSolver1D
-from hydra.visualization import plot_fields, plot_conserved_time_series
-from hydra.io import save_solution_snapshot
+from phrike.grid import Grid1D
+from phrike.equations import EulerEquations1D
+from phrike.initial_conditions import sod_shock_tube
+from phrike.solver import SpectralSolver1D
+from phrike.visualization import plot_fields, plot_conserved_time_series
+from phrike.io import save_solution_snapshot
 from .base import BaseProblem
 
 

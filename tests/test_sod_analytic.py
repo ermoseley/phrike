@@ -1,6 +1,6 @@
 import numpy as np
 
-from hydra.sod_analytic import sod_sample
+from phrike.sod_analytic import sod_sample
 
 
 def test_sod_sample_shapes():

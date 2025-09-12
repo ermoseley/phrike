@@ -1,12 +1,12 @@
 import argparse
 import os
 
-from hydra.io import load_config, ensure_outdir, save_solution_snapshot
-from hydra.grid import Grid1D
-from hydra.equations import EulerEquations1D
-from hydra.initial_conditions import sod_shock_tube
-from hydra.solver import SpectralSolver1D
-from hydra.visualization import plot_fields
+from phrike.io import load_config, ensure_outdir, save_solution_snapshot
+from phrike.grid import Grid1D
+from phrike.equations import EulerEquations1D
+from phrike.initial_conditions import sod_shock_tube
+from phrike.solver import SpectralSolver1D
+from phrike.visualization import plot_fields
 
 
 def main() -> None:
@@ -51,7 +51,7 @@ def main() -> None:
 
     # Optionally plot conserved quantities
     if history and len(history.get("time", [])) > 0:
-        from hydra.visualization import plot_conserved_time_series
+        from phrike.visualization import plot_conserved_time_series
         plot_conserved_time_series(history, outpath=os.path.join(outdir, "conserved.png"))
 
 

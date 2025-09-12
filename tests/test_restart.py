@@ -4,12 +4,12 @@ import os
 import tempfile
 import numpy as np
 
-from hydra.grid import Grid1D
-from hydra.equations import EulerEquations1D
-from hydra.initial_conditions import sod_shock_tube
-from hydra.solver import SpectralSolver1D
-from hydra.io import save_solution_snapshot, load_checkpoint
-from hydra.problems.sod import SodProblem
+from phrike.grid import Grid1D
+from phrike.equations import EulerEquations1D
+from phrike.initial_conditions import sod_shock_tube
+from phrike.solver import SpectralSolver1D
+from phrike.io import save_solution_snapshot, load_checkpoint
+from phrike.problems.sod import SodProblem
 
 
 def test_checkpoint_save_and_load():
@@ -162,7 +162,7 @@ io:
             f.write(config_content)
         
         # Run first simulation
-        from hydra.problems import ProblemRegistry
+        from phrike.problems import ProblemRegistry
         problem1 = ProblemRegistry.create_problem("sod", config_path=config_path)
         solver1, _ = problem1.run(backend="numpy", generate_video=False)
         

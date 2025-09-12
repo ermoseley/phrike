@@ -3,13 +3,13 @@ import os
 
 import numpy as np
 
-from hydra.io import load_config, ensure_outdir
-from hydra.grid import Grid1D
-from hydra.equations import EulerEquations1D
-from hydra.initial_conditions import sod_shock_tube
-from hydra.solver import SpectralSolver1D
-from hydra.sod_analytic import sod_sample
-from hydra.visualization import plot_fields
+from phrike.io import load_config, ensure_outdir
+from phrike.grid import Grid1D
+from phrike.equations import EulerEquations1D
+from phrike.initial_conditions import sod_shock_tube
+from phrike.solver import SpectralSolver1D
+from phrike.sod_analytic import sod_sample
+from phrike.visualization import plot_fields
 
 
 def main() -> None:

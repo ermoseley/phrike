@@ -7,7 +7,7 @@ import sys
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from hydra import run_simulation
+from phrike import run_simulation
 
 
 def example_programmatic():
@@ -81,9 +81,9 @@ if __name__ == "__main__":
         print("\n" + "=" * 40)
         print("Examples completed successfully!")
         print("\nYou can also use the CLI:")
-        print("  python -m hydra sod --config configs/sod.yaml")
-        print("  python -m hydra khi2d --backend torch --device mps")
-        print("  python -m hydra tgv3d --no-video")
+        print("  python -m phrike sod --config configs/sod.yaml")
+        print("  python -m phrike khi2d --backend torch --device mps")
+        print("  python -m phrike tgv3d --no-video")
         
     except Exception as e:
         print(f"Error running examples: {e}")

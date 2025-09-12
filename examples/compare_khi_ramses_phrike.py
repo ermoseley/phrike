@@ -57,7 +57,7 @@ def read_ramses_data(output_num, ramses_path, variable=0):
         return None, None, None, None, None, None, None
 
 
-def read_hydra_data(snapshot_path):
+def read_phrike_data(snapshot_path):
     """Read HYDRA data from snapshot."""
     try:
         data = np.load(snapshot_path, allow_pickle=True)
@@ -86,7 +86,7 @@ def read_hydra_data(snapshot_path):
         return None, None, None, None, None, None, None, None
 
 
-def create_comparison_frame(frame_idx, ramses_path, hydra_snapshots, output_dir, 
+def create_comparison_frame(frame_idx, ramses_path, phrike_snapshots, output_dir, 
                           variable_name="density", variable_idx=0):
     """Create a single comparison frame."""
     
@@ -110,12 +110,12 @@ def create_comparison_frame(frame_idx, ramses_path, hydra_snapshots, output_dir,
         return False
     
     # Read HYDRA data
-    if frame_idx >= len(hydra_snapshots):
+    if frame_idx >= len(phrike_snapshots):
         print(f"HYDRA snapshot {frame_idx} not found")
         return False
     
-    snapshot_path = hydra_snapshots[frame_idx]
-    X_hyd, Y_hyd, rho_hyd, ux_hyd, uy_hyd, p_hyd, Lx, Ly = read_hydra_data(snapshot_path)
+    snapshot_path = phrike_snapshots[frame_idx]
+    X_hyd, Y_hyd, rho_hyd, ux_hyd, uy_hyd, p_hyd, Lx, Ly = read_phrike_data(snapshot_path)
     
     if X_hyd is None:
         print(f"Failed to read HYDRA data for frame {frame_idx}")
@@ -198,25 +198,25 @@ def main():
     # Paths
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ramses_path = os.path.join(base_dir, 'outputs', 'khi2d', 'khi_ramses')
-    hydra_snapshots_dir = os.path.join(base_dir, 'outputs', 'khi2d')
+    phrike_snapshots_dir = os.path.join(base_dir, 'outputs', 'khi2d')
     output_dir = os.path.join(base_dir, 'outputs', 'khi2d', 'comparison_frames')
     
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
     
     # Find HYDRA snapshots by scanning the directory
-    hydra_snapshots = []
-    snapshot_files = sorted([f for f in os.listdir(hydra_snapshots_dir) if f.startswith('snapshot_t') and f.endswith('.npz')])
+    phrike_snapshots = []
+    snapshot_files = sorted([f for f in os.listdir(phrike_snapshots_dir) if f.startswith('snapshot_t') and f.endswith('.npz')])
     
     for snapshot_file in snapshot_files:
-        snapshot_path = os.path.join(hydra_snapshots_dir, snapshot_file)
-        hydra_snapshots.append(snapshot_path)
+        snapshot_path = os.path.join(phrike_snapshots_dir, snapshot_file)
+        phrike_snapshots.append(snapshot_path)
     
-    print(f"Found {len(hydra_snapshots)} HYDRA snapshots")
+    print(f"Found {len(phrike_snapshots)} HYDRA snapshots")
     
     # Create comparison frames for all time steps
-    if len(hydra_snapshots) > 0:
-        print(f"Creating comparison frames for {len(hydra_snapshots)} time steps...")
+    if len(phrike_snapshots) > 0:
+        print(f"Creating comparison frames for {len(phrike_snapshots)} time steps...")
         
         # Only generate density frames
         var_name = "density"
@@ -228,12 +228,12 @@ def main():
         os.makedirs(var_output_dir, exist_ok=True)
         
         success_count = 0
-        for frame_idx in range(len(hydra_snapshots)):
-            if create_comparison_frame(frame_idx, ramses_path, hydra_snapshots, 
+        for frame_idx in range(len(phrike_snapshots)):
+            if create_comparison_frame(frame_idx, ramses_path, phrike_snapshots, 
                                     var_output_dir, var_name, var_idx):
                 success_count += 1
         
-        print(f"Generated {success_count}/{len(hydra_snapshots)} frames for {var_name}")
+        print(f"Generated {success_count}/{len(phrike_snapshots)} frames for {var_name}")
     
     print(f"\nComparison frames saved to: {output_dir}")
     print("You can now create videos from these frames using ffmpeg.")

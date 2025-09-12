@@ -5,11 +5,11 @@ import subprocess
 import numpy as np
 import matplotlib.pyplot as plt
 
-from hydra.io import load_config, ensure_outdir, save_solution_snapshot
-from hydra.grid import Grid3D
-from hydra.equations import EulerEquations3D
-from hydra.initial_conditions import turbulent_velocity_3d
-from hydra.solver import SpectralSolver3D
+from phrike.io import load_config, ensure_outdir, save_solution_snapshot
+from phrike.grid import Grid3D
+from phrike.equations import EulerEquations3D
+from phrike.initial_conditions import turbulent_velocity_3d
+from phrike.solver import SpectralSolver3D
 
 # Import and register the custom colormap
 import sys

@@ -6,11 +6,11 @@ from typing import Optional, Dict, Any
 import matplotlib.pyplot as plt
 import numpy as np
 
-from hydra.grid import Grid2D
-from hydra.equations import EulerEquations2D
-from hydra.initial_conditions import kelvin_helmholtz_2d
-from hydra.solver import SpectralSolver2D
-from hydra.io import save_solution_snapshot
+from phrike.grid import Grid2D
+from phrike.equations import EulerEquations2D
+from phrike.initial_conditions import kelvin_helmholtz_2d
+from phrike.solver import SpectralSolver2D
+from phrike.io import save_solution_snapshot
 from .base import BaseProblem
 
 

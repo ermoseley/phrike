@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 
-from hydra.io import load_config, ensure_outdir, save_solution_snapshot
+from phrike.io import load_config, ensure_outdir, save_solution_snapshot
 
 
 class BaseProblem(ABC):
@@ -111,7 +111,7 @@ class BaseProblem(ABC):
     
     def load_restart_data(self) -> None:
         """Load restart data from checkpoint file."""
-        from hydra.io import load_checkpoint
+        from phrike.io import load_checkpoint
         
         if self.restart_from is None:
             return

@@ -1,8 +1,8 @@
 import numpy as np
 
-from hydra.grid import Grid1D
-from hydra.equations import EulerEquations1D
-from hydra.solver import SpectralSolver1D
+from phrike.grid import Grid1D
+from phrike.equations import EulerEquations1D
+from phrike.solver import SpectralSolver1D
 
 
 def test_rk_advances_time():

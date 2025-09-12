@@ -1,9 +1,9 @@
 import numpy as np
 
-from hydra.grid import Grid1D
-from hydra.equations import EulerEquations1D
-from hydra.solver import SpectralSolver1D
-from hydra.acoustic import AcousticParams, acoustic_ic, acoustic_exact
+from phrike.grid import Grid1D
+from phrike.equations import EulerEquations1D
+from phrike.solver import SpectralSolver1D
+from phrike.acoustic import AcousticParams, acoustic_ic, acoustic_exact
 
 
 def test_acoustic_accuracy_small_amplitude():

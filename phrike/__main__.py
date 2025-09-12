@@ -1,4 +1,4 @@
-"""Entry point for running hydra as a module."""
+"""Entry point for running phrike as a module."""
 
 from .cli import main
 

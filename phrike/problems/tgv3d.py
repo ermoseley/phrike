@@ -6,11 +6,11 @@ from typing import Optional, Dict, Any
 import matplotlib.pyplot as plt
 import numpy as np
 
-from hydra.grid import Grid3D
-from hydra.equations import EulerEquations3D
-from hydra.initial_conditions import taylor_green_vortex_3d
-from hydra.solver import SpectralSolver3D
-from hydra.io import save_solution_snapshot
+from phrike.grid import Grid3D
+from phrike.equations import EulerEquations3D
+from phrike.initial_conditions import taylor_green_vortex_3d
+from phrike.solver import SpectralSolver3D
+from phrike.io import save_solution_snapshot
 from .base import BaseProblem
 
 

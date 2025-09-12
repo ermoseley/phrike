@@ -3,12 +3,12 @@ import os
 
 import numpy as np
 
-from hydra.io import load_config, ensure_outdir
-from hydra.grid import Grid1D
-from hydra.equations import EulerEquations1D
-from hydra.solver import SpectralSolver1D
-from hydra.acoustic import AcousticParams, acoustic_ic, acoustic_exact
-from hydra.visualization import plot_fields
+from phrike.io import load_config, ensure_outdir
+from phrike.grid import Grid1D
+from phrike.equations import EulerEquations1D
+from phrike.solver import SpectralSolver1D
+from phrike.acoustic import AcousticParams, acoustic_ic, acoustic_exact
+from phrike.visualization import plot_fields
 
 
 def main() -> None:

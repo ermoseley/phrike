@@ -10,14 +10,14 @@ from .problems import ProblemRegistry
 def main() -> None:
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
-        description="Hydra CFD Solver",
+        description="PHRIKE CFD Solver",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  hydra sod --config configs/sod.yaml
-  hydra khi2d --backend torch --device mps
-  hydra tgv3d --config configs/tgv3d.yaml --backend torch --device cuda
-  hydra turb3d --no-video
+  phrike sod --config configs/sod.yaml
+  phrike khi2d --backend torch --device mps
+  phrike tgv3d --config configs/tgv3d.yaml --backend torch --device cuda
+  phrike turb3d --no-video
         """
     )
     
@@ -104,7 +104,7 @@ Examples:
         # Override output directory if specified
         if args.outdir:
             problem.outdir = args.outdir
-            from hydra.io import ensure_outdir
+            from phrike.io import ensure_outdir
             ensure_outdir(problem.outdir)
         
         # Run simulation

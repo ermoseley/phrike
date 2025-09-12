@@ -1,9 +1,9 @@
 import numpy as np
 
-from hydra.grid import Grid1D
-from hydra.equations import EulerEquations1D
-from hydra.initial_conditions import sod_shock_tube
-from hydra.solver import SpectralSolver1D
+from phrike.grid import Grid1D
+from phrike.equations import EulerEquations1D
+from phrike.initial_conditions import sod_shock_tube
+from phrike.solver import SpectralSolver1D
 
 
 def test_sod_runs_without_crash():

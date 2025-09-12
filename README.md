@@ -1,7 +1,7 @@
-HYDRA (HYDRodynamics GPU-Accelerated solver)
+PHRIKE (Pseudo-spectral Hydrodynamical solver for Realistic Integration of physiKal Environments)
 =====================================================
 
-HYDRA is a modular pseudo-spectral solver for compressible flows. The initial release implements 1D, 2D, and 3D solvers for the Euler equations using FFT-based spatial derivatives with RK2/RK4 time integration. The design is dimension-agnostic and supports both CPU (NumPy) and GPU (Torch) backends.
+PHRIKE is a modular pseudo-spectral solver for compressible flows. The initial release implements 1D, 2D, and 3D solvers for the Euler equations using FFT-based spatial derivatives with RK2/RK4 time integration. The design is dimension-agnostic and supports both CPU (NumPy) and GPU (Torch) backends.
 
 Quick start
 -----------
@@ -13,22 +13,22 @@ Quick start
 2. Run simulations using the unified CLI:
 
    # 1D Sod shock tube
-   python -m hydra sod --config configs/sod.yaml
+   python -m phrike sod --config configs/sod.yaml
    
    # 2D Kelvin-Helmholtz instability
-   python -m hydra khi2d --config configs/khi2d.yaml
+   python -m phrike khi2d --config configs/khi2d.yaml
    
    # 3D Taylor-Green vortex
-   python -m hydra tgv3d --config configs/tgv3d.yaml
+   python -m phrike tgv3d --config configs/tgv3d.yaml
    
    # 3D turbulent velocity field
-   python -m hydra turb3d --config configs/turb3d.yaml
+   python -m phrike turb3d --config configs/turb3d.yaml
    
    # 3D turbulent simulation with monitoring (monitoring enabled by default)
    python examples/run_turb3d_with_monitoring.py
    
    # Restart from checkpoint
-   python -m hydra sod --config configs/sod.yaml --restart-from outputs/sod/snapshot_t0.100000.npz
+   python -m phrike sod --config configs/sod.yaml --restart-from outputs/sod/snapshot_t0.100000.npz
 
 Backends (NumPy vs Torch)
 -------------------------
@@ -48,16 +48,16 @@ Use the `--backend` flag to select the backend, and optionally `--device` for To
 
 ```
 # NumPy (default)
-python -m hydra khi2d --config configs/khi2d.yaml --backend numpy
+python -m phrike khi2d --config configs/khi2d.yaml --backend numpy
 
 # Torch on CPU
-python -m hydra khi2d --config configs/khi2d.yaml --backend torch --device cpu
+python -m phrike khi2d --config configs/khi2d.yaml --backend torch --device cpu
 
 # Torch on Apple Silicon GPU (MPS)
-python -m hydra khi2d --config configs/khi2d.yaml --backend torch --device mps
+python -m phrike khi2d --config configs/khi2d.yaml --backend torch --device mps
 
 # Torch on CUDA (Linux/NVIDIA)
-python -m hydra khi2d --config configs/khi2d.yaml --backend torch --device cuda
+python -m phrike khi2d --config configs/khi2d.yaml --backend torch --device cuda
 ```
 
 Notes:
@@ -73,13 +73,13 @@ Hydra provides a unified command-line interface for all problems:
 
 ```bash
 # Basic usage
-python -m hydra <problem> [options]
+python -m phrike <problem> [options]
 
 # Available problems
-python -m hydra --help
+python -m phrike --help
 
 # Common options
-python -m hydra sod --config configs/sod.yaml --backend torch --device mps --no-video -v
+python -m phrike sod --config configs/sod.yaml --backend torch --device mps --no-video -v
 ```
 
 **Available Problems:**
@@ -103,7 +103,7 @@ Programmatic API
 You can also use Hydra programmatically:
 
 ```python
-from hydra import run_simulation
+from phrike import run_simulation
 
 # Using config file
 solver, history = run_simulation("sod", config_path="configs/sod.yaml")
@@ -133,10 +133,10 @@ Hydra supports restarting simulations from checkpoint files, which is useful for
 
 ```bash
 # Run a simulation with checkpointing enabled
-python -m hydra sod --config configs/sod.yaml
+python -m phrike sod --config configs/sod.yaml
 
 # Restart from a specific checkpoint
-python -m hydra sod --config configs/sod.yaml --restart-from outputs/sod/snapshot_t0.100000.npz
+python -m phrike sod --config configs/sod.yaml --restart-from outputs/sod/snapshot_t0.100000.npz
 ```
 
 **Checkpoint Configuration:**
@@ -151,7 +151,7 @@ integration:
 **Programmatic Restart:**
 
 ```python
-from hydra.problems import ProblemRegistry
+from phrike.problems import ProblemRegistry
 
 # Create problem with restart
 problem = ProblemRegistry.create_problem(
@@ -183,7 +183,7 @@ Hydra uses a modular, extensible architecture:
 - **Type-Safe**: Full type hints and validation throughout
 
 **Adding New Problems:**
-1. Inherit from `BaseProblem` in `hydra/problems/`
+1. Inherit from `BaseProblem` in `phrike/problems/`
 2. Implement required methods: `create_grid()`, `create_equations()`, etc.
 3. Register with `ProblemRegistry.register("name", ProblemClass)`
 4. Create YAML config file in `configs/`
@@ -191,7 +191,7 @@ Hydra uses a modular, extensible architecture:
 Project structure
 -----------------
 
-- hydra/
+- phrike/
   - cli.py: unified command-line interface
   - problems/: problem-specific implementations
     - base.py: base problem class with common functionality
