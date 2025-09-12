@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "spectralhydro"
+name = "hydra"
 version = "0.1.0"
 description = "Pseudo-spectral hydrodynamics solver (1D, extendable to 2D/3D)"
 readme = "README.md"
@@ -20,12 +20,15 @@ dependencies = [
   "numba>=0.58"
 ]
 
+[project.scripts]
+hydra = "hydra.cli:main"
+
 [project.optional-dependencies]
 fastfft = ["pyfftw>=0.13"]
 dev = ["pytest>=7.0", "ruff>=0.3.0"]
 
 [tool.setuptools.package-data]
-spectralhydro = ["py.typed"]
+hydra = ["py.typed"]
 
 [tool.setuptools.packages.find]
 where = ["."]

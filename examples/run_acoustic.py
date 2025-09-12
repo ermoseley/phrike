@@ -3,12 +3,12 @@ import os
 
 import numpy as np
 
-from spectralhydro.io import load_config, ensure_outdir
-from spectralhydro.grid import Grid1D
-from spectralhydro.equations import EulerEquations1D
-from spectralhydro.solver import SpectralSolver1D
-from spectralhydro.acoustic import AcousticParams, acoustic_ic, acoustic_exact
-from spectralhydro.visualization import plot_fields
+from hydra.io import load_config, ensure_outdir
+from hydra.grid import Grid1D
+from hydra.equations import EulerEquations1D
+from hydra.solver import SpectralSolver1D
+from hydra.acoustic import AcousticParams, acoustic_ic, acoustic_exact
+from hydra.visualization import plot_fields
 
 
 def main() -> None:

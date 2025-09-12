@@ -5,11 +5,11 @@ import subprocess
 import numpy as np
 import matplotlib.pyplot as plt
 
-from spectralhydro.io import load_config, ensure_outdir, save_solution_snapshot
-from spectralhydro.grid import Grid2D
-from spectralhydro.equations import EulerEquations2D
-from spectralhydro.initial_conditions import kelvin_helmholtz_2d
-from spectralhydro.solver import SpectralSolver2D
+from hydra.io import load_config, ensure_outdir, save_solution_snapshot
+from hydra.grid import Grid2D
+from hydra.equations import EulerEquations2D
+from hydra.initial_conditions import kelvin_helmholtz_2d
+from hydra.solver import SpectralSolver2D
 
 
 def main() -> None:

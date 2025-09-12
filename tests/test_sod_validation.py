@@ -1,9 +1,9 @@
 import numpy as np
 
-from spectralhydro.grid import Grid1D
-from spectralhydro.equations import EulerEquations1D
-from spectralhydro.initial_conditions import sod_shock_tube
-from spectralhydro.solver import SpectralSolver1D
+from hydra.grid import Grid1D
+from hydra.equations import EulerEquations1D
+from hydra.initial_conditions import sod_shock_tube
+from hydra.solver import SpectralSolver1D
 
 
 def test_sod_runs_without_crash():

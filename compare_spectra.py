@@ -6,8 +6,8 @@ Compare different turbulence spectrum types and wavenumber ranges.
 import os
 import numpy as np
 import matplotlib.pyplot as plt
-from spectralhydro.grid import Grid3D
-from spectralhydro.initial_conditions import turbulent_velocity_3d
+from hydra.grid import Grid3D
+from hydra.initial_conditions import turbulent_velocity_3d
 
 # Import and register the custom colormap
 import sys
@@ -41,7 +41,7 @@ def compare_spectra():
     
     # Extract velocity components
     def get_velocity_components(U):
-        from spectralhydro.equations import EulerEquations3D
+        from hydra.equations import EulerEquations3D
         eqs = EulerEquations3D(gamma=1.4)
         rho, ux, uy, uz, p = eqs.primitive(U)
         return ux, uy, uz
