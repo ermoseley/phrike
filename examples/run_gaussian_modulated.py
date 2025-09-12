@@ -6,11 +6,11 @@ import subprocess
 import numpy as np
 import matplotlib.pyplot as plt
 
-from spectralhydro.io import load_config, ensure_outdir
-from spectralhydro.grid import Grid1D
-from spectralhydro.equations import EulerEquations1D
-from spectralhydro.solver import SpectralSolver1D
-from spectralhydro.acoustic import AcousticParams, two_modulated_gaussian_acoustic_ic
+from hydra.io import load_config, ensure_outdir
+from hydra.grid import Grid1D
+from hydra.equations import EulerEquations1D
+from hydra.solver import SpectralSolver1D
+from hydra.acoustic import AcousticParams, two_modulated_gaussian_acoustic_ic
 
 
 def main() -> None:

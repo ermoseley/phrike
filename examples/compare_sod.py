@@ -3,13 +3,13 @@ import os
 
 import numpy as np
 
-from spectralhydro.io import load_config, ensure_outdir
-from spectralhydro.grid import Grid1D
-from spectralhydro.equations import EulerEquations1D
-from spectralhydro.initial_conditions import sod_shock_tube
-from spectralhydro.solver import SpectralSolver1D
-from spectralhydro.sod_analytic import sod_sample
-from spectralhydro.visualization import plot_fields
+from hydra.io import load_config, ensure_outdir
+from hydra.grid import Grid1D
+from hydra.equations import EulerEquations1D
+from hydra.initial_conditions import sod_shock_tube
+from hydra.solver import SpectralSolver1D
+from hydra.sod_analytic import sod_sample
+from hydra.visualization import plot_fields
 
 
 def main() -> None:

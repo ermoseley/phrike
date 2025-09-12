@@ -1,7 +1,8 @@
 Add restart capabilities
-Add 3D
+rename spectralhydro directory to hydra
+Add turbulent driving
+Add new basis functions
 Add MHD
-Test against RAMSES
 
 
 Longer term:

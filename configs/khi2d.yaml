@@ -1,8 +1,8 @@
 problem: khi2d
 
 grid:
-  Nx: 512
-  Ny: 512
+  Nx: 128
+  Ny: 128
   Lx: 1.0
   Ly: 1.0
   dealias: true

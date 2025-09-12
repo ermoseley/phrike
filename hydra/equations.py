@@ -220,6 +220,22 @@ class EulerEquations1D:
             return float(torch.max(torch.abs(u) + a).item())
         return float(_max_wave_speed_kernel(U, self.gamma))
 
+    def conserved_quantities(self, U: Array) -> Dict[str, float]:
+        rho, u, p, _ = self.primitive(U)
+        if _TORCH_AVAILABLE and isinstance(rho, (torch.Tensor,)):
+            total_mass = float(torch.sum(rho).item())
+            total_momentum = float(torch.sum(rho * u).item())
+            total_energy = float(torch.sum(p / (self.gamma - 1.0) + 0.5 * rho * u * u).item())
+        else:
+            total_mass = float(np.sum(rho))
+            total_momentum = float(np.sum(rho * u))
+            total_energy = float(np.sum(p / (self.gamma - 1.0) + 0.5 * rho * u * u))
+        return {
+            "mass": total_mass,
+            "momentum": total_momentum,
+            "energy": total_energy,
+        }
+
 
 @dataclass
 class EulerEquations2D:

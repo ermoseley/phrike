@@ -1,12 +1,12 @@
 import argparse
 import os
 
-from spectralhydro.io import load_config, ensure_outdir, save_solution_snapshot
-from spectralhydro.grid import Grid1D
-from spectralhydro.equations import EulerEquations1D
-from spectralhydro.initial_conditions import sod_shock_tube
-from spectralhydro.solver import SpectralSolver1D
-from spectralhydro.visualization import plot_fields
+from hydra.io import load_config, ensure_outdir, save_solution_snapshot
+from hydra.grid import Grid1D
+from hydra.equations import EulerEquations1D
+from hydra.initial_conditions import sod_shock_tube
+from hydra.solver import SpectralSolver1D
+from hydra.visualization import plot_fields
 
 
 def main() -> None:
@@ -51,7 +51,7 @@ def main() -> None:
 
     # Optionally plot conserved quantities
     if history and len(history.get("time", [])) > 0:
-        from spectralhydro.visualization import plot_conserved_time_series
+        from hydra.visualization import plot_conserved_time_series
         plot_conserved_time_series(history, outpath=os.path.join(outdir, "conserved.png"))
 
 
