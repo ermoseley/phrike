@@ -1,0 +1,656 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../../">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>phrike.equations &mdash; PHRIKE 0.1.0 documentation</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=e59714d7" />
+
+  
+      <script src="../../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../../_static/documentation_options.js?v=01f34227"></script>
+      <script src="../../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            PHRIKE
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quickstart.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../user_guide.html">User Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../api_reference.html">API Reference</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../examples.html">Examples</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../development.html">Development Guide</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">PHRIKE</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../index.html">Module code</a></li>
+      <li class="breadcrumb-item active">phrike.equations</li>
+      <li class="wy-breadcrumbs-aside">
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <h1>Source code for phrike.equations</h1><div class="highlight"><pre>
+<span></span><span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Dict</span><span class="p">,</span> <span class="n">Tuple</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
+
+<span class="k">try</span><span class="p">:</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>  <span class="c1"># type: ignore</span>
+
+    <span class="n">_TORCH_AVAILABLE</span> <span class="o">=</span> <span class="kc">True</span>
+<span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
+    <span class="n">_TORCH_AVAILABLE</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">torch</span> <span class="o">=</span> <span class="kc">None</span>  <span class="c1"># type: ignore</span>
+
+<span class="k">try</span><span class="p">:</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">numba</span><span class="w"> </span><span class="kn">import</span> <span class="n">njit</span><span class="p">,</span> <span class="n">prange</span>
+
+    <span class="n">_NUMBA_AVAILABLE</span> <span class="o">=</span> <span class="kc">True</span>
+<span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
+    <span class="n">_NUMBA_AVAILABLE</span> <span class="o">=</span> <span class="kc">False</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">njit</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>  <span class="c1"># type: ignore</span>
+        <span class="k">def</span><span class="w"> </span><span class="nf">inner</span><span class="p">(</span><span class="n">func</span><span class="p">):</span>
+            <span class="k">return</span> <span class="n">func</span>
+
+        <span class="k">return</span> <span class="n">inner</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">prange</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>  <span class="c1"># type: ignore</span>
+        <span class="k">return</span> <span class="nb">range</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+
+
+<span class="c1"># --- Numba-accelerated kernels (1D) ---</span>
+
+
+<div class="viewcode-block" id="_primitive_kernel">
+<a class="viewcode-back" href="../../api/equations.html#phrike.equations._primitive_kernel">[docs]</a>
+<span class="nd">@njit</span><span class="p">(</span><span class="n">cache</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">fastmath</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_primitive_kernel</span><span class="p">(</span>
+    <span class="n">U</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">gamma</span><span class="p">:</span> <span class="nb">float</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Convert conservative variables to primitive variables for 1D Euler equations.</span>
+
+<span class="sd">    Args:</span>
+<span class="sd">        U: Conservative variables array of shape (3, N) where:</span>
+<span class="sd">           U[0] = rho (density)</span>
+<span class="sd">           U[1] = rho * u (momentum density)</span>
+<span class="sd">           U[2] = E (total energy density)</span>
+<span class="sd">        gamma: Adiabatic index</span>
+
+<span class="sd">    Returns:</span>
+<span class="sd">        Tuple of (rho, u, p, a) where:</span>
+<span class="sd">        - rho: density array</span>
+<span class="sd">        - u: velocity array</span>
+<span class="sd">        - p: pressure array</span>
+<span class="sd">        - a: sound speed array</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">rho</span> <span class="o">=</span> <span class="n">U</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+    <span class="n">mom</span> <span class="o">=</span> <span class="n">U</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+    <span class="n">E</span> <span class="o">=</span> <span class="n">U</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span>
+    <span class="n">u</span> <span class="o">=</span> <span class="n">mom</span> <span class="o">/</span> <span class="n">rho</span>
+    <span class="n">kinetic</span> <span class="o">=</span> <span class="mf">0.5</span> <span class="o">*</span> <span class="n">rho</span> <span class="o">*</span> <span class="n">u</span> <span class="o">*</span> <span class="n">u</span>
+    <span class="n">p</span> <span class="o">=</span> <span class="p">(</span><span class="n">gamma</span> <span class="o">-</span> <span class="mf">1.0</span><span class="p">)</span> <span class="o">*</span> <span class="p">(</span><span class="n">E</span> <span class="o">-</span> <span class="n">kinetic</span><span class="p">)</span>
+    <span class="n">a</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="n">gamma</span> <span class="o">*</span> <span class="n">p</span> <span class="o">/</span> <span class="n">rho</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">rho</span><span class="p">,</span> <span class="n">u</span><span class="p">,</span> <span class="n">p</span><span class="p">,</span> <span class="n">a</span></div>
+
+
+
+<div class="viewcode-block" id="_flux_kernel">
+<a class="viewcode-back" href="../../api/equations.html#phrike.equations._flux_kernel">[docs]</a>
+<span class="nd">@njit</span><span class="p">(</span><span class="n">cache</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">fastmath</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_flux_kernel</span><span class="p">(</span><span class="n">U</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">gamma</span><span class="p">:</span> <span class="nb">float</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Compute flux vector for 1D Euler equations.</span>
+
+<span class="sd">    Args:</span>
+<span class="sd">        U: Conservative variables array of shape (3, N)</span>
+<span class="sd">        gamma: Adiabatic index</span>
+
+<span class="sd">    Returns:</span>
+<span class="sd">        Flux array of shape (3, N) where:</span>
+<span class="sd">        - F[0] = rho * u (mass flux)</span>
+<span class="sd">        - F[1] = rho * u^2 + p (momentum flux)</span>
+<span class="sd">        - F[2] = (E + p) * u (energy flux)</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">rho</span><span class="p">,</span> <span class="n">u</span><span class="p">,</span> <span class="n">p</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">_primitive_kernel</span><span class="p">(</span><span class="n">U</span><span class="p">,</span> <span class="n">gamma</span><span class="p">)</span>
+    <span class="n">mom</span> <span class="o">=</span> <span class="n">rho</span> <span class="o">*</span> <span class="n">u</span>
+    <span class="n">F</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">empty_like</span><span class="p">(</span><span class="n">U</span><span class="p">)</span>
+    <span class="n">F</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="n">mom</span>
+    <span class="n">F</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="n">mom</span> <span class="o">*</span> <span class="n">u</span> <span class="o">+</span> <span class="n">p</span>
+    <span class="n">F</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">U</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">+</span> <span class="n">p</span><span class="p">)</span> <span class="o">*</span> <span class="n">u</span>
+    <span class="k">return</span> <span class="n">F</span></div>
+
+
+
+<div class="viewcode-block" id="_max_wave_speed_kernel">
+<a class="viewcode-back" href="../../api/equations.html#phrike.equations._max_wave_speed_kernel">[docs]</a>
+<span class="nd">@njit</span><span class="p">(</span><span class="n">cache</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">fastmath</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_max_wave_speed_kernel</span><span class="p">(</span><span class="n">U</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">gamma</span><span class="p">:</span> <span class="nb">float</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span><span class="p">:</span>
+    <span class="c1"># U shape (3, N)</span>
+    <span class="n">rho</span><span class="p">,</span> <span class="n">u</span><span class="p">,</span> <span class="n">p</span><span class="p">,</span> <span class="n">a</span> <span class="o">=</span> <span class="n">_primitive_kernel</span><span class="p">(</span><span class="n">U</span><span class="p">,</span> <span class="n">gamma</span><span class="p">)</span>
+    <span class="n">c</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">abs</span><span class="p">(</span><span class="n">u</span><span class="p">)</span> <span class="o">+</span> <span class="n">a</span>
+    <span class="n">max_c</span> <span class="o">=</span> <span class="mf">0.0</span>
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]):</span>
+        <span class="k">if</span> <span class="n">c</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">&gt;</span> <span class="n">max_c</span><span class="p">:</span>
+            <span class="n">max_c</span> <span class="o">=</span> <span class="n">c</span><span class="p">[</span><span class="n">i</span><span class="p">]</span>
+    <span class="k">return</span> <span class="n">max_c</span></div>
+
+
+
+<span class="c1"># --- 2D Euler kernels ---</span>
+
+
+<div class="viewcode-block" id="_primitive2d_kernel">
+<a class="viewcode-back" href="../../api/equations.html#phrike.equations._primitive2d_kernel">[docs]</a>
+<span class="nd">@njit</span><span class="p">(</span><span class="n">cache</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">fastmath</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_primitive2d_kernel</span><span class="p">(</span>
+    <span class="n">U</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">gamma</span><span class="p">:</span> <span class="nb">float</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">]:</span>
+    <span class="n">rho</span> <span class="o">=</span> <span class="n">U</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+    <span class="n">momx</span> <span class="o">=</span> <span class="n">U</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+    <span class="n">momy</span> <span class="o">=</span> <span class="n">U</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span>
+    <span class="n">E</span> <span class="o">=</span> <span class="n">U</span><span class="p">[</span><span class="mi">3</span><span class="p">]</span>
+    <span class="n">ux</span> <span class="o">=</span> <span class="n">momx</span> <span class="o">/</span> <span class="n">rho</span>
+    <span class="n">uy</span> <span class="o">=</span> <span class="n">momy</span> <span class="o">/</span> <span class="n">rho</span>
+    <span class="n">kinetic</span> <span class="o">=</span> <span class="mf">0.5</span> <span class="o">*</span> <span class="n">rho</span> <span class="o">*</span> <span class="p">(</span><span class="n">ux</span> <span class="o">*</span> <span class="n">ux</span> <span class="o">+</span> <span class="n">uy</span> <span class="o">*</span> <span class="n">uy</span><span class="p">)</span>
+    <span class="n">p</span> <span class="o">=</span> <span class="p">(</span><span class="n">gamma</span> <span class="o">-</span> <span class="mf">1.0</span><span class="p">)</span> <span class="o">*</span> <span class="p">(</span><span class="n">E</span> <span class="o">-</span> <span class="n">kinetic</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">rho</span><span class="p">,</span> <span class="n">ux</span><span class="p">,</span> <span class="n">uy</span><span class="p">,</span> <span class="n">p</span></div>
+
+
+
+<div class="viewcode-block" id="_flux2d_kernel">
+<a class="viewcode-back" href="../../api/equations.html#phrike.equations._flux2d_kernel">[docs]</a>
+<span class="nd">@njit</span><span class="p">(</span><span class="n">cache</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">fastmath</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_flux2d_kernel</span><span class="p">(</span><span class="n">U</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">gamma</span><span class="p">:</span> <span class="nb">float</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">]:</span>
+    <span class="n">rho</span><span class="p">,</span> <span class="n">ux</span><span class="p">,</span> <span class="n">uy</span><span class="p">,</span> <span class="n">p</span> <span class="o">=</span> <span class="n">_primitive2d_kernel</span><span class="p">(</span><span class="n">U</span><span class="p">,</span> <span class="n">gamma</span><span class="p">)</span>
+    <span class="n">momx</span> <span class="o">=</span> <span class="n">rho</span> <span class="o">*</span> <span class="n">ux</span>
+    <span class="n">momy</span> <span class="o">=</span> <span class="n">rho</span> <span class="o">*</span> <span class="n">uy</span>
+    <span class="n">Fx</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">empty</span><span class="p">((</span><span class="mi">4</span><span class="p">,</span> <span class="n">U</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">2</span><span class="p">],</span> <span class="n">U</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">U</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+    <span class="n">Fy</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">empty_like</span><span class="p">(</span><span class="n">Fx</span><span class="p">)</span>
+    <span class="n">Fx</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="n">momx</span>
+    <span class="n">Fx</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="n">momx</span> <span class="o">*</span> <span class="n">ux</span> <span class="o">+</span> <span class="n">p</span>
+    <span class="n">Fx</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">=</span> <span class="n">momx</span> <span class="o">*</span> <span class="n">uy</span>
+    <span class="n">Fx</span><span class="p">[</span><span class="mi">3</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">U</span><span class="p">[</span><span class="mi">3</span><span class="p">]</span> <span class="o">+</span> <span class="n">p</span><span class="p">)</span> <span class="o">*</span> <span class="n">ux</span>
+    <span class="n">Fy</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="n">momy</span>
+    <span class="n">Fy</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="n">momy</span> <span class="o">*</span> <span class="n">ux</span>
+    <span class="n">Fy</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">=</span> <span class="n">momy</span> <span class="o">*</span> <span class="n">uy</span> <span class="o">+</span> <span class="n">p</span>
+    <span class="n">Fy</span><span class="p">[</span><span class="mi">3</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">U</span><span class="p">[</span><span class="mi">3</span><span class="p">]</span> <span class="o">+</span> <span class="n">p</span><span class="p">)</span> <span class="o">*</span> <span class="n">uy</span>
+    <span class="k">return</span> <span class="n">Fx</span><span class="p">,</span> <span class="n">Fy</span></div>
+
+
+
+<div class="viewcode-block" id="_max_wave_speed2d_kernel">
+<a class="viewcode-back" href="../../api/equations.html#phrike.equations._max_wave_speed2d_kernel">[docs]</a>
+<span class="nd">@njit</span><span class="p">(</span><span class="n">cache</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">fastmath</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_max_wave_speed2d_kernel</span><span class="p">(</span><span class="n">U</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">gamma</span><span class="p">:</span> <span class="nb">float</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span><span class="p">:</span>
+    <span class="n">rho</span><span class="p">,</span> <span class="n">ux</span><span class="p">,</span> <span class="n">uy</span><span class="p">,</span> <span class="n">p</span> <span class="o">=</span> <span class="n">_primitive2d_kernel</span><span class="p">(</span><span class="n">U</span><span class="p">,</span> <span class="n">gamma</span><span class="p">)</span>
+    <span class="n">a</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="n">gamma</span> <span class="o">*</span> <span class="n">p</span> <span class="o">/</span> <span class="n">rho</span><span class="p">)</span>
+    <span class="n">c</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">abs</span><span class="p">(</span><span class="n">ux</span><span class="p">)</span> <span class="o">+</span> <span class="n">a</span>
+    <span class="n">max_c</span> <span class="o">=</span> <span class="mf">0.0</span>
+    <span class="k">for</span> <span class="n">j</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]):</span>
+        <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]):</span>
+            <span class="k">if</span> <span class="n">c</span><span class="p">[</span><span class="n">j</span><span class="p">,</span> <span class="n">i</span><span class="p">]</span> <span class="o">&gt;</span> <span class="n">max_c</span><span class="p">:</span>
+                <span class="n">max_c</span> <span class="o">=</span> <span class="n">c</span><span class="p">[</span><span class="n">j</span><span class="p">,</span> <span class="n">i</span><span class="p">]</span>
+    <span class="k">return</span> <span class="n">max_c</span></div>
+
+
+
+<div class="viewcode-block" id="_primitive3d_kernel">
+<a class="viewcode-back" href="../../api/equations.html#phrike.equations._primitive3d_kernel">[docs]</a>
+<span class="nd">@njit</span><span class="p">(</span><span class="n">cache</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">fastmath</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_primitive3d_kernel</span><span class="p">(</span>
+    <span class="n">U</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">gamma</span><span class="p">:</span> <span class="nb">float</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">]:</span>
+    <span class="n">rho</span> <span class="o">=</span> <span class="n">U</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+    <span class="n">momx</span> <span class="o">=</span> <span class="n">U</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+    <span class="n">momy</span> <span class="o">=</span> <span class="n">U</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span>
+    <span class="n">momz</span> <span class="o">=</span> <span class="n">U</span><span class="p">[</span><span class="mi">3</span><span class="p">]</span>
+    <span class="n">E</span> <span class="o">=</span> <span class="n">U</span><span class="p">[</span><span class="mi">4</span><span class="p">]</span>
+    <span class="n">ux</span> <span class="o">=</span> <span class="n">momx</span> <span class="o">/</span> <span class="n">rho</span>
+    <span class="n">uy</span> <span class="o">=</span> <span class="n">momy</span> <span class="o">/</span> <span class="n">rho</span>
+    <span class="n">uz</span> <span class="o">=</span> <span class="n">momz</span> <span class="o">/</span> <span class="n">rho</span>
+    <span class="n">kinetic</span> <span class="o">=</span> <span class="mf">0.5</span> <span class="o">*</span> <span class="n">rho</span> <span class="o">*</span> <span class="p">(</span><span class="n">ux</span> <span class="o">*</span> <span class="n">ux</span> <span class="o">+</span> <span class="n">uy</span> <span class="o">*</span> <span class="n">uy</span> <span class="o">+</span> <span class="n">uz</span> <span class="o">*</span> <span class="n">uz</span><span class="p">)</span>
+    <span class="n">p</span> <span class="o">=</span> <span class="p">(</span><span class="n">gamma</span> <span class="o">-</span> <span class="mf">1.0</span><span class="p">)</span> <span class="o">*</span> <span class="p">(</span><span class="n">E</span> <span class="o">-</span> <span class="n">kinetic</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">rho</span><span class="p">,</span> <span class="n">ux</span><span class="p">,</span> <span class="n">uy</span><span class="p">,</span> <span class="n">uz</span><span class="p">,</span> <span class="n">p</span></div>
+
+
+
+<div class="viewcode-block" id="_flux3d_kernel">
+<a class="viewcode-back" href="../../api/equations.html#phrike.equations._flux3d_kernel">[docs]</a>
+<span class="nd">@njit</span><span class="p">(</span><span class="n">cache</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">fastmath</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_flux3d_kernel</span><span class="p">(</span>
+    <span class="n">U</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">gamma</span><span class="p">:</span> <span class="nb">float</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">]:</span>
+    <span class="n">rho</span><span class="p">,</span> <span class="n">ux</span><span class="p">,</span> <span class="n">uy</span><span class="p">,</span> <span class="n">uz</span><span class="p">,</span> <span class="n">p</span> <span class="o">=</span> <span class="n">_primitive3d_kernel</span><span class="p">(</span><span class="n">U</span><span class="p">,</span> <span class="n">gamma</span><span class="p">)</span>
+    <span class="n">momx</span> <span class="o">=</span> <span class="n">rho</span> <span class="o">*</span> <span class="n">ux</span>
+    <span class="n">momy</span> <span class="o">=</span> <span class="n">rho</span> <span class="o">*</span> <span class="n">uy</span>
+    <span class="n">momz</span> <span class="o">=</span> <span class="n">rho</span> <span class="o">*</span> <span class="n">uz</span>
+    <span class="n">Fx</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">empty</span><span class="p">((</span><span class="mi">5</span><span class="p">,</span> <span class="n">U</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">3</span><span class="p">],</span> <span class="n">U</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">2</span><span class="p">],</span> <span class="n">U</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">U</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+    <span class="n">Fy</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">empty_like</span><span class="p">(</span><span class="n">Fx</span><span class="p">)</span>
+    <span class="n">Fz</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">empty_like</span><span class="p">(</span><span class="n">Fx</span><span class="p">)</span>
+    <span class="c1"># x-fluxes</span>
+    <span class="n">Fx</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="n">momx</span>
+    <span class="n">Fx</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="n">momx</span> <span class="o">*</span> <span class="n">ux</span> <span class="o">+</span> <span class="n">p</span>
+    <span class="n">Fx</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">=</span> <span class="n">momx</span> <span class="o">*</span> <span class="n">uy</span>
+    <span class="n">Fx</span><span class="p">[</span><span class="mi">3</span><span class="p">]</span> <span class="o">=</span> <span class="n">momx</span> <span class="o">*</span> <span class="n">uz</span>
+    <span class="n">Fx</span><span class="p">[</span><span class="mi">4</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">U</span><span class="p">[</span><span class="mi">4</span><span class="p">]</span> <span class="o">+</span> <span class="n">p</span><span class="p">)</span> <span class="o">*</span> <span class="n">ux</span>
+    <span class="c1"># y-fluxes</span>
+    <span class="n">Fy</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="n">momy</span>
+    <span class="n">Fy</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="n">momy</span> <span class="o">*</span> <span class="n">ux</span>
+    <span class="n">Fy</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">=</span> <span class="n">momy</span> <span class="o">*</span> <span class="n">uy</span> <span class="o">+</span> <span class="n">p</span>
+    <span class="n">Fy</span><span class="p">[</span><span class="mi">3</span><span class="p">]</span> <span class="o">=</span> <span class="n">momy</span> <span class="o">*</span> <span class="n">uz</span>
+    <span class="n">Fy</span><span class="p">[</span><span class="mi">4</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">U</span><span class="p">[</span><span class="mi">4</span><span class="p">]</span> <span class="o">+</span> <span class="n">p</span><span class="p">)</span> <span class="o">*</span> <span class="n">uy</span>
+    <span class="c1"># z-fluxes</span>
+    <span class="n">Fz</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="n">momz</span>
+    <span class="n">Fz</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="n">momz</span> <span class="o">*</span> <span class="n">ux</span>
+    <span class="n">Fz</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">=</span> <span class="n">momz</span> <span class="o">*</span> <span class="n">uy</span>
+    <span class="n">Fz</span><span class="p">[</span><span class="mi">3</span><span class="p">]</span> <span class="o">=</span> <span class="n">momz</span> <span class="o">*</span> <span class="n">uz</span> <span class="o">+</span> <span class="n">p</span>
+    <span class="n">Fz</span><span class="p">[</span><span class="mi">4</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">U</span><span class="p">[</span><span class="mi">4</span><span class="p">]</span> <span class="o">+</span> <span class="n">p</span><span class="p">)</span> <span class="o">*</span> <span class="n">uz</span>
+    <span class="k">return</span> <span class="n">Fx</span><span class="p">,</span> <span class="n">Fy</span><span class="p">,</span> <span class="n">Fz</span></div>
+
+
+
+<div class="viewcode-block" id="_max_wave_speed3d_kernel">
+<a class="viewcode-back" href="../../api/equations.html#phrike.equations._max_wave_speed3d_kernel">[docs]</a>
+<span class="nd">@njit</span><span class="p">(</span><span class="n">cache</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">fastmath</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_max_wave_speed3d_kernel</span><span class="p">(</span><span class="n">U</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">gamma</span><span class="p">:</span> <span class="nb">float</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span><span class="p">:</span>
+    <span class="n">rho</span><span class="p">,</span> <span class="n">ux</span><span class="p">,</span> <span class="n">uy</span><span class="p">,</span> <span class="n">uz</span><span class="p">,</span> <span class="n">p</span> <span class="o">=</span> <span class="n">_primitive3d_kernel</span><span class="p">(</span><span class="n">U</span><span class="p">,</span> <span class="n">gamma</span><span class="p">)</span>
+    <span class="n">a</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="n">gamma</span> <span class="o">*</span> <span class="n">p</span> <span class="o">/</span> <span class="n">rho</span><span class="p">)</span>
+    <span class="c1"># conservative bound using max component speed</span>
+    <span class="n">comp</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">maximum</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">maximum</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">abs</span><span class="p">(</span><span class="n">ux</span><span class="p">),</span> <span class="n">np</span><span class="o">.</span><span class="n">abs</span><span class="p">(</span><span class="n">uy</span><span class="p">)),</span> <span class="n">np</span><span class="o">.</span><span class="n">abs</span><span class="p">(</span><span class="n">uz</span><span class="p">))</span> <span class="o">+</span> <span class="n">a</span>
+    <span class="n">max_c</span> <span class="o">=</span> <span class="mf">0.0</span>
+    <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">comp</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]):</span>
+        <span class="k">for</span> <span class="n">j</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">comp</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]):</span>
+            <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">comp</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">2</span><span class="p">]):</span>
+                <span class="k">if</span> <span class="n">comp</span><span class="p">[</span><span class="n">k</span><span class="p">,</span> <span class="n">j</span><span class="p">,</span> <span class="n">i</span><span class="p">]</span> <span class="o">&gt;</span> <span class="n">max_c</span><span class="p">:</span>
+                    <span class="n">max_c</span> <span class="o">=</span> <span class="n">comp</span><span class="p">[</span><span class="n">k</span><span class="p">,</span> <span class="n">j</span><span class="p">,</span> <span class="n">i</span><span class="p">]</span>
+    <span class="k">return</span> <span class="n">max_c</span></div>
+
+
+
+<span class="n">Array</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span>
+
+
+<div class="viewcode-block" id="EulerEquations1D">
+<a class="viewcode-back" href="../../api_reference.html#phrike.equations.EulerEquations1D">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">EulerEquations1D</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Compressible Euler equations in 1D, conservative form.</span>
+
+<span class="sd">    This class implements the 1D compressible Euler equations:</span>
+
+<span class="sd">    .. math::</span>
+<span class="sd">        \\frac{\\partial \\rho}{\\partial t} + \\frac{\\partial (\\rho u)}{\\partial x} = 0</span>
+<span class="sd">        \\frac{\\partial (\\rho u)}{\\partial t} + \\frac{\\partial (\\rho u^2 + p)}{\\partial x} = 0</span>
+<span class="sd">        \\frac{\\partial E}{\\partial t} + \\frac{\\partial ((E + p)u)}{\\partial x} = 0</span>
+
+<span class="sd">    where :math:`E = \\frac{p}{\\gamma-1} + \\frac{1}{2}\\rho u^2` is the total energy density.</span>
+
+<span class="sd">    State vector U = [rho, mom, E], where:</span>
+<span class="sd">      - rho: density</span>
+<span class="sd">      - mom: momentum density (rho * u)</span>
+<span class="sd">      - E: total energy density = p/(gamma-1) + 0.5*rho*u^2</span>
+
+<span class="sd">    Args:</span>
+<span class="sd">        gamma: Adiabatic index (default: 1.4)</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="n">gamma</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.4</span>
+
+<div class="viewcode-block" id="EulerEquations1D.primitive">
+<a class="viewcode-back" href="../../api_reference.html#phrike.equations.EulerEquations1D.primitive">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">primitive</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">U</span><span class="p">:</span> <span class="n">Array</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Array</span><span class="p">,</span> <span class="n">Array</span><span class="p">,</span> <span class="n">Array</span><span class="p">,</span> <span class="n">Array</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Convert conservative variables to primitive variables.</span>
+
+<span class="sd">        Args:</span>
+<span class="sd">            U: Conservative variables array of shape (3, N)</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            Tuple of (rho, u, p, a) where:</span>
+<span class="sd">            - rho: density array</span>
+<span class="sd">            - u: velocity array</span>
+<span class="sd">            - p: pressure array</span>
+<span class="sd">            - a: sound speed array</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="n">_TORCH_AVAILABLE</span> <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">U</span><span class="p">,</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,)):</span>
+            <span class="n">rho</span> <span class="o">=</span> <span class="n">U</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+            <span class="n">mom</span> <span class="o">=</span> <span class="n">U</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+            <span class="n">E</span> <span class="o">=</span> <span class="n">U</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span>
+            <span class="n">u</span> <span class="o">=</span> <span class="n">mom</span> <span class="o">/</span> <span class="n">rho</span>
+            <span class="n">kinetic</span> <span class="o">=</span> <span class="mf">0.5</span> <span class="o">*</span> <span class="n">rho</span> <span class="o">*</span> <span class="n">u</span> <span class="o">*</span> <span class="n">u</span>
+            <span class="n">p</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">gamma</span> <span class="o">-</span> <span class="mf">1.0</span><span class="p">)</span> <span class="o">*</span> <span class="p">(</span><span class="n">E</span> <span class="o">-</span> <span class="n">kinetic</span><span class="p">)</span>
+            <span class="n">a</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">gamma</span> <span class="o">*</span> <span class="n">p</span> <span class="o">/</span> <span class="n">rho</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">rho</span><span class="p">,</span> <span class="n">u</span><span class="p">,</span> <span class="n">p</span><span class="p">,</span> <span class="n">a</span>
+        <span class="k">return</span> <span class="n">_primitive_kernel</span><span class="p">(</span><span class="n">U</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">gamma</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="EulerEquations1D.conservative">
+<a class="viewcode-back" href="../../api_reference.html#phrike.equations.EulerEquations1D.conservative">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">conservative</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rho</span><span class="p">:</span> <span class="n">Array</span><span class="p">,</span> <span class="n">u</span><span class="p">:</span> <span class="n">Array</span><span class="p">,</span> <span class="n">p</span><span class="p">:</span> <span class="n">Array</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Array</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Convert primitive variables to conservative variables.</span>
+
+<span class="sd">        Args:</span>
+<span class="sd">            rho: Density array</span>
+<span class="sd">            u: Velocity array</span>
+<span class="sd">            p: Pressure array</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            Conservative variables array of shape (3, N) where:</span>
+<span class="sd">            - U[0] = rho (density)</span>
+<span class="sd">            - U[1] = rho * u (momentum density)</span>
+<span class="sd">            - U[2] = E (total energy density)</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="n">mom</span> <span class="o">=</span> <span class="n">rho</span> <span class="o">*</span> <span class="n">u</span>
+        <span class="k">if</span> <span class="n">_TORCH_AVAILABLE</span> <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">rho</span><span class="p">,</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,)):</span>
+            <span class="n">E</span> <span class="o">=</span> <span class="n">p</span> <span class="o">/</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">gamma</span> <span class="o">-</span> <span class="mf">1.0</span><span class="p">)</span> <span class="o">+</span> <span class="mf">0.5</span> <span class="o">*</span> <span class="n">rho</span> <span class="o">*</span> <span class="n">u</span> <span class="o">*</span> <span class="n">u</span>
+            <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">([</span><span class="n">rho</span><span class="p">,</span> <span class="n">mom</span><span class="p">,</span> <span class="n">E</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">E</span> <span class="o">=</span> <span class="n">p</span> <span class="o">/</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">gamma</span> <span class="o">-</span> <span class="mf">1.0</span><span class="p">)</span> <span class="o">+</span> <span class="mf">0.5</span> <span class="o">*</span> <span class="n">rho</span> <span class="o">*</span> <span class="n">u</span> <span class="o">*</span> <span class="n">u</span>
+            <span class="k">return</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span><span class="n">rho</span><span class="p">,</span> <span class="n">mom</span><span class="p">,</span> <span class="n">E</span><span class="p">])</span></div>
+
+
+<div class="viewcode-block" id="EulerEquations1D.flux">
+<a class="viewcode-back" href="../../api_reference.html#phrike.equations.EulerEquations1D.flux">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">flux</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">U</span><span class="p">:</span> <span class="n">Array</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Array</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">_TORCH_AVAILABLE</span> <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">U</span><span class="p">,</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,)):</span>
+            <span class="n">rho</span><span class="p">,</span> <span class="n">u</span><span class="p">,</span> <span class="n">p</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">primitive</span><span class="p">(</span><span class="n">U</span><span class="p">)</span>
+            <span class="n">mom</span> <span class="o">=</span> <span class="n">rho</span> <span class="o">*</span> <span class="n">u</span>
+            <span class="n">F1</span> <span class="o">=</span> <span class="n">mom</span>
+            <span class="n">F2</span> <span class="o">=</span> <span class="n">mom</span> <span class="o">*</span> <span class="n">u</span> <span class="o">+</span> <span class="n">p</span>
+            <span class="n">F3</span> <span class="o">=</span> <span class="p">(</span><span class="n">U</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">+</span> <span class="n">p</span><span class="p">)</span> <span class="o">*</span> <span class="n">u</span>
+            <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">([</span><span class="n">F1</span><span class="p">,</span> <span class="n">F2</span><span class="p">,</span> <span class="n">F3</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">_flux_kernel</span><span class="p">(</span><span class="n">U</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">gamma</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="EulerEquations1D.max_wave_speed">
+<a class="viewcode-back" href="../../api_reference.html#phrike.equations.EulerEquations1D.max_wave_speed">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">max_wave_speed</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">U</span><span class="p">:</span> <span class="n">Array</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">_TORCH_AVAILABLE</span> <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">U</span><span class="p">,</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,)):</span>
+            <span class="n">_</span><span class="p">,</span> <span class="n">u</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">a</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">primitive</span><span class="p">(</span><span class="n">U</span><span class="p">)</span>
+            <span class="k">return</span> <span class="nb">float</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">max</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">abs</span><span class="p">(</span><span class="n">u</span><span class="p">)</span> <span class="o">+</span> <span class="n">a</span><span class="p">)</span><span class="o">.</span><span class="n">item</span><span class="p">())</span>
+        <span class="k">return</span> <span class="nb">float</span><span class="p">(</span><span class="n">_max_wave_speed_kernel</span><span class="p">(</span><span class="n">U</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">gamma</span><span class="p">))</span></div>
+
+
+<div class="viewcode-block" id="EulerEquations1D.conserved_quantities">
+<a class="viewcode-back" href="../../api_reference.html#phrike.equations.EulerEquations1D.conserved_quantities">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">conserved_quantities</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">U</span><span class="p">:</span> <span class="n">Array</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]:</span>
+        <span class="n">rho</span><span class="p">,</span> <span class="n">u</span><span class="p">,</span> <span class="n">p</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">primitive</span><span class="p">(</span><span class="n">U</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">_TORCH_AVAILABLE</span> <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">rho</span><span class="p">,</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,)):</span>
+            <span class="n">total_mass</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">rho</span><span class="p">)</span><span class="o">.</span><span class="n">item</span><span class="p">())</span>
+            <span class="n">total_momentum</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">rho</span> <span class="o">*</span> <span class="n">u</span><span class="p">)</span><span class="o">.</span><span class="n">item</span><span class="p">())</span>
+            <span class="n">total_energy</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span>
+                <span class="n">torch</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">p</span> <span class="o">/</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">gamma</span> <span class="o">-</span> <span class="mf">1.0</span><span class="p">)</span> <span class="o">+</span> <span class="mf">0.5</span> <span class="o">*</span> <span class="n">rho</span> <span class="o">*</span> <span class="n">u</span> <span class="o">*</span> <span class="n">u</span><span class="p">)</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+            <span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">total_mass</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">rho</span><span class="o">.</span><span class="n">sum</span><span class="p">())</span>
+            <span class="n">total_momentum</span> <span class="o">=</span> <span class="nb">float</span><span class="p">((</span><span class="n">rho</span> <span class="o">*</span> <span class="n">u</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">())</span>
+            <span class="n">total_energy</span> <span class="o">=</span> <span class="nb">float</span><span class="p">((</span><span class="n">p</span> <span class="o">/</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">gamma</span> <span class="o">-</span> <span class="mf">1.0</span><span class="p">)</span> <span class="o">+</span> <span class="mf">0.5</span> <span class="o">*</span> <span class="n">rho</span> <span class="o">*</span> <span class="n">u</span> <span class="o">*</span> <span class="n">u</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">())</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="s2">&quot;mass&quot;</span><span class="p">:</span> <span class="n">total_mass</span><span class="p">,</span>
+            <span class="s2">&quot;momentum&quot;</span><span class="p">:</span> <span class="n">total_momentum</span><span class="p">,</span>
+            <span class="s2">&quot;energy&quot;</span><span class="p">:</span> <span class="n">total_energy</span><span class="p">,</span>
+        <span class="p">}</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="EulerEquations2D">
+<a class="viewcode-back" href="../../api_reference.html#phrike.equations.EulerEquations2D">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">EulerEquations2D</span><span class="p">:</span>
+    <span class="n">gamma</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.4</span>
+
+<div class="viewcode-block" id="EulerEquations2D.primitive">
+<a class="viewcode-back" href="../../api_reference.html#phrike.equations.EulerEquations2D.primitive">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">primitive</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">U</span><span class="p">:</span> <span class="n">Array</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Array</span><span class="p">,</span> <span class="n">Array</span><span class="p">,</span> <span class="n">Array</span><span class="p">,</span> <span class="n">Array</span><span class="p">]:</span>
+        <span class="k">if</span> <span class="n">_TORCH_AVAILABLE</span> <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">U</span><span class="p">,</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,)):</span>
+            <span class="n">rho</span> <span class="o">=</span> <span class="n">U</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+            <span class="n">momx</span> <span class="o">=</span> <span class="n">U</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+            <span class="n">momy</span> <span class="o">=</span> <span class="n">U</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span>
+            <span class="n">E</span> <span class="o">=</span> <span class="n">U</span><span class="p">[</span><span class="mi">3</span><span class="p">]</span>
+            <span class="n">ux</span> <span class="o">=</span> <span class="n">momx</span> <span class="o">/</span> <span class="n">rho</span>
+            <span class="n">uy</span> <span class="o">=</span> <span class="n">momy</span> <span class="o">/</span> <span class="n">rho</span>
+            <span class="n">kinetic</span> <span class="o">=</span> <span class="mf">0.5</span> <span class="o">*</span> <span class="n">rho</span> <span class="o">*</span> <span class="p">(</span><span class="n">ux</span> <span class="o">*</span> <span class="n">ux</span> <span class="o">+</span> <span class="n">uy</span> <span class="o">*</span> <span class="n">uy</span><span class="p">)</span>
+            <span class="n">p</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">gamma</span> <span class="o">-</span> <span class="mf">1.0</span><span class="p">)</span> <span class="o">*</span> <span class="p">(</span><span class="n">E</span> <span class="o">-</span> <span class="n">kinetic</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">rho</span><span class="p">,</span> <span class="n">ux</span><span class="p">,</span> <span class="n">uy</span><span class="p">,</span> <span class="n">p</span>
+        <span class="k">return</span> <span class="n">_primitive2d_kernel</span><span class="p">(</span><span class="n">U</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">gamma</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="EulerEquations2D.conservative">
+<a class="viewcode-back" href="../../api_reference.html#phrike.equations.EulerEquations2D.conservative">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">conservative</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rho</span><span class="p">:</span> <span class="n">Array</span><span class="p">,</span> <span class="n">ux</span><span class="p">:</span> <span class="n">Array</span><span class="p">,</span> <span class="n">uy</span><span class="p">:</span> <span class="n">Array</span><span class="p">,</span> <span class="n">p</span><span class="p">:</span> <span class="n">Array</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Array</span><span class="p">:</span>
+        <span class="n">momx</span> <span class="o">=</span> <span class="n">rho</span> <span class="o">*</span> <span class="n">ux</span>
+        <span class="n">momy</span> <span class="o">=</span> <span class="n">rho</span> <span class="o">*</span> <span class="n">uy</span>
+        <span class="n">E</span> <span class="o">=</span> <span class="n">p</span> <span class="o">/</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">gamma</span> <span class="o">-</span> <span class="mf">1.0</span><span class="p">)</span> <span class="o">+</span> <span class="mf">0.5</span> <span class="o">*</span> <span class="n">rho</span> <span class="o">*</span> <span class="p">(</span><span class="n">ux</span> <span class="o">*</span> <span class="n">ux</span> <span class="o">+</span> <span class="n">uy</span> <span class="o">*</span> <span class="n">uy</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">_TORCH_AVAILABLE</span> <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">rho</span><span class="p">,</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,)):</span>
+            <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">([</span><span class="n">rho</span><span class="p">,</span> <span class="n">momx</span><span class="p">,</span> <span class="n">momy</span><span class="p">,</span> <span class="n">E</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span><span class="n">rho</span><span class="p">,</span> <span class="n">momx</span><span class="p">,</span> <span class="n">momy</span><span class="p">,</span> <span class="n">E</span><span class="p">])</span></div>
+
+
+<div class="viewcode-block" id="EulerEquations2D.flux">
+<a class="viewcode-back" href="../../api_reference.html#phrike.equations.EulerEquations2D.flux">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">flux</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">U</span><span class="p">:</span> <span class="n">Array</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Array</span><span class="p">,</span> <span class="n">Array</span><span class="p">]:</span>
+        <span class="k">if</span> <span class="n">_TORCH_AVAILABLE</span> <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">U</span><span class="p">,</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,)):</span>
+            <span class="n">rho</span><span class="p">,</span> <span class="n">ux</span><span class="p">,</span> <span class="n">uy</span><span class="p">,</span> <span class="n">p</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">primitive</span><span class="p">(</span><span class="n">U</span><span class="p">)</span>
+            <span class="n">momx</span> <span class="o">=</span> <span class="n">rho</span> <span class="o">*</span> <span class="n">ux</span>
+            <span class="n">momy</span> <span class="o">=</span> <span class="n">rho</span> <span class="o">*</span> <span class="n">uy</span>
+            <span class="n">Fx0</span> <span class="o">=</span> <span class="n">momx</span>
+            <span class="n">Fx1</span> <span class="o">=</span> <span class="n">momx</span> <span class="o">*</span> <span class="n">ux</span> <span class="o">+</span> <span class="n">p</span>
+            <span class="n">Fx2</span> <span class="o">=</span> <span class="n">momx</span> <span class="o">*</span> <span class="n">uy</span>
+            <span class="n">Fx3</span> <span class="o">=</span> <span class="p">(</span><span class="n">U</span><span class="p">[</span><span class="mi">3</span><span class="p">]</span> <span class="o">+</span> <span class="n">p</span><span class="p">)</span> <span class="o">*</span> <span class="n">ux</span>
+            <span class="n">Fy0</span> <span class="o">=</span> <span class="n">momy</span>
+            <span class="n">Fy1</span> <span class="o">=</span> <span class="n">momy</span> <span class="o">*</span> <span class="n">ux</span>
+            <span class="n">Fy2</span> <span class="o">=</span> <span class="n">momy</span> <span class="o">*</span> <span class="n">uy</span> <span class="o">+</span> <span class="n">p</span>
+            <span class="n">Fy3</span> <span class="o">=</span> <span class="p">(</span><span class="n">U</span><span class="p">[</span><span class="mi">3</span><span class="p">]</span> <span class="o">+</span> <span class="n">p</span><span class="p">)</span> <span class="o">*</span> <span class="n">uy</span>
+            <span class="n">Fx</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">([</span><span class="n">Fx0</span><span class="p">,</span> <span class="n">Fx1</span><span class="p">,</span> <span class="n">Fx2</span><span class="p">,</span> <span class="n">Fx3</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+            <span class="n">Fy</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">([</span><span class="n">Fy0</span><span class="p">,</span> <span class="n">Fy1</span><span class="p">,</span> <span class="n">Fy2</span><span class="p">,</span> <span class="n">Fy3</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">Fx</span><span class="p">,</span> <span class="n">Fy</span>
+        <span class="k">return</span> <span class="n">_flux2d_kernel</span><span class="p">(</span><span class="n">U</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">gamma</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="EulerEquations2D.max_wave_speed">
+<a class="viewcode-back" href="../../api_reference.html#phrike.equations.EulerEquations2D.max_wave_speed">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">max_wave_speed</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">U</span><span class="p">:</span> <span class="n">Array</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">_TORCH_AVAILABLE</span> <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">U</span><span class="p">,</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,)):</span>
+            <span class="n">rho</span><span class="p">,</span> <span class="n">ux</span><span class="p">,</span> <span class="n">uy</span><span class="p">,</span> <span class="n">p</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">primitive</span><span class="p">(</span><span class="n">U</span><span class="p">)</span>
+            <span class="n">a</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">gamma</span> <span class="o">*</span> <span class="n">p</span> <span class="o">/</span> <span class="n">rho</span><span class="p">)</span>
+            <span class="k">return</span> <span class="nb">float</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">max</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">abs</span><span class="p">(</span><span class="n">ux</span><span class="p">)</span> <span class="o">+</span> <span class="n">a</span><span class="p">)</span><span class="o">.</span><span class="n">item</span><span class="p">())</span>
+        <span class="k">return</span> <span class="nb">float</span><span class="p">(</span><span class="n">_max_wave_speed2d_kernel</span><span class="p">(</span><span class="n">U</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">gamma</span><span class="p">))</span></div>
+
+
+<div class="viewcode-block" id="EulerEquations2D.conserved_quantities">
+<a class="viewcode-back" href="../../api_reference.html#phrike.equations.EulerEquations2D.conserved_quantities">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">conserved_quantities</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">U</span><span class="p">:</span> <span class="n">Array</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]:</span>
+        <span class="n">rho</span><span class="p">,</span> <span class="n">u</span><span class="p">,</span> <span class="n">p</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">primitive</span><span class="p">(</span><span class="n">U</span><span class="p">)</span>
+        <span class="n">total_mass</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">rho</span><span class="o">.</span><span class="n">sum</span><span class="p">())</span>
+        <span class="n">total_momentum</span> <span class="o">=</span> <span class="nb">float</span><span class="p">((</span><span class="n">rho</span> <span class="o">*</span> <span class="n">u</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">())</span>
+        <span class="n">total_energy</span> <span class="o">=</span> <span class="nb">float</span><span class="p">((</span><span class="n">p</span> <span class="o">/</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">gamma</span> <span class="o">-</span> <span class="mf">1.0</span><span class="p">)</span> <span class="o">+</span> <span class="mf">0.5</span> <span class="o">*</span> <span class="n">rho</span> <span class="o">*</span> <span class="n">u</span> <span class="o">*</span> <span class="n">u</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">())</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="s2">&quot;mass&quot;</span><span class="p">:</span> <span class="n">total_mass</span><span class="p">,</span>
+            <span class="s2">&quot;momentum&quot;</span><span class="p">:</span> <span class="n">total_momentum</span><span class="p">,</span>
+            <span class="s2">&quot;energy&quot;</span><span class="p">:</span> <span class="n">total_energy</span><span class="p">,</span>
+        <span class="p">}</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="EulerEquations3D">
+<a class="viewcode-back" href="../../api_reference.html#phrike.equations.EulerEquations3D">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">EulerEquations3D</span><span class="p">:</span>
+    <span class="n">gamma</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.4</span>
+
+<div class="viewcode-block" id="EulerEquations3D.primitive">
+<a class="viewcode-back" href="../../api_reference.html#phrike.equations.EulerEquations3D.primitive">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">primitive</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">U</span><span class="p">:</span> <span class="n">Array</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Array</span><span class="p">,</span> <span class="n">Array</span><span class="p">,</span> <span class="n">Array</span><span class="p">,</span> <span class="n">Array</span><span class="p">,</span> <span class="n">Array</span><span class="p">]:</span>
+        <span class="k">if</span> <span class="n">_TORCH_AVAILABLE</span> <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">U</span><span class="p">,</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,)):</span>
+            <span class="n">rho</span> <span class="o">=</span> <span class="n">U</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+            <span class="n">momx</span> <span class="o">=</span> <span class="n">U</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+            <span class="n">momy</span> <span class="o">=</span> <span class="n">U</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span>
+            <span class="n">momz</span> <span class="o">=</span> <span class="n">U</span><span class="p">[</span><span class="mi">3</span><span class="p">]</span>
+            <span class="n">E</span> <span class="o">=</span> <span class="n">U</span><span class="p">[</span><span class="mi">4</span><span class="p">]</span>
+            <span class="n">ux</span> <span class="o">=</span> <span class="n">momx</span> <span class="o">/</span> <span class="n">rho</span>
+            <span class="n">uy</span> <span class="o">=</span> <span class="n">momy</span> <span class="o">/</span> <span class="n">rho</span>
+            <span class="n">uz</span> <span class="o">=</span> <span class="n">momz</span> <span class="o">/</span> <span class="n">rho</span>
+            <span class="n">kinetic</span> <span class="o">=</span> <span class="mf">0.5</span> <span class="o">*</span> <span class="n">rho</span> <span class="o">*</span> <span class="p">(</span><span class="n">ux</span> <span class="o">*</span> <span class="n">ux</span> <span class="o">+</span> <span class="n">uy</span> <span class="o">*</span> <span class="n">uy</span> <span class="o">+</span> <span class="n">uz</span> <span class="o">*</span> <span class="n">uz</span><span class="p">)</span>
+            <span class="n">p</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">gamma</span> <span class="o">-</span> <span class="mf">1.0</span><span class="p">)</span> <span class="o">*</span> <span class="p">(</span><span class="n">E</span> <span class="o">-</span> <span class="n">kinetic</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">rho</span><span class="p">,</span> <span class="n">ux</span><span class="p">,</span> <span class="n">uy</span><span class="p">,</span> <span class="n">uz</span><span class="p">,</span> <span class="n">p</span>
+        <span class="k">return</span> <span class="n">_primitive3d_kernel</span><span class="p">(</span><span class="n">U</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">gamma</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="EulerEquations3D.conservative">
+<a class="viewcode-back" href="../../api_reference.html#phrike.equations.EulerEquations3D.conservative">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">conservative</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">rho</span><span class="p">:</span> <span class="n">Array</span><span class="p">,</span> <span class="n">ux</span><span class="p">:</span> <span class="n">Array</span><span class="p">,</span> <span class="n">uy</span><span class="p">:</span> <span class="n">Array</span><span class="p">,</span> <span class="n">uz</span><span class="p">:</span> <span class="n">Array</span><span class="p">,</span> <span class="n">p</span><span class="p">:</span> <span class="n">Array</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Array</span><span class="p">:</span>
+        <span class="n">momx</span> <span class="o">=</span> <span class="n">rho</span> <span class="o">*</span> <span class="n">ux</span>
+        <span class="n">momy</span> <span class="o">=</span> <span class="n">rho</span> <span class="o">*</span> <span class="n">uy</span>
+        <span class="n">momz</span> <span class="o">=</span> <span class="n">rho</span> <span class="o">*</span> <span class="n">uz</span>
+        <span class="n">E</span> <span class="o">=</span> <span class="n">p</span> <span class="o">/</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">gamma</span> <span class="o">-</span> <span class="mf">1.0</span><span class="p">)</span> <span class="o">+</span> <span class="mf">0.5</span> <span class="o">*</span> <span class="n">rho</span> <span class="o">*</span> <span class="p">(</span><span class="n">ux</span> <span class="o">*</span> <span class="n">ux</span> <span class="o">+</span> <span class="n">uy</span> <span class="o">*</span> <span class="n">uy</span> <span class="o">+</span> <span class="n">uz</span> <span class="o">*</span> <span class="n">uz</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">_TORCH_AVAILABLE</span> <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">rho</span><span class="p">,</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,)):</span>
+            <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">([</span><span class="n">rho</span><span class="p">,</span> <span class="n">momx</span><span class="p">,</span> <span class="n">momy</span><span class="p">,</span> <span class="n">momz</span><span class="p">,</span> <span class="n">E</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span><span class="n">rho</span><span class="p">,</span> <span class="n">momx</span><span class="p">,</span> <span class="n">momy</span><span class="p">,</span> <span class="n">momz</span><span class="p">,</span> <span class="n">E</span><span class="p">])</span></div>
+
+
+<div class="viewcode-block" id="EulerEquations3D.flux">
+<a class="viewcode-back" href="../../api_reference.html#phrike.equations.EulerEquations3D.flux">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">flux</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">U</span><span class="p">:</span> <span class="n">Array</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Array</span><span class="p">,</span> <span class="n">Array</span><span class="p">,</span> <span class="n">Array</span><span class="p">]:</span>
+        <span class="k">if</span> <span class="n">_TORCH_AVAILABLE</span> <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">U</span><span class="p">,</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,)):</span>
+            <span class="n">rho</span><span class="p">,</span> <span class="n">ux</span><span class="p">,</span> <span class="n">uy</span><span class="p">,</span> <span class="n">uz</span><span class="p">,</span> <span class="n">p</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">primitive</span><span class="p">(</span><span class="n">U</span><span class="p">)</span>
+            <span class="n">momx</span> <span class="o">=</span> <span class="n">rho</span> <span class="o">*</span> <span class="n">ux</span>
+            <span class="n">momy</span> <span class="o">=</span> <span class="n">rho</span> <span class="o">*</span> <span class="n">uy</span>
+            <span class="n">momz</span> <span class="o">=</span> <span class="n">rho</span> <span class="o">*</span> <span class="n">uz</span>
+            <span class="n">Fx0</span> <span class="o">=</span> <span class="n">momx</span>
+            <span class="n">Fx1</span> <span class="o">=</span> <span class="n">momx</span> <span class="o">*</span> <span class="n">ux</span> <span class="o">+</span> <span class="n">p</span>
+            <span class="n">Fx2</span> <span class="o">=</span> <span class="n">momx</span> <span class="o">*</span> <span class="n">uy</span>
+            <span class="n">Fx3</span> <span class="o">=</span> <span class="n">momx</span> <span class="o">*</span> <span class="n">uz</span>
+            <span class="n">Fx4</span> <span class="o">=</span> <span class="p">(</span><span class="n">U</span><span class="p">[</span><span class="mi">4</span><span class="p">]</span> <span class="o">+</span> <span class="n">p</span><span class="p">)</span> <span class="o">*</span> <span class="n">ux</span>
+            <span class="n">Fy0</span> <span class="o">=</span> <span class="n">momy</span>
+            <span class="n">Fy1</span> <span class="o">=</span> <span class="n">momy</span> <span class="o">*</span> <span class="n">ux</span>
+            <span class="n">Fy2</span> <span class="o">=</span> <span class="n">momy</span> <span class="o">*</span> <span class="n">uy</span> <span class="o">+</span> <span class="n">p</span>
+            <span class="n">Fy3</span> <span class="o">=</span> <span class="n">momy</span> <span class="o">*</span> <span class="n">uz</span>
+            <span class="n">Fy4</span> <span class="o">=</span> <span class="p">(</span><span class="n">U</span><span class="p">[</span><span class="mi">4</span><span class="p">]</span> <span class="o">+</span> <span class="n">p</span><span class="p">)</span> <span class="o">*</span> <span class="n">uy</span>
+            <span class="n">Fz0</span> <span class="o">=</span> <span class="n">momz</span>
+            <span class="n">Fz1</span> <span class="o">=</span> <span class="n">momz</span> <span class="o">*</span> <span class="n">ux</span>
+            <span class="n">Fz2</span> <span class="o">=</span> <span class="n">momz</span> <span class="o">*</span> <span class="n">uy</span>
+            <span class="n">Fz3</span> <span class="o">=</span> <span class="n">momz</span> <span class="o">*</span> <span class="n">uz</span> <span class="o">+</span> <span class="n">p</span>
+            <span class="n">Fz4</span> <span class="o">=</span> <span class="p">(</span><span class="n">U</span><span class="p">[</span><span class="mi">4</span><span class="p">]</span> <span class="o">+</span> <span class="n">p</span><span class="p">)</span> <span class="o">*</span> <span class="n">uz</span>
+            <span class="n">Fx</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">([</span><span class="n">Fx0</span><span class="p">,</span> <span class="n">Fx1</span><span class="p">,</span> <span class="n">Fx2</span><span class="p">,</span> <span class="n">Fx3</span><span class="p">,</span> <span class="n">Fx4</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+            <span class="n">Fy</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">([</span><span class="n">Fy0</span><span class="p">,</span> <span class="n">Fy1</span><span class="p">,</span> <span class="n">Fy2</span><span class="p">,</span> <span class="n">Fy3</span><span class="p">,</span> <span class="n">Fy4</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+            <span class="n">Fz</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">([</span><span class="n">Fz0</span><span class="p">,</span> <span class="n">Fz1</span><span class="p">,</span> <span class="n">Fz2</span><span class="p">,</span> <span class="n">Fz3</span><span class="p">,</span> <span class="n">Fz4</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">Fx</span><span class="p">,</span> <span class="n">Fy</span><span class="p">,</span> <span class="n">Fz</span>
+        <span class="k">return</span> <span class="n">_flux3d_kernel</span><span class="p">(</span><span class="n">U</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">gamma</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="EulerEquations3D.max_wave_speed">
+<a class="viewcode-back" href="../../api_reference.html#phrike.equations.EulerEquations3D.max_wave_speed">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">max_wave_speed</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">U</span><span class="p">:</span> <span class="n">Array</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">_TORCH_AVAILABLE</span> <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">U</span><span class="p">,</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,)):</span>
+            <span class="n">rho</span><span class="p">,</span> <span class="n">ux</span><span class="p">,</span> <span class="n">uy</span><span class="p">,</span> <span class="n">uz</span><span class="p">,</span> <span class="n">p</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">primitive</span><span class="p">(</span><span class="n">U</span><span class="p">)</span>
+            <span class="n">a</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">gamma</span> <span class="o">*</span> <span class="n">p</span> <span class="o">/</span> <span class="n">rho</span><span class="p">)</span>
+            <span class="n">comp</span> <span class="o">=</span> <span class="p">(</span>
+                <span class="n">torch</span><span class="o">.</span><span class="n">maximum</span><span class="p">(</span>
+                    <span class="n">torch</span><span class="o">.</span><span class="n">maximum</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">abs</span><span class="p">(</span><span class="n">ux</span><span class="p">),</span> <span class="n">torch</span><span class="o">.</span><span class="n">abs</span><span class="p">(</span><span class="n">uy</span><span class="p">)),</span> <span class="n">torch</span><span class="o">.</span><span class="n">abs</span><span class="p">(</span><span class="n">uz</span><span class="p">)</span>
+                <span class="p">)</span>
+                <span class="o">+</span> <span class="n">a</span>
+            <span class="p">)</span>
+            <span class="k">return</span> <span class="nb">float</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">max</span><span class="p">(</span><span class="n">comp</span><span class="p">)</span><span class="o">.</span><span class="n">item</span><span class="p">())</span>
+        <span class="k">return</span> <span class="nb">float</span><span class="p">(</span><span class="n">_max_wave_speed3d_kernel</span><span class="p">(</span><span class="n">U</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">gamma</span><span class="p">))</span></div>
+
+
+<div class="viewcode-block" id="EulerEquations3D.conserved_quantities">
+<a class="viewcode-back" href="../../api_reference.html#phrike.equations.EulerEquations3D.conserved_quantities">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">conserved_quantities</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">U</span><span class="p">:</span> <span class="n">Array</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]:</span>
+        <span class="n">rho</span><span class="p">,</span> <span class="n">ux</span><span class="p">,</span> <span class="n">uy</span><span class="p">,</span> <span class="n">uz</span><span class="p">,</span> <span class="n">p</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">primitive</span><span class="p">(</span><span class="n">U</span><span class="p">)</span>
+        <span class="n">total_mass</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">rho</span><span class="o">.</span><span class="n">sum</span><span class="p">())</span>
+        <span class="n">momx</span> <span class="o">=</span> <span class="nb">float</span><span class="p">((</span><span class="n">rho</span> <span class="o">*</span> <span class="n">ux</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">())</span>
+        <span class="n">momy</span> <span class="o">=</span> <span class="nb">float</span><span class="p">((</span><span class="n">rho</span> <span class="o">*</span> <span class="n">uy</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">())</span>
+        <span class="n">momz</span> <span class="o">=</span> <span class="nb">float</span><span class="p">((</span><span class="n">rho</span> <span class="o">*</span> <span class="n">uz</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">())</span>
+        <span class="n">total_energy</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span>
+            <span class="p">(</span><span class="n">p</span> <span class="o">/</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">gamma</span> <span class="o">-</span> <span class="mf">1.0</span><span class="p">)</span> <span class="o">+</span> <span class="mf">0.5</span> <span class="o">*</span> <span class="n">rho</span> <span class="o">*</span> <span class="p">(</span><span class="n">ux</span> <span class="o">*</span> <span class="n">ux</span> <span class="o">+</span> <span class="n">uy</span> <span class="o">*</span> <span class="n">uy</span> <span class="o">+</span> <span class="n">uz</span> <span class="o">*</span> <span class="n">uz</span><span class="p">))</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+        <span class="p">)</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="s2">&quot;mass&quot;</span><span class="p">:</span> <span class="n">total_mass</span><span class="p">,</span>
+            <span class="s2">&quot;momentum_x&quot;</span><span class="p">:</span> <span class="n">momx</span><span class="p">,</span>
+            <span class="s2">&quot;momentum_y&quot;</span><span class="p">:</span> <span class="n">momy</span><span class="p">,</span>
+            <span class="s2">&quot;momentum_z&quot;</span><span class="p">:</span> <span class="n">momz</span><span class="p">,</span>
+            <span class="s2">&quot;energy&quot;</span><span class="p">:</span> <span class="n">total_energy</span><span class="p">,</span>
+        <span class="p">}</span></div>
+</div>
+
+</pre></div>
+
+           </div>
+          </div>
+          <footer>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2024, PHRIKE Development Team.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

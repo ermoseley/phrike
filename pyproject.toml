@@ -26,6 +26,7 @@ phrike = "phrike.cli:main"
 [project.optional-dependencies]
 fastfft = ["pyfftw>=0.13"]
 dev = ["pytest>=7.0", "ruff>=0.3.0"]
+docs = ["sphinx>=5.0", "sphinx-rtd-theme>=1.0", "myst-parser>=1.0"]
 
 [tool.setuptools.package-data]
 phrike = ["py.typed"]

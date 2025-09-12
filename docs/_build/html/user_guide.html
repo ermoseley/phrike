@@ -1,0 +1,398 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>User Guide &mdash; PHRIKE 0.1.0 documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=e59714d7" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=01f34227"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="API Reference" href="api_reference.html" />
+    <link rel="prev" title="Quick Start Guide" href="quickstart.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            PHRIKE
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quick Start Guide</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">User Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#configuration">Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#command-line-interface">Command Line Interface</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#python-api">Python API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#backend-selection">Backend Selection</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#performance-optimization">Performance Optimization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#troubleshooting">Troubleshooting</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#output-and-visualization">Output and Visualization</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api_reference.html">API Reference</a></li>
+<li class="toctree-l1"><a class="reference internal" href="examples.html">Examples</a></li>
+<li class="toctree-l1"><a class="reference internal" href="development.html">Development Guide</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">PHRIKE</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">User Guide</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/user_guide.rst.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="user-guide">
+<h1>User Guide<a class="headerlink" href="#user-guide" title="Link to this heading"></a></h1>
+<p>This guide provides detailed information on using PHRIKE for computational fluid dynamics simulations.</p>
+<section id="configuration">
+<h2>Configuration<a class="headerlink" href="#configuration" title="Link to this heading"></a></h2>
+<p>PHRIKE uses YAML configuration files to define simulation parameters. The configuration is organized into several sections:</p>
+<p>### Grid Configuration</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">grid</span></code> section defines the spatial discretization:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">grid</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">N</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1024</span><span class="w">              </span><span class="c1"># Number of grid points (1D)</span>
+<span class="w">  </span><span class="nt">Nx</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">128</span><span class="w">              </span><span class="c1"># Grid points in x (2D/3D)</span>
+<span class="w">  </span><span class="nt">Ny</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">128</span><span class="w">              </span><span class="c1"># Grid points in y (2D/3D)</span>
+<span class="w">  </span><span class="nt">Nz</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">64</span><span class="w">               </span><span class="c1"># Grid points in z (3D)</span>
+<span class="w">  </span><span class="nt">Lx</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1.0</span><span class="w">              </span><span class="c1"># Domain length in x</span>
+<span class="w">  </span><span class="nt">Ly</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1.0</span><span class="w">              </span><span class="c1"># Domain length in y</span>
+<span class="w">  </span><span class="nt">Lz</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1.0</span><span class="w">              </span><span class="c1"># Domain length in z</span>
+<span class="w">  </span><span class="nt">dealias</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w">        </span><span class="c1"># Apply 2/3-rule dealiasing</span>
+<span class="w">  </span><span class="nt">fft_workers</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span><span class="w">       </span><span class="c1"># Number of FFT threads</span>
+</pre></div>
+</div>
+<p>### Physics Configuration</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">physics</span></code> section defines the fluid properties:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">physics</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">gamma</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1.4</span><span class="w">           </span><span class="c1"># Adiabatic index</span>
+</pre></div>
+</div>
+<p>### Integration Configuration</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">integration</span></code> section controls time stepping:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">integration</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">t0</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.0</span><span class="w">              </span><span class="c1"># Initial time</span>
+<span class="w">  </span><span class="nt">t_end</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1.0</span><span class="w">           </span><span class="c1"># Final time</span>
+<span class="w">  </span><span class="nt">cfl</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.4</span><span class="w">             </span><span class="c1"># CFL number</span>
+<span class="w">  </span><span class="nt">scheme</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">rk4</span><span class="w">           </span><span class="c1"># Time integration scheme (rk2 or rk4)</span>
+<span class="w">  </span><span class="nt">output_interval</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.1</span><span class="w">  </span><span class="c1"># Time between outputs</span>
+<span class="w">  </span><span class="nt">checkpoint_interval</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.5</span><span class="w">  </span><span class="c1"># Time between checkpoints</span>
+<span class="w">  </span><span class="nt">spectral_filter</span><span class="p">:</span><span class="w">      </span><span class="c1"># Optional spectral filtering</span>
+<span class="w">    </span><span class="nt">enabled</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">    </span><span class="nt">p</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8</span><span class="w">               </span><span class="c1"># Filter order (even integer &gt;= 2)</span>
+<span class="w">    </span><span class="nt">alpha</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">36.0</span><span class="w">        </span><span class="c1"># Filter strength</span>
+</pre></div>
+</div>
+<p>### Monitoring Configuration</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">monitoring</span></code> section controls real-time statistics:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">monitoring</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">enabled</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w">        </span><span class="c1"># Enable monitoring (default: true)</span>
+<span class="w">  </span><span class="nt">step_interval</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">10</span><span class="w">    </span><span class="c1"># Steps between monitoring output</span>
+<span class="w">  </span><span class="nt">include_conservation</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w">    </span><span class="c1"># Track mass, momentum, energy</span>
+<span class="w">  </span><span class="nt">include_timestep</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w">        </span><span class="c1"># Track timestep size</span>
+<span class="w">  </span><span class="nt">include_velocity_stats</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w">  </span><span class="c1"># Track velocity statistics</span>
+<span class="w">  </span><span class="nt">output_file</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">null</span><span class="w">    </span><span class="c1"># Output file (null = stdout)</span>
+</pre></div>
+</div>
+<p>### Initial Conditions</p>
+<p>Each problem defines its own initial conditions section. See the problem-specific documentation for details.</p>
+</section>
+<section id="command-line-interface">
+<h2>Command Line Interface<a class="headerlink" href="#command-line-interface" title="Link to this heading"></a></h2>
+<p>PHRIKE provides a unified command-line interface:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>phrike<span class="w"> </span>&lt;problem&gt;<span class="w"> </span><span class="o">[</span>options<span class="o">]</span>
+</pre></div>
+</div>
+<p>### Basic Options</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">--config</span> <span class="pre">PATH</span></code>: Path to configuration file</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">--backend</span> <span class="pre">{numpy,torch}</span></code>: Array backend (default: numpy)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">--device</span> <span class="pre">DEVICE</span></code>: Torch device (cpu, cuda, mps)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">--no-video</span></code>: Skip video generation</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">--restart-from</span> <span class="pre">PATH</span></code>: Restart from checkpoint</p></li>
+</ul>
+<p>### Examples</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Basic simulation</span>
+phrike<span class="w"> </span>sod<span class="w"> </span>--config<span class="w"> </span>configs/sod.yaml
+
+<span class="c1"># GPU acceleration</span>
+phrike<span class="w"> </span>khi2d<span class="w"> </span>--backend<span class="w"> </span>torch<span class="w"> </span>--device<span class="w"> </span>cuda
+
+<span class="c1"># Restart from checkpoint</span>
+phrike<span class="w"> </span>sod<span class="w"> </span>--restart-from<span class="w"> </span>outputs/sod/snapshot_t0.100000.npz
+
+<span class="c1"># Skip video generation</span>
+phrike<span class="w"> </span>tgv3d<span class="w"> </span>--no-video
+</pre></div>
+</div>
+</section>
+<section id="python-api">
+<h2>Python API<a class="headerlink" href="#python-api" title="Link to this heading"></a></h2>
+<p>PHRIKE can be used programmatically through the Python API:</p>
+<p>### Basic Usage</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">phrike</span>
+
+<span class="c1"># Run simulation</span>
+<span class="n">solver</span><span class="p">,</span> <span class="n">history</span> <span class="o">=</span> <span class="n">phrike</span><span class="o">.</span><span class="n">run_simulation</span><span class="p">(</span>
+    <span class="n">problem_name</span><span class="o">=</span><span class="s2">&quot;sod&quot;</span><span class="p">,</span>
+    <span class="n">config_path</span><span class="o">=</span><span class="s2">&quot;configs/sod.yaml&quot;</span>
+<span class="p">)</span>
+
+<span class="c1"># Access results</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Final time: </span><span class="si">{</span><span class="n">solver</span><span class="o">.</span><span class="n">t</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Final state shape: </span><span class="si">{</span><span class="n">solver</span><span class="o">.</span><span class="n">U</span><span class="o">.</span><span class="n">shape</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>### Advanced Usage</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">phrike.problems</span><span class="w"> </span><span class="kn">import</span> <span class="n">ProblemRegistry</span>
+
+<span class="c1"># Create problem instance</span>
+<span class="n">problem</span> <span class="o">=</span> <span class="n">ProblemRegistry</span><span class="o">.</span><span class="n">create_problem</span><span class="p">(</span>
+    <span class="n">name</span><span class="o">=</span><span class="s2">&quot;sod&quot;</span><span class="p">,</span>
+    <span class="n">config_path</span><span class="o">=</span><span class="s2">&quot;configs/sod.yaml&quot;</span>
+<span class="p">)</span>
+
+<span class="c1"># Run with custom parameters</span>
+<span class="n">solver</span><span class="p">,</span> <span class="n">history</span> <span class="o">=</span> <span class="n">problem</span><span class="o">.</span><span class="n">run</span><span class="p">(</span>
+    <span class="n">backend</span><span class="o">=</span><span class="s2">&quot;torch&quot;</span><span class="p">,</span>
+    <span class="n">device</span><span class="o">=</span><span class="s2">&quot;cuda&quot;</span><span class="p">,</span>
+    <span class="n">generate_video</span><span class="o">=</span><span class="kc">True</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p>### Custom Configuration</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">config</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s2">&quot;grid&quot;</span><span class="p">:</span> <span class="p">{</span><span class="s2">&quot;N&quot;</span><span class="p">:</span> <span class="mi">512</span><span class="p">,</span> <span class="s2">&quot;Lx&quot;</span><span class="p">:</span> <span class="mf">2.0</span><span class="p">},</span>
+    <span class="s2">&quot;physics&quot;</span><span class="p">:</span> <span class="p">{</span><span class="s2">&quot;gamma&quot;</span><span class="p">:</span> <span class="mf">1.4</span><span class="p">},</span>
+    <span class="s2">&quot;integration&quot;</span><span class="p">:</span> <span class="p">{</span><span class="s2">&quot;t_end&quot;</span><span class="p">:</span> <span class="mf">1.0</span><span class="p">,</span> <span class="s2">&quot;cfl&quot;</span><span class="p">:</span> <span class="mf">0.3</span><span class="p">}</span>
+<span class="p">}</span>
+
+<span class="n">solver</span><span class="p">,</span> <span class="n">history</span> <span class="o">=</span> <span class="n">phrike</span><span class="o">.</span><span class="n">run_simulation</span><span class="p">(</span>
+    <span class="n">problem_name</span><span class="o">=</span><span class="s2">&quot;sod&quot;</span><span class="p">,</span>
+    <span class="n">config</span><span class="o">=</span><span class="n">config</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="backend-selection">
+<h2>Backend Selection<a class="headerlink" href="#backend-selection" title="Link to this heading"></a></h2>
+<p>PHRIKE supports two array backends:</p>
+<p>### NumPy Backend (Default)</p>
+<ul class="simple">
+<li><p><strong>Pros</strong>: Stable, well-tested, no additional dependencies</p></li>
+<li><p><strong>Cons</strong>: CPU-only, limited memory management</p></li>
+<li><p><strong>Best for</strong>: Small to medium problems, development</p></li>
+</ul>
+<p>### PyTorch Backend</p>
+<ul class="simple">
+<li><p><strong>Pros</strong>: GPU acceleration, better memory management</p></li>
+<li><p><strong>Cons</strong>: Additional dependency, device-specific</p></li>
+<li><p><strong>Best for</strong>: Large problems, production runs</p></li>
+</ul>
+<p>### Device Selection</p>
+<p>For PyTorch backend, you can specify the device:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">cpu</span></code>: CPU computation</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">cuda</span></code>: NVIDIA GPU (if available)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mps</span></code>: Apple Silicon GPU (if available)</p></li>
+</ul>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Automatic device detection</span>
+<span class="n">solver</span><span class="p">,</span> <span class="n">history</span> <span class="o">=</span> <span class="n">phrike</span><span class="o">.</span><span class="n">run_simulation</span><span class="p">(</span>
+    <span class="n">problem_name</span><span class="o">=</span><span class="s2">&quot;khi2d&quot;</span><span class="p">,</span>
+    <span class="n">backend</span><span class="o">=</span><span class="s2">&quot;torch&quot;</span>
+<span class="p">)</span>
+
+<span class="c1"># Explicit device selection</span>
+<span class="n">solver</span><span class="p">,</span> <span class="n">history</span> <span class="o">=</span> <span class="n">phrike</span><span class="o">.</span><span class="n">run_simulation</span><span class="p">(</span>
+    <span class="n">problem_name</span><span class="o">=</span><span class="s2">&quot;khi2d&quot;</span><span class="p">,</span>
+    <span class="n">backend</span><span class="o">=</span><span class="s2">&quot;torch&quot;</span><span class="p">,</span>
+    <span class="n">device</span><span class="o">=</span><span class="s2">&quot;cuda&quot;</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="performance-optimization">
+<h2>Performance Optimization<a class="headerlink" href="#performance-optimization" title="Link to this heading"></a></h2>
+<p>### Resolution Guidelines</p>
+<ul class="simple">
+<li><p><strong>1D</strong>: Up to 8192 points (16K with sufficient memory)</p></li>
+<li><p><strong>2D</strong>: Up to 512² points (1024² with GPU)</p></li>
+<li><p><strong>3D</strong>: Up to 128³ points (256³ with GPU)</p></li>
+</ul>
+<p>### Memory Requirements</p>
+<p>Approximate memory usage (double precision):</p>
+<ul class="simple">
+<li><p><strong>1D</strong>: ~0.1 MB per 1000 points</p></li>
+<li><p><strong>2D</strong>: ~0.1 MB per 100² points</p></li>
+<li><p><strong>3D</strong>: ~0.1 MB per 100³ points</p></li>
+</ul>
+<p>### Performance Tips</p>
+<ol class="arabic simple">
+<li><p><strong>Use GPU for large problems</strong>: 3D simulations benefit significantly</p></li>
+<li><p><strong>Enable spectral filtering</strong>: Prevents aliasing at high resolutions</p></li>
+<li><p><strong>Optimize CFL number</strong>: Balance stability and efficiency</p></li>
+<li><p><strong>Use PyFFTW</strong>: Install for better FFT performance</p></li>
+</ol>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Install PyFFTW for better performance</span>
+pip<span class="w"> </span>install<span class="w"> </span>pyfftw
+
+<span class="c1"># Use multiple FFT threads</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">OMP_NUM_THREADS</span><span class="o">=</span><span class="m">4</span>
+</pre></div>
+</div>
+</section>
+<section id="troubleshooting">
+<h2>Troubleshooting<a class="headerlink" href="#troubleshooting" title="Link to this heading"></a></h2>
+<p>### Common Issues</p>
+<ol class="arabic simple">
+<li><p><strong>ImportError: No module named ‘numba’</strong>
+- Solution: <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">numba</span></code></p></li>
+<li><p><strong>CUDA out of memory</strong>
+- Solution: Reduce resolution or use CPU backend</p></li>
+<li><p><strong>FFT performance issues</strong>
+- Solution: Install PyFFTW or increase FFT workers</p></li>
+<li><p><strong>Simulation instability</strong>
+- Solution: Reduce CFL number or enable spectral filtering</p></li>
+</ol>
+<p>### Debug Mode</p>
+<p>Enable verbose output for debugging:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
+<span class="n">logging</span><span class="o">.</span><span class="n">basicConfig</span><span class="p">(</span><span class="n">level</span><span class="o">=</span><span class="n">logging</span><span class="o">.</span><span class="n">DEBUG</span><span class="p">)</span>
+
+<span class="n">solver</span><span class="p">,</span> <span class="n">history</span> <span class="o">=</span> <span class="n">phrike</span><span class="o">.</span><span class="n">run_simulation</span><span class="p">(</span>
+    <span class="n">problem_name</span><span class="o">=</span><span class="s2">&quot;sod&quot;</span><span class="p">,</span>
+    <span class="n">config_path</span><span class="o">=</span><span class="s2">&quot;configs/sod.yaml&quot;</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p>### Checkpoint and Restart</p>
+<p>PHRIKE supports checkpointing for long simulations:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">integration</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">checkpoint_interval</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.5</span><span class="w">  </span><span class="c1"># Save checkpoint every 0.5 time units</span>
+</pre></div>
+</div>
+<p>Restart from checkpoint:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">solver</span><span class="p">,</span> <span class="n">history</span> <span class="o">=</span> <span class="n">phrike</span><span class="o">.</span><span class="n">run_simulation</span><span class="p">(</span>
+    <span class="n">problem_name</span><span class="o">=</span><span class="s2">&quot;sod&quot;</span><span class="p">,</span>
+    <span class="n">config_path</span><span class="o">=</span><span class="s2">&quot;configs/sod.yaml&quot;</span><span class="p">,</span>
+    <span class="n">restart_from</span><span class="o">=</span><span class="s2">&quot;outputs/sod/snapshot_t0.500000.npz&quot;</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="output-and-visualization">
+<h2>Output and Visualization<a class="headerlink" href="#output-and-visualization" title="Link to this heading"></a></h2>
+<p>### Output Files</p>
+<p>PHRIKE generates several output files:</p>
+<ul class="simple">
+<li><p><strong>Field snapshots</strong>: <code class="docutils literal notranslate"><span class="pre">fields_t*.png</span></code> - Solution visualization</p></li>
+<li><p><strong>Checkpoints</strong>: <code class="docutils literal notranslate"><span class="pre">snapshot_t*.npz</span></code> - Restart files</p></li>
+<li><p><strong>Conservation plots</strong>: <code class="docutils literal notranslate"><span class="pre">conserved.png</span></code> - Conservation tracking</p></li>
+<li><p><strong>Videos</strong>: <code class="docutils literal notranslate"><span class="pre">*.mp4</span></code> - Animated solutions</p></li>
+</ul>
+<p>### Custom Visualization</p>
+<p>You can create custom visualizations:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">matplotlib.pyplot</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">plt</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
+
+<span class="c1"># Access solution data</span>
+<span class="n">rho</span><span class="p">,</span> <span class="n">u</span><span class="p">,</span> <span class="n">p</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">solver</span><span class="o">.</span><span class="n">equations</span><span class="o">.</span><span class="n">primitive</span><span class="p">(</span><span class="n">solver</span><span class="o">.</span><span class="n">U</span><span class="p">)</span>
+
+<span class="c1"># Create custom plot</span>
+<span class="n">plt</span><span class="o">.</span><span class="n">figure</span><span class="p">(</span><span class="n">figsize</span><span class="o">=</span><span class="p">(</span><span class="mi">10</span><span class="p">,</span> <span class="mi">6</span><span class="p">))</span>
+<span class="n">plt</span><span class="o">.</span><span class="n">plot</span><span class="p">(</span><span class="n">solver</span><span class="o">.</span><span class="n">grid</span><span class="o">.</span><span class="n">x</span><span class="p">,</span> <span class="n">rho</span><span class="p">,</span> <span class="n">label</span><span class="o">=</span><span class="s1">&#39;Density&#39;</span><span class="p">)</span>
+<span class="n">plt</span><span class="o">.</span><span class="n">plot</span><span class="p">(</span><span class="n">solver</span><span class="o">.</span><span class="n">grid</span><span class="o">.</span><span class="n">x</span><span class="p">,</span> <span class="n">u</span><span class="p">,</span> <span class="n">label</span><span class="o">=</span><span class="s1">&#39;Velocity&#39;</span><span class="p">)</span>
+<span class="n">plt</span><span class="o">.</span><span class="n">plot</span><span class="p">(</span><span class="n">solver</span><span class="o">.</span><span class="n">grid</span><span class="o">.</span><span class="n">x</span><span class="p">,</span> <span class="n">p</span><span class="p">,</span> <span class="n">label</span><span class="o">=</span><span class="s1">&#39;Pressure&#39;</span><span class="p">)</span>
+<span class="n">plt</span><span class="o">.</span><span class="n">legend</span><span class="p">()</span>
+<span class="n">plt</span><span class="o">.</span><span class="n">xlabel</span><span class="p">(</span><span class="s1">&#39;x&#39;</span><span class="p">)</span>
+<span class="n">plt</span><span class="o">.</span><span class="n">title</span><span class="p">(</span><span class="sa">f</span><span class="s1">&#39;Solution at t = </span><span class="si">{</span><span class="n">solver</span><span class="o">.</span><span class="n">t</span><span class="si">:</span><span class="s1">.3f</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">)</span>
+<span class="n">plt</span><span class="o">.</span><span class="n">show</span><span class="p">()</span>
+</pre></div>
+</div>
+<p>### Video Generation</p>
+<p>Videos are generated automatically unless disabled:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Skip video generation</span>
+phrike<span class="w"> </span>sod<span class="w"> </span>--no-video
+
+<span class="c1"># Custom video settings</span>
+phrike<span class="w"> </span>sod<span class="w"> </span>--config<span class="w"> </span>configs/sod.yaml<span class="w"> </span>--video-fps<span class="w"> </span><span class="m">60</span>
+</pre></div>
+</div>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="quickstart.html" class="btn btn-neutral float-left" title="Quick Start Guide" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="api_reference.html" class="btn btn-neutral float-right" title="API Reference" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2024, PHRIKE Development Team.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

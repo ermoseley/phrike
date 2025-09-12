@@ -1,10 +1,9 @@
 """3D Taylor-Green vortex problem."""
 
 import os
-from typing import Optional, Dict, Any
+from typing import Optional
 
 import matplotlib.pyplot as plt
-import numpy as np
 
 from phrike.grid import Grid3D
 from phrike.equations import EulerEquations3D
@@ -16,8 +15,10 @@ from .base import BaseProblem
 
 class TGV3DProblem(BaseProblem):
     """3D Taylor-Green vortex problem."""
-    
-    def create_grid(self, backend: str = "numpy", device: Optional[str] = None) -> Grid3D:
+
+    def create_grid(
+        self, backend: str = "numpy", device: Optional[str] = None
+    ) -> Grid3D:
         """Create 3D grid."""
         Nx = int(self.config["grid"]["Nx"])
         Ny = int(self.config["grid"]["Ny"])
@@ -26,79 +27,93 @@ class TGV3DProblem(BaseProblem):
         Ly = float(self.config["grid"]["Ly"])
         Lz = float(self.config["grid"]["Lz"])
         dealias = bool(self.config["grid"].get("dealias", True))
-        
+
         return Grid3D(
-            Nx=Nx, Ny=Ny, Nz=Nz, Lx=Lx, Ly=Ly, Lz=Lz,
+            Nx=Nx,
+            Ny=Ny,
+            Nz=Nz,
+            Lx=Lx,
+            Ly=Ly,
+            Lz=Lz,
             dealias=dealias,
             filter_params=self.filter_config,
             fft_workers=self.fft_workers,
             backend=backend,
-            torch_device=device
+            torch_device=device,
         )
-    
+
     def create_equations(self) -> EulerEquations3D:
         """Create 3D Euler equations."""
         return EulerEquations3D(gamma=self.gamma)
-    
+
     def create_initial_conditions(self, grid: Grid3D):
         """Create TGV initial conditions."""
         X, Y, Z = grid.xyz_mesh()
         icfg = self.config["initial_conditions"]
-        
+
         rho0 = float(icfg.get("rho0", 1.0))
         p0 = float(icfg.get("p0", 100.0))
         U0 = float(icfg.get("U0", 1.0))
         k = int(icfg.get("k", 2))
-        
+
         return taylor_green_vortex_3d(
-            X, Y, Z, 
-            rho0=rho0, p0=p0, U0=U0, k=k, gamma=self.gamma
+            X, Y, Z, rho0=rho0, p0=p0, U0=U0, k=k, gamma=self.gamma
         )
-    
+
     def create_visualization(self, solver, t: float, U) -> None:
         """Create visualization for current state."""
         rho, ux, uy, uz, p = solver.equations.primitive(U)
         rho = self.convert_torch_to_numpy(rho)[0]
-        
+
         # Take mid-plane slice
         mid = rho.shape[0] // 2
-        
+
         # Create frame
         fig, ax = plt.subplots(1, 1, figsize=(7, 6), constrained_layout=True)
-        ax.imshow(rho[mid], origin='lower', extent=[0, solver.grid.Lx, 0, solver.grid.Ly], aspect='equal')
+        ax.imshow(
+            rho[mid],
+            origin="lower",
+            extent=[0, solver.grid.Lx, 0, solver.grid.Ly],
+            aspect="equal",
+        )
         ax.set_title(f"Density z=mid t={t:.3f}")
-        ax.set_xlabel('x')
-        ax.set_ylabel('y')
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
         fig.canvas.draw()
         fig.canvas.flush_events()
-        
+
         # Save frame
         frames_dir = os.path.join(self.outdir, "frames")
         fig.savefig(os.path.join(frames_dir, f"frame_{t:08.3f}.png"), dpi=120)
         plt.close(fig)
-        
+
         # Save snapshot
         snapshot_path = save_solution_snapshot(
             self.outdir, t, U=U, grid=solver.grid, equations=solver.equations
         )
         print(f"Saved snapshot at t={t:.3f}: {snapshot_path}")
-    
+
     def create_final_visualization(self, solver) -> None:
         """Create final visualization plots."""
         rho, ux, uy, uz, p = solver.equations.primitive(solver.U)
         rho = self.convert_torch_to_numpy(rho)[0]
-        
+
         # Final mid-plane slice plot
         mid = rho.shape[0] // 2
         plt.figure(figsize=(7, 6))
-        plt.imshow(rho[mid], origin='lower', extent=[0, solver.grid.Lx, 0, solver.grid.Ly], aspect='equal')
+        plt.imshow(
+            rho[mid],
+            origin="lower",
+            extent=[0, solver.grid.Lx, 0, solver.grid.Ly],
+            aspect="equal",
+        )
         plt.title(f"Density z=mid t={solver.t:.3f}")
-        plt.xlabel('x')
-        plt.ylabel('y')
+        plt.xlabel("x")
+        plt.ylabel("y")
         plt.tight_layout()
         plt.savefig(os.path.join(self.outdir, f"tgv3d_t{solver.t:.3f}.png"), dpi=150)
         plt.close()
-    
+
     def get_solver_class(self):
         """Get 3D solver class."""
         return SpectralSolver3D

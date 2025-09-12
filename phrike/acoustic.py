@@ -24,8 +24,9 @@ class AcousticParams:
     gamma: float = 1.4
 
 
-def _fields_from_phase(phase: np.ndarray, params: AcousticParams) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    eqs = EulerEquations1D(gamma=params.gamma)
+def _fields_from_phase(
+    phase: np.ndarray, params: AcousticParams
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     c = np.sqrt(params.gamma * params.p0 / params.rho0)
 
     if params.fractional:
@@ -48,7 +49,9 @@ def acoustic_ic(x: np.ndarray, params: AcousticParams) -> np.ndarray:
     return eqs.conservative(rho, u, p)
 
 
-def acoustic_exact(x: np.ndarray, t: float, params: AcousticParams) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def acoustic_exact(
+    x: np.ndarray, t: float, params: AcousticParams
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     c = np.sqrt(params.gamma * params.p0 / params.rho0)
     k = 2.0 * np.pi * params.mode_m / params.Lx
     shift = -c * t if params.direction == "right" else c * t
@@ -132,11 +135,11 @@ def two_modulated_gaussian_acoustic_ic(
         u = params.u0 - c * (drho / params.rho0)
     else:
         # Counter-propagating default
-        u = params.u0 + c * (amp / params.rho0) * (amp_left_factor * gL * carrierL - amp_right_factor * gR * carrierR)
+        u = params.u0 + c * (amp / params.rho0) * (
+            amp_left_factor * gL * carrierL - amp_right_factor * gR * carrierR
+        )
     rho = params.rho0 + drho
     p = params.p0 + (c * c) * drho
 
     eqs = EulerEquations1D(gamma=params.gamma)
     return eqs.conservative(rho, u, p)
-
-

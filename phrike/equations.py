@@ -4,8 +4,10 @@ from dataclasses import dataclass
 from typing import Dict, Tuple
 
 import numpy as np
+
 try:
     import torch  # type: ignore
+
     _TORCH_AVAILABLE = True
 except Exception:
     _TORCH_AVAILABLE = False
@@ -13,21 +15,44 @@ except Exception:
 
 try:
     from numba import njit, prange
+
     _NUMBA_AVAILABLE = True
 except Exception:
     _NUMBA_AVAILABLE = False
+
     def njit(*args, **kwargs):  # type: ignore
         def inner(func):
             return func
+
         return inner
+
     def prange(*args, **kwargs):  # type: ignore
         return range(*args, **kwargs)
 
 
 # --- Numba-accelerated kernels (1D) ---
 
+
 @njit(cache=True, fastmath=True)
-def _primitive_kernel(U: np.ndarray, gamma: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _primitive_kernel(
+    U: np.ndarray, gamma: float
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Convert conservative variables to primitive variables for 1D Euler equations.
+
+    Args:
+        U: Conservative variables array of shape (3, N) where:
+           U[0] = rho (density)
+           U[1] = rho * u (momentum density)
+           U[2] = E (total energy density)
+        gamma: Adiabatic index
+
+    Returns:
+        Tuple of (rho, u, p, a) where:
+        - rho: density array
+        - u: velocity array
+        - p: pressure array
+        - a: sound speed array
+    """
     rho = U[0]
     mom = U[1]
     E = U[2]
@@ -40,6 +65,18 @@ def _primitive_kernel(U: np.ndarray, gamma: float) -> Tuple[np.ndarray, np.ndarr
 
 @njit(cache=True, fastmath=True)
 def _flux_kernel(U: np.ndarray, gamma: float) -> np.ndarray:
+    """Compute flux vector for 1D Euler equations.
+
+    Args:
+        U: Conservative variables array of shape (3, N)
+        gamma: Adiabatic index
+
+    Returns:
+        Flux array of shape (3, N) where:
+        - F[0] = rho * u (mass flux)
+        - F[1] = rho * u^2 + p (momentum flux)
+        - F[2] = (E + p) * u (energy flux)
+    """
     rho, u, p, _ = _primitive_kernel(U, gamma)
     mom = rho * u
     F = np.empty_like(U)
@@ -63,8 +100,11 @@ def _max_wave_speed_kernel(U: np.ndarray, gamma: float) -> float:
 
 # --- 2D Euler kernels ---
 
+
 @njit(cache=True, fastmath=True)
-def _primitive2d_kernel(U: np.ndarray, gamma: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _primitive2d_kernel(
+    U: np.ndarray, gamma: float
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     rho = U[0]
     momx = U[1]
     momy = U[2]
@@ -73,7 +113,6 @@ def _primitive2d_kernel(U: np.ndarray, gamma: float) -> Tuple[np.ndarray, np.nda
     uy = momy / rho
     kinetic = 0.5 * rho * (ux * ux + uy * uy)
     p = (gamma - 1.0) * (E - kinetic)
-    a = np.sqrt(gamma * p / rho)
     return rho, ux, uy, p
 
 
@@ -109,7 +148,9 @@ def _max_wave_speed2d_kernel(U: np.ndarray, gamma: float) -> float:
 
 
 @njit(cache=True, fastmath=True)
-def _primitive3d_kernel(U: np.ndarray, gamma: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _primitive3d_kernel(
+    U: np.ndarray, gamma: float
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     rho = U[0]
     momx = U[1]
     momy = U[2]
@@ -124,7 +165,9 @@ def _primitive3d_kernel(U: np.ndarray, gamma: float) -> Tuple[np.ndarray, np.nda
 
 
 @njit(cache=True, fastmath=True)
-def _flux3d_kernel(U: np.ndarray, gamma: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _flux3d_kernel(
+    U: np.ndarray, gamma: float
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     rho, ux, uy, uz, p = _primitive3d_kernel(U, gamma)
     momx = rho * ux
     momy = rho * uy
@@ -175,15 +218,39 @@ Array = np.ndarray
 class EulerEquations1D:
     """Compressible Euler equations in 1D, conservative form.
 
+    This class implements the 1D compressible Euler equations:
+
+    .. math::
+        \\frac{\\partial \\rho}{\\partial t} + \\frac{\\partial (\\rho u)}{\\partial x} = 0
+        \\frac{\\partial (\\rho u)}{\\partial t} + \\frac{\\partial (\\rho u^2 + p)}{\\partial x} = 0
+        \\frac{\\partial E}{\\partial t} + \\frac{\\partial ((E + p)u)}{\\partial x} = 0
+
+    where :math:`E = \\frac{p}{\\gamma-1} + \\frac{1}{2}\\rho u^2` is the total energy density.
+
     State vector U = [rho, mom, E], where:
       - rho: density
       - mom: momentum density (rho * u)
       - E: total energy density = p/(gamma-1) + 0.5*rho*u^2
+
+    Args:
+        gamma: Adiabatic index (default: 1.4)
     """
 
     gamma: float = 1.4
 
     def primitive(self, U: Array) -> Tuple[Array, Array, Array, Array]:
+        """Convert conservative variables to primitive variables.
+
+        Args:
+            U: Conservative variables array of shape (3, N)
+
+        Returns:
+            Tuple of (rho, u, p, a) where:
+            - rho: density array
+            - u: velocity array
+            - p: pressure array
+            - a: sound speed array
+        """
         if _TORCH_AVAILABLE and isinstance(U, (torch.Tensor,)):
             rho = U[0]
             mom = U[1]
@@ -196,6 +263,19 @@ class EulerEquations1D:
         return _primitive_kernel(U, self.gamma)
 
     def conservative(self, rho: Array, u: Array, p: Array) -> Array:
+        """Convert primitive variables to conservative variables.
+
+        Args:
+            rho: Density array
+            u: Velocity array
+            p: Pressure array
+
+        Returns:
+            Conservative variables array of shape (3, N) where:
+            - U[0] = rho (density)
+            - U[1] = rho * u (momentum density)
+            - U[2] = E (total energy density)
+        """
         mom = rho * u
         if _TORCH_AVAILABLE and isinstance(rho, (torch.Tensor,)):
             E = p / (self.gamma - 1.0) + 0.5 * rho * u * u
@@ -225,7 +305,9 @@ class EulerEquations1D:
         if _TORCH_AVAILABLE and isinstance(rho, (torch.Tensor,)):
             total_mass = float(torch.sum(rho).item())
             total_momentum = float(torch.sum(rho * u).item())
-            total_energy = float(torch.sum(p / (self.gamma - 1.0) + 0.5 * rho * u * u).item())
+            total_energy = float(
+                torch.sum(p / (self.gamma - 1.0) + 0.5 * rho * u * u).item()
+            )
         else:
             total_mass = float(rho.sum())
             total_momentum = float((rho * u).sum())
@@ -318,7 +400,9 @@ class EulerEquations3D:
             return rho, ux, uy, uz, p
         return _primitive3d_kernel(U, self.gamma)
 
-    def conservative(self, rho: Array, ux: Array, uy: Array, uz: Array, p: Array) -> Array:
+    def conservative(
+        self, rho: Array, ux: Array, uy: Array, uz: Array, p: Array
+    ) -> Array:
         momx = rho * ux
         momy = rho * uy
         momz = rho * uz
@@ -358,7 +442,12 @@ class EulerEquations3D:
         if _TORCH_AVAILABLE and isinstance(U, (torch.Tensor,)):
             rho, ux, uy, uz, p = self.primitive(U)
             a = torch.sqrt(self.gamma * p / rho)
-            comp = torch.maximum(torch.maximum(torch.abs(ux), torch.abs(uy)), torch.abs(uz)) + a
+            comp = (
+                torch.maximum(
+                    torch.maximum(torch.abs(ux), torch.abs(uy)), torch.abs(uz)
+                )
+                + a
+            )
             return float(torch.max(comp).item())
         return float(_max_wave_speed3d_kernel(U, self.gamma))
 
@@ -368,7 +457,9 @@ class EulerEquations3D:
         momx = float((rho * ux).sum())
         momy = float((rho * uy).sum())
         momz = float((rho * uz).sum())
-        total_energy = float((p / (self.gamma - 1.0) + 0.5 * rho * (ux * ux + uy * uy + uz * uz)).sum())
+        total_energy = float(
+            (p / (self.gamma - 1.0) + 0.5 * rho * (ux * ux + uy * uy + uz * uz)).sum()
+        )
         return {
             "mass": total_mass,
             "momentum_x": momx,
@@ -376,4 +467,3 @@ class EulerEquations3D:
             "momentum_z": momz,
             "energy": total_energy,
         }
-

@@ -1,14 +1,14 @@
 from __future__ import annotations
 
+from typing import Dict, Tuple
+
+import numpy as np
+
 """Analytic solution for the Sod shock tube (1D Riemann problem).
 
 This implements a standard solver for the piecewise self-similar solution.
 The implementation is adapted from classical formulations (e.g. Toro's book).
 """
-
-from typing import Dict, Tuple
-
-import numpy as np
 
 
 def _pressure_function(p: float, rho: float, pK: float, gamma: float) -> float:
@@ -20,10 +20,14 @@ def _pressure_function(p: float, rho: float, pK: float, gamma: float) -> float:
     else:
         # Rarefaction
         aK = np.sqrt(gamma * pK / rho)
-        return (2.0 * aK / (gamma - 1.0)) * (np.power(p / pK, (gamma - 1.0) / (2.0 * gamma)) - 1.0)
+        return (2.0 * aK / (gamma - 1.0)) * (
+            np.power(p / pK, (gamma - 1.0) / (2.0 * gamma)) - 1.0
+        )
 
 
-def _solve_star_state(left: Dict[str, float], right: Dict[str, float], gamma: float) -> Tuple[float, float]:
+def _solve_star_state(
+    left: Dict[str, float], right: Dict[str, float], gamma: float
+) -> Tuple[float, float]:
     rhoL, uL, pL = left["rho"], left["u"], left["p"]
     rhoR, uR, pR = right["rho"], right["u"], right["p"]
 
@@ -38,8 +42,8 @@ def _solve_star_state(left: Dict[str, float], right: Dict[str, float], gamma: fl
     for _ in range(30):
         fL = _pressure_function(p, rhoL, pL, gamma)
         fR = _pressure_function(p, rhoR, pR, gamma)
-        gL = (p > pL)
-        gR = (p > pR)
+        gL = p > pL
+        gR = p > pR
         if gL:
             A = 2.0 / ((gamma + 1.0) * rhoL)
             B = (gamma - 1.0) / (gamma + 1.0) * pL
@@ -67,7 +71,14 @@ def _solve_star_state(left: Dict[str, float], right: Dict[str, float], gamma: fl
     return p, u_star
 
 
-def sod_sample(x: np.ndarray, t: float, x0: float, left: Dict[str, float], right: Dict[str, float], gamma: float) -> Dict[str, np.ndarray]:
+def sod_sample(
+    x: np.ndarray,
+    t: float,
+    x0: float,
+    left: Dict[str, float],
+    right: Dict[str, float],
+    gamma: float,
+) -> Dict[str, np.ndarray]:
     # Shift coords
     xi = (x - x0) / max(t, 1e-12)
     rhoL, uL, pL = left["rho"], left["u"], left["p"]
@@ -79,9 +90,14 @@ def sod_sample(x: np.ndarray, t: float, x0: float, left: Dict[str, float], right
 
     # Left state
     if p_star > pL:  # left shock
-        SL = uL - aL * np.sqrt((gamma + 1.0) / (2.0 * gamma) * (p_star / pL - 1.0) + 1.0)
+        SL = uL - aL * np.sqrt(
+            (gamma + 1.0) / (2.0 * gamma) * (p_star / pL - 1.0) + 1.0
+        )
         SML = u_star
-        rho_star_L = rhoL * ((p_star / pL + (gamma - 1.0) / (gamma + 1.0)) / ((gamma - 1.0) / (gamma + 1.0) * p_star / pL + 1.0))
+        rho_star_L = rhoL * (
+            (p_star / pL + (gamma - 1.0) / (gamma + 1.0))
+            / ((gamma - 1.0) / (gamma + 1.0) * p_star / pL + 1.0)
+        )
         pLfan = None
     else:  # left rarefaction
         SHL = uL - aL
@@ -93,9 +109,14 @@ def sod_sample(x: np.ndarray, t: float, x0: float, left: Dict[str, float], right
 
     # Right state
     if p_star > pR:  # right shock
-        SR = uR + aR * np.sqrt((gamma + 1.0) / (2.0 * gamma) * (p_star / pR - 1.0) + 1.0)
+        SR = uR + aR * np.sqrt(
+            (gamma + 1.0) / (2.0 * gamma) * (p_star / pR - 1.0) + 1.0
+        )
         SMR = u_star
-        rho_star_R = rhoR * ((p_star / pR + (gamma - 1.0) / (gamma + 1.0)) / ((gamma - 1.0) / (gamma + 1.0) * p_star / pR + 1.0))
+        rho_star_R = rhoR * (
+            (p_star / pR + (gamma - 1.0) / (gamma + 1.0))
+            / ((gamma - 1.0) / (gamma + 1.0) * p_star / pR + 1.0)
+        )
         pRfan = None
     else:  # right rarefaction
         SHR = uR + aR
@@ -124,7 +145,9 @@ def sod_sample(x: np.ndarray, t: float, x0: float, left: Dict[str, float], right
                     rho[i], u[i], p[i] = rhoL, uL, pL
                 elif s < STL:
                     u_loc = (2.0 / (gamma + 1.0)) * (aL + 0.5 * (gamma - 1.0) * uL + s)
-                    a_loc = (2.0 / (gamma + 1.0)) * (aL + 0.5 * (gamma - 1.0) * (uL - s))
+                    a_loc = (2.0 / (gamma + 1.0)) * (
+                        aL + 0.5 * (gamma - 1.0) * (uL - s)
+                    )
                     rho[i] = rhoL * (a_loc / aL) ** (2.0 / (gamma - 1.0))
                     u[i] = u_loc
                     p[i] = pL * (a_loc / aL) ** (2.0 * gamma / (gamma - 1.0))
@@ -145,7 +168,9 @@ def sod_sample(x: np.ndarray, t: float, x0: float, left: Dict[str, float], right
                     rho[i], u[i], p[i] = rhoR, uR, pR
                 elif s > SMR:
                     u_loc = (2.0 / (gamma + 1.0)) * (-aR + 0.5 * (gamma - 1.0) * uR + s)
-                    a_loc = (2.0 / (gamma + 1.0)) * (-aR + 0.5 * (gamma - 1.0) * (s - uR))
+                    a_loc = (2.0 / (gamma + 1.0)) * (
+                        -aR + 0.5 * (gamma - 1.0) * (s - uR)
+                    )
                     rho[i] = rhoR * (a_loc / aR) ** (2.0 / (gamma - 1.0))
                     u[i] = u_loc
                     p[i] = pR * (a_loc / aR) ** (2.0 * gamma / (gamma - 1.0))
@@ -154,5 +179,3 @@ def sod_sample(x: np.ndarray, t: float, x0: float, left: Dict[str, float], right
                     rho[i], u[i], p[i] = rho_star_R, u_star, p_star
 
     return {"rho": rho, "u": u, "p": p}
-
-

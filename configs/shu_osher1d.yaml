@@ -1,0 +1,36 @@
+# Shu-Osher 1D Test Problem Configuration
+# Tests shock-capturing and wave propagation in a high-order solver
+problem: shu_osher1d
+
+grid:
+  N: 256            # number of points
+  Lx: 1.0           # domain length [0, Lx) with periodic BCs
+  dealias: true     # apply 2/3-rule dealiasing
+
+physics:
+  gamma: 1.4        # adiabatic index
+
+integration:
+  t0: 0.0
+  t_end: 0.2        # very short time for testing
+  cfl: 0.1          # much more conservative CFL number for shock stability
+  scheme: rk4       # 4th-order Runge-Kutta
+  output_interval: 0.005
+  checkpoint_interval: 0.05
+  spectral_filter:
+    enabled: true
+    p: 8            # even integer >= 2
+    alpha: 72.0     # stronger filter for shock stability
+
+io:
+  outdir: outputs/shu_osher1d
+  save_spectra: true
+
+monitoring:
+  enabled: true
+  step_interval: 100  # Monitor every 100 steps
+  include_conservation: true
+  include_timestep: true
+  include_time: true
+  include_velocity_stats: true
+  include_density_stats: true

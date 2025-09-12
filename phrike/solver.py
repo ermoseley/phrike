@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional
 
 import numpy as np
+
 try:
     import torch  # type: ignore
+
     _TORCH_AVAILABLE = True
 except Exception:
     _TORCH_AVAILABLE = False
@@ -50,7 +52,6 @@ def _apply_physical_filters(grid: Grid1D, U: Array) -> Array:
     return grid.apply_spectral_filter(U)
 
 
-@dataclass
 class SpectralSolver1D:
     grid: Grid1D
     equations: EulerEquations1D
@@ -60,6 +61,23 @@ class SpectralSolver1D:
     # Runtime state
     t: float = 0.0
     U: Optional[Array] = None
+
+    def __init__(self, grid: Grid1D, equations: EulerEquations1D, U0: Optional[Array] = None, scheme: str = "rk4", cfl: float = 0.4):
+        """Initialize the 1D spectral solver.
+        
+        Args:
+            grid: 1D grid
+            equations: 1D Euler equations
+            U0: Initial solution (optional)
+            scheme: Time integration scheme ("rk2" or "rk4")
+            cfl: CFL number
+        """
+        self.grid = grid
+        self.equations = equations
+        self.scheme = scheme
+        self.cfl = cfl
+        self.t = 0.0
+        self.U = U0
 
     def compute_dt(self, U: Array) -> float:
         max_speed = self.equations.max_wave_speed(U)
@@ -89,18 +107,30 @@ class SpectralSolver1D:
     ) -> Dict[str, List[float]]:
         from .io import save_solution_snapshot
 
-        self.U = U0.copy()
+        if _TORCH_AVAILABLE and isinstance(U0, (torch.Tensor,)):
+            self.U = U0.clone()
+        else:
+            self.U = U0.copy()
         self.t = float(t0)
         next_output = self.t + output_interval
-        next_checkpoint = self.t + checkpoint_interval if checkpoint_interval and checkpoint_interval > 0 else np.inf
+        next_checkpoint = (
+            self.t + checkpoint_interval
+            if checkpoint_interval and checkpoint_interval > 0
+            else np.inf
+        )
 
-        history: Dict[str, List[float]] = {"time": [], "mass": [], "momentum": [], "energy": []}
+        history: Dict[str, List[float]] = {
+            "time": [],
+            "mass": [],
+            "momentum": [],
+            "energy": [],
+        }
         step_count = 0
 
         def record() -> None:
             cons = self.equations.conserved_quantities(self.U)  # type: ignore[arg-type]
             history["time"].append(self.t)
-            history["mass"].append(cons["mass"])   # type: ignore[index]
+            history["mass"].append(cons["mass"])  # type: ignore[index]
             history["momentum"].append(cons["momentum"])  # type: ignore[index]
             history["energy"].append(cons["energy"])  # type: ignore[index]
 
@@ -125,7 +155,9 @@ class SpectralSolver1D:
                 next_output += output_interval
 
             if outdir and self.t + 1e-12 >= next_checkpoint:
-                save_solution_snapshot(outdir, self.t, U=self.U, grid=self.grid, equations=self.equations)
+                save_solution_snapshot(
+                    outdir, self.t, U=self.U, grid=self.grid, equations=self.equations
+                )
                 next_checkpoint += checkpoint_interval
 
         record()
@@ -135,6 +167,7 @@ class SpectralSolver1D:
 
 
 # 2D solver
+
 
 def _compute_rhs_2d(grid: Grid2D, eqs: EulerEquations2D, U: Array) -> Array:
     # Fluxes in x and y
@@ -211,9 +244,19 @@ class SpectralSolver2D:
             self.U = U0.copy()
         self.t = float(t0)
         next_output = self.t + output_interval
-        next_checkpoint = self.t + checkpoint_interval if checkpoint_interval and checkpoint_interval > 0 else np.inf
+        next_checkpoint = (
+            self.t + checkpoint_interval
+            if checkpoint_interval and checkpoint_interval > 0
+            else np.inf
+        )
 
-        history: Dict[str, List[float]] = {"time": [], "mass": [], "momentum_x": [], "momentum_y": [], "energy": []}
+        history: Dict[str, List[float]] = {
+            "time": [],
+            "mass": [],
+            "momentum_x": [],
+            "momentum_y": [],
+            "energy": [],
+        }
         step_count = 0
 
         def record() -> None:
@@ -222,12 +265,22 @@ class SpectralSolver2D:
                 mass = float(torch.sum(rho).item())
                 momx = float(torch.sum(rho * ux).item())
                 momy = float(torch.sum(rho * uy).item())
-                energy = float(torch.sum(p / (self.equations.gamma - 1.0) + 0.5 * rho * (ux * ux + uy * uy)).item())
+                energy = float(
+                    torch.sum(
+                        p / (self.equations.gamma - 1.0)
+                        + 0.5 * rho * (ux * ux + uy * uy)
+                    ).item()
+                )
             else:
                 mass = float(rho.sum())
                 momx = float((rho * ux).sum())
                 momy = float((rho * uy).sum())
-                energy = float((p / (self.equations.gamma - 1.0) + 0.5 * rho * (ux * ux + uy * uy)).sum())
+                energy = float(
+                    (
+                        p / (self.equations.gamma - 1.0)
+                        + 0.5 * rho * (ux * ux + uy * uy)
+                    ).sum()
+                )
             history["time"].append(self.t)
             history["mass"].append(mass)
             history["momentum_x"].append(momx)
@@ -255,7 +308,9 @@ class SpectralSolver2D:
                 next_output += output_interval
 
             if outdir and self.t + 1e-12 >= next_checkpoint:
-                save_solution_snapshot(outdir, self.t, U=self.U, grid=self.grid, equations=self.equations)
+                save_solution_snapshot(
+                    outdir, self.t, U=self.U, grid=self.grid, equations=self.equations
+                )
                 next_checkpoint += checkpoint_interval
 
         record()
@@ -333,6 +388,7 @@ class SpectralSolver3D:
 
         try:
             import torch  # type: ignore
+
             _TORCH_AVAILABLE = True
         except Exception:
             _TORCH_AVAILABLE = False
@@ -344,9 +400,20 @@ class SpectralSolver3D:
             self.U = U0.copy()
         self.t = float(t0)
         next_output = self.t + output_interval
-        next_checkpoint = self.t + checkpoint_interval if checkpoint_interval and checkpoint_interval > 0 else np.inf
+        next_checkpoint = (
+            self.t + checkpoint_interval
+            if checkpoint_interval and checkpoint_interval > 0
+            else np.inf
+        )
 
-        history: Dict[str, List[float]] = {"time": [], "mass": [], "momentum_x": [], "momentum_y": [], "momentum_z": [], "energy": []}
+        history: Dict[str, List[float]] = {
+            "time": [],
+            "mass": [],
+            "momentum_x": [],
+            "momentum_y": [],
+            "momentum_z": [],
+            "energy": [],
+        }
         step_count = 0
 
         def record() -> None:
@@ -356,13 +423,23 @@ class SpectralSolver3D:
                 momx = float(torch.sum(rho * ux).item())
                 momy = float(torch.sum(rho * uy).item())
                 momz = float(torch.sum(rho * uz).item())
-                energy = float(torch.sum(p / (self.equations.gamma - 1.0) + 0.5 * rho * (ux * ux + uy * uy + uz * uz)).item())
+                energy = float(
+                    torch.sum(
+                        p / (self.equations.gamma - 1.0)
+                        + 0.5 * rho * (ux * ux + uy * uy + uz * uz)
+                    ).item()
+                )
             else:
                 mass = float(rho.sum())
                 momx = float((rho * ux).sum())
                 momy = float((rho * uy).sum())
                 momz = float((rho * uz).sum())
-                energy = float((p / (self.equations.gamma - 1.0) + 0.5 * rho * (ux * ux + uy * uy + uz * uz)).sum())
+                energy = float(
+                    (
+                        p / (self.equations.gamma - 1.0)
+                        + 0.5 * rho * (ux * ux + uy * uy + uz * uz)
+                    ).sum()
+                )
             history["time"].append(self.t)
             history["mass"].append(mass)
             history["momentum_x"].append(momx)
@@ -391,11 +468,12 @@ class SpectralSolver3D:
                 next_output += output_interval
 
             if outdir and self.t + 1e-12 >= next_checkpoint:
-                save_solution_snapshot(outdir, self.t, U=self.U, grid=self.grid, equations=self.equations)
+                save_solution_snapshot(
+                    outdir, self.t, U=self.U, grid=self.grid, equations=self.equations
+                )
                 next_checkpoint += checkpoint_interval
 
         record()
         if on_output is not None:
             on_output(self.t, self.U)
         return history
-

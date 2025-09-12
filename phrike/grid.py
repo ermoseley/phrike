@@ -7,6 +7,7 @@ import numpy as np
 
 try:
     import torch  # type: ignore
+
     _TORCH_AVAILABLE = True
 except Exception:  # pragma: no cover - torch may not be installed
     _TORCH_AVAILABLE = False
@@ -15,9 +16,11 @@ except Exception:  # pragma: no cover - torch may not be installed
 try:  # Prefer pyfftw if available for performance
     import pyfftw.interfaces.scipy_fft as scipy_fft  # type: ignore
     from pyfftw.interfaces import cache as fftw_cache  # type: ignore
+
     scipy_fft_cache_enabled = True
 except Exception:  # Fallback to SciPy's FFT
     from scipy import fft as scipy_fft  # type: ignore
+
     scipy_fft_cache_enabled = False
     fftw_cache = None  # type: ignore
 
@@ -27,7 +30,7 @@ def _build_filter_mask(N: int, dealias: bool) -> np.ndarray:
         return np.ones(N, dtype=float)
     # 2/3 rule: zero modes with |k| > N/3
     k = np.fft.fftfreq(N) * N
-    cutoff = (N // 3)
+    cutoff = N // 3
     mask = (np.abs(k) <= cutoff).astype(float)
     return mask
 
@@ -37,7 +40,7 @@ def _build_exponential_filter(N: int, p: int, alpha: float) -> np.ndarray:
     k = np.fft.fftfreq(N) * N
     kmax = np.max(np.abs(k)) if N > 0 else 1.0
     eta = np.abs(k) / max(kmax, 1.0)
-    sigma = np.exp(-alpha * eta ** p)
+    sigma = np.exp(-alpha * eta**p)
     return sigma
 
 
@@ -46,8 +49,8 @@ def _build_filter_mask_2d(Nx: int, Ny: int, dealias: bool) -> np.ndarray:
         return np.ones((Ny, Nx), dtype=float)
     kx = (np.fft.fftfreq(Nx) * Nx).astype(float)
     ky = (np.fft.fftfreq(Ny) * Ny).astype(float)
-    cutoff_x = (Nx // 3)
-    cutoff_y = (Ny // 3)
+    cutoff_x = Nx // 3
+    cutoff_y = Ny // 3
     mask_x = (np.abs(kx) <= cutoff_x).astype(float)
     mask_y = (np.abs(ky) <= cutoff_y).astype(float)
     return mask_y[:, None] * mask_x[None, :]
@@ -60,8 +63,8 @@ def _build_exponential_filter_2d(Nx: int, Ny: int, p: int, alpha: float) -> np.n
     kymax = np.max(np.abs(ky)) if Ny > 0 else 1.0
     eta_x = np.abs(kx) / max(kxmax, 1.0)
     eta_y = np.abs(ky) / max(kymax, 1.0)
-    sigma_x = np.exp(-alpha * eta_x ** p)
-    sigma_y = np.exp(-alpha * eta_y ** p)
+    sigma_x = np.exp(-alpha * eta_x**p)
+    sigma_y = np.exp(-alpha * eta_y**p)
     return sigma_y[:, None] * sigma_x[None, :]
 
 
@@ -71,16 +74,18 @@ def _build_filter_mask_3d(Nx: int, Ny: int, Nz: int, dealias: bool) -> np.ndarra
     kx = (np.fft.fftfreq(Nx) * Nx).astype(float)
     ky = (np.fft.fftfreq(Ny) * Ny).astype(float)
     kz = (np.fft.fftfreq(Nz) * Nz).astype(float)
-    cutoff_x = (Nx // 3)
-    cutoff_y = (Ny // 3)
-    cutoff_z = (Nz // 3)
+    cutoff_x = Nx // 3
+    cutoff_y = Ny // 3
+    cutoff_z = Nz // 3
     mask_x = (np.abs(kx) <= cutoff_x).astype(float)
     mask_y = (np.abs(ky) <= cutoff_y).astype(float)
     mask_z = (np.abs(kz) <= cutoff_z).astype(float)
     return mask_z[:, None, None] * mask_y[None, :, None] * mask_x[None, None, :]
 
 
-def _build_exponential_filter_3d(Nx: int, Ny: int, Nz: int, p: int, alpha: float) -> np.ndarray:
+def _build_exponential_filter_3d(
+    Nx: int, Ny: int, Nz: int, p: int, alpha: float
+) -> np.ndarray:
     kx = (np.fft.fftfreq(Nx) * Nx).astype(float)
     ky = (np.fft.fftfreq(Ny) * Ny).astype(float)
     kz = (np.fft.fftfreq(Nz) * Nz).astype(float)
@@ -90,9 +95,9 @@ def _build_exponential_filter_3d(Nx: int, Ny: int, Nz: int, p: int, alpha: float
     eta_x = np.abs(kx) / max(kxmax, 1.0)
     eta_y = np.abs(ky) / max(kymax, 1.0)
     eta_z = np.abs(kz) / max(kzmax, 1.0)
-    sigma_x = np.exp(-alpha * eta_x ** p)
-    sigma_y = np.exp(-alpha * eta_y ** p)
-    sigma_z = np.exp(-alpha * eta_z ** p)
+    sigma_x = np.exp(-alpha * eta_x**p)
+    sigma_y = np.exp(-alpha * eta_y**p)
+    sigma_z = np.exp(-alpha * eta_z**p)
     return sigma_z[:, None, None] * sigma_y[None, :, None] * sigma_x[None, None, :]
 
 
@@ -156,7 +161,11 @@ class Grid1D:
             if self.torch_device is None:
                 dev = "cpu"
                 try:
-                    if torch is not None and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                    if (
+                        torch is not None
+                        and hasattr(torch.backends, "mps")
+                        and torch.backends.mps.is_available()
+                    ):
                         dev = "mps"
                     elif torch is not None and torch.cuda.is_available():
                         dev = "cuda"
@@ -166,16 +175,26 @@ class Grid1D:
 
             # Choose dtype based on device (MPS only supports float32)
             torch_dtype = torch.float32 if self.torch_device == "mps" else torch.float64
-            torch_cdtype = torch.complex64 if self.torch_device == "mps" else torch.complex128
+            torch_cdtype = (
+                torch.complex64 if self.torch_device == "mps" else torch.complex128
+            )
 
             # Move arrays to torch
             assert torch is not None
-            self.x = torch.from_numpy(np.asarray(self.x)).to(dtype=torch_dtype, device=self.torch_device)
-            k_t = torch.from_numpy(np.asarray(self.k)).to(dtype=torch_dtype, device=self.torch_device)
+            self.x = torch.from_numpy(np.asarray(self.x)).to(
+                dtype=torch_dtype, device=self.torch_device
+            )
+            k_t = torch.from_numpy(np.asarray(self.k)).to(
+                dtype=torch_dtype, device=self.torch_device
+            )
             self.k = k_t
             self.ik = k_t.to(dtype=torch_cdtype) * (1j)
-            self.dealias_mask = torch.from_numpy(np.asarray(self.dealias_mask)).to(dtype=torch_dtype, device=self.torch_device)
-            self.filter_sigma = torch.from_numpy(np.asarray(self.filter_sigma)).to(dtype=torch_dtype, device=self.torch_device)
+            self.dealias_mask = torch.from_numpy(np.asarray(self.dealias_mask)).to(
+                dtype=torch_dtype, device=self.torch_device
+            )
+            self.filter_sigma = torch.from_numpy(np.asarray(self.filter_sigma)).to(
+                dtype=torch_dtype, device=self.torch_device
+            )
 
     # FFT wrappers
     def rfft(self, f: np.ndarray) -> np.ndarray:
@@ -260,7 +279,9 @@ class Grid2D:
         if self.filter_params and bool(self.filter_params.get("enabled", False)):
             p = int(self.filter_params.get("p", 8))
             alpha = float(self.filter_params.get("alpha", 36.0))
-            self.filter_sigma = _build_exponential_filter_2d(self.Nx, self.Ny, p=p, alpha=alpha)
+            self.filter_sigma = _build_exponential_filter_2d(
+                self.Nx, self.Ny, p=p, alpha=alpha
+            )
 
         if scipy_fft_cache_enabled and fftw_cache is not None:
             try:
@@ -276,7 +297,10 @@ class Grid2D:
             if self.torch_device is None:
                 dev = "cpu"
                 try:
-                    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                    if (
+                        hasattr(torch.backends, "mps")
+                        and torch.backends.mps.is_available()
+                    ):
                         dev = "mps"
                     elif torch.cuda.is_available():
                         dev = "cuda"
@@ -286,19 +310,33 @@ class Grid2D:
 
             # Choose dtype based on device (MPS only supports float32)
             torch_dtype = torch.float32 if self.torch_device == "mps" else torch.float64
-            torch_cdtype = torch.complex64 if self.torch_device == "mps" else torch.complex128
+            torch_cdtype = (
+                torch.complex64 if self.torch_device == "mps" else torch.complex128
+            )
 
-            self.x = torch.from_numpy(np.asarray(self.x)).to(dtype=torch_dtype, device=self.torch_device)
-            self.y = torch.from_numpy(np.asarray(self.y)).to(dtype=torch_dtype, device=self.torch_device)
+            self.x = torch.from_numpy(np.asarray(self.x)).to(
+                dtype=torch_dtype, device=self.torch_device
+            )
+            self.y = torch.from_numpy(np.asarray(self.y)).to(
+                dtype=torch_dtype, device=self.torch_device
+            )
 
-            kx_t = torch.from_numpy(np.asarray(self.kx)).to(dtype=torch_dtype, device=self.torch_device)
-            ky_t = torch.from_numpy(np.asarray(self.ky)).to(dtype=torch_dtype, device=self.torch_device)
+            kx_t = torch.from_numpy(np.asarray(self.kx)).to(
+                dtype=torch_dtype, device=self.torch_device
+            )
+            ky_t = torch.from_numpy(np.asarray(self.ky)).to(
+                dtype=torch_dtype, device=self.torch_device
+            )
             self.kx = kx_t
             self.ky = ky_t
             self.ikx = kx_t.to(dtype=torch_cdtype)[None, :] * (1j)
             self.iky = ky_t.to(dtype=torch_cdtype)[:, None] * (1j)
-            self.dealias_mask = torch.from_numpy(np.asarray(self.dealias_mask)).to(dtype=torch_dtype, device=self.torch_device)
-            self.filter_sigma = torch.from_numpy(np.asarray(self.filter_sigma)).to(dtype=torch_dtype, device=self.torch_device)
+            self.dealias_mask = torch.from_numpy(np.asarray(self.dealias_mask)).to(
+                dtype=torch_dtype, device=self.torch_device
+            )
+            self.filter_sigma = torch.from_numpy(np.asarray(self.filter_sigma)).to(
+                dtype=torch_dtype, device=self.torch_device
+            )
 
     # 2D FFT wrappers
     def fft2(self, f: np.ndarray) -> np.ndarray:
@@ -399,12 +437,16 @@ class Grid3D:
         self.ikz = 1j * self.kz[:, None, None]
 
         # Dealias and filter
-        self.dealias_mask = _build_filter_mask_3d(self.Nx, self.Ny, self.Nz, self.dealias)
+        self.dealias_mask = _build_filter_mask_3d(
+            self.Nx, self.Ny, self.Nz, self.dealias
+        )
         self.filter_sigma = np.ones((self.Nz, self.Ny, self.Nx), dtype=float)
         if self.filter_params and bool(self.filter_params.get("enabled", False)):
             p = int(self.filter_params.get("p", 8))
             alpha = float(self.filter_params.get("alpha", 36.0))
-            self.filter_sigma = _build_exponential_filter_3d(self.Nx, self.Ny, self.Nz, p=p, alpha=alpha)
+            self.filter_sigma = _build_exponential_filter_3d(
+                self.Nx, self.Ny, self.Nz, p=p, alpha=alpha
+            )
 
         if scipy_fft_cache_enabled and fftw_cache is not None:
             try:
@@ -420,7 +462,10 @@ class Grid3D:
             if self.torch_device is None:
                 dev = "cpu"
                 try:
-                    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                    if (
+                        hasattr(torch.backends, "mps")
+                        and torch.backends.mps.is_available()
+                    ):
                         dev = "mps"
                     elif torch.cuda.is_available():
                         dev = "cuda"
@@ -429,23 +474,41 @@ class Grid3D:
                 self.torch_device = dev
 
             torch_dtype = torch.float32 if self.torch_device == "mps" else torch.float64
-            torch_cdtype = torch.complex64 if self.torch_device == "mps" else torch.complex128
+            torch_cdtype = (
+                torch.complex64 if self.torch_device == "mps" else torch.complex128
+            )
 
-            self.x = torch.from_numpy(np.asarray(self.x)).to(dtype=torch_dtype, device=self.torch_device)
-            self.y = torch.from_numpy(np.asarray(self.y)).to(dtype=torch_dtype, device=self.torch_device)
-            self.z = torch.from_numpy(np.asarray(self.z)).to(dtype=torch_dtype, device=self.torch_device)
+            self.x = torch.from_numpy(np.asarray(self.x)).to(
+                dtype=torch_dtype, device=self.torch_device
+            )
+            self.y = torch.from_numpy(np.asarray(self.y)).to(
+                dtype=torch_dtype, device=self.torch_device
+            )
+            self.z = torch.from_numpy(np.asarray(self.z)).to(
+                dtype=torch_dtype, device=self.torch_device
+            )
 
-            kx_t = torch.from_numpy(np.asarray(self.kx)).to(dtype=torch_dtype, device=self.torch_device)
-            ky_t = torch.from_numpy(np.asarray(self.ky)).to(dtype=torch_dtype, device=self.torch_device)
-            kz_t = torch.from_numpy(np.asarray(self.kz)).to(dtype=torch_dtype, device=self.torch_device)
+            kx_t = torch.from_numpy(np.asarray(self.kx)).to(
+                dtype=torch_dtype, device=self.torch_device
+            )
+            ky_t = torch.from_numpy(np.asarray(self.ky)).to(
+                dtype=torch_dtype, device=self.torch_device
+            )
+            kz_t = torch.from_numpy(np.asarray(self.kz)).to(
+                dtype=torch_dtype, device=self.torch_device
+            )
             self.kx = kx_t
             self.ky = ky_t
             self.kz = kz_t
             self.ikx = kx_t.to(dtype=torch_cdtype)[None, None, :] * (1j)
             self.iky = ky_t.to(dtype=torch_cdtype)[None, :, None] * (1j)
             self.ikz = kz_t.to(dtype=torch_cdtype)[:, None, None] * (1j)
-            self.dealias_mask = torch.from_numpy(np.asarray(self.dealias_mask)).to(dtype=torch_dtype, device=self.torch_device)
-            self.filter_sigma = torch.from_numpy(np.asarray(self.filter_sigma)).to(dtype=torch_dtype, device=self.torch_device)
+            self.dealias_mask = torch.from_numpy(np.asarray(self.dealias_mask)).to(
+                dtype=torch_dtype, device=self.torch_device
+            )
+            self.filter_sigma = torch.from_numpy(np.asarray(self.filter_sigma)).to(
+                dtype=torch_dtype, device=self.torch_device
+            )
 
     # 3D FFT wrappers
     def fftn(self, f: np.ndarray) -> np.ndarray:
@@ -511,4 +574,3 @@ class Grid3D:
             # Return arrays with shape (Nz, Ny, Nx)
             Z, Y, X = np.meshgrid(self.z, self.y, self.x, indexing="ij")
             return X, Y, Z
-
