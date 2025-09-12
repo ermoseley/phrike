@@ -1,8 +1,10 @@
-"""Base problem class for SpectralHydro simulations."""
+"""Base problem class for Hydra simulations."""
 
 import os
 import subprocess
+import shutil
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import matplotlib.pyplot as plt
@@ -13,6 +15,29 @@ from hydra.io import load_config, ensure_outdir, save_solution_snapshot
 
 class BaseProblem(ABC):
     """Base class for all Hydra problems."""
+    
+    @staticmethod
+    def clear_numba_cache():
+        """Clear numba cache to prevent module name conflicts.
+        
+        This is primarily useful as a one-time fix after package renames.
+        Use the --clear-cache CLI flag when needed.
+        """
+        try:
+            # Clear user's numba cache
+            numba_cache = Path.home() / ".numba_cache"
+            if numba_cache.exists():
+                shutil.rmtree(numba_cache)
+            
+            # Clear local __pycache__ directories
+            current_dir = Path(__file__).parent.parent
+            for pycache in current_dir.rglob("__pycache__"):
+                if pycache.is_dir():
+                    shutil.rmtree(pycache)
+                    
+        except Exception:
+            # Silently fail if cache clearing doesn't work
+            pass
     
     def __init__(self, config_path: Optional[str] = None, config: Optional[Dict[str, Any]] = None):
         """Initialize problem with configuration.

@@ -63,6 +63,13 @@ Examples:
         help="Override output directory"
     )
     
+    # Cache management
+    parser.add_argument(
+        "--clear-cache", 
+        action="store_true", 
+        help="Clear numba cache before running (one-time fix for package rename issues)"
+    )
+    
     # Verbosity
     parser.add_argument(
         "-v", "--verbose", 
@@ -73,6 +80,13 @@ Examples:
     args = parser.parse_args()
     
     try:
+        # Clear cache if requested
+        if args.clear_cache:
+            from .problems.base import BaseProblem
+            BaseProblem.clear_numba_cache()
+            if args.verbose:
+                print("Cleared numba cache")
+        
         # Create problem instance
         problem = ProblemRegistry.create_problem(
             name=args.problem,
