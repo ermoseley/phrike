@@ -1,0 +1,46 @@
+# Configuration for 3D turbulent velocity field matching RAMSES turb3d.nml
+problem: turb3d
+
+grid:
+  Nx: 64
+  Ny: 64
+  Nz: 64
+  Lx: 1.0
+  Ly: 1.0
+  Lz: 1.0
+  dealias: true
+  fft_workers: 4
+
+physics:
+  gamma: 1.4
+
+integration:
+  t0: 0.0
+  t_end: 1.0
+  cfl: 0.8  # Matching RAMSES courant_factor
+  scheme: rk4
+  output_interval: 0.1
+  spectral_filter:
+    enabled: true
+    p: 8
+    alpha: 36.0
+
+initial_conditions:
+  rho0: 1.0
+  p0: 1.0
+  vrms: 0.1  # Target RMS velocity magnitude
+  kmin: 1.0  # Minimum wavenumber for band-pass
+  kmax: 5.0  # Maximum wavenumber for band-pass (modes 1-5)
+  alpha: 0.3333  # Compressive fraction (matching RAMSES comp_frac)
+  spectrum_type: "power_law"  # Power law spectrum
+  power_law_slope: -1.6666666666666667  # Kolmogorov slope (-5/3)
+  seed: 4
+
+io:
+  outdir: outputs/turb3d
+
+video:
+  fps: 30
+  codec: h264_videotoolbox
+  crf: 18
+  pix_fmt: yuv420p

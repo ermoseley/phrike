@@ -11,4 +11,9 @@ outputs/
 .ruff_cache/
 .DS_Store
 
+# Additional files and directories
+frames/
+colormaps.py
+ramses-utils/
+example.py
 

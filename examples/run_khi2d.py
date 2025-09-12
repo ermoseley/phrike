@@ -66,7 +66,7 @@ def main() -> None:
     frames_dir = os.path.join(outdir, "frames")
     ensure_outdir(frames_dir)
 
-    fig, axs = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
+    fig, ax = plt.subplots(1, 1, figsize=(8, 8), constrained_layout=True)
     def render(t: float, U):
         rho, ux, uy, p = eqs.primitive(U)
         # Convert torch tensors to numpy for plotting
@@ -74,26 +74,23 @@ def main() -> None:
             import torch  # type: ignore
             if isinstance(rho, (torch.Tensor,)):
                 rho = rho.detach().cpu().numpy()
-                uy = uy.detach().cpu().numpy()
         except Exception:
             pass
         
-        axs[0].cla(); axs[1].cla()
-        axs[0].imshow(rho, origin='lower', extent=[0, Lx, 0, Ly], aspect='auto')
-        axs[0].set_title(f"rho t={t:.3f}")
-        axs[1].imshow(uy, origin='lower', extent=[0, Lx, 0, Ly], aspect='auto')
-        axs[1].set_title("uy")
-        for ax in axs:
-            ax.set_xlabel('x'); ax.set_ylabel('y')
+        ax.cla()
+        ax.imshow(rho, origin='lower', extent=[0, Lx, 0, Ly], aspect='equal')
+        ax.set_title(f"Density t={t:.3f}")
+        ax.set_xlabel('x')
+        ax.set_ylabel('y')
         fig.canvas.draw(); fig.canvas.flush_events()
         fig.savefig(os.path.join(frames_dir, f"frame_{t:08.3f}.png"), dpi=120)
+        
+        # Save snapshot at every output interval
+        snapshot_path = save_solution_snapshot(outdir, t, U=U, grid=grid, equations=eqs)
+        print(f"Saved snapshot at t={t:.3f}: {snapshot_path}")
 
     solver.run(U0, t0=t0, t_end=t_end, output_interval=output_interval, outdir=outdir, on_output=render)
     plt.close(fig)
-    
-    # Save final snapshot and a final image
-    snapshot_path = save_solution_snapshot(outdir, solver.t, U=solver.U, grid=grid, equations=eqs)
-    print(f"Saved final snapshot: {snapshot_path}")
     
     rho, ux, uy, p = eqs.primitive(solver.U)
     # Convert torch tensors to numpy for plotting
@@ -101,13 +98,14 @@ def main() -> None:
         import torch  # type: ignore
         if isinstance(rho, (torch.Tensor,)):
             rho = rho.detach().cpu().numpy()
-            uy = uy.detach().cpu().numpy()
     except Exception:
         pass
     
-    plt.figure(figsize=(10,4))
-    plt.subplot(1,2,1); plt.imshow(rho, origin='lower', extent=[0, Lx, 0, Ly], aspect='auto'); plt.title(f"rho t={solver.t:.3f}")
-    plt.subplot(1,2,2); plt.imshow(uy, origin='lower', extent=[0, Lx, 0, Ly], aspect='auto'); plt.title("uy")
+    plt.figure(figsize=(8, 8))
+    plt.imshow(rho, origin='lower', extent=[0, Lx, 0, Ly], aspect='equal')
+    plt.title(f"Density t={solver.t:.3f}")
+    plt.xlabel('x')
+    plt.ylabel('y')
     plt.tight_layout()
     plt.savefig(os.path.join(outdir, f"khi2d_t{solver.t:.3f}.png"), dpi=150)
     plt.close()
