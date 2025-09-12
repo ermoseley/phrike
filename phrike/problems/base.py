@@ -96,6 +96,23 @@ class BaseProblem(ABC):
         self.filter_config = self.config["integration"].get(
             "spectral_filter", {"enabled": False}
         )
+        
+        # Adaptive time-stepping parameters
+        adaptive_raw = self.config["integration"].get("adaptive", None)
+        if adaptive_raw:
+            self.adaptive_config = {
+                "enabled": bool(adaptive_raw.get("enabled", False)),
+                "scheme": str(adaptive_raw.get("scheme", "rk45")),
+                "rtol": float(adaptive_raw.get("rtol", 1e-6)),
+                "atol": float(adaptive_raw.get("atol", 1e-8)),
+                "safety_factor": float(adaptive_raw.get("safety_factor", 0.9)),
+                "min_dt_factor": float(adaptive_raw.get("min_dt_factor", 0.1)),
+                "max_dt_factor": float(adaptive_raw.get("max_dt_factor", 5.0)),
+                "max_rejections": int(adaptive_raw.get("max_rejections", 10)),
+                "fallback_scheme": str(adaptive_raw.get("fallback_scheme", "rk4"))
+            }
+        else:
+            self.adaptive_config = None
 
         # FFT workers
         self.fft_workers = int(
@@ -606,7 +623,8 @@ class BaseProblem(ABC):
         # Create solver
         solver_class = self.get_solver_class()
         solver = solver_class(
-            grid=grid, equations=equations, scheme=self.scheme, cfl=self.cfl
+            grid=grid, equations=equations, scheme=self.scheme, cfl=self.cfl,
+            adaptive_config=self.adaptive_config
         )
 
         # Setup visualization

@@ -15,6 +15,7 @@ except Exception:
 
 from .grid import Grid1D, Grid2D, Grid3D
 from .equations import EulerEquations1D, EulerEquations2D, EulerEquations3D
+from .adaptive import AdaptiveTimeStepper, create_adaptive_stepper
 
 
 Array = np.ndarray
@@ -55,22 +56,28 @@ def _apply_physical_filters(grid: Grid1D, U: Array) -> Array:
 class SpectralSolver1D:
     grid: Grid1D
     equations: EulerEquations1D
-    scheme: str = "rk4"  # "rk2" or "rk4"
+    scheme: str = "rk4"  # "rk2", "rk4", "rk23", "rk45", "rk78"
     cfl: float = 0.4
 
     # Runtime state
     t: float = 0.0
     U: Optional[Array] = None
+    
+    # Adaptive time-stepping
+    adaptive_stepper: Optional[AdaptiveTimeStepper] = None
+    adaptive_enabled: bool = False
 
-    def __init__(self, grid: Grid1D, equations: EulerEquations1D, U0: Optional[Array] = None, scheme: str = "rk4", cfl: float = 0.4):
+    def __init__(self, grid: Grid1D, equations: EulerEquations1D, U0: Optional[Array] = None, 
+                 scheme: str = "rk4", cfl: float = 0.4, adaptive_config: Optional[Dict] = None):
         """Initialize the 1D spectral solver.
         
         Args:
             grid: 1D grid
             equations: 1D Euler equations
             U0: Initial solution (optional)
-            scheme: Time integration scheme ("rk2" or "rk4")
+            scheme: Time integration scheme ("rk2", "rk4", "rk23", "rk45", "rk78")
             cfl: CFL number
+            adaptive_config: Configuration for adaptive time-stepping
         """
         self.grid = grid
         self.equations = equations
@@ -78,6 +85,34 @@ class SpectralSolver1D:
         self.cfl = cfl
         self.t = 0.0
         self.U = U0
+        
+        # Setup adaptive time-stepping if configured
+        self.adaptive_enabled = False
+        self.adaptive_stepper = None
+        
+        if adaptive_config and adaptive_config.get("enabled", False):
+            adaptive_method = adaptive_config.get("scheme", "rk45")
+            rtol = adaptive_config.get("rtol", 1e-6)
+            atol = adaptive_config.get("atol", 1e-8)
+            
+            # Extract controller parameters
+            controller_kwargs = {
+                "safety_factor": adaptive_config.get("safety_factor", 0.9),
+                "min_dt_factor": adaptive_config.get("min_dt_factor", 0.1),
+                "max_dt_factor": adaptive_config.get("max_dt_factor", 5.0),
+                "max_rejections": adaptive_config.get("max_rejections", 10)
+            }
+            
+            # Check if scheme is adaptive
+            if adaptive_method in ["rk23", "rk45", "rk78"]:
+                self.adaptive_stepper = create_adaptive_stepper(
+                    adaptive_method, rtol=rtol, atol=atol, **controller_kwargs
+                )
+                self.adaptive_enabled = True
+                self.scheme = adaptive_method
+            else:
+                # Fall back to non-adaptive scheme
+                self.scheme = adaptive_config.get("fallback_scheme", "rk4")
 
     def compute_dt(self, U: Array) -> float:
         max_speed = self.equations.max_wave_speed(U)
@@ -87,12 +122,97 @@ class SpectralSolver1D:
         return self.cfl * self.grid.dx / max_speed
 
     def step(self, U: Array, dt: float) -> Array:
+        """Perform one time step using the configured scheme.
+        
+        Args:
+            U: Current solution vector
+            dt: Time step
+            
+        Returns:
+            New solution vector
+        """
+        if self.adaptive_enabled and self.adaptive_stepper is not None:
+            # Use adaptive time-stepping
+            return self._adaptive_step(U, dt)
+        else:
+            # Use fixed time-stepping
+            return self._fixed_step(U, dt)
+    
+    def _fixed_step(self, U: Array, dt: float) -> Array:
+        """Perform one fixed time step."""
         if self.scheme.lower() == "rk2":
             Un = _rk2_step(self.grid, self.equations, U, dt)
         else:
             Un = _rk4_step(self.grid, self.equations, U, dt)
         Un = _apply_physical_filters(self.grid, Un)
         return Un
+    
+    def _adaptive_step(self, U: Array, dt: float) -> Array:
+        """Perform one adaptive time step."""
+        def rhs_func(U_current: Array) -> Array:
+            """RHS function for adaptive stepper."""
+            return _compute_rhs(self.grid, self.equations, U_current)
+        
+        # Compute solution scale for relative error
+        if _TORCH_AVAILABLE and isinstance(U, torch.Tensor):
+            solution_scale = float(torch.max(torch.abs(U)).item())
+        else:
+            solution_scale = float(np.max(np.abs(U)))
+        
+        # Perform adaptive step
+        result = self.adaptive_stepper.step(rhs_func, U, dt, solution_scale)
+        
+        # Apply spectral filtering to accepted solution
+        if result.accepted:
+            Un = _apply_physical_filters(self.grid, result.U_new)
+        else:
+            # Return original solution if step was rejected
+            Un = U
+            
+        return Un
+    
+    def _adaptive_run_step(self, dt: float, step_count: int, 
+                          on_step: Optional[Callable[[int, float, Array], None]]) -> float:
+        """Perform one step in adaptive run loop."""
+        def rhs_func(U_current: Array) -> Array:
+            return _compute_rhs(self.grid, self.equations, U_current)
+        
+        # Compute solution scale for relative error
+        if _TORCH_AVAILABLE and isinstance(self.U, torch.Tensor):
+            solution_scale = float(torch.max(torch.abs(self.U)).item())
+        else:
+            solution_scale = float(np.max(np.abs(self.U)))
+        
+        # Perform adaptive step
+        result = self.adaptive_stepper.step(rhs_func, self.U, dt, solution_scale)
+        
+        if result.accepted:
+            # Step accepted - update solution and time
+            self.U = _apply_physical_filters(self.grid, result.U_new)
+            self.t += dt
+            
+            # Call monitoring callback
+            if on_step is not None:
+                on_step(step_count, dt, self.U)
+            
+            # Return recommended next step size
+            return result.dt_next
+        else:
+            # Step rejected - return recommended smaller step size
+            return result.dt_next
+    
+    def _fixed_run_step(self, dt: float, step_count: int,
+                       on_step: Optional[Callable[[int, float, Array], None]]) -> float:
+        """Perform one step in fixed run loop."""
+        self.U = self.step(self.U, dt)
+        self.t += dt
+        
+        # Call monitoring callback
+        if on_step is not None:
+            on_step(step_count, dt, self.U)
+        
+        # Return next CFL-based step size
+        return min(self.compute_dt(self.U), 1e-6 if self.equations.max_wave_speed(self.U) <= 0.0 else float('inf'))
 
     def run(
         self,
@@ -138,15 +258,21 @@ class SpectralSolver1D:
         if on_output is not None:
             on_output(self.t, self.U)
 
+        # Initialize time step
+        dt = self.compute_dt(self.U) if self.U is not None else 1e-6
+        
         while self.t < t_end - 1e-12:
-            dt = min(self.compute_dt(self.U), t_end - self.t)  # type: ignore[arg-type]
-            self.U = self.step(self.U, dt)  # type: ignore[arg-type]
-            self.t += dt
+            # Ensure we don't overshoot the end time
+            dt = min(dt, t_end - self.t)
+            
+            if self.adaptive_enabled and self.adaptive_stepper is not None:
+                # Adaptive time-stepping
+                dt = self._adaptive_run_step(dt, step_count, on_step)
+            else:
+                # Fixed time-stepping (original behavior)
+                dt = self._fixed_run_step(dt, step_count, on_step)
+            
             step_count += 1
-
-            # Call step monitoring callback
-            if on_step is not None:
-                on_step(step_count, dt, self.U)
 
             if self.t + 1e-12 >= next_output:
                 record()
@@ -209,6 +335,57 @@ class SpectralSolver2D:
 
     t: float = 0.0
     U: Optional[Array] = None
+    
+    # Adaptive time-stepping
+    adaptive_stepper: Optional[AdaptiveTimeStepper] = None
+    adaptive_enabled: bool = False
+
+    def __init__(self, grid: Grid2D, equations: EulerEquations2D, U0: Optional[Array] = None, 
+                 scheme: str = "rk4", cfl: float = 0.3, adaptive_config: Optional[Dict] = None):
+        """Initialize the 2D spectral solver.
+        
+        Args:
+            grid: 2D grid
+            equations: 2D Euler equations
+            U0: Initial solution (optional)
+            scheme: Time integration scheme ("rk2", "rk4", "rk23", "rk45", "rk78")
+            cfl: CFL number
+            adaptive_config: Configuration for adaptive time-stepping
+        """
+        self.grid = grid
+        self.equations = equations
+        self.scheme = scheme
+        self.cfl = cfl
+        self.t = 0.0
+        self.U = U0
+        
+        # Setup adaptive time-stepping if configured
+        self.adaptive_enabled = False
+        self.adaptive_stepper = None
+        
+        if adaptive_config and adaptive_config.get("enabled", False):
+            adaptive_method = adaptive_config.get("scheme", "rk45")
+            rtol = adaptive_config.get("rtol", 1e-6)
+            atol = adaptive_config.get("atol", 1e-8)
+            
+            # Extract controller parameters
+            controller_kwargs = {
+                "safety_factor": adaptive_config.get("safety_factor", 0.9),
+                "min_dt_factor": adaptive_config.get("min_dt_factor", 0.1),
+                "max_dt_factor": adaptive_config.get("max_dt_factor", 5.0),
+                "max_rejections": adaptive_config.get("max_rejections", 10)
+            }
+            
+            # Check if scheme is adaptive
+            if adaptive_method in ["rk23", "rk45", "rk78"]:
+                self.adaptive_stepper = create_adaptive_stepper(
+                    adaptive_method, rtol=rtol, atol=atol, **controller_kwargs
+                )
+                self.adaptive_enabled = True
+                self.scheme = adaptive_method
+            else:
+                # Fall back to non-adaptive scheme
+                self.scheme = adaptive_config.get("fallback_scheme", "rk4")
 
     def compute_dt(self, U: Array) -> float:
         max_speed = self.equations.max_wave_speed(U)
@@ -218,12 +395,86 @@ class SpectralSolver2D:
         return self.cfl * min(self.grid.dx, self.grid.dy) / max_speed
 
     def step(self, U: Array, dt: float) -> Array:
+        """Perform one time step using the configured scheme.
+        
+        Args:
+            U: Current solution vector
+            dt: Time step
+            
+        Returns:
+            New solution vector
+        """
+        if self.adaptive_enabled and self.adaptive_stepper is not None:
+            # Use adaptive time-stepping
+            return self._adaptive_step(U, dt)
+        else:
+            # Use fixed time-stepping
+            return self._fixed_step(U, dt)
+    
+    def _fixed_step(self, U: Array, dt: float) -> Array:
+        """Perform one fixed time step."""
         if self.scheme.lower() == "rk2":
             Un = _rk2_step_2d(self.grid, self.equations, U, dt)
         else:
             Un = _rk4_step_2d(self.grid, self.equations, U, dt)
         Un = _apply_physical_filters_2d(self.grid, Un)
         return Un
+    
+    def _adaptive_step(self, U: Array, dt: float) -> Array:
+        """Perform one adaptive time step."""
+        def rhs_func(U_current: Array) -> Array:
+            """RHS function for adaptive stepper."""
+            return _compute_rhs_2d(self.grid, self.equations, U_current)
+        
+        # Compute solution scale for relative error
+        if _TORCH_AVAILABLE and isinstance(U, torch.Tensor):
+            solution_scale = float(torch.max(torch.abs(U)).item())
+        else:
+            solution_scale = float(np.max(np.abs(U)))
+        
+        result = self.adaptive_stepper.step(rhs_func, U, dt, solution_scale, self.adaptive_stepper.controller)
+        
+        if result.accepted:
+            Un = _apply_physical_filters_2d(self.grid, result.U_new)
+        else:
+            Un = U
+            
+        return Un
+
+    def _adaptive_run_step(self, dt: float, step_count: int, 
+                          on_step: Optional[Callable[[int, float, Array], None]]) -> float:
+        """Perform one step in adaptive run loop."""
+        def rhs_func(U_current: Array) -> Array:
+            return _compute_rhs_2d(self.grid, self.equations, U_current)
+        
+        if _TORCH_AVAILABLE and isinstance(self.U, torch.Tensor):
+            solution_scale = float(torch.max(torch.abs(self.U)).item())
+        else:
+            solution_scale = float(np.max(np.abs(self.U)))
+        
+        result = self.adaptive_stepper.step(rhs_func, self.U, dt, solution_scale)
+        
+        if result.accepted:
+            self.U = _apply_physical_filters_2d(self.grid, result.U_new)
+            self.t += dt
+            if on_step is not None:
+                on_step(step_count, dt, self.U)
+            return result.dt_next
+        else:
+            return result.dt_next
+    
+    def _fixed_run_step(self, dt: float, step_count: int,
+                       on_step: Optional[Callable[[int, float, Array], None]]) -> float:
+        """Perform one step in fixed run loop."""
+        self.U = self.step(self.U, dt)
+        self.t += dt
+        
+        # Call monitoring callback
+        if on_step is not None:
+            on_step(step_count, dt, self.U)
+        
+        # Return next CFL-based step size
+        return min(self.compute_dt(self.U), 1e-6 if self.equations.max_wave_speed(self.U) <= 0.0 else float('inf'))
 
     def run(
         self,
@@ -291,15 +542,21 @@ class SpectralSolver2D:
         if on_output is not None:
             on_output(self.t, self.U)
 
+        # Initialize time step
+        dt = self.compute_dt(self.U) if self.U is not None else 1e-6
+        
         while self.t < t_end - 1e-12:
-            dt = min(self.compute_dt(self.U), t_end - self.t)  # type: ignore[arg-type]
-            self.U = self.step(self.U, dt)  # type: ignore[arg-type]
-            self.t += dt
+            # Ensure we don't overshoot the end time
+            dt = min(dt, t_end - self.t)
+            
+            if self.adaptive_enabled and self.adaptive_stepper is not None:
+                # Adaptive time-stepping
+                dt = self._adaptive_run_step(dt, step_count, on_step)
+            else:
+                # Fixed time-stepping (original behavior)
+                dt = self._fixed_run_step(dt, step_count, on_step)
+            
             step_count += 1
-
-            # Call step monitoring callback
-            if on_step is not None:
-                on_step(step_count, dt, self.U)
 
             if self.t + 1e-12 >= next_output:
                 record()
@@ -358,6 +615,57 @@ class SpectralSolver3D:
 
     t: float = 0.0
     U: Optional[Array] = None
+    
+    # Adaptive time-stepping
+    adaptive_stepper: Optional[AdaptiveTimeStepper] = None
+    adaptive_enabled: bool = False
+
+    def __init__(self, grid: Grid3D, equations: EulerEquations3D, U0: Optional[Array] = None, 
+                 scheme: str = "rk4", cfl: float = 0.25, adaptive_config: Optional[Dict] = None):
+        """Initialize the 3D spectral solver.
+        
+        Args:
+            grid: 3D grid
+            equations: 3D Euler equations
+            U0: Initial solution (optional)
+            scheme: Time integration scheme ("rk2", "rk4", "rk23", "rk45", "rk78")
+            cfl: CFL number
+            adaptive_config: Configuration for adaptive time-stepping
+        """
+        self.grid = grid
+        self.equations = equations
+        self.scheme = scheme
+        self.cfl = cfl
+        self.t = 0.0
+        self.U = U0
+        
+        # Setup adaptive time-stepping if configured
+        self.adaptive_enabled = False
+        self.adaptive_stepper = None
+        
+        if adaptive_config and adaptive_config.get("enabled", False):
+            adaptive_method = adaptive_config.get("scheme", "rk45")
+            rtol = adaptive_config.get("rtol", 1e-6)
+            atol = adaptive_config.get("atol", 1e-8)
+            
+            # Extract controller parameters
+            controller_kwargs = {
+                "safety_factor": adaptive_config.get("safety_factor", 0.9),
+                "min_dt_factor": adaptive_config.get("min_dt_factor", 0.1),
+                "max_dt_factor": adaptive_config.get("max_dt_factor", 5.0),
+                "max_rejections": adaptive_config.get("max_rejections", 10)
+            }
+            
+            # Check if scheme is adaptive
+            if adaptive_method in ["rk23", "rk45", "rk78"]:
+                self.adaptive_stepper = create_adaptive_stepper(
+                    adaptive_method, rtol=rtol, atol=atol, **controller_kwargs
+                )
+                self.adaptive_enabled = True
+                self.scheme = adaptive_method
+            else:
+                # Fall back to non-adaptive scheme
+                self.scheme = adaptive_config.get("fallback_scheme", "rk4")
 
     def compute_dt(self, U: Array) -> float:
         max_speed = self.equations.max_wave_speed(U)
@@ -366,12 +674,86 @@ class SpectralSolver3D:
         return self.cfl * min(self.grid.dx, self.grid.dy, self.grid.dz) / max_speed
 
     def step(self, U: Array, dt: float) -> Array:
+        """Perform one time step using the configured scheme.
+        
+        Args:
+            U: Current solution vector
+            dt: Time step
+            
+        Returns:
+            New solution vector
+        """
+        if self.adaptive_enabled and self.adaptive_stepper is not None:
+            # Use adaptive time-stepping
+            return self._adaptive_step(U, dt)
+        else:
+            # Use fixed time-stepping
+            return self._fixed_step(U, dt)
+    
+    def _fixed_step(self, U: Array, dt: float) -> Array:
+        """Perform one fixed time step."""
         if self.scheme.lower() == "rk2":
             Un = _rk2_step_3d(self.grid, self.equations, U, dt)
         else:
             Un = _rk4_step_3d(self.grid, self.equations, U, dt)
         Un = _apply_physical_filters_3d(self.grid, Un)
         return Un
+    
+    def _adaptive_step(self, U: Array, dt: float) -> Array:
+        """Perform one adaptive time step."""
+        def rhs_func(U_current: Array) -> Array:
+            """RHS function for adaptive stepper."""
+            return _compute_rhs_3d(self.grid, self.equations, U_current)
+        
+        # Compute solution scale for relative error
+        if _TORCH_AVAILABLE and isinstance(U, torch.Tensor):
+            solution_scale = float(torch.max(torch.abs(U)).item())
+        else:
+            solution_scale = float(np.max(np.abs(U)))
+        
+        result = self.adaptive_stepper.step(rhs_func, U, dt, solution_scale, self.adaptive_stepper.controller)
+        
+        if result.accepted:
+            Un = _apply_physical_filters_3d(self.grid, result.U_new)
+        else:
+            Un = U
+            
+        return Un
+
+    def _adaptive_run_step(self, dt: float, step_count: int, 
+                          on_step: Optional[Callable[[int, float, Array], None]]) -> float:
+        """Perform one step in adaptive run loop."""
+        def rhs_func(U_current: Array) -> Array:
+            return _compute_rhs_3d(self.grid, self.equations, U_current)
+        
+        if _TORCH_AVAILABLE and isinstance(self.U, torch.Tensor):
+            solution_scale = float(torch.max(torch.abs(self.U)).item())
+        else:
+            solution_scale = float(np.max(np.abs(self.U)))
+        
+        result = self.adaptive_stepper.step(rhs_func, self.U, dt, solution_scale)
+        
+        if result.accepted:
+            self.U = _apply_physical_filters_3d(self.grid, result.U_new)
+            self.t += dt
+            if on_step is not None:
+                on_step(step_count, dt, self.U)
+            return result.dt_next
+        else:
+            return result.dt_next
+    
+    def _fixed_run_step(self, dt: float, step_count: int,
+                       on_step: Optional[Callable[[int, float, Array], None]]) -> float:
+        """Perform one step in fixed run loop."""
+        self.U = self.step(self.U, dt)
+        self.t += dt
+        
+        # Call monitoring callback
+        if on_step is not None:
+            on_step(step_count, dt, self.U)
+        
+        # Return next CFL-based step size
+        return min(self.compute_dt(self.U), 1e-6 if self.equations.max_wave_speed(self.U) <= 0.0 else float('inf'))
 
     def run(
         self,
@@ -451,15 +833,21 @@ class SpectralSolver3D:
         if on_output is not None:
             on_output(self.t, self.U)
 
+        # Initialize time step
+        dt = self.compute_dt(self.U) if self.U is not None else 1e-6
+        
         while self.t < t_end - 1e-12:
-            dt = min(self.compute_dt(self.U), t_end - self.t)  # type: ignore[arg-type]
-            self.U = self.step(self.U, dt)  # type: ignore[arg-type]
-            self.t += dt
+            # Ensure we don't overshoot the end time
+            dt = min(dt, t_end - self.t)
+            
+            if self.adaptive_enabled and self.adaptive_stepper is not None:
+                # Adaptive time-stepping
+                dt = self._adaptive_run_step(dt, step_count, on_step)
+            else:
+                # Fixed time-stepping (original behavior)
+                dt = self._fixed_run_step(dt, step_count, on_step)
+            
             step_count += 1
-
-            # Call step monitoring callback
-            if on_step is not None:
-                on_step(step_count, dt, self.U)
 
             if self.t + 1e-12 >= next_output:
                 record()

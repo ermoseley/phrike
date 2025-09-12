@@ -1,0 +1,55 @@
+# Configuration for 1D Gaussian wave packet - Traveling version with adaptive time-stepping
+# Tests convergence, dispersion, and profile preservation
+problem: gaussian_wave1d
+
+grid:
+  N: 512            # number of points (power of 2 recommended for spectral methods)
+  Lx: 6.283185307179586  # domain length 2π for periodic BCs
+  dealias: true     # apply 2/3-rule dealiasing
+
+physics:
+  gamma: 1.4        # adiabatic index
+
+integration:
+  t0: 0.0
+  t_end: 6.283185307179586  # one sound crossing time (2π/c_s)
+  cfl: 0.4          # Upper bound for dt
+  scheme: rk4       # Fallback for non-adaptive
+  output_interval: 0.6283185307179586  # 0.1 * crossing time
+  checkpoint_interval: 1.2566370614359172  # 0.2 * crossing time
+  spectral_filter:
+    enabled: true
+    p: 8            # even integer >= 2
+    alpha: 36.0     # filter strength
+  
+  # Adaptive time-stepping configuration
+  adaptive:
+    enabled: true
+    scheme: rk45    # rk23, rk45, rk78
+    rtol: 1e-6      # Relative tolerance
+    atol: 1e-8      # Absolute tolerance
+    safety_factor: 0.9
+    min_dt_factor: 0.1
+    max_dt_factor: 5.0
+    max_rejections: 10
+    fallback_scheme: rk4
+
+initial_conditions:
+  wave_type: traveling  # traveling wave packet
+  rho0: 1.0         # background density
+  u0: 0.0           # background velocity (at rest)
+  p0: 1.0           # background pressure
+  amplitude: 1e-6   # Gaussian amplitude (same as acoustic test)
+  sigma: 0.2        # Gaussian width
+  x0: 3.141592653589793  # center at π (middle of domain)
+
+io:
+  outdir: outputs/gaussian_wave_traveling_adaptive
+  save_spectra: true
+
+monitoring:
+  enabled: true
+  step_interval: 100
+  include_conservation: true
+  include_timestep: true
+  include_time: true

@@ -1,0 +1,58 @@
+# Configuration for 1D Sod shock tube with adaptive time-stepping
+problem: sod
+
+grid:
+  N: 512           # number of points (power of 2 recommended)
+  Lx: 1.0           # domain length
+  x0: 0.5           # discontinuity location
+  dealias: true     # apply 2/3-rule dealiasing
+
+physics:
+  gamma: 1.4
+
+integration:
+  t0: 0.0
+  t_end: 0.2
+  cfl: 0.4          # Upper bound for dt
+  scheme: rk4       # Fallback for non-adaptive
+  output_interval: 0.02
+  checkpoint_interval: 0.1
+  spectral_filter:
+    enabled: true
+    p: 8            # even integer >= 2
+    alpha: 36.0     # filter strength
+  
+  # Adaptive time-stepping configuration
+  adaptive:
+    enabled: true
+    scheme: rk45    # rk23, rk45, rk78
+    rtol: 1e-6      # Relative tolerance
+    atol: 1e-8      # Absolute tolerance
+    safety_factor: 0.9
+    min_dt_factor: 0.1
+    max_dt_factor: 5.0
+    max_rejections: 10
+    fallback_scheme: rk4  # Fallback if adaptive fails
+
+initial_conditions:
+  left:
+    rho: 1.0
+    u: 0.0
+    p: 1.0
+  right:
+    rho: 0.125
+    u: 0.0
+    p: 0.1
+
+io:
+  outdir: outputs/sod_adaptive
+  save_spectra: true
+
+monitoring:
+  enabled: true
+  step_interval: 100
+  include_conservation: true
+  include_timestep: true
+  include_time: true
+  include_velocity_stats: true
+  include_density_stats: true
