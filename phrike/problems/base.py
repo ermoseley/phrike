@@ -1,4 +1,4 @@
-"""Base problem class for Hydra simulations."""
+"""Base problem class for PHRIKE simulations."""
 
 import os
 import subprocess
@@ -13,7 +13,7 @@ from phrike.io import load_config, ensure_outdir
 
 
 class BaseProblem(ABC):
-    """Base class for all Hydra problems."""
+    """Base class for all PHRIKE problems."""
 
     @staticmethod
     def clear_numba_cache():
@@ -474,15 +474,22 @@ class BaseProblem(ABC):
                     f"Unexpected number of primitive variables: {len(primitive_vars)}"
                 )
 
-        # Compute relative errors
+        # Compute conservation errors relative to initial values.
+        # Keep sign for mass and energy; keep momentum errors absolute.
         errors = {}
         for key, initial_val in self.monitoring_initial_values.items():
-            if key in current_cons and initial_val != 0:
-                errors[f"{key}_error"] = abs(
-                    (current_cons[key] - initial_val) / initial_val
-                )
-            elif key in current_cons:
-                errors[f"{key}_error"] = abs(current_cons[key] - initial_val)
+            if key in current_cons:
+                if initial_val != 0:
+                    delta = (current_cons[key] - initial_val) / initial_val
+                else:
+                    delta = current_cons[key] - initial_val
+
+                # Momentum components (including 1D 'momentum') remain absolute
+                if key.startswith("momentum"):
+                    errors[f"{key}_error"] = abs(delta)
+                else:
+                    # mass and energy (and any other conserved scalars) keep sign
+                    errors[f"{key}_error"] = delta
 
         return errors
 
