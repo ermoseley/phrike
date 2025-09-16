@@ -15,7 +15,7 @@ integration:
   t_end: 6.283185307179586  # one sound crossing time (2π/c_s)
   cfl: 0.4          # Upper bound for dt
   scheme: rk4       # Fallback for non-adaptive
-  output_interval: 0.00025  # High frame rate for smooth video
+  output_interval: 0.1      # Reasonable frame rate for video
   checkpoint_interval: 1.2566370614359172  # 0.2 * crossing time
   spectral_filter:
     enabled: true

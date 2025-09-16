@@ -1,4 +1,4 @@
-"""Hydra package initialization."""
+"""PHRIKE package initialization."""
 
 # Register all problems
 from .problems import register  # noqa: F401
