@@ -103,7 +103,10 @@ def _build_exponential_filter_3d(
 
 @dataclass
 class Grid1D:
-    """Uniform periodic 1D grid and spectral operators.
+    """1D grid and spectral operators with pluggable basis.
+
+    Default is periodic Fourier basis on a uniform grid, preserving existing
+    behavior. Optionally, a Chebyshev basis with non-periodic BCs can be used.
 
     Attributes
     ----------
@@ -111,8 +114,12 @@ class Grid1D:
         Number of spatial points.
     Lx : float
         Domain length.
+    basis : str
+        Spectral basis: "fourier" (default) or "chebyshev".
+    bc : Optional[str]
+        Boundary condition for non-periodic bases (e.g., "dirichlet").
     dealias : bool
-        If True, apply 2/3-rule dealiasing mask in spectral space.
+        If True, apply 2/3-rule dealiasing mask in spectral space (Fourier only).
     filter_params : Optional[Dict[str, float]]
         Optional exponential filter configuration with keys:
         - enabled: bool
@@ -122,6 +129,8 @@ class Grid1D:
 
     N: int
     Lx: float
+    basis: str = "fourier"
+    bc: Optional[str] = None
     dealias: bool = True
     filter_params: Optional[Dict[str, float]] = None
     fft_workers: int = 1
@@ -129,21 +138,55 @@ class Grid1D:
     torch_device: Optional[str] = None
 
     def __post_init__(self) -> None:
-        self.dx = self.Lx / self.N
-        self.x = np.linspace(0.0, self.Lx, num=self.N, endpoint=False)
-        # Physical-to-spectral wave numbers (2*pi/L scaling)
-        k_index = np.fft.fftfreq(self.N, d=self.dx)  # cycles per length
-        self.k = 2.0 * np.pi * k_index
-        self.ik = 1j * self.k
+        # Basis selection (Fourier default)
+        self._basis_name = str(self.basis).lower()
 
-        # Dealias mask and optional spectral filter
-        self.dealias_mask = _build_filter_mask(self.N, self.dealias)
+        if self._basis_name == "fourier":
+            # Existing periodic uniform grid path
+            self.dx = self.Lx / self.N
+            self.x = np.linspace(0.0, self.Lx, num=self.N, endpoint=False)
+            # Physical-to-spectral wave numbers (2*pi/L scaling)
+            k_index = np.fft.fftfreq(self.N, d=self.dx)  # cycles per length
+            self.k = 2.0 * np.pi * k_index
+            self.ik = 1j * self.k
 
-        self.filter_sigma = np.ones(self.N, dtype=float)
-        if self.filter_params and bool(self.filter_params.get("enabled", False)):
-            p = int(self.filter_params.get("p", 8))
-            alpha = float(self.filter_params.get("alpha", 36.0))
-            self.filter_sigma = _build_exponential_filter(self.N, p=p, alpha=alpha)
+            # Dealias mask and optional spectral filter
+            self.dealias_mask = _build_filter_mask(self.N, self.dealias)
+
+            self.filter_sigma = np.ones(self.N, dtype=float)
+            if self.filter_params and bool(self.filter_params.get("enabled", False)):
+                p = int(self.filter_params.get("p", 8))
+                alpha = float(self.filter_params.get("alpha", 36.0))
+                self.filter_sigma = _build_exponential_filter(self.N, p=p, alpha=alpha)
+
+            # Initialize Fourier basis instance (NumPy path used inside helpers)
+            try:
+                from .basis.fourier import FourierBasis1D
+
+                self._basis = FourierBasis1D(self.N, self.Lx, fft_workers=self.fft_workers)
+            except Exception:
+                self._basis = None  # Fallback to direct FFT wrappers below
+        elif self._basis_name == "chebyshev":
+            # Chebyshev–Gauss–Lobatto nodes on [0, Lx]
+            try:
+                from .basis.chebyshev import ChebyshevBasis1D
+
+                bc = self.bc or "dirichlet"
+                self._basis = ChebyshevBasis1D(self.N, self.Lx, bc=bc, fft_workers=self.fft_workers)
+                self.x = self._basis.nodes()
+                # Use min spacing as stability proxy for CFL
+                x_np = np.asarray(self.x)
+                if self.N > 1:
+                    self.dx = float(np.min(np.diff(x_np)))
+                else:
+                    self.dx = self.Lx
+                # No Fourier dealias/filter masks in Chebyshev mode
+                self.dealias_mask = np.ones(self.N, dtype=float)
+                self.filter_sigma = np.ones(self.N, dtype=float)
+            except Exception as e:
+                raise RuntimeError(f"Chebyshev basis initialization failed: {e}")
+        else:
+            raise ValueError(f"Unknown basis: {self.basis}")
 
         # Enable FFTW planning cache if available (no-op with SciPy backend)
         if scipy_fft_cache_enabled and fftw_cache is not None:
@@ -154,7 +197,7 @@ class Grid1D:
             except Exception:
                 pass
 
-        # Torch backend setup
+        # Torch backend setup (Fourier and Chebyshev supported)
         self._use_torch = (self.backend.lower() == "torch") and _TORCH_AVAILABLE
         if self._use_torch:
             # Choose device if not provided
@@ -184,19 +227,20 @@ class Grid1D:
             self.x = torch.from_numpy(np.asarray(self.x)).to(
                 dtype=torch_dtype, device=self.torch_device
             )
-            k_t = torch.from_numpy(np.asarray(self.k)).to(
-                dtype=torch_dtype, device=self.torch_device
-            )
-            self.k = k_t
-            self.ik = k_t.to(dtype=torch_cdtype) * (1j)
-            self.dealias_mask = torch.from_numpy(np.asarray(self.dealias_mask)).to(
-                dtype=torch_dtype, device=self.torch_device
-            )
-            self.filter_sigma = torch.from_numpy(np.asarray(self.filter_sigma)).to(
-                dtype=torch_dtype, device=self.torch_device
-            )
+            if self._basis_name == "fourier":
+                k_t = torch.from_numpy(np.asarray(self.k)).to(
+                    dtype=torch_dtype, device=self.torch_device
+                )
+                self.k = k_t
+                self.ik = k_t.to(dtype=torch_cdtype) * (1j)
+                self.dealias_mask = torch.from_numpy(np.asarray(self.dealias_mask)).to(
+                    dtype=torch_dtype, device=self.torch_device
+                )
+                self.filter_sigma = torch.from_numpy(np.asarray(self.filter_sigma)).to(
+                    dtype=torch_dtype, device=self.torch_device
+                )
 
-    # FFT wrappers
+    # FFT wrappers (Fourier basis only)
     def rfft(self, f: np.ndarray) -> np.ndarray:
         # FFT along the last axis to support batched inputs (..., N)
         if getattr(self, "_use_torch", False):
@@ -219,18 +263,30 @@ class Grid1D:
     # Spectral derivative
     def dx1(self, f: np.ndarray) -> np.ndarray:
         # Supports f with shape (..., N)
-        F = self.rfft(f)
-        F *= self.dealias_mask
-        F *= self.filter_sigma
-        dF = self.ik * F
-        return self.irfft(dF)
+        if self._basis_name == "fourier":
+            F = self.rfft(f)
+            F *= self.dealias_mask
+            F *= self.filter_sigma
+            dF = self.ik * F
+            return self.irfft(dF)
+        else:
+            # Chebyshev basis path (NumPy only)
+            return self._basis.dx(f)  # type: ignore[union-attr]
 
     def apply_spectral_filter(self, f: np.ndarray) -> np.ndarray:
         # Supports f with shape (..., N)
-        F = self.rfft(f)
-        F *= self.dealias_mask
-        F *= self.filter_sigma
-        return self.irfft(F)
+        if self._basis_name == "fourier":
+            F = self.rfft(f)
+            F *= self.dealias_mask
+            F *= self.filter_sigma
+            return self.irfft(F)
+        else:
+            # Apply exponential modal filter if configured
+            if self.filter_params and bool(self.filter_params.get("enabled", False)):
+                p = int(self.filter_params.get("p", 8))
+                alpha = float(self.filter_params.get("alpha", 36.0))
+                return self._basis.apply_spectral_filter(f, p=p, alpha=alpha)  # type: ignore[union-attr]
+            return f
 
     def convolve(self, f: np.ndarray, g: np.ndarray) -> np.ndarray:
         """Compute product in physical space, with dealiased spectral filtering.
@@ -240,6 +296,29 @@ class Grid1D:
         """
         h = f * g
         return self.apply_spectral_filter(h)
+
+    # --- Boundary conditions (1D) ---
+    def apply_boundary_conditions(self, U: np.ndarray, equations) -> np.ndarray:
+        """Apply boundary conditions to conservative variables U in-place.
+
+        For Chebyshev basis with reflective (wall) or Dirichlet BCs, we set
+        the velocity to zero at the endpoints (x=0 and x=Lx), which implies
+        zero momentum at the endpoints. Density and pressure are left unchanged.
+        """
+        if self._basis_name != "chebyshev":
+            return U
+        bc_type = (self.bc or "reflective").lower()
+        if U.shape[-1] != self.N:
+            return U
+        if U.shape[0] < 2:
+            return U
+        # Enforce u=0 at boundaries => momentum = 0 at boundaries
+        if bc_type in ("reflective", "dirichlet", "wall"):
+            # Support batched leading dims (..., 3, N)
+            # Only modify the momentum component index 1
+            U[..., 1, 0] = 0.0
+            U[..., 1, -1] = 0.0
+        return U
 
 
 @dataclass

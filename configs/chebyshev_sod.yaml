@@ -1,0 +1,57 @@
+# Chebyshev-based 1D Sod shock tube (non-periodic BC)
+problem: sod
+
+grid:
+  N: 512
+  Lx: 1.0
+  basis: chebyshev
+  bc: dirichlet     # reflective/dirichlet at endpoints for momentum
+  dealias: false    # not applicable to Chebyshev, left false
+
+physics:
+  gamma: 1.4
+
+integration:
+  t0: 0.0
+  t_end: 0.2
+  cfl: 0.2         # smaller CFL due to clustered nodes near boundaries
+  scheme: rk4
+  output_interval: 0.01
+  checkpoint_interval: 0.05
+  spectral_filter:
+    enabled: true
+    p: 8
+    alpha: 36.0
+
+initial_conditions:
+  left:
+    rho: 1.0
+    u: 0.0
+    p: 1.0
+  right:
+    rho: 0.125
+    u: 0.0
+    p: 0.1
+
+io:
+  outdir: outputs/sod_cheb
+  save_spectra: true
+
+monitoring:
+  enabled: true
+  step_interval: 100
+  include_conservation: true
+  include_timestep: true
+  include_time: true
+
+video:
+  fps: 30
+  width: 1280
+  height: 720
+  scale: 1.5
+  frame_dpi: 120
+  codec: h264_videotoolbox
+  crf: 20
+  preset: medium
+  pix_fmt: yuv420p
+

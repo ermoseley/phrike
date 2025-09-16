@@ -25,6 +25,9 @@ Array = np.ndarray
 def _compute_rhs(grid: Grid1D, eqs: EulerEquations1D, U: Array, 
                 artificial_viscosity: Optional[SpectralArtificialViscosity] = None) -> Array:
     # Pseudo-spectral: compute flux in physical space, then differentiate spectrally
+    # Enforce boundary conditions for non-periodic bases before computing flux
+    if hasattr(grid, "apply_boundary_conditions"):
+        U = grid.apply_boundary_conditions(U, eqs)
     F = eqs.flux(U)
     # Batched spectral derivative across components (shape (3, N))
     dFdx = grid.dx1(F)

@@ -18,9 +18,23 @@ def sod_shock_tube(
 
     left/right dictionaries should include keys: rho, u, p
     """
-    rho = np.where(x < x0, left["rho"], right["rho"])  # type: ignore[index]
-    u = np.where(x < x0, left["u"], right["u"])  # type: ignore[index]
-    p = np.where(x < x0, left["p"], right["p"])  # type: ignore[index]
+    # Support both NumPy arrays and Torch tensors for x
+    try:
+        import torch  # type: ignore
+
+        _TORCH_AVAILABLE = True
+    except Exception:
+        _TORCH_AVAILABLE = False
+        torch = None  # type: ignore
+
+    if _TORCH_AVAILABLE and isinstance(x, (torch.Tensor,)):
+        rho = torch.where(x < x0, torch.tensor(left["rho"], dtype=x.dtype, device=x.device), torch.tensor(right["rho"], dtype=x.dtype, device=x.device))
+        u = torch.where(x < x0, torch.tensor(left["u"], dtype=x.dtype, device=x.device), torch.tensor(right["u"], dtype=x.dtype, device=x.device))
+        p = torch.where(x < x0, torch.tensor(left["p"], dtype=x.dtype, device=x.device), torch.tensor(right["p"], dtype=x.dtype, device=x.device))
+    else:
+        rho = np.where(x < x0, left["rho"], right["rho"])  # type: ignore[index]
+        u = np.where(x < x0, left["u"], right["u"])  # type: ignore[index]
+        p = np.where(x < x0, left["p"], right["p"])  # type: ignore[index]
     eqs = EulerEquations1D(gamma=gamma)
     return eqs.conservative(rho, u, p)
 

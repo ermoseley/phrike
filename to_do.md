@@ -2,6 +2,9 @@
 ✅ rename spectralhydro directory to phrike
 Add new basis functions
     - Chebyshev + Filtering near discontinuities
+Add single-precision option
+
+After the fork:
 Add turbulent driving
 Add MPI
 Add MHD

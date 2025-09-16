@@ -42,10 +42,14 @@ class Acoustic1DProblem(BaseProblem):
         N = int(self.config["grid"]["N"])
         Lx = float(self.config["grid"]["Lx"])
         dealias = bool(self.config["grid"].get("dealias", True))
+        basis = str(self.config["grid"].get("basis", "fourier")).lower()
+        bc = self.config["grid"].get("bc", None)
 
         return Grid1D(
             N=N,
             Lx=Lx,
+            basis=basis,
+            bc=bc,
             dealias=dealias,
             filter_params=self.filter_config,
             fft_workers=self.fft_workers,

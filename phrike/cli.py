@@ -41,6 +41,20 @@ Examples:
         choices=["numpy", "torch"],
         help="Array backend (default: numpy)",
     )
+    # Basis options (1D only currently)
+    parser.add_argument(
+        "--basis",
+        type=str,
+        default=None,
+        choices=["fourier", "chebyshev"],
+        help="Spectral basis (1D problems): fourier|chebyshev",
+    )
+    parser.add_argument(
+        "--bc",
+        type=str,
+        default=None,
+        help="Boundary condition for non-periodic basis (e.g., dirichlet, reflective)",
+    )
     parser.add_argument(
         "--device",
         type=str,
@@ -122,6 +136,15 @@ Examples:
             if args.device:
                 print(f"Device: {args.device}")
             print(f"Output directory: {problem.outdir}")
+
+        # Inject CLI overrides into problem config if provided
+        if args.basis or args.bc:
+            if "grid" not in problem.config:
+                problem.config["grid"] = {}
+            if args.basis:
+                problem.config["grid"]["basis"] = args.basis
+            if args.bc:
+                problem.config["grid"]["bc"] = args.bc
 
         solver, history = problem.run(
             backend=args.backend, device=args.device, generate_video=not args.no_video
