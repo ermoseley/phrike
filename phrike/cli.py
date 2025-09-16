@@ -9,7 +9,7 @@ from .problems import ProblemRegistry
 def main() -> None:
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
-        description="PHRIKE CFD Solver",
+        description="PHRIKE (Pseudo-spectral Hydrodynamical solver for Realistic Integration of physiKal Environments)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
