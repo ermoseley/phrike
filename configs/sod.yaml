@@ -90,10 +90,11 @@ video:
   height: 1080               # Output video height (0 = auto from frames)
   scale: 2.0                 # Scale factor for frames (1.0 = original size)
   frame_dpi: 150             # DPI for frame generation (higher = better quality)
+  quality: high              # Quality preset: low, medium, high
 
   # FFmpeg encoding parameters
   codec: h264_videotoolbox   # Video codec (h264_videotoolbox, libx264, libopenh264, etc.)
-  crf: 18                    # Constant Rate Factor (0-51, lower = better quality)
+  crf: 23                    # Constant Rate Factor (0-51, lower = better quality)
   preset: medium             # Encoding preset (ultrafast, fast, medium, slow, veryslow)
   pix_fmt: yuv420p           # Pixel format (yuv420p, yuv444p, etc.)
   

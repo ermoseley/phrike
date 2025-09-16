@@ -1,8 +1,9 @@
 ✅ Add restart capabilities
 ✅ rename spectralhydro directory to phrike
-Add turbulent driving
 Add new basis functions
     - Chebyshev + Filtering near discontinuities
+Add turbulent driving
+Add MPI
 Add MHD
 
 

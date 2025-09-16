@@ -276,7 +276,8 @@ class BaseProblem(ABC):
             "height": int(video_config.get("height", 0)),  # 0 = auto
             "scale": float(video_config.get("scale", 1.0)),
             "codec": str(video_config.get("codec", "h264_videotoolbox")),
-            "crf": int(video_config.get("crf", 18)),
+            "quality": str(video_config.get("quality", "high")),  # low, medium, high
+            "crf": int(video_config.get("crf", 23)),  # Default to higher quality
             "preset": str(video_config.get("preset", "medium")),
             "pix_fmt": str(video_config.get("pix_fmt", "yuv420p")),
             "bitrate": video_config.get("bitrate"),
@@ -288,7 +289,7 @@ class BaseProblem(ABC):
         }
 
     def generate_video(self, frames_dir: str, video_name: str) -> str:
-        """Generate video from frames using enhanced ffmpeg parameters."""
+        """Generate video from frames using enhanced ffmpeg parameters based on amr2vid.py approach."""
         video_config = self.setup_video_generation()
         video_path = os.path.join(self.outdir, f"{video_name}.mp4")
 
@@ -301,103 +302,128 @@ class BaseProblem(ABC):
             ]
         )
         
+        print(f"Found {len(frames)} frames to rename")
         for i, fname in enumerate(frames):
             src = os.path.join(frames_dir, fname)
             dst = os.path.join(frames_dir, f"frame_{i:08d}.png")
             if src != dst:
+                print(f"Renaming {fname} -> frame_{i:08d}.png")
                 os.replace(src, dst)
 
-        def build_ffmpeg_cmd(codec_name: str) -> list:
-            """Build ffmpeg command with all configured parameters."""
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-framerate",
-                str(video_config["fps"]),
-                "-i",
-                os.path.join(frames_dir, "frame_%08d.png"),
-                "-c:v",
-                codec_name,
-                "-pix_fmt",
-                video_config["pix_fmt"],
-            ]
+        # Check if ffmpeg is available
+        try:
+            subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            print("Error: ffmpeg not found. Please install ffmpeg to create movies.")
+            print("Frames have been generated in:", frames_dir)
+            return frames_dir
 
-            # Add preset only for codecs that support it
-            if codec_name in ["libx264", "libx265"]:
-                cmd.extend(["-preset", video_config["preset"]])
-
-            # Add profile and level only for H.264/H.265 codecs
-            if codec_name in ["libx264", "h264_videotoolbox"]:
-                cmd.extend(["-profile:v", video_config["profile"]])
-                cmd.extend(["-level", video_config["level"]])
-
-            # Add scaling if specified
-            if video_config["scale"] != 1.0:
-                cmd.extend(
-                    [
-                        "-vf",
-                        f"scale=iw*{video_config['scale']}:ih*{video_config['scale']}",
-                    ]
-                )
-            elif video_config["width"] > 0 and video_config["height"] > 0:
-                cmd.extend(
-                    ["-vf", f"scale={video_config['width']}:{video_config['height']}"]
-                )
-
-            # Add bitrate control (CRF or bitrate)
-            if video_config["bitrate"]:
-                cmd.extend(["-b:v", video_config["bitrate"]])
-                if video_config["maxrate"]:
-                    cmd.extend(["-maxrate", video_config["maxrate"]])
-                if video_config["bufsize"]:
-                    cmd.extend(["-bufsize", video_config["bufsize"]])
-            else:
-                cmd.extend(["-crf", str(video_config["crf"])])
-
-            # Add tune if specified
-            if video_config["tune"]:
-                cmd.extend(["-tune", video_config["tune"]])
-
-            # Add output file
-            cmd.append(video_path)
-
-            return cmd
-
-        def try_ffmpeg(codec_name: str) -> bool:
-            """Try to run ffmpeg with the given codec."""
-            cmd = build_ffmpeg_cmd(codec_name)
-            try:
-                proc = subprocess.run(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
-                )
-                if proc.returncode == 0:
-                    print(f"Wrote video: {video_path} using codec {codec_name}")
-                    print(f"Command: {' '.join(cmd)}")
-                    return True
-                else:
-                    print(
-                        f"FFmpeg failed with codec {codec_name}: {proc.stderr.decode()}"
-                    )
-                    return False
-            except FileNotFoundError:
-                print("FFmpeg not found. Please install ffmpeg to generate videos.")
-                return False
-
-        # Try different codecs in order of preference
-        codecs_to_try = [
-            video_config["codec"],
-            "libx264",
-            "libopenh264",
-            "mpeg4",
-            "libvpx-vp9",
-            "libaom-av1",
+        # Define encoding options based on quality and available codecs
+        quality = video_config["quality"]
+        
+        # Try different encoding options based on what's available
+        encoding_options = [
+            # Option 1: H.264 with libx264 (best quality)
+            {
+                "name": "H.264 (libx264)",
+                "cmd": [
+                    "ffmpeg", "-y",
+                    "-framerate", str(video_config["fps"]),
+                    "-i", os.path.join(frames_dir, "frame_%08d.png"),
+                    "-c:v", "libx264",
+                    "-crf", "18" if quality == "high" else "23" if quality == "medium" else "28",
+                    "-pix_fmt", video_config["pix_fmt"],
+                ]
+            },
+            # Option 2: H.264 with h264_videotoolbox (macOS hardware acceleration)
+            {
+                "name": "H.264 (videotoolbox)",
+                "cmd": [
+                    "ffmpeg", "-y",
+                    "-framerate", str(video_config["fps"]),
+                    "-i", os.path.join(frames_dir, "frame_%08d.png"),
+                    "-c:v", "h264_videotoolbox",
+                    "-b:v", "15M" if quality == "high" else "10M" if quality == "medium" else "5M",
+                    "-pix_fmt", video_config["pix_fmt"],
+                    "-profile:v", video_config["profile"],
+                    "-level", video_config["level"],
+                ]
+            },
+            # Option 3: H.264 with nvenc (NVIDIA hardware acceleration)
+            {
+                "name": "H.264 (nvenc)",
+                "cmd": [
+                    "ffmpeg", "-y",
+                    "-framerate", str(video_config["fps"]),
+                    "-i", os.path.join(frames_dir, "frame_%08d.png"),
+                    "-c:v", "h264_nvenc",
+                    "-b:v", "15M" if quality == "high" else "10M" if quality == "medium" else "5M",
+                    "-pix_fmt", video_config["pix_fmt"],
+                ]
+            },
+            # Option 4: MPEG-4 (more widely supported)
+            {
+                "name": "MPEG-4",
+                "cmd": [
+                    "ffmpeg", "-y",
+                    "-framerate", str(video_config["fps"]),
+                    "-i", os.path.join(frames_dir, "frame_%08d.png"),
+                    "-c:v", "mpeg4",
+                    "-q:v", "1" if quality == "high" else "2" if quality == "medium" else "5",
+                    "-pix_fmt", video_config["pix_fmt"],
+                ]
+            },
+            # Option 5: VP9 (good compression)
+            {
+                "name": "VP9",
+                "cmd": [
+                    "ffmpeg", "-y",
+                    "-framerate", str(video_config["fps"]),
+                    "-i", os.path.join(frames_dir, "frame_%08d.png"),
+                    "-c:v", "libvpx-vp9",
+                    "-crf", "15" if quality == "high" else "20" if quality == "medium" else "25",
+                    "-b:v", "0",  # Use CRF mode
+                    "-pix_fmt", video_config["pix_fmt"],
+                ]
+            }
         ]
 
-        for codec in codecs_to_try:
-            if try_ffmpeg(codec):
-                return video_path
+        # Add scaling and output file to all options
+        for option in encoding_options:
+            # Add scaling if specified
+            if video_config["scale"] != 1.0:
+                option["cmd"].extend(["-vf", f"scale=iw*{video_config['scale']}:ih*{video_config['scale']}"])
+            elif video_config["width"] > 0 and video_config["height"] > 0:
+                option["cmd"].extend(["-vf", f"scale={video_config['width']}:{video_config['height']}"])
+            
+            # Add output file
+            option["cmd"].append(video_path)
 
-        print("Warning: Could not create video with any codec. Frames in:", frames_dir)
+        print(f"Creating movie: {video_path}")
+        print(f"Using {len(frames)} frames at {video_config['fps']} fps")
+        print(f"Quality setting: {quality}")
+
+        # Try each encoding option until one works
+        for option in encoding_options:
+            print(f"Trying {option['name']}...")
+            try:
+                result = subprocess.run(option['cmd'], capture_output=True, text=True, timeout=300)
+                if result.returncode == 0:
+                    print(f"Movie created successfully using {option['name']}: {video_path}")
+                    return video_path
+                else:
+                    print(f"Failed with {option['name']}: {result.stderr}")
+                    continue
+            except subprocess.TimeoutExpired:
+                print(f"Timeout with {option['name']}")
+                continue
+            except Exception as e:
+                print(f"Exception with {option['name']}: {e}")
+                continue
+
+        print("All encoding options failed. Frames are available for manual processing.")
+        print("You can try creating the movie manually with:")
+        print(f"ffmpeg -framerate {video_config['fps']} -i {frames_dir}/frame_%05d.png -c:v libx264 -crf 23 -pix_fmt yuv420p {video_path}")
         return frames_dir
 
     def convert_torch_to_numpy(self, *arrays):

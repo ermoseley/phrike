@@ -3,6 +3,7 @@
 import os
 from typing import Optional
 
+import matplotlib.pyplot as plt
 
 from phrike.grid import Grid1D
 from phrike.equations import EulerEquations1D
@@ -46,9 +47,71 @@ class SodProblem(BaseProblem):
 
     def create_visualization(self, solver, t: float, U):
         """Create visualization for current state."""
-        # For 1D problems, we don't need frame-by-frame visualization
-        # The final plot will be created in create_final_visualization
-        pass
+        # Save frame for video generation
+        frames_dir = os.path.join(self.outdir, "frames")
+        os.makedirs(frames_dir, exist_ok=True)
+        
+        # Get video configuration for frame settings
+        video_config = self.config.get("video", {})
+        frame_dpi = int(video_config.get("frame_dpi", 150))
+        frame_scale = float(video_config.get("scale", 1.0))
+        
+        # Calculate figure size based on scale
+        base_size = 10
+        figsize = (base_size * frame_scale, 6 * frame_scale)
+        
+        # Create frame plot
+        fig, axs = plt.subplots(2, 2, figsize=figsize, constrained_layout=True)
+        fig.suptitle(f"Sod Shock Tube at t={t:.3f}", fontsize=14)
+        
+        x = solver.grid.x
+        rho, u, p, _ = solver.equations.primitive(U)
+        
+        # Convert to numpy if needed
+        x = self.convert_torch_to_numpy(x)[0]
+        rho = self.convert_torch_to_numpy(rho)[0]
+        u = self.convert_torch_to_numpy(u)[0]
+        p = self.convert_torch_to_numpy(p)[0]
+        
+        # Density
+        axs[0, 0].plot(x, rho, "b-", linewidth=2)
+        axs[0, 0].set_xlabel("x")
+        axs[0, 0].set_ylabel("Density")
+        axs[0, 0].set_title("Density Profile")
+        axs[0, 0].grid(True, alpha=0.3)
+        
+        # Velocity
+        axs[0, 1].plot(x, u, "g-", linewidth=2)
+        axs[0, 1].set_xlabel("x")
+        axs[0, 1].set_ylabel("Velocity")
+        axs[0, 1].set_title("Velocity Profile")
+        axs[0, 1].grid(True, alpha=0.3)
+        
+        # Pressure
+        axs[1, 0].plot(x, p, "m-", linewidth=2)
+        axs[1, 0].set_xlabel("x")
+        axs[1, 0].set_ylabel("Pressure")
+        axs[1, 0].set_title("Pressure Profile")
+        axs[1, 0].grid(True, alpha=0.3)
+        
+        # Energy density
+        E = U[2]  # Total energy density
+        E = self.convert_torch_to_numpy(E)[0]
+        axs[1, 1].plot(x, E, "r-", linewidth=2)
+        axs[1, 1].set_xlabel("x")
+        axs[1, 1].set_ylabel("Energy Density")
+        axs[1, 1].set_title("Energy Density Profile")
+        axs[1, 1].grid(True, alpha=0.3)
+        
+        # Save frame
+        fig.savefig(os.path.join(frames_dir, f"frame_{t:08.3f}.png"), dpi=frame_dpi)
+        plt.close(fig)
+        
+        # Save snapshot
+        snapshot_path = save_solution_snapshot(
+            self.outdir, t, U=U, grid=solver.grid, equations=solver.equations
+        )
+        print(f"Saved snapshot at t={t:.3f}: {snapshot_path}")
 
     def create_final_visualization(self, solver) -> None:
         """Create final visualization plots."""

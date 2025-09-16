@@ -17,6 +17,8 @@ Examples:
   phrike khi2d --backend torch --device mps
   phrike tgv3d --config configs/tgv3d.yaml --backend torch --device cuda
   phrike turb3d --no-video
+  phrike sod --video-quality high --video-fps 60
+  phrike khi2d --video-codec libx264 --video-quality medium
         """,
     )
 
@@ -49,6 +51,17 @@ Examples:
     # Output options
     parser.add_argument("--no-video", action="store_true", help="Skip video generation")
     parser.add_argument("--outdir", type=str, help="Override output directory")
+    
+    # Video quality options
+    parser.add_argument(
+        "--video-quality",
+        type=str,
+        choices=["low", "medium", "high"],
+        default="high",
+        help="Video quality setting (default: high)",
+    )
+    parser.add_argument("--video-fps", type=int, help="Video frames per second")
+    parser.add_argument("--video-codec", type=str, help="Video codec (e.g., libx264, h264_videotoolbox)")
 
     # Restart options
     parser.add_argument(
@@ -89,6 +102,18 @@ Examples:
             from phrike.io import ensure_outdir
 
             ensure_outdir(problem.outdir)
+        
+        # Override video settings if specified
+        if not args.no_video:
+            if 'video' not in problem.config:
+                problem.config['video'] = {}
+            
+            if args.video_quality:
+                problem.config['video']['quality'] = args.video_quality
+            if args.video_fps:
+                problem.config['video']['fps'] = args.video_fps
+            if args.video_codec:
+                problem.config['video']['codec'] = args.video_codec
 
         # Run simulation
         if args.verbose:
