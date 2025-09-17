@@ -11,5 +11,6 @@ Modules:
 """
 
 from .base import Basis1D  # noqa: F401
+from .legendre import LegendreLobattoBasis1D  # noqa: F401
 
 

@@ -1,6 +1,7 @@
 """Command-line interface for SpectralHydro."""
 
 import argparse
+import os
 import sys
 
 from .problems import ProblemRegistry
@@ -46,8 +47,8 @@ Examples:
         "--basis",
         type=str,
         default=None,
-        choices=["fourier", "chebyshev"],
-        help="Spectral basis (1D problems): fourier|chebyshev",
+        choices=["fourier", "chebyshev", "legendre"],
+        help="Spectral basis (1D problems): fourier|chebyshev|legendre",
     )
     parser.add_argument(
         "--bc",
@@ -124,6 +125,31 @@ Examples:
             from phrike.io import ensure_outdir
 
             ensure_outdir(problem.outdir)
+        
+        # Optional runtime threading control via config: runtime.num_threads: int|"auto"
+        try:
+            runtime_cfg = problem.config.get("runtime", {})
+            num_threads_cfg = runtime_cfg.get("num_threads", None)
+            if num_threads_cfg is not None:
+                if isinstance(num_threads_cfg, str) and num_threads_cfg.strip().lower() == "auto":
+                    num_threads = os.cpu_count() or 1
+                else:
+                    num_threads = int(num_threads_cfg)
+                # Set common BLAS/OpenMP env vars before heavy ops
+                for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+                    os.environ[var] = str(num_threads)
+                # Torch threading (CPU codepaths)
+                try:
+                    import torch  # type: ignore
+
+                    torch.set_num_threads(num_threads)
+                except Exception:
+                    pass
+                if args.verbose:
+                    print(f"Threads: {num_threads} (from runtime.num_threads)")
+        except Exception:
+            # Non-fatal: continue with defaults
+            pass
         
         # Override video settings if specified
         if not args.no_video:

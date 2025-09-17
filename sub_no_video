@@ -1,0 +1,89 @@
+#!/bin/bash
+#SBATCH --job-name=phrike-khi2d
+#SBATCH -p preempt
+#SBATCH -N 1
+#SBATCH -n 1
+#SBATCH -A marlowe-m000115
+#SBATCH -G 1
+#SBATCH --requeue
+#SBATCH --time=01:00:00
+#SBATCH --error=error.out
+#SBATCH --output=run.out
+#SBATCH --mem=64G
+#SBATCH --cpus-per-task=16
+
+# Exit on any error
+set -e
+
+# Function to log with timestamp
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
+
+log "Starting PHRIKE cluster job (NO VIDEO MODE)..."
+
+# Load environment
+log "Loading environment..."
+source ~/.bashrc
+source ~/phrike_env/bin/activate
+
+# Load required modules
+log "Loading modules..."
+module load slurm
+module load cudnn/cuda12/9.3.0.75
+
+# Verify GPU
+log "Checking GPU availability..."
+if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi
+    log "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
+else
+    log "Warning: nvidia-smi not found"
+fi
+
+# Set up output directory
+OUTPUT_DIR="$SCRATCH/khi2d_$(date +%Y%m%d_%H%M%S)"
+log "Output directory: $OUTPUT_DIR"
+mkdir -p "$OUTPUT_DIR"
+
+# Set environment variables
+export CUDA_LAUNCH_BLOCKING=0
+export CUDA_CACHE_DISABLE=1
+export OMP_NUM_THREADS=16
+
+# Check if cluster-optimized config exists, otherwise use default
+CONFIG_FILE="configs/khi2d_cluster.yaml"
+if [ ! -f "$CONFIG_FILE" ]; then
+    CONFIG_FILE="configs/khi2d.yaml"
+    log "Using default config: $CONFIG_FILE"
+else
+    log "Using cluster-optimized config: $CONFIG_FILE"
+fi
+
+# Run simulation WITHOUT video generation
+log "Starting PHRIKE simulation (no video)..."
+START_TIME=$(date +%s)
+
+if srun phrike khi2d --config "$CONFIG_FILE" --backend torch --device cuda -v --outdir "$OUTPUT_DIR" --no-video; then
+    END_TIME=$(date +%s)
+    DURATION=$((END_TIME - START_TIME))
+    
+    log "Simulation completed successfully in ${DURATION} seconds!"
+    log "Results saved to: $OUTPUT_DIR"
+    
+    # List output files
+    log "Output files:"
+    ls -la "$OUTPUT_DIR"
+    
+    # Check for frames (video generation was disabled)
+    if [ -d "$OUTPUT_DIR/frames" ]; then
+        FRAME_COUNT=$(find "$OUTPUT_DIR/frames" -name "frame_*.png" | wc -l)
+        log "Found $FRAME_COUNT frames (video generation was disabled)"
+        log "You can create video manually later with ffmpeg"
+    fi
+else
+    log "Simulation failed"
+    exit 1
+fi
+
+log "Job completed at $(date)"

@@ -47,8 +47,102 @@ for ffmpeg_module in "ffmpeg/4.4.2" "ffmpeg/4.3.2" "ffmpeg/4.2.7" "ffmpeg"; do
     fi
 done
 
+# If no module found, try to install user-level ffmpeg
 if [ "$FFMPEG_LOADED" = false ]; then
-    log "Warning: Could not load ffmpeg module. Will try to use system ffmpeg."
+    log "No ffmpeg module found. Attempting user-level installation..."
+    
+    # Create local bin directory if it doesn't exist
+    LOCAL_BIN="$HOME/.local/bin"
+    mkdir -p "$LOCAL_BIN"
+    
+    # Check if we already have ffmpeg in local bin
+    if [ -f "$LOCAL_BIN/ffmpeg" ]; then
+        log "Found existing user-level ffmpeg installation"
+        export PATH="$LOCAL_BIN:$PATH"
+    else
+        log "Installing ffmpeg to user directory..."
+        
+        # Try different installation methods based on what's available
+        # Prioritize static binary download for cluster reliability
+        log "Attempting to download static ffmpeg binary (most reliable for clusters)..."
+        cd "$LOCAL_BIN"
+        
+        if command_exists wget; then
+            wget -q https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
+        elif command_exists curl; then
+            curl -L -o ffmpeg-release-amd64-static.tar.xz https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
+        else
+            log "Neither wget nor curl available for downloading ffmpeg"
+        fi
+        
+        if [ -f "ffmpeg-release-amd64-static.tar.xz" ]; then
+            tar -xf ffmpeg-release-amd64-static.tar.xz
+            mv ffmpeg-*-amd64-static/ffmpeg .
+            mv ffmpeg-*-amd64-static/ffprobe .
+            chmod +x ffmpeg ffprobe
+            rm -rf ffmpeg-*-amd64-static*
+            rm ffmpeg-release-amd64-static.tar.xz
+            log "Successfully installed static ffmpeg binary"
+        else
+            log "Static binary download failed, trying conda..."
+            # Fallback to conda if static download fails
+            if command_exists conda; then
+                log "Installing ffmpeg via conda..."
+                if conda create -n ffmpeg_env -c conda-forge ffmpeg -y 2>/dev/null; then
+                    log "Created user-specific conda environment with ffmpeg"
+                    # Create a wrapper script to activate the environment
+                    cat > "$LOCAL_BIN/ffmpeg" << 'EOF'
+#!/bin/bash
+source ~/.bashrc
+# Initialize conda if needed
+if ! command -v conda >/dev/null 2>&1; then
+    eval "$(conda shell.bash hook)"
+fi
+conda activate ffmpeg_env
+exec ffmpeg "$@"
+EOF
+                    cat > "$LOCAL_BIN/ffprobe" << 'EOF'
+#!/bin/bash
+source ~/.bashrc
+# Initialize conda if needed
+if ! command -v conda >/dev/null 2>&1; then
+    eval "$(conda shell.bash hook)"
+fi
+conda activate ffmpeg_env
+exec ffprobe "$@"
+EOF
+                    chmod +x "$LOCAL_BIN/ffmpeg" "$LOCAL_BIN/ffprobe"
+                else
+                    log "Conda installation failed, trying other methods..."
+                fi
+            elif command_exists brew; then
+                log "Installing ffmpeg via homebrew..."
+                brew install ffmpeg
+            elif command_exists yum; then
+                log "Installing ffmpeg via yum..."
+                yum install -y ffmpeg
+            elif command_exists apt-get; then
+                log "Installing ffmpeg via apt-get..."
+                apt-get update && apt-get install -y ffmpeg
+            else
+                # Try to find existing ffmpeg in the system and copy it
+                log "Searching for existing ffmpeg installation..."
+                if command_exists ffmpeg; then
+                    log "Found system ffmpeg, copying to local directory..."
+                    cp "$(which ffmpeg)" "$LOCAL_BIN/"
+                    if command_exists ffprobe; then
+                        cp "$(which ffprobe)" "$LOCAL_BIN/"
+                    fi
+                    chmod +x "$LOCAL_BIN/ffmpeg" "$LOCAL_BIN/ffprobe" 2>/dev/null || true
+                else
+                    log "All installation methods failed"
+                fi
+            fi
+        fi
+        
+        # Add to PATH
+        export PATH="$LOCAL_BIN:$PATH"
+    fi
 fi
 
 # Verify GPU availability
@@ -73,9 +167,17 @@ log "Checking ffmpeg availability..."
 if command_exists ffmpeg; then
     log "FFmpeg version:"
     ffmpeg -version | head -n 1
+    log "FFmpeg location: $(which ffmpeg)"
+    ENABLE_VIDEO=true
 else
-    log "Error: ffmpeg not found. Please load the ffmpeg module or install ffmpeg."
-    exit 1
+    log "Warning: ffmpeg not found after installation attempts."
+    log "Simulation will run without video generation."
+    log "To enable video generation, install ffmpeg manually:"
+    log "  - conda install -c conda-forge ffmpeg"
+    log "  - brew install ffmpeg (on macOS)"
+    log "  - yum install ffmpeg (on RHEL/CentOS)"
+    log "  - apt-get install ffmpeg (on Ubuntu/Debian)"
+    ENABLE_VIDEO=false
 fi
 
 # Set up output directory with timestamp
@@ -107,12 +209,20 @@ fi
 
 # Run the simulation with proper error handling
 log "Starting PHRIKE simulation..."
-log "Command: phrike khi2d --config $CONFIG_FILE --backend torch --device cuda -v --outdir $OUTPUT_DIR --video-quality high --video-fps 30"
+
+# Build command based on video availability
+if [ "$ENABLE_VIDEO" = true ]; then
+    PHRIKE_CMD="phrike khi2d --config $CONFIG_FILE --backend torch --device cuda -v --outdir $OUTPUT_DIR --video-quality high --video-fps 30"
+else
+    PHRIKE_CMD="phrike khi2d --config $CONFIG_FILE --backend torch --device cuda -v --outdir $OUTPUT_DIR --no-video"
+fi
+
+log "Command: $PHRIKE_CMD"
 
 # Capture start time
 START_TIME=$(date +%s)
 
-if srun phrike khi2d --config "$CONFIG_FILE" --backend torch --device cuda -v --outdir "$OUTPUT_DIR" --video-quality high --video-fps 30; then
+if srun $PHRIKE_CMD; then
     # Capture end time
     END_TIME=$(date +%s)
     DURATION=$((END_TIME - START_TIME))
@@ -124,23 +234,32 @@ if srun phrike khi2d --config "$CONFIG_FILE" --backend torch --device cuda -v --
     log "Output files:"
     ls -la "$OUTPUT_DIR"
     
-    # Check if video was created
-    if [ -f "$OUTPUT_DIR/khi2d.mp4" ]; then
-        log "Video created successfully: $OUTPUT_DIR/khi2d.mp4"
-        log "Video size: $(du -h "$OUTPUT_DIR/khi2d.mp4" | cut -f1)"
-        
-        # Get video info
-        if command_exists ffprobe; then
-            log "Video information:"
-            ffprobe -v quiet -print_format json -show_format -show_streams "$OUTPUT_DIR/khi2d.mp4" | jq '.format.duration, .streams[0].width, .streams[0].height, .streams[0].r_frame_rate' 2>/dev/null || true
+    # Check if video was created (only if video was enabled)
+    if [ "$ENABLE_VIDEO" = true ]; then
+        if [ -f "$OUTPUT_DIR/khi2d.mp4" ]; then
+            log "Video created successfully: $OUTPUT_DIR/khi2d.mp4"
+            log "Video size: $(du -h "$OUTPUT_DIR/khi2d.mp4" | cut -f1)"
+            
+            # Get video info
+            if command_exists ffprobe; then
+                log "Video information:"
+                ffprobe -v quiet -print_format json -show_format -show_streams "$OUTPUT_DIR/khi2d.mp4" | jq '.format.duration, .streams[0].width, .streams[0].height, .streams[0].r_frame_rate' 2>/dev/null || true
+            fi
+        else
+            log "Warning: Video file not found. Checking for frames directory..."
+            if [ -d "$OUTPUT_DIR/frames" ]; then
+                FRAME_COUNT=$(find "$OUTPUT_DIR/frames" -name "frame_*.png" | wc -l)
+                log "Found $FRAME_COUNT frames in $OUTPUT_DIR/frames"
+                log "You can create the video manually with:"
+                log "ffmpeg -framerate 30 -i $OUTPUT_DIR/frames/frame_%08d.png -c:v libx264 -crf 20 -pix_fmt yuv420p $OUTPUT_DIR/khi2d.mp4"
+            fi
         fi
     else
-        log "Warning: Video file not found. Checking for frames directory..."
+        log "Video generation was disabled due to ffmpeg unavailability."
         if [ -d "$OUTPUT_DIR/frames" ]; then
             FRAME_COUNT=$(find "$OUTPUT_DIR/frames" -name "frame_*.png" | wc -l)
             log "Found $FRAME_COUNT frames in $OUTPUT_DIR/frames"
-            log "You can create the video manually with:"
-            log "ffmpeg -framerate 30 -i $OUTPUT_DIR/frames/frame_%08d.png -c:v libx264 -crf 20 -pix_fmt yuv420p $OUTPUT_DIR/khi2d.mp4"
+            log "Install ffmpeg and run the simulation again to generate video."
         fi
     fi
     

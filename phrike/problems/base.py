@@ -153,10 +153,31 @@ class BaseProblem(ABC):
         else:
             self.ic_smoothing_config = None
 
-        # FFT workers
-        self.fft_workers = int(
-            self.config["grid"].get("fft_workers", os.cpu_count() or 1)
-        )
+        # Threading / FFT workers (unified via runtime.num_threads, fallback to grid.fft_workers)
+        runtime_cfg = self.config.get("runtime", {})
+        num_threads_cfg = runtime_cfg.get("num_threads", None)
+        threads: int | None
+        if num_threads_cfg is not None:
+            if isinstance(num_threads_cfg, str) and num_threads_cfg.strip().lower() == "auto":
+                threads = os.cpu_count() or 1
+            else:
+                try:
+                    threads = int(num_threads_cfg)
+                except Exception:
+                    threads = os.cpu_count() or 1
+        else:
+            threads = None
+
+        grid_threads = self.config["grid"].get("fft_workers", None)
+        if grid_threads is not None:
+            try:
+                self.fft_workers = int(grid_threads)
+            except Exception:
+                self.fft_workers = os.cpu_count() or 1
+        elif threads is not None:
+            self.fft_workers = threads
+        else:
+            self.fft_workers = os.cpu_count() or 1
 
         # Monitoring parameters - enabled by default
         self.monitoring_config = self.config.get("monitoring", {})

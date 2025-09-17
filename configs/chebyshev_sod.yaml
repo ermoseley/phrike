@@ -2,7 +2,7 @@
 problem: sod
 
 grid:
-  N: 128
+  N: 32             # Low resolution for quick test
   Lx: 1.0
   basis: chebyshev
   bc: dirichlet     # reflective/dirichlet at endpoints for momentum
@@ -13,11 +13,11 @@ physics:
 
 integration:
   t0: 0.0
-  t_end: 0.05      # shorter run for faster completion
-  cfl: 0.2         # smaller CFL due to clustered nodes near boundaries
+  t_end: 0.02      # very short run for quick test
+  cfl: 0.1         # conservative CFL for low resolution
   scheme: rk4
-  output_interval: 0.005  # more frequent output
-  checkpoint_interval: 0.01
+  output_interval: 0.002  # frequent output for verification
+  checkpoint_interval: 0.005
   spectral_filter:
     enabled: true
     p: 8
@@ -39,7 +39,7 @@ io:
 
 monitoring:
   enabled: true
-  step_interval: 50  # Less frequent monitoring to reduce overhead
+  step_interval: 10  # More frequent monitoring for low-res test
   include_conservation: true
   include_timestep: true
   include_time: true

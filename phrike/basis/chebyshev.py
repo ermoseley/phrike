@@ -17,6 +17,14 @@ except Exception:  # Fallback to SciPy's FFT
 
 from .base import Basis1D, _as_last_axis_matrix_apply
 
+# Optional torch support (used only for input/output conversion)
+try:  # pragma: no cover - torch optional
+    import torch  # type: ignore
+    _TORCH_AVAILABLE = True
+except Exception:  # pragma: no cover
+    _TORCH_AVAILABLE = False
+    torch = None  # type: ignore
+
 
 def _cheb_nodes_gl(N: int) -> np.ndarray:
     """Chebyshev-Gauss-Lobatto nodes on [-1, 1]."""
@@ -85,47 +93,100 @@ class ChebyshevBasis1D(Basis1D):
 
     # Derivatives
     def dx(self, f: np.ndarray) -> np.ndarray:
-        # Compute Chebyshev coefficients of f
-        a = self.forward(f)
-        N = a.shape[-1]
+        # Correct Chebyshev spectral derivative using DCT-I with norm=None
+        # 1) Convert nodal values -> standard Chebyshev coefficients a_k
+        #    a = dct_none(f)/(N-1); a0 and a_{N-1} are halved
+        # 2) Apply standard recurrence to get derivative coeffs b_k (w.r.t y)
+        # 3) Evaluate derivative on nodes via IDCT-I (norm=None) using b_k with
+        #    interior modes doubled in the cosine sum, then scale dy->dx.
+
+        # Handle optional torch input
+        is_torch = False
+        if _TORCH_AVAILABLE and isinstance(f, (torch.Tensor,)):
+            is_torch = True
+            f_np = f.detach().cpu().numpy()
+        else:
+            f_np = np.asarray(f)
+
+        N = f_np.shape[-1]
         if N <= 1:
-            return np.zeros_like(f)
-        
-        # Differentiate coefficients w.r.t y via recurrence
+            out = np.zeros_like(f_np)
+            if is_torch:  # match input backend
+                return torch.from_numpy(out).to(dtype=f.dtype, device=f.device)
+            return out
+
+        # Forward DCT-I (no normalization) to standard Chebyshev coefficients
+        a = scipy_fft.dct(f_np, type=1, axis=-1, norm=None)
+        a = a / (N - 1)
+        a[..., 0] *= 0.5
+        a[..., -1] *= 0.5
+
+        # Recurrence for derivative coefficients (w.r.t y)
         b = np.zeros_like(a)
         if N >= 2:
             b[..., -2] = 2.0 * (N - 1) * a[..., -1]
             for k in range(N - 3, -1, -1):
                 b[..., k] = b[..., k + 2] + 2.0 * (k + 1) * a[..., k + 1]
             b[..., 0] *= 0.5
-        
-        # Map dy->dx
-        b *= self._dy_dx
-        return self.inverse(b)
+
+        # Build cosine-sum vector for IDCT-I (norm=None): double interior modes
+        b_sum = b.copy()
+        if N > 2:
+            b_sum[..., 1:-1] *= 2.0
+
+        # Inverse DCT-I (no normalization); divide by (N-1) to evaluate nodal values
+        df_dy = scipy_fft.idct(b_sum, type=1, axis=-1, norm=None) / (N - 1)
+        df_dx = df_dy * self._dy_dx
+
+        if is_torch:
+            return torch.from_numpy(df_dx).to(dtype=f.dtype, device=f.device)
+        return df_dx
 
     def d2x(self, f: np.ndarray) -> np.ndarray:
-        # Differentiate twice via spectral recurrence
-        a = self.forward(f)
-        N = a.shape[-1]
+        # Handle optional torch input
+        is_torch = False
+        if _TORCH_AVAILABLE and isinstance(f, (torch.Tensor,)):
+            is_torch = True
+            f_np = f.detach().cpu().numpy()
+        else:
+            f_np = np.asarray(f)
+
+        N = f_np.shape[-1]
         if N <= 2:
-            return np.zeros_like(f)
-        
-        # First derivative coeffs (w.r.t y)
+            out = np.zeros_like(f_np)
+            if is_torch:
+                return torch.from_numpy(out).to(dtype=f.dtype, device=f.device)
+            return out
+
+        # Forward to standard Chebyshev coefficients (no normalization)
+        a = scipy_fft.dct(f_np, type=1, axis=-1, norm=None)
+        a = a / (N - 1)
+        a[..., 0] *= 0.5
+        a[..., -1] *= 0.5
+
+        # First derivative coefficients (w.r.t y)
         b = np.zeros_like(a)
-        if N >= 2:
-            b[..., -2] = 2.0 * (N - 1) * a[..., -1]
-            for k in range(N - 3, -1, -1):
-                b[..., k] = b[..., k + 2] + 2.0 * (k + 1) * a[..., k + 1]
-            b[..., 0] *= 0.5
-        
-        # Second derivative coeffs: apply recurrence to b
+        b[..., -2] = 2.0 * (N - 1) * a[..., -1]
+        for k in range(N - 3, -1, -1):
+            b[..., k] = b[..., k + 2] + 2.0 * (k + 1) * a[..., k + 1]
+        b[..., 0] *= 0.5
+
+        # Second derivative coefficients (w.r.t y)
         c = np.zeros_like(a)
-        if N >= 2:
-            c[..., -2] = 2.0 * (N - 1) * b[..., -1]
-            for k in range(N - 3, -1, -1):
-                c[..., k] = c[..., k + 2] + 2.0 * (k + 1) * b[..., k + 1]
-            c[..., 0] *= 0.5
-        
-        # Map (dy)^2 -> (dx)^2 factor
-        c *= (self._dy_dx ** 2)
-        return self.inverse(c)
+        c[..., -2] = 2.0 * (N - 1) * b[..., -1]
+        for k in range(N - 3, -1, -1):
+            c[..., k] = c[..., k + 2] + 2.0 * (k + 1) * b[..., k + 1]
+        c[..., 0] *= 0.5
+
+        # Build cosine-sum vector for IDCT-I (norm=None): double interior modes
+        c_sum = c.copy()
+        if N > 2:
+            c_sum[..., 1:-1] *= 2.0
+
+        # Inverse DCT-I (no normalization); divide by (N-1) to evaluate nodal values
+        d2f_dy2 = scipy_fft.idct(c_sum, type=1, axis=-1, norm=None) / (N - 1)
+        d2f_dx2 = d2f_dy2 * (self._dy_dx ** 2)
+
+        if is_torch:
+            return torch.from_numpy(d2f_dx2).to(dtype=f.dtype, device=f.device)
+        return d2f_dx2
