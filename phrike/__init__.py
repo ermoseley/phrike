@@ -17,7 +17,9 @@ def run_simulation(
     config: dict = None,
     backend: str = "numpy",
     device: str = None,
+    precision: str = "double",
     generate_video: bool = True,
+    debug: bool = False,
 ):
     """Convenience function to run a simulation.
 
@@ -27,7 +29,9 @@ def run_simulation(
         config: Configuration dictionary
         backend: Array backend ('numpy' or 'torch')
         device: Torch device ('cpu', 'mps', 'cuda')
+        precision: Floating point precision ('single' or 'double')
         generate_video: Whether to generate video from frames
+        debug: Debug mode - error if specified backend/device is not available
 
     Returns:
         Tuple of (solver, history)
@@ -38,4 +42,15 @@ def run_simulation(
         name=problem_name, config_path=config_path, config=config
     )
 
-    return problem.run(backend=backend, device=device, generate_video=generate_video)
+    # Override precision in config if provided
+    if precision:
+        if "grid" not in problem.config:
+            problem.config["grid"] = {}
+        problem.config["grid"]["precision"] = precision
+        # Also update in-memory attribute to ensure downstream getters see override
+        try:
+            problem.precision = precision
+        except Exception:
+            pass
+
+    return problem.run(backend=backend, device=device, generate_video=generate_video, debug=debug)

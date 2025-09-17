@@ -1,4 +1,4 @@
-__pycache__/
+0;276;0c11;rgb:1818/1818/181811;rgb:1818/1818/1818__pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
@@ -17,4 +17,4 @@ frames/
 colormaps.py
 ramses-utils/
 example.py
-
+dedalus/

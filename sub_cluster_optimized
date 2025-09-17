@@ -1,0 +1,166 @@
+#!/bin/bash
+#SBATCH --job-name=phrike-khi2d
+#SBATCH -p preempt
+#SBATCH -N 1
+#SBATCH -n 1
+#SBATCH -A marlowe-m000115
+#SBATCH -G 1
+#SBATCH --requeue
+#SBATCH --time=01:00:00
+#SBATCH --error=error.out
+#SBATCH --output=run.out
+#SBATCH --mem=64G
+#SBATCH --cpus-per-task=16
+
+# Exit on any error
+set -e
+
+# Function to check if a command exists
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# Function to log with timestamp
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
+
+log "Starting PHRIKE cluster job..."
+
+# Load environment
+log "Loading environment..."
+source ~/.bashrc
+source ~/phrike_env/bin/activate
+
+# Load required modules
+log "Loading modules..."
+module load slurm
+module load cudnn/cuda12/9.3.0.75
+
+# Try to load ffmpeg - check multiple possible module names
+FFMPEG_LOADED=false
+for ffmpeg_module in "ffmpeg/4.4.2" "ffmpeg/4.3.2" "ffmpeg/4.2.7" "ffmpeg"; do
+    if module load "$ffmpeg_module" 2>/dev/null; then
+        log "Successfully loaded ffmpeg module: $ffmpeg_module"
+        FFMPEG_LOADED=true
+        break
+    fi
+done
+
+if [ "$FFMPEG_LOADED" = false ]; then
+    log "Warning: Could not load ffmpeg module. Will try to use system ffmpeg."
+fi
+
+# Verify GPU availability
+log "Checking GPU availability..."
+if command_exists nvidia-smi; then
+    log "GPU Information:"
+    nvidia-smi
+    log "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
+    
+    # Check if CUDA is working
+    if python -c "import torch; print(f'PyTorch CUDA available: {torch.cuda.is_available()}'); print(f'CUDA devices: {torch.cuda.device_count()}')" 2>/dev/null; then
+        log "PyTorch CUDA verification successful"
+    else
+        log "Warning: PyTorch CUDA verification failed"
+    fi
+else
+    log "Warning: nvidia-smi not found. GPU may not be available."
+fi
+
+# Verify ffmpeg availability
+log "Checking ffmpeg availability..."
+if command_exists ffmpeg; then
+    log "FFmpeg version:"
+    ffmpeg -version | head -n 1
+else
+    log "Error: ffmpeg not found. Please load the ffmpeg module or install ffmpeg."
+    exit 1
+fi
+
+# Set up output directory with timestamp
+OUTPUT_DIR="$SCRATCH/khi2d_$(date +%Y%m%d_%H%M%S)"
+log "Output directory: $OUTPUT_DIR"
+
+# Create output directory
+mkdir -p "$OUTPUT_DIR"
+
+# Set environment variables for better GPU utilization
+export CUDA_LAUNCH_BLOCKING=0
+export CUDA_CACHE_DISABLE=1
+export OMP_NUM_THREADS=16
+export MKL_NUM_THREADS=16
+export NUMEXPR_NUM_THREADS=16
+
+# Set PyTorch specific environment variables
+export TORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+
+# Check if cluster-optimized config exists, otherwise use default
+CONFIG_FILE="configs/khi2d_cluster.yaml"
+if [ ! -f "$CONFIG_FILE" ]; then
+    CONFIG_FILE="configs/khi2d.yaml"
+    log "Using default config: $CONFIG_FILE"
+else
+    log "Using cluster-optimized config: $CONFIG_FILE"
+fi
+
+# Run the simulation with proper error handling
+log "Starting PHRIKE simulation..."
+log "Command: phrike khi2d --config $CONFIG_FILE --backend torch --device cuda -v --outdir $OUTPUT_DIR --video-quality high --video-fps 30"
+
+# Capture start time
+START_TIME=$(date +%s)
+
+if srun phrike khi2d --config "$CONFIG_FILE" --backend torch --device cuda -v --outdir "$OUTPUT_DIR" --video-quality high --video-fps 30; then
+    # Capture end time
+    END_TIME=$(date +%s)
+    DURATION=$((END_TIME - START_TIME))
+    
+    log "Simulation completed successfully in ${DURATION} seconds!"
+    log "Results saved to: $OUTPUT_DIR"
+    
+    # List output files
+    log "Output files:"
+    ls -la "$OUTPUT_DIR"
+    
+    # Check if video was created
+    if [ -f "$OUTPUT_DIR/khi2d.mp4" ]; then
+        log "Video created successfully: $OUTPUT_DIR/khi2d.mp4"
+        log "Video size: $(du -h "$OUTPUT_DIR/khi2d.mp4" | cut -f1)"
+        
+        # Get video info
+        if command_exists ffprobe; then
+            log "Video information:"
+            ffprobe -v quiet -print_format json -show_format -show_streams "$OUTPUT_DIR/khi2d.mp4" | jq '.format.duration, .streams[0].width, .streams[0].height, .streams[0].r_frame_rate' 2>/dev/null || true
+        fi
+    else
+        log "Warning: Video file not found. Checking for frames directory..."
+        if [ -d "$OUTPUT_DIR/frames" ]; then
+            FRAME_COUNT=$(find "$OUTPUT_DIR/frames" -name "frame_*.png" | wc -l)
+            log "Found $FRAME_COUNT frames in $OUTPUT_DIR/frames"
+            log "You can create the video manually with:"
+            log "ffmpeg -framerate 30 -i $OUTPUT_DIR/frames/frame_%08d.png -c:v libx264 -crf 20 -pix_fmt yuv420p $OUTPUT_DIR/khi2d.mp4"
+        fi
+    fi
+    
+    # Check for any error logs
+    if [ -f "$OUTPUT_DIR/error.log" ]; then
+        log "Error log found:"
+        tail -20 "$OUTPUT_DIR/error.log"
+    fi
+    
+else
+    log "Simulation failed with exit code $?"
+    log "Check error.out for details"
+    
+    # Try to provide more debugging info
+    if [ -f "error.out" ]; then
+        log "Last 20 lines of error.out:"
+        tail -20 error.out
+    fi
+    
+    exit 1
+fi
+
+log "Job completed at $(date)"

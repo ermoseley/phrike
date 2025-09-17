@@ -73,7 +73,7 @@ class ShuOsher1DProblem(BaseProblem):
         # Sound speed in post-shock region
         self.c_post = np.sqrt(self.gamma * self.p_post / self.rho_post)
     
-    def create_grid(self, backend: str = "numpy", device: Optional[str] = None):
+    def create_grid(self, backend: str = "numpy", device: Optional[str] = None, debug: bool = False):
         """Create the computational grid with optional basis/BC from config."""
         grid_cfg = self.config.get("grid", {})
         N = int(grid_cfg.get("N", self.N))
@@ -91,6 +91,7 @@ class ShuOsher1DProblem(BaseProblem):
             fft_workers=self.fft_workers,
             backend=backend,
             torch_device=device,
+            precision=self.precision,
         )
     
     def create_equations(self):

@@ -44,6 +44,27 @@ def _build_exponential_filter(N: int, p: int, alpha: float) -> np.ndarray:
     return sigma
 
 
+def _validate_torch_device(device: str, debug: bool) -> None:
+    """Validate that the requested torch device is available.
+    
+    Args:
+        device: The requested device ('cpu', 'cuda', 'mps')
+        debug: If True, raise error if device is not available
+        
+    Raises:
+        RuntimeError: If debug=True and device is not available
+    """
+    if not debug:
+        return
+        
+    if device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(f"Debug mode: CUDA requested but not available. PyTorch was not compiled with CUDA support.")
+    elif device == "mps" and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+        raise RuntimeError(f"Debug mode: MPS requested but not available. MPS is only available on Apple Silicon Macs.")
+    elif device not in ["cpu", "cuda", "mps"]:
+        raise RuntimeError(f"Debug mode: Unknown device '{device}' requested. Valid devices are: cpu, cuda, mps")
+
+
 def _build_filter_mask_2d(Nx: int, Ny: int, dealias: bool) -> np.ndarray:
     if not dealias:
         return np.ones((Ny, Nx), dtype=float)
@@ -136,6 +157,8 @@ class Grid1D:
     fft_workers: int = 1
     backend: str = "numpy"  # "numpy" or "torch"
     torch_device: Optional[str] = None
+    precision: str = "double"  # "single" or "double"
+    debug: bool = False
 
     def __post_init__(self) -> None:
         # Basis selection (Fourier default)
@@ -215,12 +238,24 @@ class Grid1D:
                 except Exception:
                     dev = "cpu"
                 self.torch_device = dev
+            
+            # Debug mode: validate that the requested device is available
+            if self.torch_device is not None:
+                _validate_torch_device(self.torch_device, self.debug)
 
-            # Choose dtype based on device (MPS only supports float32)
-            torch_dtype = torch.float32 if self.torch_device == "mps" else torch.float64
-            torch_cdtype = (
-                torch.complex64 if self.torch_device == "mps" else torch.complex128
-            )
+            # Choose dtype based on precision and device
+            if self.precision == "single":
+                torch_dtype = torch.float32
+                torch_cdtype = torch.complex64
+            elif self.precision == "double":
+                torch_dtype = torch.float64
+                torch_cdtype = torch.complex128
+            else:
+                # Fallback to device-based logic (MPS only supports float32)
+                torch_dtype = torch.float32 if self.torch_device == "mps" else torch.float64
+                torch_cdtype = (
+                    torch.complex64 if self.torch_device == "mps" else torch.complex128
+                )
 
             # Move arrays to torch (including CPU device)
             assert torch is not None
@@ -507,6 +542,8 @@ class Grid2D:
     fft_workers: int = 1
     backend: str = "numpy"  # "numpy" or "torch"
     torch_device: Optional[str] = None
+    precision: str = "double"  # "single" or "double"
+    debug: bool = False
 
     def __post_init__(self) -> None:
         self.dx = self.Lx / self.Nx
@@ -557,11 +594,19 @@ class Grid2D:
                     dev = "cpu"
                 self.torch_device = dev
 
-            # Choose dtype based on device (MPS only supports float32)
-            torch_dtype = torch.float32 if self.torch_device == "mps" else torch.float64
-            torch_cdtype = (
-                torch.complex64 if self.torch_device == "mps" else torch.complex128
-            )
+            # Choose dtype based on precision and device
+            if self.precision == "single":
+                torch_dtype = torch.float32
+                torch_cdtype = torch.complex64
+            elif self.precision == "double":
+                torch_dtype = torch.float64
+                torch_cdtype = torch.complex128
+            else:
+                # Fallback to device-based logic (MPS only supports float32)
+                torch_dtype = torch.float32 if self.torch_device == "mps" else torch.float64
+                torch_cdtype = (
+                    torch.complex64 if self.torch_device == "mps" else torch.complex128
+                )
 
             self.x = torch.from_numpy(np.asarray(self.x)).to(
                 dtype=torch_dtype, device=self.torch_device
@@ -665,6 +710,8 @@ class Grid3D:
     fft_workers: int = 1
     backend: str = "numpy"  # "numpy" or "torch"
     torch_device: Optional[str] = None
+    precision: str = "double"  # "single" or "double"
+    debug: bool = False
 
     def __post_init__(self) -> None:
         self.dx = self.Lx / self.Nx
@@ -722,10 +769,19 @@ class Grid3D:
                     dev = "cpu"
                 self.torch_device = dev
 
-            torch_dtype = torch.float32 if self.torch_device == "mps" else torch.float64
-            torch_cdtype = (
-                torch.complex64 if self.torch_device == "mps" else torch.complex128
-            )
+            # Choose dtype based on precision and device
+            if self.precision == "single":
+                torch_dtype = torch.float32
+                torch_cdtype = torch.complex64
+            elif self.precision == "double":
+                torch_dtype = torch.float64
+                torch_cdtype = torch.complex128
+            else:
+                # Fallback to device-based logic (MPS only supports float32)
+                torch_dtype = torch.float32 if self.torch_device == "mps" else torch.float64
+                torch_cdtype = (
+                    torch.complex64 if self.torch_device == "mps" else torch.complex128
+                )
 
             self.x = torch.from_numpy(np.asarray(self.x)).to(
                 dtype=torch_dtype, device=self.torch_device

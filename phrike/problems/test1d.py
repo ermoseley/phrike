@@ -36,7 +36,7 @@ class Acoustic1DProblem(BaseProblem):
     """
 
     def create_grid(
-        self, backend: str = "numpy", device: Optional[str] = None
+        self, backend: str = "numpy", device: Optional[str] = None, debug: bool = False
     ) -> Grid1D:
         """Create 1D periodic grid."""
         N = int(self.config["grid"]["N"])
@@ -51,6 +51,7 @@ class Acoustic1DProblem(BaseProblem):
             fft_workers=self.fft_workers,
             backend=backend,
             torch_device=device,
+            precision=self.precision,
         )
 
     def create_equations(self) -> EulerEquations1D:

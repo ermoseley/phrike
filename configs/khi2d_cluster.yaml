@@ -1,27 +1,27 @@
-# Configuration for 1D Sod shock tube problem
-problem: sod
+# Configuration for 2D Kelvin-Helmholtz instability problem - Cluster Optimized
+problem: khi2d
 
 grid:
-  N: 1024
+  Nx: 512
+  Ny: 512
   Lx: 1.0
-  x0: 0.5               # discontinuity location
+  Ly: 1.0
   dealias: true
   precision: double      # single or double precision
-  # basis: fourier        # switch to 'chebyshev' for non-periodic BCs
-  # bc: dirichlet         # used when basis=chebyshev (e.g., reflective/dirichlet)
+  fft_workers: 8         # Increased for cluster
 
 physics:
   gamma: 1.4
 
 integration:
   t0: 0.0
-  t_end: 0.2
-  cfl: 0.4
-  scheme: rk45
+  t_end: 5.0
+  cfl: 0.25
+  scheme: rk78
   rtol: 1e-6
   atol: 1e-8
-  output_interval: 0.01
-  checkpoint_interval: 0.05
+  output_interval: 0.02
+  checkpoint_interval: 0.5
   spectral_filter:
     enabled: true
     p: 8
@@ -29,7 +29,7 @@ integration:
 
 # Initial conditions smoothing (optional)
 initial_conditions_smoothing:
-  enabled: false        # Disabled by default for Sod problem
+  enabled: false        # Disabled by default for KHI2D problem
   kernel_size: 0.01     # 1% of domain length
   mode: "constant"      # Non-periodic boundary conditions
   variables: ["density", "velocity", "pressure"]
@@ -38,48 +38,50 @@ initial_conditions_smoothing:
 # Adaptive time-stepping configuration
 adaptive:
   enabled: true
-  scheme: rk45          # rk23, rk45, rk78
-  rtol: 1e-6            # Relative tolerance
-  atol: 1e-8            # Absolute tolerance
-  safety_factor: 0.9
+  scheme: rk78          # rk23, rk45, rk78
+  rtol: 1e-6            # Tighter relative tolerance
+  atol: 1e-8            # Tighter absolute tolerance
+  safety_factor: 0.5
   min_dt_factor: 0.1
-  max_dt_factor: 5.0
+  max_dt_factor: 2.0
   max_rejections: 10
   fallback_scheme: rk4
 
 # Artificial viscosity configuration
 artificial_viscosity:
-  enabled: true
-  nu_max: 1e-3          # Maximum viscosity coefficient
-  s_ref: 1.0            # Reference smoothness threshold
-  s_min: 0.1            # Minimum smoothness for applying viscosity
-  p: 2.0                # Exponent for smoothness scaling
+  enabled: false
+  nu_max: 5e-4          # Lower viscosity for 2D
+  s_ref: 0.5            # Lower reference smoothness
+  s_min: 0.05           # Lower minimum threshold
+  p: 1.5                # Gentler scaling
   epsilon: 1e-12        # Small number to avoid division by zero
   variable_weights:
     density: 1.0
-    momentum_x: 1.0
+    momentum_x: 0.8
+    momentum_y: 0.8
     energy: 1.0
   sensor_variable: "density"
   diagnostic_output: true
 
 # Initial conditions
 initial_conditions:
-  left:
-    rho: 1.0
-    u: 0.0
-    p: 1.0
-  right:
-    rho: 0.125
-    u: 0.0
-    p: 0.1
+  rho_outer: 1.0
+  rho_inner: 2.0
+  u0: 1.0
+  shear_thickness: 0.02
+  pressure_outer: 1.0
+  pressure_inner: 1.0
+  perturb_eps: 0.01
+  perturb_sigma: 0.02
+  perturb_kx: 2          # wavenumber for sinusoidal modulation in x
 
 io:
-  outdir: outputs/sod
+  outdir: outputs/khi2d
   save_spectra: true
 
 monitoring:
   enabled: true
-  step_interval: 100
+  step_interval: 50
   include_conservation: true
   include_timestep: true
   include_time: true
@@ -95,10 +97,10 @@ video:
   frame_dpi: 150             # DPI for frame generation (higher = better quality)
   quality: high              # Quality preset: low, medium, high
 
-  # FFmpeg encoding parameters
-  codec: h264_videotoolbox   # Video codec (h264_videotoolbox, libx264, libopenh264, etc.)
-  crf: 23                    # Constant Rate Factor (0-51, lower = better quality)
-  preset: medium             # Encoding preset (ultrafast, fast, medium, slow, veryslow)
+  # FFmpeg encoding parameters - Cluster optimized
+  codec: libx264             # Use libx264 for better cluster compatibility
+  crf: 20                    # Slightly higher quality for cluster
+  preset: fast               # Faster encoding for cluster
   pix_fmt: yuv420p           # Pixel format (yuv420p, yuv444p, etc.)
   
   # Additional FFmpeg options

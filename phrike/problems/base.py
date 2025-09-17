@@ -97,6 +97,9 @@ class BaseProblem(ABC):
             "spectral_filter", {"enabled": False}
         )
         
+        # Grid parameters
+        self.precision = str(self.config["grid"].get("precision", "double"))
+        
         # Adaptive time-stepping parameters
         adaptive_raw = self.config["integration"].get("adaptive", None)
         if adaptive_raw:
@@ -244,7 +247,7 @@ class BaseProblem(ABC):
                 )
 
     @abstractmethod
-    def create_grid(self, backend: str = "numpy", device: Optional[str] = None):
+    def create_grid(self, backend: str = "numpy", device: Optional[str] = None, debug: bool = False):
         """Create the computational grid."""
         pass
 
@@ -760,10 +763,11 @@ class BaseProblem(ABC):
         backend: str = "numpy",
         device: Optional[str] = None,
         generate_video: bool = True,
+        debug: bool = False,
     ) -> Any:
         """Run the simulation."""
         # Create components
-        grid = self.create_grid(backend, device)
+        grid = self.create_grid(backend, device, debug)
         equations = self.create_equations()
 
         # Create initial conditions (use restart data if available)

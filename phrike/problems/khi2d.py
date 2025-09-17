@@ -17,7 +17,7 @@ class KHI2DProblem(BaseProblem):
     """2D Kelvin-Helmholtz instability problem."""
 
     def create_grid(
-        self, backend: str = "numpy", device: Optional[str] = None
+        self, backend: str = "numpy", device: Optional[str] = None, debug: bool = False
     ) -> Grid2D:
         """Create 2D grid."""
         Nx = int(self.config["grid"]["Nx"])
@@ -36,6 +36,7 @@ class KHI2DProblem(BaseProblem):
             fft_workers=self.fft_workers,
             backend=backend,
             torch_device=device,
+            precision=self.precision,
         )
 
     def create_equations(self) -> EulerEquations2D:

@@ -61,6 +61,13 @@ Examples:
         default=None,
         help="Torch device: cpu|mps|cuda (if backend=torch)",
     )
+    parser.add_argument(
+        "--precision",
+        type=str,
+        choices=["single", "double"],
+        default="double",
+        help="Floating point precision: single|double (default: double)",
+    )
 
     # Output options
     parser.add_argument("--no-video", action="store_true", help="Skip video generation")
@@ -91,7 +98,8 @@ Examples:
         help="Clear numba cache before running (one-time fix for package rename issues)",
     )
 
-    # Verbosity
+    # Debug and verbosity
+    parser.add_argument("--debug", action="store_true", help="Debug mode")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
 
     args = parser.parse_args()
@@ -135,19 +143,27 @@ Examples:
             print(f"Backend: {args.backend}")
             if args.device:
                 print(f"Device: {args.device}")
+            print(f"Precision: {args.precision}")
             print(f"Output directory: {problem.outdir}")
 
         # Inject CLI overrides into problem config if provided
-        if args.basis or args.bc:
+        if args.basis or args.bc or args.precision:
             if "grid" not in problem.config:
                 problem.config["grid"] = {}
             if args.basis:
                 problem.config["grid"]["basis"] = args.basis
             if args.bc:
                 problem.config["grid"]["bc"] = args.bc
+            if args.precision:
+                problem.config["grid"]["precision"] = args.precision
+                # Ensure in-memory attribute reflects CLI override applied post-init
+                try:
+                    problem.precision = args.precision
+                except Exception:
+                    pass
 
         solver, history = problem.run(
-            backend=args.backend, device=args.device, generate_video=not args.no_video
+            backend=args.backend, device=args.device, generate_video=not args.no_video, debug=args.debug
         )
 
         if args.verbose:
