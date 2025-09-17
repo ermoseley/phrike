@@ -18,19 +18,40 @@ class SodProblem(BaseProblem):
     """1D Sod shock tube problem."""
 
     def create_grid(
-        self, backend: str = "numpy", device: Optional[str] = None
+        self, backend: str = "numpy", device: Optional[str] = None, debug: bool = False
     ) -> Grid1D:
         """Create 1D grid."""
+        # Debug mode: validate backend and device availability
+        if debug:
+            if backend == "torch":
+                try:
+                    import torch
+                    if device == "cuda" and not torch.cuda.is_available():
+                        raise RuntimeError(f"Debug mode: CUDA requested but not available. PyTorch was not compiled with CUDA support.")
+                    elif device == "mps" and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+                        raise RuntimeError(f"Debug mode: MPS requested but not available. MPS is only available on Apple Silicon Macs.")
+                    elif device not in [None, "cpu", "cuda", "mps"]:
+                        raise RuntimeError(f"Debug mode: Unknown device '{device}' requested. Valid devices are: cpu, cuda, mps")
+                except ImportError:
+                    raise RuntimeError(f"Debug mode: Torch backend requested but PyTorch is not installed.")
+        
         N = int(self.config["grid"]["N"])
         Lx = float(self.config["grid"]["Lx"])
         dealias = bool(self.config["grid"].get("dealias", True))
+        basis = str(self.config["grid"].get("basis", "fourier")).lower()
+        bc = self.config["grid"].get("bc", None)
 
         return Grid1D(
             N=N,
             Lx=Lx,
+            basis=basis,
+            bc=bc,
             dealias=dealias,
             filter_params=self.filter_config,
             fft_workers=self.fft_workers,
+            backend=backend,
+            torch_device=device,
+            precision=self.precision,
         )
 
     def create_equations(self) -> EulerEquations1D:

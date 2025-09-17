@@ -44,6 +44,27 @@ def _build_exponential_filter(N: int, p: int, alpha: float) -> np.ndarray:
     return sigma
 
 
+def _validate_torch_device(device: str, debug: bool) -> None:
+    """Validate that the requested torch device is available.
+    
+    Args:
+        device: The requested device ('cpu', 'cuda', 'mps')
+        debug: If True, raise error if device is not available
+        
+    Raises:
+        RuntimeError: If debug=True and device is not available
+    """
+    if not debug:
+        return
+        
+    if device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(f"Debug mode: CUDA requested but not available. PyTorch was not compiled with CUDA support.")
+    elif device == "mps" and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+        raise RuntimeError(f"Debug mode: MPS requested but not available. MPS is only available on Apple Silicon Macs.")
+    elif device not in ["cpu", "cuda", "mps"]:
+        raise RuntimeError(f"Debug mode: Unknown device '{device}' requested. Valid devices are: cpu, cuda, mps")
+
+
 def _build_filter_mask_2d(Nx: int, Ny: int, dealias: bool) -> np.ndarray:
     if not dealias:
         return np.ones((Ny, Nx), dtype=float)
@@ -103,7 +124,10 @@ def _build_exponential_filter_3d(
 
 @dataclass
 class Grid1D:
-    """Uniform periodic 1D grid and spectral operators.
+    """1D grid and spectral operators with pluggable basis.
+
+    Default is periodic Fourier basis on a uniform grid, preserving existing
+    behavior. Optionally, a Chebyshev basis with non-periodic BCs can be used.
 
     Attributes
     ----------
@@ -111,8 +135,12 @@ class Grid1D:
         Number of spatial points.
     Lx : float
         Domain length.
+    basis : str
+        Spectral basis: "fourier" (default) or "chebyshev".
+    bc : Optional[str]
+        Boundary condition for non-periodic bases (e.g., "dirichlet").
     dealias : bool
-        If True, apply 2/3-rule dealiasing mask in spectral space.
+        If True, apply 2/3-rule dealiasing mask in spectral space (Fourier only).
     filter_params : Optional[Dict[str, float]]
         Optional exponential filter configuration with keys:
         - enabled: bool
@@ -122,28 +150,66 @@ class Grid1D:
 
     N: int
     Lx: float
+    basis: str = "fourier"
+    bc: Optional[str] = None
     dealias: bool = True
     filter_params: Optional[Dict[str, float]] = None
     fft_workers: int = 1
     backend: str = "numpy"  # "numpy" or "torch"
     torch_device: Optional[str] = None
+    precision: str = "double"  # "single" or "double"
+    debug: bool = False
 
     def __post_init__(self) -> None:
-        self.dx = self.Lx / self.N
-        self.x = np.linspace(0.0, self.Lx, num=self.N, endpoint=False)
-        # Physical-to-spectral wave numbers (2*pi/L scaling)
-        k_index = np.fft.fftfreq(self.N, d=self.dx)  # cycles per length
-        self.k = 2.0 * np.pi * k_index
-        self.ik = 1j * self.k
+        # Basis selection (Fourier default)
+        self._basis_name = str(self.basis).lower()
 
-        # Dealias mask and optional spectral filter
-        self.dealias_mask = _build_filter_mask(self.N, self.dealias)
+        if self._basis_name == "fourier":
+            # Existing periodic uniform grid path
+            self.dx = self.Lx / self.N
+            self.x = np.linspace(0.0, self.Lx, num=self.N, endpoint=False)
+            # Physical-to-spectral wave numbers (2*pi/L scaling)
+            k_index = np.fft.fftfreq(self.N, d=self.dx)  # cycles per length
+            self.k = 2.0 * np.pi * k_index
+            self.ik = 1j * self.k
 
-        self.filter_sigma = np.ones(self.N, dtype=float)
-        if self.filter_params and bool(self.filter_params.get("enabled", False)):
-            p = int(self.filter_params.get("p", 8))
-            alpha = float(self.filter_params.get("alpha", 36.0))
-            self.filter_sigma = _build_exponential_filter(self.N, p=p, alpha=alpha)
+            # Dealias mask and optional spectral filter
+            self.dealias_mask = _build_filter_mask(self.N, self.dealias)
+
+            self.filter_sigma = np.ones(self.N, dtype=float)
+            if self.filter_params and bool(self.filter_params.get("enabled", False)):
+                p = int(self.filter_params.get("p", 8))
+                alpha = float(self.filter_params.get("alpha", 36.0))
+                self.filter_sigma = _build_exponential_filter(self.N, p=p, alpha=alpha)
+
+            # Initialize Fourier basis instance (NumPy path used inside helpers)
+            try:
+                from .basis.fourier import FourierBasis1D
+
+                self._basis = FourierBasis1D(self.N, self.Lx, fft_workers=self.fft_workers)
+            except Exception:
+                self._basis = None  # Fallback to direct FFT wrappers below
+        elif self._basis_name == "chebyshev":
+            # Chebyshev–Gauss–Lobatto nodes on [0, Lx]
+            try:
+                from .basis.chebyshev import ChebyshevBasis1D
+
+                bc = self.bc or "dirichlet"
+                self._basis = ChebyshevBasis1D(self.N, self.Lx, bc=bc, fft_workers=self.fft_workers)
+                self.x = self._basis.nodes()
+                # Use min spacing as stability proxy for CFL
+                x_np = np.asarray(self.x)
+                if self.N > 1:
+                    self.dx = float(np.min(np.diff(x_np)))
+                else:
+                    self.dx = self.Lx
+                # No Fourier dealias/filter masks in Chebyshev mode
+                self.dealias_mask = np.ones(self.N, dtype=float)
+                self.filter_sigma = np.ones(self.N, dtype=float)
+            except Exception as e:
+                raise RuntimeError(f"Chebyshev basis initialization failed: {e}")
+        else:
+            raise ValueError(f"Unknown basis: {self.basis}")
 
         # Enable FFTW planning cache if available (no-op with SciPy backend)
         if scipy_fft_cache_enabled and fftw_cache is not None:
@@ -154,7 +220,7 @@ class Grid1D:
             except Exception:
                 pass
 
-        # Torch backend setup
+        # Torch backend setup (Fourier and Chebyshev supported)
         self._use_torch = (self.backend.lower() == "torch") and _TORCH_AVAILABLE
         if self._use_torch:
             # Choose device if not provided
@@ -172,35 +238,60 @@ class Grid1D:
                 except Exception:
                     dev = "cpu"
                 self.torch_device = dev
+            
+            # Debug mode: validate that the requested device is available
+            if self.torch_device is not None:
+                _validate_torch_device(self.torch_device, self.debug)
 
-            # Choose dtype based on device (MPS only supports float32)
-            torch_dtype = torch.float32 if self.torch_device == "mps" else torch.float64
-            torch_cdtype = (
-                torch.complex64 if self.torch_device == "mps" else torch.complex128
-            )
+            # Choose dtype based on precision and device
+            if self.precision == "single":
+                torch_dtype = torch.float32
+                torch_cdtype = torch.complex64
+            elif self.precision == "double":
+                torch_dtype = torch.float64
+                torch_cdtype = torch.complex128
+            else:
+                # Fallback to device-based logic (MPS only supports float32)
+                torch_dtype = torch.float32 if self.torch_device == "mps" else torch.float64
+                torch_cdtype = (
+                    torch.complex64 if self.torch_device == "mps" else torch.complex128
+                )
 
-            # Move arrays to torch
+            # Move arrays to torch (including CPU device)
             assert torch is not None
             self.x = torch.from_numpy(np.asarray(self.x)).to(
                 dtype=torch_dtype, device=self.torch_device
             )
-            k_t = torch.from_numpy(np.asarray(self.k)).to(
-                dtype=torch_dtype, device=self.torch_device
-            )
-            self.k = k_t
-            self.ik = k_t.to(dtype=torch_cdtype) * (1j)
-            self.dealias_mask = torch.from_numpy(np.asarray(self.dealias_mask)).to(
-                dtype=torch_dtype, device=self.torch_device
-            )
-            self.filter_sigma = torch.from_numpy(np.asarray(self.filter_sigma)).to(
-                dtype=torch_dtype, device=self.torch_device
-            )
+            if self._basis_name == "fourier":
+                k_t = torch.from_numpy(np.asarray(self.k)).to(
+                    dtype=torch_dtype, device=self.torch_device
+                )
+                self.k = k_t
+                self.ik = k_t.to(dtype=torch_cdtype) * (1j)
+                self.dealias_mask = torch.from_numpy(np.asarray(self.dealias_mask)).to(
+                    dtype=torch_dtype, device=self.torch_device
+                )
+                self.filter_sigma = torch.from_numpy(np.asarray(self.filter_sigma)).to(
+                    dtype=torch_dtype, device=self.torch_device
+                )
+        else:
+            # Keep as numpy arrays for CPU backend
+            if self._basis_name == "fourier":
+                self.k = np.asarray(self.k)
+                self.ik = self.k * (1j)
+                self.dealias_mask = np.asarray(self.dealias_mask)
+                self.filter_sigma = np.asarray(self.filter_sigma)
 
-    # FFT wrappers
+    # FFT wrappers (Fourier basis only)
     def rfft(self, f: np.ndarray) -> np.ndarray:
         # FFT along the last axis to support batched inputs (..., N)
         if getattr(self, "_use_torch", False):
             assert torch is not None
+            # Convert to torch if needed
+            if not isinstance(f, torch.Tensor):
+                f = torch.from_numpy(np.asarray(f)).to(
+                    dtype=self.x.dtype, device=self.x.device
+                )
             return torch.fft.fft(f, dim=-1)
         try:
             return scipy_fft.fft(f, axis=-1, workers=self.fft_workers)  # type: ignore[call-arg]
@@ -210,27 +301,197 @@ class Grid1D:
     def irfft(self, F: np.ndarray) -> np.ndarray:
         if getattr(self, "_use_torch", False):
             assert torch is not None
+            # Convert to torch if needed
+            if not isinstance(F, torch.Tensor):
+                F = torch.from_numpy(np.asarray(F)).to(
+                    dtype=self.x.dtype, device=self.x.device
+                )
             return torch.fft.ifft(F, dim=-1).real
         try:
             return scipy_fft.ifft(F, axis=-1, workers=self.fft_workers).real  # type: ignore[call-arg]
         except TypeError:
             return scipy_fft.ifft(F, axis=-1).real
 
+    # DCT wrappers (Chebyshev basis only)
+    def dct(self, f: np.ndarray) -> np.ndarray:
+        """DCT-I forward transform for Chebyshev basis."""
+        if getattr(self, "_use_torch", False):
+            assert torch is not None
+            # Convert to torch if needed
+            if not isinstance(f, torch.Tensor):
+                f = torch.from_numpy(np.asarray(f)).to(
+                    dtype=self.x.dtype, device=self.x.device
+                )
+            return self._dct1_ortho_torch(f)
+        try:
+            return scipy_fft.dct(f, type=1, axis=-1, norm="ortho", workers=self.fft_workers)  # type: ignore[call-arg]
+        except TypeError:
+            return scipy_fft.dct(f, type=1, axis=-1, norm="ortho")
+
+    def idct(self, F: np.ndarray) -> np.ndarray:
+        """DCT-I inverse transform for Chebyshev basis."""
+        if getattr(self, "_use_torch", False):
+            assert torch is not None
+            # Convert to torch if needed
+            if not isinstance(F, torch.Tensor):
+                F = torch.from_numpy(np.asarray(F)).to(
+                    dtype=self.x.dtype, device=self.x.device
+                )
+            return self._idct1_ortho_torch(F)
+        try:
+            return scipy_fft.idct(F, type=1, axis=-1, norm="ortho", workers=self.fft_workers)  # type: ignore[call-arg]
+        except TypeError:
+            return scipy_fft.idct(F, type=1, axis=-1, norm="ortho")
+
+    def _dct1_ortho_torch(self, x):
+        """Torch implementation of orthonormal DCT-I."""
+        assert torch is not None
+        n = x.shape[-1]
+        if n == 1:
+            return x.clone()
+        
+        # DCT-I orthonormal scaling factors
+        dn, dout = self._torch_dct_scales(n, device=x.device, dtype=x.dtype)
+        
+        # Pre-scale input
+        x_scaled = x * dn
+        # Mirror without duplicating endpoints: [x0, x1, ..., xN-1, xN-2, ..., x1]
+        tail = x_scaled[..., 1:-1]
+        if tail.shape[-1] > 0:
+            tail = torch.flip(tail, dims=(-1,))
+        y = torch.cat([x_scaled, tail], dim=-1)
+        
+        # Real FFT
+        c_none = torch.fft.rfft(y, dim=-1).real
+        return c_none * dout
+
+    def _idct1_ortho_torch(self, c):
+        """Torch implementation of orthonormal IDCT-I."""
+        assert torch is not None
+        n = c.shape[-1]
+        if n == 1:
+            return c.clone()
+        
+        # Undo output scaling
+        _, dout = self._torch_dct_scales(n, device=c.device, dtype=c.dtype)
+        c_none = c / dout
+        
+        # Inverse via mirrored irfft
+        y = torch.fft.irfft(torch.complex(c_none, torch.zeros_like(c_none)), n=max(2 * n - 2, 1), dim=-1)
+        x_scaled = y[..., :n]
+        
+        # Undo input scaling
+        dn, _ = self._torch_dct_scales(n, device=c.device, dtype=c.dtype)
+        return x_scaled / dn
+
+    def _torch_dct_scales(self, n: int, *, device, dtype):
+        """Compute DCT-I orthonormal scaling factors for torch."""
+        assert torch is not None
+        # D_in (pre-scale columns / input samples), D_out (post-scale rows / output coeffs)
+        # These diagonals satisfy: A_ortho = diag(D_out) @ A_none @ diag(D_in)
+        if n <= 0:
+            raise ValueError("Invalid size for DCT-I scales")
+        dn = torch.full((n,), 0.5, device=device, dtype=dtype)
+        if n >= 2:
+            sqrt2 = torch.sqrt(torch.tensor(2.0, device=device, dtype=dtype))
+            dn[0] = 1.0 / sqrt2
+            dn[-1] = 1.0 / sqrt2
+        dout = torch.full((n,), float(np.sqrt(2.0 / max(n - 1, 1))), device=device, dtype=dtype)
+        if n >= 2:
+            dout[0] = float(np.sqrt(1.0 / (n - 1)))
+            dout[-1] = float(np.sqrt(1.0 / (n - 1)))
+        return dn, dout
+
+    def _chebyshev_dx(self, f: np.ndarray) -> np.ndarray:
+        """Chebyshev spectral derivative using DCT methods (mirrors Fourier pattern)."""
+        # Forward transform
+        a = self.dct(f)
+        N = a.shape[-1]
+        if N <= 1:
+            if getattr(self, "_use_torch", False) and isinstance(f, (torch.Tensor,)):
+                return torch.zeros_like(f)
+            return np.zeros_like(f)
+        
+        # Differentiate coefficients w.r.t y via recurrence
+        if getattr(self, "_use_torch", False) and isinstance(a, (torch.Tensor,)):
+            assert torch is not None
+            b = torch.zeros_like(a)
+            if N >= 2:
+                b[..., -2] = 2.0 * (N - 1) * a[..., -1]
+                for k in range(N - 3, -1, -1):
+                    b[..., k] = b[..., k + 2] + 2.0 * (k + 1) * a[..., k + 1]
+                b[..., 0] = 0.5 * b[..., 0]
+            # Map dy->dx
+            b = b * float(self._basis._dy_dx)
+            return self.idct(b)
+        else:
+            b = np.zeros_like(a)
+            if N >= 2:
+                b[..., -2] = 2.0 * (N - 1) * a[..., -1]
+                for k in range(N - 3, -1, -1):
+                    b[..., k] = b[..., k + 2] + 2.0 * (k + 1) * a[..., k + 1]
+                b[..., 0] *= 0.5
+            # Map dy->dx
+            b *= self._basis._dy_dx
+            return self.idct(b)
+
+    def _chebyshev_spectral_filter(self, f: np.ndarray, *, p: int = 8, alpha: float = 36.0) -> np.ndarray:
+        """Chebyshev spectral filter using DCT methods (mirrors Fourier pattern)."""
+        # Forward transform
+        F = self.dct(f)
+        N = F.shape[-1]
+        
+        # Build filter in spectral space
+        k = np.arange(N, dtype=float)
+        kmax = max(float(N - 1), 1.0)
+        eta = k / kmax
+        sigma_np = np.exp(-float(alpha) * eta**int(p))
+        
+        # Match backend of F (torch or numpy)
+        try:
+            import torch  # type: ignore
+            is_torch = isinstance(F, torch.Tensor)
+        except Exception:
+            is_torch = False
+            torch = None  # type: ignore
+            
+        if is_torch:  # type: ignore[truthy-bool]
+            sigma = torch.from_numpy(sigma_np).to(dtype=F.dtype, device=F.device)  # type: ignore[attr-defined]
+            shape = (1,) * (F.ndim - 1) + (N,)
+            sigma = sigma.reshape(shape)
+            F_filtered = F * sigma
+            return self.idct(F_filtered)
+        else:
+            F_filtered = F * sigma_np.reshape((1,) * (F.ndim - 1) + (N,))
+            return self.idct(F_filtered)
+
     # Spectral derivative
     def dx1(self, f: np.ndarray) -> np.ndarray:
         # Supports f with shape (..., N)
-        F = self.rfft(f)
-        F *= self.dealias_mask
-        F *= self.filter_sigma
-        dF = self.ik * F
-        return self.irfft(dF)
+        if self._basis_name == "fourier":
+            F = self.rfft(f)
+            F *= self.dealias_mask
+            F *= self.filter_sigma
+            dF = self.ik * F
+            return self.irfft(dF)
+        else:
+            # Chebyshev basis path - use Grid1D DCT methods (mirrors Fourier pattern)
+            return self._chebyshev_dx(f)
 
     def apply_spectral_filter(self, f: np.ndarray) -> np.ndarray:
         # Supports f with shape (..., N)
-        F = self.rfft(f)
-        F *= self.dealias_mask
-        F *= self.filter_sigma
-        return self.irfft(F)
+        if self._basis_name == "fourier":
+            F = self.rfft(f)
+            F *= self.dealias_mask
+            F *= self.filter_sigma
+            return self.irfft(F)
+        else:
+            # Chebyshev basis path - use Grid1D DCT methods (mirrors Fourier pattern)
+            if self.filter_params and bool(self.filter_params.get("enabled", False)):
+                p = int(self.filter_params.get("p", 8))
+                alpha = float(self.filter_params.get("alpha", 36.0))
+                return self._chebyshev_spectral_filter(f, p=p, alpha=alpha)
+            return f
 
     def convolve(self, f: np.ndarray, g: np.ndarray) -> np.ndarray:
         """Compute product in physical space, with dealiased spectral filtering.
@@ -240,6 +501,29 @@ class Grid1D:
         """
         h = f * g
         return self.apply_spectral_filter(h)
+
+    # --- Boundary conditions (1D) ---
+    def apply_boundary_conditions(self, U: np.ndarray, equations) -> np.ndarray:
+        """Apply boundary conditions to conservative variables U in-place.
+
+        For Chebyshev basis with reflective (wall) or Dirichlet BCs, we set
+        the velocity to zero at the endpoints (x=0 and x=Lx), which implies
+        zero momentum at the endpoints. Density and pressure are left unchanged.
+        """
+        if self._basis_name != "chebyshev":
+            return U
+        bc_type = (self.bc or "reflective").lower()
+        if U.shape[-1] != self.N:
+            return U
+        if U.shape[0] < 2:
+            return U
+        # Enforce u=0 at boundaries => momentum = 0 at boundaries
+        if bc_type in ("reflective", "dirichlet", "wall"):
+            # Support batched leading dims (..., 3, N)
+            # Only modify the momentum component index 1
+            U[..., 1, 0] = 0.0
+            U[..., 1, -1] = 0.0
+        return U
 
 
 @dataclass
@@ -258,6 +542,8 @@ class Grid2D:
     fft_workers: int = 1
     backend: str = "numpy"  # "numpy" or "torch"
     torch_device: Optional[str] = None
+    precision: str = "double"  # "single" or "double"
+    debug: bool = False
 
     def __post_init__(self) -> None:
         self.dx = self.Lx / self.Nx
@@ -308,11 +594,19 @@ class Grid2D:
                     dev = "cpu"
                 self.torch_device = dev
 
-            # Choose dtype based on device (MPS only supports float32)
-            torch_dtype = torch.float32 if self.torch_device == "mps" else torch.float64
-            torch_cdtype = (
-                torch.complex64 if self.torch_device == "mps" else torch.complex128
-            )
+            # Choose dtype based on precision and device
+            if self.precision == "single":
+                torch_dtype = torch.float32
+                torch_cdtype = torch.complex64
+            elif self.precision == "double":
+                torch_dtype = torch.float64
+                torch_cdtype = torch.complex128
+            else:
+                # Fallback to device-based logic (MPS only supports float32)
+                torch_dtype = torch.float32 if self.torch_device == "mps" else torch.float64
+                torch_cdtype = (
+                    torch.complex64 if self.torch_device == "mps" else torch.complex128
+                )
 
             self.x = torch.from_numpy(np.asarray(self.x)).to(
                 dtype=torch_dtype, device=self.torch_device
@@ -416,6 +710,8 @@ class Grid3D:
     fft_workers: int = 1
     backend: str = "numpy"  # "numpy" or "torch"
     torch_device: Optional[str] = None
+    precision: str = "double"  # "single" or "double"
+    debug: bool = False
 
     def __post_init__(self) -> None:
         self.dx = self.Lx / self.Nx
@@ -473,10 +769,19 @@ class Grid3D:
                     dev = "cpu"
                 self.torch_device = dev
 
-            torch_dtype = torch.float32 if self.torch_device == "mps" else torch.float64
-            torch_cdtype = (
-                torch.complex64 if self.torch_device == "mps" else torch.complex128
-            )
+            # Choose dtype based on precision and device
+            if self.precision == "single":
+                torch_dtype = torch.float32
+                torch_cdtype = torch.complex64
+            elif self.precision == "double":
+                torch_dtype = torch.float64
+                torch_cdtype = torch.complex128
+            else:
+                # Fallback to device-based logic (MPS only supports float32)
+                torch_dtype = torch.float32 if self.torch_device == "mps" else torch.float64
+                torch_cdtype = (
+                    torch.complex64 if self.torch_device == "mps" else torch.complex128
+                )
 
             self.x = torch.from_numpy(np.asarray(self.x)).to(
                 dtype=torch_dtype, device=self.torch_device

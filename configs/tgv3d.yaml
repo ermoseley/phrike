@@ -9,6 +9,7 @@ grid:
   Ly: 6.283185307179586  # 2*pi
   Lz: 6.283185307179586  # 2*pi
   dealias: true
+  precision: double      # single or double precision
   fft_workers: 4
 
 physics:

@@ -34,7 +34,7 @@ class Turb3DProblem(BaseProblem):
             pass  # colormap registration is optional
 
     def create_grid(
-        self, backend: str = "numpy", device: Optional[str] = None
+        self, backend: str = "numpy", device: Optional[str] = None, debug: bool = False
     ) -> Grid3D:
         """Create 3D grid."""
         Nx = int(self.config["grid"]["Nx"])
@@ -57,6 +57,7 @@ class Turb3DProblem(BaseProblem):
             fft_workers=self.fft_workers,
             backend=backend,
             torch_device=device,
+            precision=self.precision,
         )
 
     def create_equations(self) -> EulerEquations3D:

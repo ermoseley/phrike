@@ -1,0 +1,86 @@
+#!/bin/bash
+#SBATCH --job-name=phrike
+#SBATCH -p preempt
+#SBATCH -N 1
+#SBATCH -n 1
+#SBATCH -A marlowe-m000115
+#SBATCH -G 1
+#SBATCH --requeue
+#SBATCH --time=00:30:00
+#SBATCH --error=error.out
+#SBATCH --output=run.out
+#SBATCH --mem=32G
+#SBATCH --cpus-per-task=8
+
+# Exit on any error
+set -e
+
+# Load environment
+echo "Loading environment..."
+source ~/.bashrc
+source ~/phrike_env/bin/activate
+
+# Load required modules
+echo "Loading modules..."
+module load slurm
+module load cudnn/cuda12/9.3.0.75
+module load ffmpeg/4.4.2  # Adjust version as available on your cluster
+
+# Verify GPU availability
+echo "Checking GPU availability..."
+if command -v nvidia-smi &> /dev/null; then
+    echo "GPU Information:"
+    nvidia-smi
+    echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
+else
+    echo "Warning: nvidia-smi not found. GPU may not be available."
+fi
+
+# Verify ffmpeg availability
+echo "Checking ffmpeg availability..."
+if command -v ffmpeg &> /dev/null; then
+    echo "FFmpeg version:"
+    ffmpeg -version | head -n 1
+else
+    echo "Error: ffmpeg not found. Please load the ffmpeg module."
+    exit 1
+fi
+
+# Set up output directory
+OUTPUT_DIR="$SCRATCH/khi2d_$(date +%Y%m%d_%H%M%S)"
+echo "Output directory: $OUTPUT_DIR"
+
+# Create output directory
+mkdir -p "$OUTPUT_DIR"
+
+# Set environment variables for better GPU utilization
+export CUDA_LAUNCH_BLOCKING=0
+export CUDA_CACHE_DISABLE=1
+export OMP_NUM_THREADS=8
+
+# Run the simulation with proper error handling
+echo "Starting PHRIKE simulation..."
+echo "Command: phrike khi2d --config configs/khi2d.yaml --backend torch --device cuda -v --outdir $OUTPUT_DIR --video-quality high --video-fps 30"
+
+if srun phrike khi2d --config configs/khi2d.yaml --backend torch --device cuda -v --outdir "$OUTPUT_DIR" --video-quality high --video-fps 30; then
+    echo "Simulation completed successfully!"
+    echo "Results saved to: $OUTPUT_DIR"
+    
+    # List output files
+    echo "Output files:"
+    ls -la "$OUTPUT_DIR"
+    
+    # Check if video was created
+    if [ -f "$OUTPUT_DIR/khi2d.mp4" ]; then
+        echo "Video created successfully: $OUTPUT_DIR/khi2d.mp4"
+        echo "Video size: $(du -h "$OUTPUT_DIR/khi2d.mp4" | cut -f1)"
+    else
+        echo "Warning: Video file not found. Check frames directory for manual processing."
+    fi
+else
+    echo "Simulation failed with exit code $?"
+    echo "Check error.out for details"
+    exit 1
+fi
+
+echo "Job completed at $(date)"

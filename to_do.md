@@ -1,10 +1,29 @@
 ✅ Add restart capabilities
 ✅ rename spectralhydro directory to phrike
+Create a debug option that will print out an error if it doesn't use the specified device and backend
 Add new basis functions
     - Chebyshev + Filtering near discontinuities
+    - LGL
+    - Compare Dedalus Chebyshev to ours
+Add single-precision option
+
+After the fork:
 Add turbulent driving
 Add MPI
 Add MHD
+
+Install PyTorch with CUDA support:
+Apply to chebyshev_so...
+cu118
+Consider using float32 for large problems:
+Modify the grid initialization to use torch.float32 instead of torch.float64
+This would roughly double the effective memory and speed
+Enable multi-GPU support (future enhancement):
+The current architecture could be extended for multi-GPU simulations
+PyTorch's DistributedDataParallel could be integrated
+Optimize FFT operations:
+Consider using cuFFT directly for even better performance
+Batch multiple FFT operations when possible
 
 
 Longer term:

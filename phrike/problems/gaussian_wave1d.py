@@ -41,21 +41,26 @@ class GaussianWave1DProblem(BaseProblem):
     """
 
     def create_grid(
-        self, backend: str = "numpy", device: Optional[str] = None
+        self, backend: str = "numpy", device: Optional[str] = None, debug: bool = False
     ) -> Grid1D:
         """Create 1D periodic grid."""
         N = int(self.config["grid"]["N"])
         Lx = float(self.config["grid"]["Lx"])
         dealias = bool(self.config["grid"].get("dealias", True))
+        basis = str(self.config["grid"].get("basis", "fourier")).lower()
+        bc = self.config["grid"].get("bc", None)
 
         return Grid1D(
             N=N,
             Lx=Lx,
+            basis=basis,
+            bc=bc,
             dealias=dealias,
             filter_params=self.filter_config,
             fft_workers=self.fft_workers,
             backend=backend,
             torch_device=device,
+            precision=self.precision,
         )
 
     def create_equations(self) -> EulerEquations1D:

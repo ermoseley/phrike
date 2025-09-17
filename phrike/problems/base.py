@@ -97,6 +97,9 @@ class BaseProblem(ABC):
             "spectral_filter", {"enabled": False}
         )
         
+        # Grid parameters
+        self.precision = str(self.config["grid"].get("precision", "double"))
+        
         # Adaptive time-stepping parameters
         adaptive_raw = self.config["integration"].get("adaptive", None)
         if adaptive_raw:
@@ -244,7 +247,7 @@ class BaseProblem(ABC):
                 )
 
     @abstractmethod
-    def create_grid(self, backend: str = "numpy", device: Optional[str] = None):
+    def create_grid(self, backend: str = "numpy", device: Optional[str] = None, debug: bool = False):
         """Create the computational grid."""
         pass
 
@@ -450,51 +453,96 @@ class BaseProblem(ABC):
         if hasattr(solver.equations, "conserved_quantities"):
             current_cons = solver.equations.conserved_quantities(U)
         else:
-            # Fallback: compute manually
+            # Fallback: compute manually - work directly with torch tensors
             primitive_vars = solver.equations.primitive(U)
-            primitive_vars = self.convert_torch_to_numpy(*primitive_vars)
+            # Only convert to numpy for final computation, not intermediate steps
 
-            # Compute conserved quantities
+            # Compute conserved quantities - work with torch tensors directly
+            try:
+                import torch
+                is_torch = any(isinstance(v, torch.Tensor) for v in primitive_vars)
+            except ImportError:
+                is_torch = False
+                torch = None
+
             if len(primitive_vars) == 4:  # Could be 1D or 2D
                 rho = primitive_vars[0]
                 if len(rho.shape) == 1:  # 1D: rho, u, p, a
                     rho, u, p, a = primitive_vars
-                    current_cons = {
-                        "mass": float(rho.sum()),
-                        "momentum": float((rho * u).sum()),
-                        "energy": float(
-                            (
-                                p / (solver.equations.gamma - 1.0) + 0.5 * rho * u**2
-                            ).sum()
-                        ),
-                    }
+                    if is_torch:
+                        current_cons = {
+                            "mass": float(torch.sum(rho).item()),
+                            "momentum": float(torch.sum(rho * u).item()),
+                            "energy": float(
+                                torch.sum(
+                                    p / (solver.equations.gamma - 1.0) + 0.5 * rho * u**2
+                                ).item()
+                            ),
+                        }
+                    else:
+                        current_cons = {
+                            "mass": float(rho.sum()),
+                            "momentum": float((rho * u).sum()),
+                            "energy": float(
+                                (
+                                    p / (solver.equations.gamma - 1.0) + 0.5 * rho * u**2
+                                ).sum()
+                            ),
+                        }
                 else:  # 2D: rho, ux, uy, p
                     rho, ux, uy, p = primitive_vars
+                    if is_torch:
+                        current_cons = {
+                            "mass": float(torch.sum(rho).item()),
+                            "momentum_x": float(torch.sum(rho * ux).item()),
+                            "momentum_y": float(torch.sum(rho * uy).item()),
+                            "energy": float(
+                                torch.sum(
+                                    p / (solver.equations.gamma - 1.0)
+                                    + 0.5 * rho * (ux**2 + uy**2)
+                                ).item()
+                            ),
+                        }
+                    else:
+                        current_cons = {
+                            "mass": float(rho.sum()),
+                            "momentum_x": float((rho * ux).sum()),
+                            "momentum_y": float((rho * uy).sum()),
+                            "energy": float(
+                                (
+                                    p / (solver.equations.gamma - 1.0)
+                                    + 0.5 * rho * (ux**2 + uy**2)
+                                ).sum()
+                            ),
+                        }
+            elif len(primitive_vars) == 5:  # 3D: rho, ux, uy, uz, p
+                rho, ux, uy, uz, p = primitive_vars
+                if is_torch:
+                    current_cons = {
+                        "mass": float(torch.sum(rho).item()),
+                        "momentum_x": float(torch.sum(rho * ux).item()),
+                        "momentum_y": float(torch.sum(rho * uy).item()),
+                        "momentum_z": float(torch.sum(rho * uz).item()),
+                        "energy": float(
+                            torch.sum(
+                                p / (solver.equations.gamma - 1.0)
+                                + 0.5 * rho * (ux**2 + uy**2 + uz**2)
+                            ).item()
+                        ),
+                    }
+                else:
                     current_cons = {
                         "mass": float(rho.sum()),
                         "momentum_x": float((rho * ux).sum()),
                         "momentum_y": float((rho * uy).sum()),
+                        "momentum_z": float((rho * uz).sum()),
                         "energy": float(
                             (
                                 p / (solver.equations.gamma - 1.0)
-                                + 0.5 * rho * (ux**2 + uy**2)
+                                + 0.5 * rho * (ux**2 + uy**2 + uz**2)
                             ).sum()
                         ),
                     }
-            elif len(primitive_vars) == 5:  # 3D: rho, ux, uy, uz, p
-                rho, ux, uy, uz, p = primitive_vars
-                current_cons = {
-                    "mass": float(rho.sum()),
-                    "momentum_x": float((rho * ux).sum()),
-                    "momentum_y": float((rho * uy).sum()),
-                    "momentum_z": float((rho * uz).sum()),
-                    "energy": float(
-                        (
-                            p / (solver.equations.gamma - 1.0)
-                            + 0.5 * rho * (ux**2 + uy**2 + uz**2)
-                        ).sum()
-                    ),
-                }
             else:
                 raise ValueError(
                     f"Unexpected number of primitive variables: {len(primitive_vars)}"
@@ -522,50 +570,91 @@ class BaseProblem(ABC):
     def compute_velocity_stats(self, solver, U):
         """Compute velocity statistics."""
         primitive_vars = solver.equations.primitive(U)
-        primitive_vars = self.convert_torch_to_numpy(*primitive_vars)
+        # Work directly with torch tensors, only convert final results
 
-        # Handle different dimensions
+        # Handle different dimensions - work with torch tensors directly
+        try:
+            import torch
+            is_torch = any(isinstance(v, torch.Tensor) for v in primitive_vars)
+        except ImportError:
+            is_torch = False
+            torch = None
+
         if len(primitive_vars) == 4:  # Could be 1D or 2D
             rho = primitive_vars[0]
             if len(rho.shape) == 1:  # 1D: rho, u, p, a
                 rho, u, p, a = primitive_vars
-                v_mag = np.abs(u)
+                if is_torch:
+                    v_mag = torch.abs(u)
+                else:
+                    v_mag = np.abs(u)
             else:  # 2D: rho, ux, uy, p
                 rho, ux, uy, p = primitive_vars
-                v_mag = np.sqrt(ux**2 + uy**2)
+                if is_torch:
+                    v_mag = torch.sqrt(ux**2 + uy**2)
+                else:
+                    v_mag = np.sqrt(ux**2 + uy**2)
         elif len(primitive_vars) == 5:  # 3D: rho, ux, uy, uz, p
             rho, ux, uy, uz, p = primitive_vars
-            v_mag = np.sqrt(ux**2 + uy**2 + uz**2)
+            if is_torch:
+                v_mag = torch.sqrt(ux**2 + uy**2 + uz**2)
+            else:
+                v_mag = np.sqrt(ux**2 + uy**2 + uz**2)
         else:
             raise ValueError(
                 f"Unexpected number of primitive variables: {len(primitive_vars)}"
             )
 
         # Compute density-weighted statistics
-        total_mass = rho.sum()
-        if total_mass > 0:
-            v_rms = np.sqrt((rho * v_mag**2).sum() / total_mass)
-            v_max = v_mag.max()
-            v_min = v_mag.min()
+        if is_torch:
+            total_mass = torch.sum(rho)
+            if total_mass > 0:
+                v_rms = torch.sqrt(torch.sum(rho * v_mag**2) / total_mass)
+                v_max = torch.max(v_mag)
+                v_min = torch.min(v_mag)
+            else:
+                v_rms = v_max = v_min = torch.tensor(0.0, device=rho.device)
+            return {"v_rms": float(v_rms.item()), "v_max": float(v_max.item()), "v_min": float(v_min.item())}
         else:
-            v_rms = v_max = v_min = 0.0
-
-        return {"v_rms": float(v_rms), "v_max": float(v_max), "v_min": float(v_min)}
+            total_mass = rho.sum()
+            if total_mass > 0:
+                v_rms = np.sqrt((rho * v_mag**2).sum() / total_mass)
+                v_max = v_mag.max()
+                v_min = v_mag.min()
+            else:
+                v_rms = v_max = v_min = 0.0
+            return {"v_rms": float(v_rms), "v_max": float(v_max), "v_min": float(v_min)}
 
     def compute_density_stats(self, solver, U):
         """Compute density statistics."""
         primitive_vars = solver.equations.primitive(U)
-        primitive_vars = self.convert_torch_to_numpy(*primitive_vars)
+        # Work directly with torch tensors, only convert final results
 
         # Extract density (first variable)
         rho = primitive_vars[0]
 
-        return {
-            "rho_mean": float(np.mean(rho)),
-            "rho_max": float(np.max(rho)),
-            "rho_min": float(np.min(rho)),
-            "rho_std": float(np.std(rho)),
-        }
+        # Work with torch tensors directly
+        try:
+            import torch
+            is_torch = isinstance(rho, torch.Tensor)
+        except ImportError:
+            is_torch = False
+            torch = None
+
+        if is_torch:
+            return {
+                "rho_mean": float(torch.mean(rho).item()),
+                "rho_max": float(torch.max(rho).item()),
+                "rho_min": float(torch.min(rho).item()),
+                "rho_std": float(torch.std(rho).item()),
+            }
+        else:
+            return {
+                "rho_mean": float(np.mean(rho)),
+                "rho_max": float(np.max(rho)),
+                "rho_min": float(np.min(rho)),
+                "rho_std": float(np.std(rho)),
+            }
 
     def output_monitoring_info(self, solver, U, step_count, dt):
         """Output monitoring information."""
@@ -674,10 +763,11 @@ class BaseProblem(ABC):
         backend: str = "numpy",
         device: Optional[str] = None,
         generate_video: bool = True,
+        debug: bool = False,
     ) -> Any:
         """Run the simulation."""
         # Create components
-        grid = self.create_grid(backend, device)
+        grid = self.create_grid(backend, device, debug)
         equations = self.create_equations()
 
         # Create initial conditions (use restart data if available)
