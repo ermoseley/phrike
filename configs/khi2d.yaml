@@ -2,8 +2,8 @@
 problem: khi2d
 
 grid:
-  Nx: 256
-  Ny: 256
+  Nx: 512
+  Ny: 512
   Lx: 1.0
   Ly: 1.0
   dealias: true
@@ -14,12 +14,12 @@ physics:
 
 integration:
   t0: 0.0
-  t_end: 2.0
+  t_end: 5.0
   cfl: 0.25
   scheme: rk78
   rtol: 1e-6
   atol: 1e-8
-  output_interval: 0.05
+  output_interval: 0.02
   checkpoint_interval: 0.5
   spectral_filter:
     enabled: true

@@ -49,7 +49,7 @@ def _rk2_step(grid: Grid1D, eqs: EulerEquations1D, U: Array, dt: float,
     k1 = _compute_rhs(grid, eqs, U, artificial_viscosity)
     U1 = U + dt * 0.5 * k1
     k2 = _compute_rhs(grid, eqs, U1, artificial_viscosity)
-    return U + dt * k2
+    return _apply_physical_filters(grid, U + dt * k2, eqs)
 
 
 def _rk4_step(grid: Grid1D, eqs: EulerEquations1D, U: Array, dt: float,
@@ -61,12 +61,19 @@ def _rk4_step(grid: Grid1D, eqs: EulerEquations1D, U: Array, dt: float,
     k3 = _compute_rhs(grid, eqs, U3, artificial_viscosity)
     U4 = U + dt * k3
     k4 = _compute_rhs(grid, eqs, U4, artificial_viscosity)
-    return U + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+    return _apply_physical_filters(grid, U + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4), eqs)
 
 
-def _apply_physical_filters(grid: Grid1D, U: Array) -> Array:
+def _apply_physical_filters(grid: Grid1D, U: Array, equations: Optional[EulerEquations1D] = None) -> Array:
     # Apply optional spectral filter to each component to suppress Gibbs/aliasing
-    return grid.apply_spectral_filter(U)
+    U_filtered = grid.apply_spectral_filter(U)
+    # Re-apply boundary conditions after filtering to prevent endpoint drift (Chebyshev)
+    if equations is not None and hasattr(grid, "apply_boundary_conditions"):
+        try:
+            U_filtered = grid.apply_boundary_conditions(U_filtered, equations)
+        except Exception:
+            pass
+    return U_filtered
 
 
 class SpectralSolver1D:
@@ -192,7 +199,7 @@ class SpectralSolver1D:
         
         # Apply spectral filtering to accepted solution
         if result.accepted:
-            Un = _apply_physical_filters(self.grid, result.U_new)
+            Un = _apply_physical_filters(self.grid, result.U_new, self.equations)
         else:
             # Return original solution if step was rejected
             Un = U

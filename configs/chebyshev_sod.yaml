@@ -2,7 +2,7 @@
 problem: sod
 
 grid:
-  N: 512
+  N: 128
   Lx: 1.0
   basis: chebyshev
   bc: dirichlet     # reflective/dirichlet at endpoints for momentum
@@ -13,11 +13,11 @@ physics:
 
 integration:
   t0: 0.0
-  t_end: 0.2
+  t_end: 0.05      # shorter run for faster completion
   cfl: 0.2         # smaller CFL due to clustered nodes near boundaries
   scheme: rk4
-  output_interval: 0.01
-  checkpoint_interval: 0.05
+  output_interval: 0.005  # more frequent output
+  checkpoint_interval: 0.01
   spectral_filter:
     enabled: true
     p: 8
@@ -39,7 +39,7 @@ io:
 
 monitoring:
   enabled: true
-  step_interval: 100
+  step_interval: 50  # Less frequent monitoring to reduce overhead
   include_conservation: true
   include_timestep: true
   include_time: true

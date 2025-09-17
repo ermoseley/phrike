@@ -1,0 +1,18 @@
+ compile date = 09/17/25-10:38:55
+ compile command = /Applications/Xcode.app/Contents/Developer/usr/bin/make MPI=1 HYDRO=1 NDIM=2
+ remote repo = git@bitbucket.org:ermoseley/mini-ramses-dev.git
+ local branch = develop
+ last commit = 2cfebbe822f5094bd1014d9560f49ea1217873c3
+ PATCH = 
+ NHILBERT = 1                             
+ NVECTOR = 32                            
+ NDIM = 2                             
+ NPRE = 8
+ NVAR = 5                             
+ NENER = 0                             
+ HYDRO = 1
+ GRAV = 0
+ MHD = 0
+ MPI = 1
+ UNITS = 
+ INIT = 

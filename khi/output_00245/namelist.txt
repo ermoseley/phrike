@@ -1,0 +1,48 @@
+0;276;0crgb:1818/1818/1818This namelist sets up a 2D Kelvin–Helmholtz instability using grafic ICs.
+Compile using:
+make NDIM=2 HYDRO=1 (optional: MPI=1)
+
+&RUN_PARAMS
+ hydro=.true.
+ ncontrol=1
+ nrestart=0
+ nremap=0
+ nsubcycle=10*1
+ verbose=.false.
+ nstepmax=1000000
+ nsuperoct=0
+/
+
+&AMR_PARAMS
+ levelmin=9
+ levelmax=9
+ ngridtot=8000000
+ ncachemax=30000
+ nexpand=1
+ boxlen=1.0
+/
+
+&INIT_PARAMS
+ filetype='grafic'
+ initfile(1)='/Users/moseley/ramses-development/rundir/khi/ic_khi/ic_khi_9_2d'
+/
+
+&OUTPUT_PARAMS
+ delta_tout=0.02
+ tend=5.0
+/
+
+&HYDRO_PARAMS
+ gamma=1.4
+ courant_factor=0.8
+ slope_type=2
+ riemann='hllc'
+/
+
+&REFINE_PARAMS
+ interpol_var=0
+ interpol_type=2
+ err_grad_d=0.1
+/
+
+
