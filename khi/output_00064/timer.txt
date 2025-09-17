@@ -1,9 +1,0 @@
-
-     seconds         %    STEP
-       6.069       7.2    time step               
-       1.802       2.1    hydro - set unew        
-       0.926       1.1    update time             
-      73.557      86.8    hydro - godunov         
-       2.388       2.8    hydro - set uold        
-      84.747     100.0    TOTAL
-
