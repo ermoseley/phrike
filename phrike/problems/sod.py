@@ -63,8 +63,16 @@ class SodProblem(BaseProblem):
         x0 = float(self.config["grid"].get("x0", 0.5 * grid.Lx))
         left = self.config["initial_conditions"]["left"]
         right = self.config["initial_conditions"]["right"]
+        U0 = sod_shock_tube(grid.x, x0, left, right, self.gamma)
 
-        return sod_shock_tube(grid.x, x0, left, right, self.gamma)
+        # Optionally smooth initial conditions to reduce Gibbs at t=0
+        if getattr(self, "ic_smoothing_config", None) and self.ic_smoothing_config.get("enabled", False):
+            eq = EulerEquations1D(gamma=self.gamma)
+            rho, u, p, _ = eq.primitive(U0)
+            rho_s, u_s, p_s = self.apply_initial_conditions_smoothing(rho, u, p, grid)
+            U0 = eq.conservative(rho_s, u_s, p_s)
+
+        return U0
 
     def create_visualization(self, solver, t: float, U):
         """Create visualization for current state."""

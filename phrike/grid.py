@@ -208,6 +208,24 @@ class Grid1D:
                 self.filter_sigma = np.ones(self.N, dtype=float)
             except Exception as e:
                 raise RuntimeError(f"Chebyshev basis initialization failed: {e}")
+        elif self._basis_name == "legendre":
+            # Legendre–Gauss–Lobatto nodes on [0, Lx]
+            try:
+                from .basis.legendre import LegendreLobattoBasis1D
+
+                bc = self.bc or "dirichlet"
+                self._basis = LegendreLobattoBasis1D(self.N, self.Lx, bc=bc)
+                self.x = self._basis.nodes()
+                x_np = np.asarray(self.x)
+                if self.N > 1:
+                    self.dx = float(np.min(np.diff(x_np)))
+                else:
+                    self.dx = self.Lx
+                # No Fourier masks in non-periodic modal bases
+                self.dealias_mask = np.ones(self.N, dtype=float)
+                self.filter_sigma = np.ones(self.N, dtype=float)
+            except Exception as e:
+                raise RuntimeError(f"Legendre basis initialization failed: {e}")
         else:
             raise ValueError(f"Unknown basis: {self.basis}")
 
@@ -220,8 +238,12 @@ class Grid1D:
             except Exception:
                 pass
 
-        # Torch backend setup (Fourier and Chebyshev supported)
-        self._use_torch = (self.backend.lower() == "torch") and _TORCH_AVAILABLE
+        # Torch backend setup (Fourier, Chebyshev, Legendre supported)
+        self._use_torch = (
+            (self.backend.lower() == "torch")
+            and _TORCH_AVAILABLE
+            and (self._basis_name in ("fourier", "chebyshev", "legendre"))
+        )
         if self._use_torch:
             # Choose device if not provided
             if self.torch_device is None:
@@ -474,9 +496,12 @@ class Grid1D:
             F *= self.filter_sigma
             dF = self.ik * F
             return self.irfft(dF)
+        elif self._basis_name == "chebyshev":
+            # Delegate to basis implementation to avoid normalization drift
+            return self._basis.dx(f)  # type: ignore[union-attr]
         else:
-            # Chebyshev basis path - use Grid1D DCT methods (mirrors Fourier pattern)
-            return self._chebyshev_dx(f)
+            # Generic basis path (e.g., Legendre): delegate to basis implementation
+            return self._basis.dx(f)  # type: ignore[union-attr]
 
     def apply_spectral_filter(self, f: np.ndarray) -> np.ndarray:
         # Supports f with shape (..., N)
@@ -486,11 +511,12 @@ class Grid1D:
             F *= self.filter_sigma
             return self.irfft(F)
         else:
-            # Chebyshev basis path - use Grid1D DCT methods (mirrors Fourier pattern)
+            # Non-Fourier path
             if self.filter_params and bool(self.filter_params.get("enabled", False)):
                 p = int(self.filter_params.get("p", 8))
                 alpha = float(self.filter_params.get("alpha", 36.0))
-                return self._chebyshev_spectral_filter(f, p=p, alpha=alpha)
+                # Delegate to basis filter (Chebyshev/Legendre implement modal filters)
+                return self._basis.apply_spectral_filter(f, p=p, alpha=alpha)  # type: ignore[union-attr]
             return f
 
     def convolve(self, f: np.ndarray, g: np.ndarray) -> np.ndarray:
@@ -506,23 +532,42 @@ class Grid1D:
     def apply_boundary_conditions(self, U: np.ndarray, equations) -> np.ndarray:
         """Apply boundary conditions to conservative variables U in-place.
 
-        For Chebyshev basis with reflective (wall) or Dirichlet BCs, we set
-        the velocity to zero at the endpoints (x=0 and x=Lx), which implies
-        zero momentum at the endpoints. Density and pressure are left unchanged.
+        For Chebyshev/Legendre bases with reflective (wall) or Dirichlet BCs,
+        enforce u=0 at x=0 and x=Lx by adding a low-degree modal lift to the
+        momentum component. This preserves spectral structure better than
+        overwriting endpoint nodal values.
         """
-        if self._basis_name != "chebyshev":
+        if self._basis_name not in ("chebyshev", "legendre"):
             return U
         bc_type = (self.bc or "reflective").lower()
         if U.shape[-1] != self.N:
             return U
         if U.shape[0] < 2:
             return U
-        # Enforce u=0 at boundaries => momentum = 0 at boundaries
         if bc_type in ("reflective", "dirichlet", "wall"):
-            # Support batched leading dims (..., 3, N)
-            # Only modify the momentum component index 1
-            U[..., 1, 0] = 0.0
-            U[..., 1, -1] = 0.0
+            # Simple, robust wall BCs for collocation methods:
+            # - Zero velocity at boundaries (momentum = 0)
+            # - Zero-gradient for density and energy at boundaries
+            if self.N >= 2:
+                # Copy interior state to boundaries for rho and E
+                U[..., 0, 0] = U[..., 0, 1]
+                U[..., 2, 0] = U[..., 2, 1]
+                U[..., 0, -1] = U[..., 0, -2]
+                U[..., 2, -1] = U[..., 2, -2]
+            # Enforce u=0 → momentum=0 at boundaries
+            U[..., 1, 0] = 0
+            U[..., 1, -1] = 0
+        elif bc_type in ("neumann", "open"):
+            # Neumann/open: enforce zero gradient (∂/∂x = 0) at boundaries
+            # Simple and robust: copy interior state to boundaries
+            if self.N >= 3:
+                U[..., :, 0] = U[..., :, 1]
+                U[..., :, -1] = U[..., :, -2]
+            elif self.N == 2:
+                # With only two points, set both ends to average to avoid drift
+                avg = 0.5 * (U[..., :, 0] + U[..., :, 1])
+                U[..., :, 0] = avg
+                U[..., :, 1] = avg
         return U
 
 

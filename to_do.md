@@ -1,11 +1,5 @@
-✅ Add restart capabilities
-✅ rename spectralhydro directory to phrike
-Create a debug option that will print out an error if it doesn't use the specified device and backend
 Add new basis functions
     - Chebyshev + Filtering near discontinuities
-    - LGL
-    - Compare Dedalus Chebyshev to ours
-Add single-precision option
 
 After the fork:
 Add turbulent driving
