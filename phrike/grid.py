@@ -161,6 +161,39 @@ class Grid1D:
     debug: bool = False
 
     def __post_init__(self) -> None:
+        # Normalize/parse boundary condition configuration (string or dict)
+        def _normalize_bc_value(name: str) -> str:
+            n = str(name).strip().lower()
+            if n in ("reflective", "dirichlet", "wall"):
+                return "wall"
+            if n in ("neumann", "open"):
+                return "neumann"
+            return n
+
+        def _normalize_var_name(v: str) -> str:
+            n = str(v).strip().lower()
+            if n in ("rho", "density"):
+                return "density"
+            if n in ("p", "pressure"):
+                return "pressure"
+            if n in ("u", "velocity", "mom", "momentum", "momentum_x"):
+                return "momentum"
+            return n
+
+        # bc may be a string or a dict mapping variables to bc types
+        self._bc_global: str | None = None
+        self._bc_map: dict[str, str] | None = None
+        self._dirichlet_values_map: dict[str, tuple[float, float]] | None = None
+        if isinstance(self.bc, dict):
+            # Per-variable map
+            self._bc_map = {}
+            for k, v in self.bc.items():  # type: ignore[union-attr]
+                self._bc_map[_normalize_var_name(k)] = _normalize_bc_value(v)
+        elif isinstance(self.bc, str) and self.bc:
+            self._bc_global = _normalize_bc_value(self.bc)
+        else:
+            self._bc_global = None
+
         # Basis selection (Fourier default)
         self._basis_name = str(self.basis).lower()
 
@@ -228,6 +261,25 @@ class Grid1D:
                 raise RuntimeError(f"Legendre basis initialization failed: {e}")
         else:
             raise ValueError(f"Unknown basis: {self.basis}")
+
+    def set_dirichlet_bc_values(self, values: dict[str, tuple[float, float]]) -> None:
+        """Set per-variable Dirichlet boundary values.
+
+        Args:
+            values: Mapping from variable name to (left_value, right_value). Variable
+                names use normalized keys: 'density', 'pressure', 'momentum'.
+        """
+        # Normalize keys
+        def _n(v: str) -> str:
+            vn = str(v).strip().lower()
+            if vn in ("rho", "density"):
+                return "density"
+            if vn in ("p", "pressure"):
+                return "pressure"
+            if vn in ("u", "velocity", "mom", "momentum", "momentum_x"):
+                return "momentum"
+            return vn
+        self._dirichlet_values_map = { _n(k): (float(v[0]), float(v[1])) for k, v in values.items() }
 
         # Enable FFTW planning cache if available (no-op with SciPy backend)
         if scipy_fft_cache_enabled and fftw_cache is not None:
@@ -532,42 +584,81 @@ class Grid1D:
     def apply_boundary_conditions(self, U: np.ndarray, equations) -> np.ndarray:
         """Apply boundary conditions to conservative variables U in-place.
 
-        For Chebyshev/Legendre bases with reflective (wall) or Dirichlet BCs,
-        enforce u=0 at x=0 and x=Lx by adding a low-degree modal lift to the
-        momentum component. This preserves spectral structure better than
-        overwriting endpoint nodal values.
+        Supports global or per-variable BCs for non-periodic bases. Semantics:
+        - "wall" (alias: reflective, dirichlet): velocity Dirichlet (u=0),
+          scalars density/pressure use zero-gradient (Neumann).
+        - "neumann" (alias: open): zero-gradient for all selected variables.
+        Variable keys accepted: density|rho, momentum|velocity|u, pressure|p.
         """
         if self._basis_name not in ("chebyshev", "legendre"):
             return U
-        bc_type = (self.bc or "reflective").lower()
+        # Determine BCs for each variable
+        def _get_var_bc(var: str) -> str:
+            var_n = var
+            if self._bc_map is not None:
+                return self._bc_map.get(var_n, self._bc_global or "wall")
+            # No per-var map: interpret global
+            g = self._bc_global or "wall"
+            # For global "wall": momentum Dirichlet, scalars Neumann
+            if g == "wall":
+                if var_n == "momentum":
+                    return "wall"
+                else:
+                    return "neumann"
+            return g
+
         if U.shape[-1] != self.N:
             return U
         if U.shape[0] < 2:
             return U
-        if bc_type in ("reflective", "dirichlet", "wall"):
-            # Simple, robust wall BCs for collocation methods:
-            # - Zero velocity at boundaries (momentum = 0)
-            # - Zero-gradient for density and energy at boundaries
-            if self.N >= 2:
-                # Copy interior state to boundaries for rho and E
-                U[..., 0, 0] = U[..., 0, 1]
-                U[..., 2, 0] = U[..., 2, 1]
-                U[..., 0, -1] = U[..., 0, -2]
-                U[..., 2, -1] = U[..., 2, -2]
-            # Enforce u=0 → momentum=0 at boundaries
+
+        # Resolve per-variable BCs
+        bc_rho = _get_var_bc("density")
+        bc_mom = _get_var_bc("momentum")
+        bc_p   = _get_var_bc("pressure")
+
+        # Helper: apply zero-gradient (copy nearest interior) on a component idx
+        def _apply_neumann(comp_idx: int) -> None:
+            if self.N >= 3:
+                U[..., comp_idx, 0] = U[..., comp_idx, 1]
+                U[..., comp_idx, -1] = U[..., comp_idx, -2]
+            elif self.N == 2:
+                avg = 0.5 * (U[..., comp_idx, 0] + U[..., comp_idx, 1])
+                U[..., comp_idx, 0] = avg
+                U[..., comp_idx, 1] = avg
+
+        # Helpers for Dirichlet using configured values
+        def _apply_dirichlet(comp_idx: int, var_key: str) -> None:
+            if self._dirichlet_values_map is not None and var_key in self._dirichlet_values_map:
+                left_val, right_val = self._dirichlet_values_map[var_key]
+                U[..., comp_idx, 0] = left_val
+                U[..., comp_idx, -1] = right_val
+            else:
+                # Fallback: zero for momentum, else copy interior (approximate Neumann)
+                if var_key == "momentum":
+                    U[..., comp_idx, 0] = 0
+                    U[..., comp_idx, -1] = 0
+                else:
+                    _apply_neumann(comp_idx)
+
+        # Density
+        if bc_rho in ("neumann", "open", "wall"):
+            _apply_neumann(0)
+        elif bc_rho == "dirichlet":
+            _apply_dirichlet(0, "density")
+        # Momentum / velocity
+        if bc_mom in ("wall", "reflective"):
             U[..., 1, 0] = 0
             U[..., 1, -1] = 0
-        elif bc_type in ("neumann", "open"):
-            # Neumann/open: enforce zero gradient (∂/∂x = 0) at boundaries
-            # Simple and robust: copy interior state to boundaries
-            if self.N >= 3:
-                U[..., :, 0] = U[..., :, 1]
-                U[..., :, -1] = U[..., :, -2]
-            elif self.N == 2:
-                # With only two points, set both ends to average to avoid drift
-                avg = 0.5 * (U[..., :, 0] + U[..., :, 1])
-                U[..., :, 0] = avg
-                U[..., :, 1] = avg
+        elif bc_mom == "dirichlet":
+            _apply_dirichlet(1, "momentum")
+        elif bc_mom in ("neumann", "open"):
+            _apply_neumann(1)
+        # Pressure: approximate by applying to energy component
+        if bc_p in ("neumann", "open", "wall"):
+            _apply_neumann(2)
+        elif bc_p == "dirichlet":
+            _apply_dirichlet(2, "pressure")
         return U
 
 

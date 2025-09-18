@@ -128,6 +128,8 @@ class BaseProblem(ABC):
         if artificial_viscosity_raw:
             self.artificial_viscosity_config = {
                 "enabled": bool(artificial_viscosity_raw.get("enabled", False)),
+                "mode": str(artificial_viscosity_raw.get("mode", "sensor")),
+                "nu_constant": float(artificial_viscosity_raw.get("nu_constant", 0.0)),
                 "nu_max": float(artificial_viscosity_raw.get("nu_max", 1e-3)),
                 "s_ref": float(artificial_viscosity_raw.get("s_ref", 1.0)),
                 "s_min": float(artificial_viscosity_raw.get("s_min", 0.1)),
