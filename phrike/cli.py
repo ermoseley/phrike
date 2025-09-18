@@ -17,9 +17,9 @@ Examples:
   phrike sod --config configs/sod.yaml
   phrike khi2d --backend torch --device mps
   phrike tgv3d --config configs/tgv3d.yaml --backend torch --device cuda
-  phrike turb3d --no-video
-  phrike sod --video-quality high --video-fps 60
-  phrike khi2d --video-codec libx264 --video-quality medium
+  phrike turb3d --video
+  phrike sod --video --video-quality high --video-fps 60
+  phrike khi2d --video --video-codec libx264 --video-quality medium
         """,
     )
 
@@ -71,7 +71,7 @@ Examples:
     )
 
     # Output options
-    parser.add_argument("--no-video", action="store_true", help="Skip video generation")
+    parser.add_argument("--video", action="store_true", help="Enable video generation (default: disabled)")
     parser.add_argument("--outdir", type=str, help="Override output directory")
     
     # Video quality options
@@ -155,8 +155,12 @@ Examples:
             # Non-fatal: continue with defaults
             pass
         
+        # Determine video generation setting
+        # Default: no video unless explicitly enabled via CLI or config
+        generate_video = args.video or problem.config.get('video', {}).get('enabled', False)
+        
         # Override video settings if specified
-        if not args.no_video:
+        if generate_video:
             if 'video' not in problem.config:
                 problem.config['video'] = {}
             
@@ -193,7 +197,7 @@ Examples:
                     pass
 
         solver, history = problem.run(
-            backend=args.backend, device=args.device, generate_video=not args.no_video, debug=args.debug
+            backend=args.backend, device=args.device, generate_video=generate_video, debug=args.debug
         )
 
         if args.verbose:
