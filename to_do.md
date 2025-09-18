@@ -1,5 +1,9 @@
 Add new basis functions
     - Chebyshev + Filtering near discontinuities
+Compare our Chebyshev/Legendre implementation to Dedalus. What aren't we getting right, if anything?
+Run a convection problem. Set pressure BCs for a stratified medium.
+Compare Dedalus to PHRIKE
+
 
 After the fork:
 Add turbulent driving

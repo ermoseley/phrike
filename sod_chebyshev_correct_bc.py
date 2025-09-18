@@ -23,7 +23,7 @@ def main():
     dealias = 3/2  # Dealiasing factor
     stop_sim_time = 0.2  # Simulation end time
     timestep = 1e-6  # Timestep
-    nu = 1e-3  # Moderate artificial viscosity for stability
+    nu = 3e-4  # Moderate artificial viscosity for stability
     dtype = np.float64
 
     logger.info(f"Setting up Sod shock tube simulation with {Nx} Chebyshev points on domain [0, {Lx}]")
@@ -88,7 +88,7 @@ def main():
     # Set initial conditions - smooth transition to avoid discontinuities
     x = dist.local_grid(xbasis)
     x0 = 0.5  # Discontinuity location
-    sigma = 0.001  # Smoothing parameter
+    sigma = 0.01  # Smoothing parameter (works better with Chebyshev grid)
     
     # Sod shock tube initial conditions with smoothing
     rho_left, rho_right = 1.0, 0.125

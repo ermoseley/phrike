@@ -59,18 +59,77 @@ class SodProblem(BaseProblem):
         return EulerEquations1D(gamma=self.gamma)
 
     def create_initial_conditions(self, grid: Grid1D):
-        """Create Sod shock tube initial conditions."""
+        """Create Sod shock tube initial conditions.
+
+        Supports optional tanh-smoothed discontinuity controlled by
+        initial_conditions.smoothing: { enabled: bool, sigma: float }.
+        If sigma <= 0, reverts to sharp discontinuity.
+        """
+        import numpy as np
+
         x0 = float(self.config["grid"].get("x0", 0.5 * grid.Lx))
         left = self.config["initial_conditions"]["left"]
         right = self.config["initial_conditions"]["right"]
-        U0 = sod_shock_tube(grid.x, x0, left, right, self.gamma)
 
-        # Optionally smooth initial conditions to reduce Gibbs at t=0
+        # Tanh smoothing config (separate from Gaussian smoother)
+        ic_block = self.config.get("initial_conditions", {})
+        smoothing_cfg = ic_block.get("smoothing", {}) if isinstance(ic_block, dict) else {}
+        tanh_enabled = bool(smoothing_cfg.get("enabled", False))
+        sigma = float(smoothing_cfg.get("sigma", 0.0))
+
+        if tanh_enabled and sigma > 0.0:
+            # Build smoothed primitive profiles to mirror Dedalus script
+            try:
+                import torch  # type: ignore
+                is_torch = isinstance(grid.x, torch.Tensor)
+            except Exception:
+                is_torch = False
+                torch = None  # type: ignore
+
+            if is_torch:
+                xl = grid.x
+                def _t(vl, vr):
+                    return vr + (vl - vr) * 0.5 * (1.0 + torch.tanh((x0 - xl) / sigma))
+                rho = _t(float(left["rho"]), float(right["rho"]))
+                u   = _t(float(left["u"]),   float(right["u"]))
+                p   = _t(float(left["p"]),   float(right["p"]))
+            else:
+                x = np.asarray(grid.x)
+                tanh_step = 0.5 * (1.0 + np.tanh((x0 - x) / sigma))
+                rho = float(right["rho"]) + (float(left["rho"]) - float(right["rho"])) * tanh_step
+                u   = float(right["u"])   + (float(left["u"])   - float(right["u"]))   * tanh_step
+                p   = float(right["p"])   + (float(left["p"])   - float(right["p"]))   * tanh_step
+
+            eq = EulerEquations1D(gamma=self.gamma)
+            U0 = eq.conservative(rho, u, p)
+        else:
+            # Sharp discontinuity (original)
+            U0 = sod_shock_tube(grid.x, x0, left, right, self.gamma)
+
+        # Optional Gaussian smoothing (existing feature)
         if getattr(self, "ic_smoothing_config", None) and self.ic_smoothing_config.get("enabled", False):
             eq = EulerEquations1D(gamma=self.gamma)
             rho, u, p, _ = eq.primitive(U0)
             rho_s, u_s, p_s = self.apply_initial_conditions_smoothing(rho, u, p, grid)
             U0 = eq.conservative(rho_s, u_s, p_s)
+
+        # If non-periodic basis and Dirichlet BCs are specified per-var, pass values to grid
+        # so that BCs like pressure Dirichlet can be enforced if requested.
+        bc = self.config.get("grid", {}).get("bc", None)
+        if isinstance(bc, dict):
+            dirichlet_values = {}
+            # Allow optional boundary_values map under grid.bc_values
+            bc_vals = self.config.get("grid", {}).get("bc_values", {})
+            for key in ("density", "rho", "pressure", "p", "momentum", "velocity", "u"):
+                if key in bc_vals:
+                    vals = bc_vals[key]
+                    if isinstance(vals, (list, tuple)) and len(vals) == 2:
+                        dirichlet_values[key] = (float(vals[0]), float(vals[1]))
+            if dirichlet_values:
+                try:
+                    grid.set_dirichlet_bc_values(dirichlet_values)
+                except Exception:
+                    pass
 
         return U0
 

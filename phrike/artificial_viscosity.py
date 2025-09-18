@@ -56,6 +56,8 @@ class ArtificialViscosityConfig:
         variable_weights: Weights for different conserved variables
         sensor_variable: Which variable to use for smoothness sensing
         diagnostic_output: Whether to output diagnostic information
+    mode: str = "sensor"  # "sensor" or "constant"
+    nu_constant: float = 0.0  # used when mode == "constant"
     """
     enabled: bool = True
     nu_max: float = 1e-3
@@ -76,6 +78,11 @@ class ArtificialViscosityConfig:
                 "momentum_z": 1.0,
                 "energy": 1.0
             }
+        # Normalize mode value
+        if hasattr(self, "mode") and isinstance(self.mode, str):
+            self.mode = self.mode.lower().strip()
+        else:
+            self.mode = "sensor"
 
 
 class SmoothnessSensor(ABC):
@@ -219,11 +226,19 @@ class SpectralArtificialViscosity:
         if not self.config.enabled:
             return [np.zeros_like(U[i]) for i in range(len(U))]
         
-        # Compute smoothness sensor
-        sensor = self.sensor.compute_sensor(U, grid, equations)
-        
-        # Compute viscosity coefficient
-        viscosity = self.viscosity_coeff.compute_viscosity(sensor)
+        # Compute viscosity field
+        if getattr(self.config, "mode", "sensor") == "constant":
+            # Use a uniform constant viscosity everywhere
+            nu_val = float(getattr(self.config, "nu_constant", 0.0))
+            # Backward compatibility: if nu_constant is 0, fall back to nu_max
+            if nu_val == 0.0:
+                nu_val = float(self.config.nu_max)
+            viscosity = np.full_like(U[0], nu_val)
+            sensor = None
+        else:
+            # Sensor-based viscosity
+            sensor = self.sensor.compute_sensor(U, grid, equations)
+            viscosity = self.viscosity_coeff.compute_viscosity(sensor)
         
         # Compute viscosity terms for each conserved variable
         viscosity_terms = []
@@ -242,7 +257,7 @@ class SpectralArtificialViscosity:
         
         # Store diagnostics
         if self.config.diagnostic_output:
-            self.last_sensor = sensor.copy()
+            self.last_sensor = None if sensor is None else sensor.copy()
             self.last_viscosity = viscosity.copy()
             self.last_viscosity_terms = [term.copy() for term in viscosity_terms]
         
