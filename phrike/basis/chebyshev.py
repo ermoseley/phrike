@@ -19,20 +19,53 @@ from .base import Basis1D, _as_last_axis_matrix_apply
 def _build_chebyshev_diff_matrix_y(y: np.ndarray) -> np.ndarray:
     """Chebyshev–Gauss–Lobatto first-derivative matrix with respect to y.
 
-    Based on standard Trefethen formula on CGL nodes y_j = cos(pi*j/(N-1)).
+    Uses stable Vandermonde-based approach similar to Legendre implementation.
     """
     N = y.shape[0]
     if N == 1:
         return np.zeros((1, 1))
-    c = np.ones(N)
-    c[0] = 2.0
-    c[-1] = 2.0
-    c = c * ((-1.0) ** np.arange(N))
-    Y = y[:, None]
-    dY = Y - Y.T
-    D = (c[:, None] / c[None, :]) / dY
-    np.fill_diagonal(D, 0.0)
-    D = D - np.diag(np.sum(D, axis=1))
+    
+    # Build Chebyshev Vandermonde matrix V and its derivative dV
+    # V[i,j] = T_j(y_i) where T_j is j-th Chebyshev polynomial
+    V = np.zeros((N, N))
+    dV = np.zeros((N, N))
+    
+    # Chebyshev polynomials T_j(y) = cos(j * arccos(y))
+    # Derivatives: T'_j(y) = j * sin(j * arccos(y)) / sqrt(1 - y^2)
+    
+    for j in range(N):
+        if j == 0:
+            # T_0(y) = 1, T'_0(y) = 0
+            V[:, j] = 1.0
+            dV[:, j] = 0.0
+        elif j == 1:
+            # T_1(y) = y, T'_1(y) = 1
+            V[:, j] = y
+            dV[:, j] = 1.0
+        else:
+            # T_j(y) = cos(j * arccos(y))
+            # T'_j(y) = j * sin(j * arccos(y)) / sqrt(1 - y^2)
+            # Handle edge cases at y = ±1
+            acos_y = np.arccos(y)
+            V[:, j] = np.cos(j * acos_y)
+            
+            # For derivative, handle y = ±1 separately to avoid division by zero
+            sqrt_term = np.sqrt(1 - y**2)
+            # At y = ±1, the derivative is 0 for j > 1
+            sqrt_term = np.where(np.abs(sqrt_term) < 1e-12, 1e-12, sqrt_term)
+            dV[:, j] = j * np.sin(j * acos_y) / sqrt_term
+            
+            # Fix edge cases at y = ±1
+            dV[:, j] = np.where(np.abs(y - 1.0) < 1e-12, 0.0, dV[:, j])
+            dV[:, j] = np.where(np.abs(y + 1.0) < 1e-12, 0.0, dV[:, j])
+    
+    # Solve V^T D^T = dV^T for D using stable linear solve
+    try:
+        D = np.linalg.solve(V.T, dV.T).T
+    except np.linalg.LinAlgError:
+        # Fallback to pseudo-inverse if singular
+        D = np.linalg.pinv(V.T) @ dV.T
+    
     return D
 
 # Optional torch support (used only for input/output conversion)

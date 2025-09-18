@@ -2,6 +2,9 @@
 """
 2D Kelvin-Helmholtz Instability simulation using Dedalus with phrike-compatible initial conditions.
 This script uses the same initial conditions as the phrike khi2d problem and saves data every dt=0.02.
+
+To run in parallel with 4 processes:
+    $ mpiexec -n 4 python khi2d_dedalus.py
 """
 
 import numpy as np
@@ -10,26 +13,35 @@ import logging
 import os
 import h5py
 from datetime import datetime
+from mpi4py import MPI
 
-# Set up logging
+# Set up MPI and logging
+comm = MPI.COMM_WORLD
+rank = comm.Get_rank()
+size = comm.Get_size()
+
+# Set up logging (only on rank 0 to avoid duplicate messages)
+if rank == 0:
+    logging.basicConfig(level=logging.INFO)
+else:
+    logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
 
 def run_khi2d_dedalus_simulation():
     """Run the 2D KHI simulation using Dedalus with phrike-compatible initial conditions."""
     
     # Parameters from phrike khi2d config
     Lx, Ly = 1.0, 1.0  # Domain size
-    Nx, Ny = 512, 512  # Grid resolution
+    Nx, Ny = 128, 128  # Grid resolution
     gamma = 1.4  # Ratio of specific heats
     dealias = 3/2  # Dealiasing factor
     stop_sim_time = 5.0  # Simulation end time
     max_timestep = 1e-4  # Maximum timestep
-    dt_save = 0.02  # Save data every 0.02 time units
+    dt_save = 0.01  # Save data every 0.01 time units
     dtype = np.float64
     
     # Artificial viscosity for stability
-    nu = 1e-4
+    nu = 1e-5
     
     # Create output directory
     output_dir = "khi2d_dedalus_output"
@@ -39,9 +51,11 @@ def run_khi2d_dedalus_simulation():
     snapshots_dir = os.path.join(output_dir, "snapshots")
     os.makedirs(snapshots_dir, exist_ok=True)
     
-    logger.info(f"Setting up 2D KHI simulation with {Nx}x{Ny} Fourier modes")
-    logger.info(f"Domain: [{Lx}, {Ly}], Save interval: {dt_save}")
-    logger.info(f"Output directory: {output_dir}")
+    if rank == 0:
+        logger.info(f"Setting up 2D KHI simulation with {Nx}x{Ny} Fourier modes")
+        logger.info(f"Running on {size} processes")
+        logger.info(f"Domain: [{Lx}, {Ly}], Save interval: {dt_save}")
+        logger.info(f"Output directory: {output_dir}")
 
     # Create coordinate system and distributor
     coords = d3.CartesianCoordinates('x', 'y')
@@ -64,13 +78,13 @@ def run_khi2d_dedalus_simulation():
     ex, ey = coords.unit_vector_fields(dist)
     
     # Problem setup
-    problem = d3.IVP([rho, u, p, tau_p], namespace=locals())
+    problem = d3.IVP([rho, u, p], namespace=locals())
     
-    # 2D Euler equations in primitive form with artificial viscosity
+    # 2D Compressible Euler equations in primitive form with artificial viscosity
+    # LHS must be linear, RHS contains nonlinear terms
     problem.add_equation("dt(rho) - nu*lap(rho) = - div(rho*u)")
-    problem.add_equation("dt(u) - nu*lap(u) + grad(p)/rho = - u@grad(u)")
-    problem.add_equation("div(u) + tau_p = 0")  # Incompressible constraint
-    problem.add_equation("integ(p) = 0")  # Pressure gauge
+    problem.add_equation("dt(u) - nu*lap(u) = - u@grad(u) - grad(p)/rho")
+    problem.add_equation("dt(p) - nu*lap(p) = - gamma*p*div(u) - u@grad(p)")
 
     # Build solver
     solver = problem.build_solver(d3.RK443)
@@ -139,7 +153,8 @@ def run_khi2d_dedalus_simulation():
     flow.add_property(p, name='p')
 
     # Main simulation loop
-    logger.info('Starting simulation...')
+    if rank == 0:
+        logger.info('Starting simulation...')
     step_count = 0
     last_save_time = 0.0
     
@@ -149,8 +164,8 @@ def run_khi2d_dedalus_simulation():
             solver.step(timestep)
             step_count += 1
             
-            # Log progress
-            if step_count % 100 == 0:
+            # Log progress (only on rank 0)
+            if rank == 0 and step_count % 50 == 0:
                 max_rho = flow.max('rho')
                 max_u = np.sqrt(flow.max('u2'))
                 max_p = flow.max('p')
@@ -159,17 +174,20 @@ def run_khi2d_dedalus_simulation():
             
             # Check if it's time to save data
             if solver.sim_time - last_save_time >= dt_save:
-                logger.info(f'Saving snapshot at t={solver.sim_time:.3f}')
+                if rank == 0:
+                    logger.info(f'Saving snapshot at t={solver.sim_time:.3f} (Step {step_count})')
                 last_save_time = solver.sim_time
                 
     except Exception as e:
-        logger.error(f'Exception raised: {e}')
+        if rank == 0:
+            logger.error(f'Exception raised: {e}')
         raise
     finally:
         solver.log_stats()
 
-    logger.info('Simulation completed!')
-    logger.info(f"Data saved to: {snapshots_dir}")
+    if rank == 0:
+        logger.info('Simulation completed!')
+        logger.info(f"Data saved to: {snapshots_dir}")
     
     return output_dir, snapshots_dir
 
@@ -267,18 +285,19 @@ if __name__ == "__main__":
 
 def main():
     """Main function to run the KHI2D simulation."""
-    logger.info("Starting 2D KHI simulation with Dedalus...")
+    if rank == 0:
+        logger.info("Starting 2D KHI simulation with Dedalus...")
     
     # Run simulation
     output_dir, snapshots_dir = run_khi2d_dedalus_simulation()
     
-    # Create visualization script
-    viz_script = create_visualization_script(snapshots_dir)
-    
-    logger.info("Simulation completed successfully!")
-    logger.info(f"Output directory: {output_dir}")
-    logger.info(f"Snapshots directory: {snapshots_dir}")
-    logger.info(f"To visualize results, run: python {viz_script}")
+    # Create visualization script (only on rank 0)
+    if rank == 0:
+        viz_script = create_visualization_script(snapshots_dir)
+        logger.info("Simulation completed successfully!")
+        logger.info(f"Output directory: {output_dir}")
+        logger.info(f"Snapshots directory: {snapshots_dir}")
+        logger.info(f"To visualize results, run: python {viz_script}")
 
 if __name__ == "__main__":
     main()
