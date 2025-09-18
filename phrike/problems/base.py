@@ -80,7 +80,13 @@ class BaseProblem(ABC):
 
     def setup_common_parameters(self) -> None:
         """Extract common parameters from configuration."""
-        self.gamma = float(self.config["equations"]["gamma"])
+        # Support both "equations" and "physics" for backward compatibility
+        if "equations" in self.config and "gamma" in self.config["equations"]:
+            self.gamma = float(self.config["equations"]["gamma"])
+        elif "physics" in self.config and "gamma" in self.config["physics"]:
+            self.gamma = float(self.config["physics"]["gamma"])
+        else:
+            raise KeyError("Configuration must contain either 'equations.gamma' or 'physics.gamma'")
 
         # Integration parameters
         self.t0 = float(self.config["integration"]["t0"])
@@ -795,6 +801,25 @@ class BaseProblem(ABC):
         if self.restart_data is not None:
             U0 = self.restart_data["U"]
             print(f"Using restart data for initial conditions (shape: {U0.shape})")
+            
+            # Convert restart data to appropriate backend format
+            if backend == "torch" and isinstance(U0, np.ndarray):
+                try:
+                    import torch
+                    # Determine dtype based on precision
+                    if self.precision == "single":
+                        torch_dtype = torch.float32
+                    elif self.precision == "double":
+                        torch_dtype = torch.float64
+                    else:
+                        # Fallback to device-based logic (MPS only supports float32)
+                        torch_dtype = torch.float32 if device == "mps" else torch.float64
+                    
+                    # Convert to torch tensor
+                    U0 = torch.from_numpy(U0).to(dtype=torch_dtype, device=device)
+                    print(f"Converted restart data to torch tensor: dtype={torch_dtype}, device={device}")
+                except ImportError:
+                    raise ImportError("PyTorch is required for torch backend but not available")
         else:
             U0 = self.create_initial_conditions(grid)
 
