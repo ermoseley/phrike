@@ -80,7 +80,7 @@ class BaseProblem(ABC):
 
     def setup_common_parameters(self) -> None:
         """Extract common parameters from configuration."""
-        self.gamma = float(self.config["physics"]["gamma"])
+        self.gamma = float(self.config["equations"]["gamma"])
 
         # Integration parameters
         self.t0 = float(self.config["integration"]["t0"])

@@ -101,3 +101,93 @@ def _as_last_axis_matrix_apply(A: np.ndarray, f: np.ndarray) -> np.ndarray:
     return np.tensordot(f, A, axes=([-1], [0]))
 
 
+class Basis2D(ABC):
+    """Abstract 2D spectral basis interface.
+
+    The last two axes are spatial: (..., Ny, Nx).
+    Implementations should provide per-axis nodes, transforms, and derivatives.
+    """
+
+    def __init__(self, Nx: int, Ny: int, Lx: float, Ly: float, bc: str = "dirichlet") -> None:
+        self.Nx = int(Nx)
+        self.Ny = int(Ny)
+        self.Lx = float(Lx)
+        self.Ly = float(Ly)
+        self.bc = str(bc).lower()
+
+    @abstractmethod
+    def nodes(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Return (x_nodes, y_nodes)."""
+
+    def quadrature_weights(self) -> Optional[np.ndarray]:
+        """Return 2D quadrature weights (Ny, Nx), or None."""
+        return None
+
+    @abstractmethod
+    def forward(self, f: np.ndarray) -> np.ndarray:
+        """Physical → spectral along both axes."""
+
+    @abstractmethod
+    def inverse(self, F: np.ndarray) -> np.ndarray:
+        """Spectral → physical along both axes."""
+
+    @abstractmethod
+    def dx(self, f: np.ndarray) -> np.ndarray:
+        """∂f/∂x at nodes."""
+
+    @abstractmethod
+    def dy(self, f: np.ndarray) -> np.ndarray:
+        """∂f/∂y at nodes."""
+
+    def apply_spectral_filter(self, f: np.ndarray, *, p: int = 8, alpha: float = 36.0) -> np.ndarray:
+        """Optional modal/nodal filter; default no-op."""
+        return f
+
+
+class Basis3D(ABC):
+    """Abstract 3D spectral basis interface.
+
+    The last three axes are spatial: (..., Nz, Ny, Nx).
+    """
+
+    def __init__(self, Nx: int, Ny: int, Nz: int, Lx: float, Ly: float, Lz: float, bc: str = "dirichlet") -> None:
+        self.Nx = int(Nx)
+        self.Ny = int(Ny)
+        self.Nz = int(Nz)
+        self.Lx = float(Lx)
+        self.Ly = float(Ly)
+        self.Lz = float(Lz)
+        self.bc = str(bc).lower()
+
+    @abstractmethod
+    def nodes(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return (x_nodes, y_nodes, z_nodes)."""
+
+    def quadrature_weights(self) -> Optional[np.ndarray]:
+        """Return 3D quadrature weights (Nz, Ny, Nx), or None."""
+        return None
+
+    @abstractmethod
+    def forward(self, f: np.ndarray) -> np.ndarray:
+        """Physical → spectral along all axes."""
+
+    @abstractmethod
+    def inverse(self, F: np.ndarray) -> np.ndarray:
+        """Spectral → physical along all axes."""
+
+    @abstractmethod
+    def dx(self, f: np.ndarray) -> np.ndarray:
+        """∂f/∂x at nodes."""
+
+    @abstractmethod
+    def dy(self, f: np.ndarray) -> np.ndarray:
+        """∂f/∂y at nodes."""
+
+    @abstractmethod
+    def dz(self, f: np.ndarray) -> np.ndarray:
+        """∂f/∂z at nodes."""
+
+    def apply_spectral_filter(self, f: np.ndarray, *, p: int = 8, alpha: float = 36.0) -> np.ndarray:
+        return f
+
+

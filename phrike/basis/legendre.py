@@ -245,3 +245,111 @@ class LegendreLobattoBasis1D(Basis1D):
         return cache
 
 
+
+class LegendreLobattoBasis2D:
+    """Tensor-product LGL basis on [0,Lx]×[0,Ly] with nodal ops.
+
+    Last two axes are (..., Ny, Nx). Derivatives via precomputed Dx,Dy.
+    """
+
+    def __init__(self, Nx: int, Ny: int, Lx: float, Ly: float, *, bc: str = "dirichlet") -> None:
+        self.Nx = int(Nx)
+        self.Ny = int(Ny)
+        self.Lx = float(Lx)
+        self.Ly = float(Ly)
+        self.bc = str(bc).lower()
+
+        yx, wx = _legendre_gauss_lobatto_nodes_weights(self.Nx)
+        yy, wy = _legendre_gauss_lobatto_nodes_weights(self.Ny)
+        orderx = np.argsort(-yx)
+        ordery = np.argsort(-yy)
+        yx = yx[orderx]; wx = wx[orderx]
+        yy = yy[ordery]; wy = wy[ordery]
+        self._x = (1.0 - yx) * (self.Lx / 2.0)
+        self._y = (1.0 - yy) * (self.Ly / 2.0)
+        Vx = npleg.legvander(yx, self.Nx - 1)
+        Vy = npleg.legvander(yy, self.Ny - 1)
+        Dx_y = np.linalg.solve(Vx.T, npleg.legvander( yx, self.Nx - 1).deriv(1) if hasattr(npleg.legvander( yx, self.Nx - 1), 'deriv') else _stable_legendre_diff_matrix(yx).T).T  # fallback
+        Dx_y = _stable_legendre_diff_matrix(yx)
+        Dy_y = _stable_legendre_diff_matrix(yy)
+        self._Dx = (-2.0 / self.Lx) * Dx_y
+        self._Dy = (-2.0 / self.Ly) * Dy_y
+        self._Vx = Vx
+        self._Vy = Vy
+
+    def nodes(self) -> Tuple[np.ndarray, np.ndarray]:
+        return self._x, self._y
+
+    def dx(self, f: np.ndarray) -> np.ndarray:
+        # Apply along x (last axis)
+        return np.tensordot(f, self._Dx.T, axes=([-1], [0]))
+
+    def dy(self, f: np.ndarray) -> np.ndarray:
+        # Apply along y (second-to-last axis)
+        return np.tensordot(self._Dy, f, axes=([1], [-2]))
+
+    def _filter_axis(self, f: np.ndarray, V: np.ndarray, p: int, alpha: float, axis: int) -> np.ndarray:
+        N = V.shape[0]
+        k = np.arange(N, dtype=float)
+        kmax = max(float(N - 1), 1.0)
+        sigma = np.exp(-float(alpha) * (k / kmax) ** int(p))
+        Fm = (V * ((2.0 * k + 1.0) / 2.0 * sigma).reshape(1, -1)) @ V.T
+        f_move = np.moveaxis(f, axis, -1)
+        g = np.tensordot(f_move, Fm.T, axes=([-1], [0]))
+        return np.moveaxis(g, -1, axis)
+
+    def apply_spectral_filter(self, f: np.ndarray, *, p: int = 8, alpha: float = 36.0) -> np.ndarray:
+        g = self._filter_axis(f, self._Vx, p, alpha, axis=-1)
+        g = self._filter_axis(g, self._Vy, p, alpha, axis=-2)
+        return g
+
+
+class LegendreLobattoBasis3D:
+    def __init__(self, Nx: int, Ny: int, Nz: int, Lx: float, Ly: float, Lz: float, *, bc: str = "dirichlet") -> None:
+        self.Nx = int(Nx); self.Ny = int(Ny); self.Nz = int(Nz)
+        self.Lx = float(Lx); self.Ly = float(Ly); self.Lz = float(Lz)
+        self.bc = str(bc).lower()
+
+        yx, _ = _legendre_gauss_lobatto_nodes_weights(self.Nx)
+        yy, _ = _legendre_gauss_lobatto_nodes_weights(self.Ny)
+        yz, _ = _legendre_gauss_lobatto_nodes_weights(self.Nz)
+        orderx = np.argsort(-yx); yx = yx[orderx]
+        ordery = np.argsort(-yy); yy = yy[ordery]
+        orderz = np.argsort(-yz); yz = yz[orderz]
+        self._x = (1.0 - yx) * (self.Lx / 2.0)
+        self._y = (1.0 - yy) * (self.Ly / 2.0)
+        self._z = (1.0 - yz) * (self.Lz / 2.0)
+        self._Dx = (-2.0 / self.Lx) * _stable_legendre_diff_matrix(yx)
+        self._Dy = (-2.0 / self.Ly) * _stable_legendre_diff_matrix(yy)
+        self._Dz = (-2.0 / self.Lz) * _stable_legendre_diff_matrix(yz)
+        self._Vx = npleg.legvander(yx, self.Nx - 1)
+        self._Vy = npleg.legvander(yy, self.Ny - 1)
+        self._Vz = npleg.legvander(yz, self.Nz - 1)
+
+    def nodes(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        return self._x, self._y, self._z
+
+    def dx(self, f: np.ndarray) -> np.ndarray:
+        return np.tensordot(f, self._Dx.T, axes=([-1], [0]))
+
+    def dy(self, f: np.ndarray) -> np.ndarray:
+        return np.tensordot(self._Dy, f, axes=([1], [-2]))
+
+    def dz(self, f: np.ndarray) -> np.ndarray:
+        return np.tensordot(self._Dz, f, axes=([1], [-3]))
+
+    def _filter_axis(self, f: np.ndarray, V: np.ndarray, p: int, alpha: float, axis: int) -> np.ndarray:
+        N = V.shape[0]
+        k = np.arange(N, dtype=float)
+        kmax = max(float(N - 1), 1.0)
+        sigma = np.exp(-float(alpha) * (k / kmax) ** int(p))
+        Fm = (V * ((2.0 * k + 1.0) / 2.0 * sigma).reshape(1, -1)) @ V.T
+        f_move = np.moveaxis(f, axis, -1)
+        g = np.tensordot(f_move, Fm.T, axes=([-1], [0]))
+        return np.moveaxis(g, -1, axis)
+
+    def apply_spectral_filter(self, f: np.ndarray, *, p: int = 8, alpha: float = 36.0) -> np.ndarray:
+        g = self._filter_axis(f, self._Vx, p, alpha, axis=-1)
+        g = self._filter_axis(g, self._Vy, p, alpha, axis=-2)
+        g = self._filter_axis(g, self._Vz, p, alpha, axis=-3)
+        return g

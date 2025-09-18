@@ -143,6 +143,10 @@ Examples:
                     import torch  # type: ignore
 
                     torch.set_num_threads(num_threads)
+                    try:
+                        torch.set_num_interop_threads(num_threads)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
                 if args.verbose:

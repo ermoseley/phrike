@@ -22,15 +22,67 @@ from .artificial_viscosity import SpectralArtificialViscosity, ArtificialViscosi
 Array = np.ndarray
 
 
+def _positivity_clamp(U: Array, eqs: EulerEquations1D, rho_min: float = 1e-10, p_min: float = 1e-12) -> Array:
+    """Clamp density and pressure to be positive (lightweight limiter).
+
+    Args:
+        U: Conservative variables (3, N)
+        eqs: Euler equations object
+        rho_min: Minimum allowed density
+        p_min: Minimum allowed pressure
+    Returns:
+        Clamped conservative variables of same shape.
+    """
+    try:
+        import torch  # type: ignore
+        is_torch = isinstance(U, torch.Tensor)
+    except Exception:
+        is_torch = False
+        torch = None  # type: ignore
+
+    rho, u, p, _ = eqs.primitive(U)
+    if is_torch:  # type: ignore[truthy-bool]
+        rho_clamped = torch.clamp(rho, min=float(rho_min))
+        p_clamped = torch.clamp(p, min=float(p_min))
+        Uc = eqs.conservative(rho_clamped, u, p_clamped)
+    else:
+        rho_clamped = np.maximum(rho, rho_min)
+        p_clamped = np.maximum(p, p_min)
+        Uc = eqs.conservative(rho_clamped, u, p_clamped)
+    return Uc
+
+
 def _compute_rhs(grid: Grid1D, eqs: EulerEquations1D, U: Array, 
                 artificial_viscosity: Optional[SpectralArtificialViscosity] = None) -> Array:
     # Pseudo-spectral: compute flux in physical space, then differentiate spectrally
     # Enforce boundary conditions for non-periodic bases before computing flux
     if hasattr(grid, "apply_boundary_conditions"):
         U = grid.apply_boundary_conditions(U, eqs)
-    F = eqs.flux(U)
-    # Batched spectral derivative across components (shape (3, N))
-    dFdx = grid.dx1(F)
+    # Dealiased flux for Chebyshev via 3/2-rule zero-padding
+    if getattr(grid, "_basis_name", "") == "chebyshev" and getattr(grid, "dealias", False):
+        try:
+            # Oversample conservative variables
+            N = grid.N
+            M = max(int(3 * N // 2), N + 2)
+            U_os = np.empty((U.shape[0], M), dtype=U.dtype)
+            basis = getattr(grid, "_basis", None)
+            for i in range(U.shape[0]):
+                U_os[i] = basis.oversample(U[i], M)  # type: ignore[attr-defined]
+            # Compute flux at oversampled resolution
+            F_os = eqs.flux(U_os)
+            # Project flux back to N
+            F = np.empty((U.shape[0], N), dtype=U.dtype)
+            for i in range(F_os.shape[0]):
+                F[i] = basis.project_to_N(F_os[i], M)  # type: ignore[attr-defined]
+            dFdx = grid.dx1(F)
+        except Exception:
+            # Fallback to standard path if oversampling path fails
+            F = eqs.flux(U)
+            dFdx = grid.dx1(F)
+    else:
+        F = eqs.flux(U)
+        # Batched spectral derivative across components (shape (3, N))
+        dFdx = grid.dx1(F)
     # Euler in conservation form: dU/dt = - dF/dx
     rhs = -dFdx
     
@@ -48,20 +100,25 @@ def _rk2_step(grid: Grid1D, eqs: EulerEquations1D, U: Array, dt: float,
               artificial_viscosity: Optional[SpectralArtificialViscosity] = None) -> Array:
     k1 = _compute_rhs(grid, eqs, U, artificial_viscosity)
     U1 = U + dt * 0.5 * k1
+    U1 = _positivity_clamp(U1, eqs)
     k2 = _compute_rhs(grid, eqs, U1, artificial_viscosity)
-    return _apply_physical_filters(grid, U + dt * k2, eqs)
+    Unew = U + dt * k2
+    Unew = _positivity_clamp(Unew, eqs)
+    return _apply_physical_filters(grid, Unew, eqs)
 
 
 def _rk4_step(grid: Grid1D, eqs: EulerEquations1D, U: Array, dt: float,
               artificial_viscosity: Optional[SpectralArtificialViscosity] = None) -> Array:
     k1 = _compute_rhs(grid, eqs, U, artificial_viscosity)
-    U2 = U + 0.5 * dt * k1
+    U2 = _positivity_clamp(U + 0.5 * dt * k1, eqs)
     k2 = _compute_rhs(grid, eqs, U2, artificial_viscosity)
-    U3 = U + 0.5 * dt * k2
+    U3 = _positivity_clamp(U + 0.5 * dt * k2, eqs)
     k3 = _compute_rhs(grid, eqs, U3, artificial_viscosity)
-    U4 = U + dt * k3
+    U4 = _positivity_clamp(U + dt * k3, eqs)
     k4 = _compute_rhs(grid, eqs, U4, artificial_viscosity)
-    return _apply_physical_filters(grid, U + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4), eqs)
+    Unew = U + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+    Unew = _positivity_clamp(Unew, eqs)
+    return _apply_physical_filters(grid, Unew, eqs)
 
 
 def _apply_physical_filters(grid: Grid1D, U: Array, equations: Optional[EulerEquations1D] = None) -> Array:
@@ -92,6 +149,8 @@ class SpectralSolver1D:
     
     # Artificial viscosity
     artificial_viscosity: Optional[SpectralArtificialViscosity] = None
+    # Filter cadence
+    filter_interval: int = 1
 
     def __init__(self, grid: Grid1D, equations: EulerEquations1D, U0: Optional[Array] = None, 
                  scheme: str = "rk4", cfl: float = 0.4, adaptive_config: Optional[Dict] = None,
@@ -148,6 +207,25 @@ class SpectralSolver1D:
             from .artificial_viscosity import create_artificial_viscosity
             self.artificial_viscosity = create_artificial_viscosity(artificial_viscosity_config)
 
+        # Filter interval: use integration.spectral_filter.interval if present
+        # If AV is enabled, default to 5; else 1
+        try:
+            from .problems.base import BaseProblem  # type: ignore
+        except Exception:
+            BaseProblem = None  # type: ignore
+        # Pull interval from grid.filter_params if provided via Problem
+        cfg = getattr(self.grid, "filter_params", None)
+        interval_cfg = None
+        if isinstance(cfg, dict):
+            interval_cfg = cfg.get("interval", None)
+        if interval_cfg is not None:
+            try:
+                self.filter_interval = max(1, int(interval_cfg))
+            except Exception:
+                self.filter_interval = 1
+        else:
+            self.filter_interval = 5 if self.artificial_viscosity is not None else 1
+
 
     def compute_dt(self, U: Array) -> float:
         max_speed = self.equations.max_wave_speed(U)
@@ -179,7 +257,10 @@ class SpectralSolver1D:
             Un = _rk2_step(self.grid, self.equations, U, dt, self.artificial_viscosity)
         else:
             Un = _rk4_step(self.grid, self.equations, U, dt, self.artificial_viscosity)
-        Un = _apply_physical_filters(self.grid, Un)
+        # Apply spectral filter with cadence
+        if (getattr(self, "_step_counter", 0) % self.filter_interval) == 0:
+            Un = _apply_physical_filters(self.grid, Un, self.equations)
+        self._step_counter = getattr(self, "_step_counter", 0) + 1
         return Un
     
     def _adaptive_step(self, U: Array, dt: float) -> Array:

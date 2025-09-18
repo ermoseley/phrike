@@ -545,39 +545,29 @@ class Grid1D:
         if U.shape[0] < 2:
             return U
         if bc_type in ("reflective", "dirichlet", "wall"):
-            # Dirichlet lift for momentum using degree-1 polynomial in y ∈ [-1,1]
-            # δ(y) = c0*T0(y) + c1*T1(y) with T0=1, T1=y, chosen to zero endpoints
-            try:
-                import torch  # type: ignore
-                is_torch = isinstance(U, torch.Tensor)
-            except Exception:
-                is_torch = False
-                torch = None  # type: ignore
-
-            # Build y on [-1,1] from grid (prefer basis internal nodes if present)
-            if hasattr(self._basis, "_y"):
-                y_np = np.asarray(getattr(self._basis, "_y"))
-            else:
-                x_np = np.asarray(self.x)
-                y_np = 1.0 - 2.0 * (x_np / float(self.Lx))
-
-            if is_torch:  # type: ignore[truthy-bool]
-                y = torch.from_numpy(y_np).to(dtype=U.dtype, device=U.device)
-            else:
-                y = y_np
-
-            m = U[..., 1, :]
-            m_left = m[..., 0]
-            m_right = m[..., -1]
-            # Solve for c0, c1: c0 + c1 = -m_left; c0 - c1 = -m_right
-            c0 = -0.5 * (m_left + m_right)
-            c1 = -0.5 * (m_left - m_right)
-            # Broadcast over nodes
-            if is_torch:  # type: ignore[truthy-bool]
-                delta = c0.unsqueeze(-1) + c1.unsqueeze(-1) * y
-            else:
-                delta = c0[..., None] + c1[..., None] * y
-            U[..., 1, :] = m + delta
+            # Simple, robust wall BCs for collocation methods:
+            # - Zero velocity at boundaries (momentum = 0)
+            # - Zero-gradient for density and energy at boundaries
+            if self.N >= 2:
+                # Copy interior state to boundaries for rho and E
+                U[..., 0, 0] = U[..., 0, 1]
+                U[..., 2, 0] = U[..., 2, 1]
+                U[..., 0, -1] = U[..., 0, -2]
+                U[..., 2, -1] = U[..., 2, -2]
+            # Enforce u=0 → momentum=0 at boundaries
+            U[..., 1, 0] = 0
+            U[..., 1, -1] = 0
+        elif bc_type in ("neumann", "open"):
+            # Neumann/open: enforce zero gradient (∂/∂x = 0) at boundaries
+            # Simple and robust: copy interior state to boundaries
+            if self.N >= 3:
+                U[..., :, 0] = U[..., :, 1]
+                U[..., :, -1] = U[..., :, -2]
+            elif self.N == 2:
+                # With only two points, set both ends to average to avoid drift
+                avg = 0.5 * (U[..., :, 0] + U[..., :, 1])
+                U[..., :, 0] = avg
+                U[..., :, 1] = avg
         return U
 
 

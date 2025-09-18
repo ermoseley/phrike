@@ -2,7 +2,7 @@
 problem: sod
 
 grid:
-  N: 1024
+  N: 4096
   Lx: 1.0
   basis: legendre
   bc: dirichlet       # reflective/dirichlet at endpoints for momentum

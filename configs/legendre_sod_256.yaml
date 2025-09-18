@@ -1,0 +1,43 @@
+problem: sod
+grid:
+  N: 256
+  Lx: 1.0
+  basis: legendre
+  bc: dirichlet
+  dealias: true
+equations:
+  gamma: 1.4
+integration:
+  t0: 0.0
+  t_end: 0.2
+  cfl: 0.15
+  scheme: rk4
+  output_interval: 0.01
+  spectral_filter:
+    enabled: true
+    p: 8
+    alpha: 36.0
+output:
+  output_interval: 0.01
+  save_history: true
+  save_frames: true
+  save_video: true
+initial_conditions:
+  left:
+    rho: 1.0
+    u: 0.0
+    p: 1.0
+  right:
+    rho: 0.125
+    u: 0.0
+    p: 0.1
+monitoring:
+  enabled: true
+  step_interval: 100
+  include_conservation: true
+  include_timestep: true
+  include_time: true
+  include_velocity_stats: true
+  include_density_stats: true
+runtime:
+  num_threads: auto
