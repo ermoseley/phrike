@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Sod shock tube simulation using Legendre basis instead of Chebyshev.
+Sod shock tube simulation using Legendre basis.
 Legendre has more uniform point distribution, better for middle-domain features.
 """
 

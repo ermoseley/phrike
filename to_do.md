@@ -1,6 +1,6 @@
 Add new basis functions
-    - Chebyshev + Filtering near discontinuities
-Compare our Chebyshev/Legendre implementation to Dedalus. What aren't we getting right, if anything?
+    - Additional filtering near discontinuities
+Compare our Legendre implementation to Dedalus. What aren't we getting right, if anything?
 Run a convection problem. Set pressure BCs for a stratified medium.
 Compare Dedalus to PHRIKE
 
@@ -11,7 +11,7 @@ Add MPI
 Add MHD
 
 Install PyTorch with CUDA support:
-Apply to chebyshev_so...
+Apply to sod_legendre...
 cu118
 Consider using float32 for large problems:
 Modify the grid initialization to use torch.float32 instead of torch.float64

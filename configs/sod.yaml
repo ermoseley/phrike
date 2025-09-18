@@ -7,8 +7,8 @@ grid:
   x0: 0.5               # discontinuity location
   dealias: true
   precision: double      # single or double precision
-  # basis: fourier        # switch to 'chebyshev' for non-periodic BCs
-  # bc: dirichlet         # used when basis=chebyshev (e.g., reflective/dirichlet)
+  # basis: fourier        # switch to 'legendre' for non-periodic BCs
+  # bc: dirichlet         # used when basis=legendre (e.g., reflective/dirichlet)
 
 physics:
   gamma: 1.4

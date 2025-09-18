@@ -37,7 +37,7 @@ def run_khi2d_dedalus_simulation():
     dealias = 3/2  # Dealiasing factor
     stop_sim_time = 5.0  # Simulation end time
     max_timestep = 1e-4  # Maximum timestep
-    dt_save = 0.01  # Save data every 0.01 time units
+    dt_save = 0.02  # Save data every 0.02 time units
     dtype = np.float64
     
     # Artificial viscosity for stability
@@ -50,6 +50,15 @@ def run_khi2d_dedalus_simulation():
     # Create snapshots directory for HDF5 files
     snapshots_dir = os.path.join(output_dir, "snapshots")
     os.makedirs(snapshots_dir, exist_ok=True)
+    
+    # Clear existing snapshots but preserve plotting script
+    if rank == 0:
+        import shutil
+        if os.path.exists(snapshots_dir):
+            for file in os.listdir(snapshots_dir):
+                if file.endswith('.h5'):
+                    os.remove(os.path.join(snapshots_dir, file))
+        print(f"Cleared existing snapshots in {snapshots_dir}")
     
     if rank == 0:
         logger.info(f"Setting up 2D KHI simulation with {Nx}x{Ny} Fourier modes")
@@ -146,11 +155,12 @@ def run_khi2d_dedalus_simulation():
                  max_change=1.5, min_change=0.5, max_dt=max_timestep)
     CFL.add_velocity(u)
 
-    # Flow properties for monitoring
-    flow = d3.GlobalFlowProperty(solver, cadence=10)
-    flow.add_property(rho, name='rho')
-    flow.add_property(u@u, name='u2')
-    flow.add_property(p, name='p')
+    # Flow properties for monitoring (only in serial mode)
+    if size == 1:
+        flow = d3.GlobalFlowProperty(solver, cadence=1)
+        flow.add_property(rho, name='rho')
+        flow.add_property(u@u, name='u2')
+        flow.add_property(p, name='p')
 
     # Main simulation loop
     if rank == 0:
@@ -165,12 +175,15 @@ def run_khi2d_dedalus_simulation():
             step_count += 1
             
             # Log progress (only on rank 0)
-            if rank == 0 and step_count % 50 == 0:
-                max_rho = flow.max('rho')
-                max_u = np.sqrt(flow.max('u2'))
-                max_p = flow.max('p')
-                logger.info(f'Step {step_count}, Time={solver.sim_time:.6f}, dt={timestep:.2e}, '
-                          f'max(rho)={max_rho:.3f}, max(u)={max_u:.3f}, max(p)={max_p:.3f}')
+            if rank == 0 and step_count % 10 == 0:
+                if size == 1:
+                    max_rho = flow.max('rho')
+                    max_u = np.sqrt(flow.max('u2'))
+                    max_p = flow.max('p')
+                    logger.info(f'Step {step_count}, Time={solver.sim_time:.6f}, dt={timestep:.2e}, '
+                              f'max(rho)={max_rho:.3f}, max(u)={max_u:.3f}, max(p)={max_p:.3f}')
+                else:
+                    logger.info(f'Step {step_count}, Time={solver.sim_time:.6f}, dt={timestep:.2e}')
             
             # Check if it's time to save data
             if solver.sim_time - last_save_time >= dt_save:
@@ -217,60 +230,70 @@ def plot_khi2d_snapshots(snapshots_dir):
     plot_dir = os.path.join(os.path.dirname(snapshots_dir), "plots")
     os.makedirs(plot_dir, exist_ok=True)
     
-    for i, snapshot_file in enumerate(snapshot_files):
+    for snapshot_file in snapshot_files:
         print(f"Processing {{snapshot_file}}")
         
         with h5py.File(snapshot_file, 'r') as f:
-            # Get data
-            density = f['tasks']['density'][0, :, :]
-            velocity = f['tasks']['velocity'][0, :, :, :]  # [2, Ny, Nx]
-            pressure = f['tasks']['pressure'][0, :, :]
-            vorticity = f['tasks']['vorticity'][0, :, :]
+            # Get all time steps
+            times = f['scales']['sim_time'][:]
+            n_times = len(times)
             
-            # Get time
-            time = f['scales']['sim_time'][0]
+            print(f"Found {{n_times}} time steps from t={{times[0]:.3f}} to t={{times[-1]:.3f}}")
             
-            # Create figure
-            fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-            fig.suptitle(f'KHI2D Simulation at t={{time:.3f}}', fontsize=16)
+            # Plot every 10th time step to avoid too many plots
+            step = max(1, n_times // 50)  # Show up to 50 frames
             
-            # Density
-            im1 = axes[0, 0].imshow(density, origin='lower', aspect='equal', cmap='viridis')
-            axes[0, 0].set_title('Density')
-            axes[0, 0].set_xlabel('x')
-            axes[0, 0].set_ylabel('y')
-            plt.colorbar(im1, ax=axes[0, 0])
-            
-            # Velocity magnitude
-            vel_mag = np.sqrt(velocity[0]**2 + velocity[1]**2)
-            im2 = axes[0, 1].imshow(vel_mag, origin='lower', aspect='equal', cmap='plasma')
-            axes[0, 1].set_title('Velocity Magnitude')
-            axes[0, 1].set_xlabel('x')
-            axes[0, 1].set_ylabel('y')
-            plt.colorbar(im2, ax=axes[0, 1])
-            
-            # Pressure
-            im3 = axes[1, 0].imshow(pressure, origin='lower', aspect='equal', cmap='coolwarm')
-            axes[1, 0].set_title('Pressure')
-            axes[1, 0].set_xlabel('x')
-            axes[1, 0].set_ylabel('y')
-            plt.colorbar(im3, ax=axes[1, 0])
-            
-            # Vorticity
-            im4 = axes[1, 1].imshow(vorticity, origin='lower', aspect='equal', cmap='RdBu_r')
-            axes[1, 1].set_title('Vorticity')
-            axes[1, 1].set_xlabel('x')
-            axes[1, 1].set_ylabel('y')
-            plt.colorbar(im4, ax=axes[1, 1])
-            
-            plt.tight_layout()
-            
-            # Save plot
-            plot_file = os.path.join(plot_dir, f"khi2d_frame_{{i:04d}}.png")
-            plt.savefig(plot_file, dpi=150, bbox_inches='tight')
-            plt.close()
-            
-            print(f"Saved plot: {{plot_file}}")
+            for i in range(0, n_times, step):
+                # Get data for this time step
+                density = f['tasks']['density'][i, :, :]
+                velocity = f['tasks']['velocity'][i, :, :, :]  # [2, Ny, Nx]
+                pressure = f['tasks']['pressure'][i, :, :]
+                vorticity = f['tasks']['vorticity'][i, :, :]
+                
+                # Get time
+                time = times[i]
+                
+                # Create figure
+                fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+                fig.suptitle(f'KHI2D Simulation at t={{time:.3f}}', fontsize=16)
+                
+                # Density
+                im1 = axes[0, 0].imshow(density, origin='lower', aspect='equal', cmap='viridis')
+                axes[0, 0].set_title('Density')
+                axes[0, 0].set_xlabel('x')
+                axes[0, 0].set_ylabel('y')
+                plt.colorbar(im1, ax=axes[0, 0])
+                
+                # Velocity magnitude
+                vel_mag = np.sqrt(velocity[0]**2 + velocity[1]**2)
+                im2 = axes[0, 1].imshow(vel_mag, origin='lower', aspect='equal', cmap='plasma')
+                axes[0, 1].set_title('Velocity Magnitude')
+                axes[0, 1].set_xlabel('x')
+                axes[0, 1].set_ylabel('y')
+                plt.colorbar(im2, ax=axes[0, 1])
+                
+                # Pressure
+                im3 = axes[1, 0].imshow(pressure, origin='lower', aspect='equal', cmap='coolwarm')
+                axes[1, 0].set_title('Pressure')
+                axes[1, 0].set_xlabel('x')
+                axes[1, 0].set_ylabel('y')
+                plt.colorbar(im3, ax=axes[1, 0])
+                
+                # Vorticity
+                im4 = axes[1, 1].imshow(vorticity, origin='lower', aspect='equal', cmap='RdBu_r')
+                axes[1, 1].set_title('Vorticity')
+                axes[1, 1].set_xlabel('x')
+                axes[1, 1].set_ylabel('y')
+                plt.colorbar(im4, ax=axes[1, 1])
+                
+                plt.tight_layout()
+                
+                # Save plot
+                plot_file = os.path.join(plot_dir, f"khi2d_frame_{{i:04d}}_t{{time:.3f}}.png")
+                plt.savefig(plot_file, dpi=150, bbox_inches='tight')
+                plt.close()
+                
+                print(f"Saved plot: {{plot_file}}")
 
 if __name__ == "__main__":
     plot_khi2d_snapshots("{snapshots_dir}")
