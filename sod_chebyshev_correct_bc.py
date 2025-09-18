@@ -40,34 +40,55 @@ def main():
     u = dist.Field(name='u', bases=xbasis)      # Velocity
     p = dist.Field(name='p', bases=xbasis)      # Pressure
     
-    # Create tau terms as scalar fields (following the documentation pattern)
-    tau_u1 = dist.Field(name='tau_u1')
-    tau_u2 = dist.Field(name='tau_u2')
+    # Create tau terms as scalar fields (first-order reductions + PDE taus)
+    tau_rho1 = dist.Field(name='tau_rho1')
+    tau_rho2 = dist.Field(name='tau_rho2')
+    tau_u1   = dist.Field(name='tau_u1')
+    tau_u2   = dist.Field(name='tau_u2')
+    tau_p1   = dist.Field(name='tau_p1')
+    tau_p2   = dist.Field(name='tau_p2')
 
     # Substitutions for derivatives with tau terms
     dx = lambda A: d3.Differentiate(A, xcoord)
     lift_basis = xbasis.derivative_basis(1)
     lift = lambda A: d3.Lift(A, lift_basis, -1)
     
-    # First-order reduction for gradients (following Rayleigh-Benard pattern)
+    # First-order reductions (Chebyshev tau method)
+    rho_x = dx(rho) + lift(tau_rho1)
+    rho_xx = dx(rho_x) + lift(tau_rho2)
     u_x = dx(u) + lift(tau_u1)
+    u_xx = dx(u_x) + lift(tau_u2)
+    p_x = dx(p) + lift(tau_p1)
+    p_xx = dx(p_x) + lift(tau_p2)
 
     # Problem setup with tau terms
-    problem = d3.IVP([rho, u, p, tau_u1, tau_u2], namespace=locals())
+    problem = d3.IVP([
+        rho, u, p,
+        tau_rho1, tau_rho2,
+        tau_u1,   tau_u2,
+        tau_p1,   tau_p2,
+    ], namespace=locals())
     
-    # Euler equations with artificial viscosity and tau terms
-    problem.add_equation("dt(rho) = -dx(rho*u) + nu*dx(dx(rho))")
-    problem.add_equation("dt(u) = -u*u_x - dx(p)/rho + nu*dx(dx(u)) + lift(tau_u2)")
-    problem.add_equation("dt(p) = -gamma*p*u_x - u*dx(p) + nu*dx(dx(p))")
+    # Euler equations in primitive vars with artificial viscosity (IMEX form)
+    # LHS strictly linear; diffusion implicit with tau terms on LHS
+    problem.add_equation("dt(rho) - nu*rho_xx + lift(tau_rho2) = -dx(rho*u)")
+    problem.add_equation("dt(u)   - nu*u_xx   + lift(tau_u2)   = -u*u_x - p_x/rho")
+    problem.add_equation("dt(p)   - nu*p_xx   + lift(tau_p2)   = -gamma*p*u_x - u*p_x")
     
-    # Boundary conditions - Dirichlet (no flow through walls)
-    problem.add_equation("u(x=0) = 0")  # No flow at left boundary
-    problem.add_equation("u(x=Lx) = 0")  # No flow at right boundary
+    # Boundary conditions:
+    # Reflecting walls: u=0 at both ends (Dirichlet);
+    # Neumann for rho and p: zero gradient at both ends via first-order reductions
+    problem.add_equation("u(x=0) = 0")
+    problem.add_equation("u(x=Lx) = 0")
+    problem.add_equation("rho_x(x=0) = 0")
+    problem.add_equation("rho_x(x=Lx) = 0")
+    problem.add_equation("p_x(x=0) = 0")
+    problem.add_equation("p_x(x=Lx) = 0")
 
     # Set initial conditions - smooth transition to avoid discontinuities
     x = dist.local_grid(xbasis)
     x0 = 0.5  # Discontinuity location
-    sigma = 0.05  # Smoothing parameter
+    sigma = 0.01  # Smoothing parameter
     
     # Sod shock tube initial conditions with smoothing
     rho_left, rho_right = 1.0, 0.125
@@ -80,7 +101,7 @@ def main():
     p['g'] = p_right + (p_left - p_right) * 0.5 * (1 + np.tanh((x0 - x) / sigma))
 
     # Build solver
-    solver = problem.build_solver(d3.RK443)
+    solver = problem.build_solver(d3.SBDF2)
     solver.stop_sim_time = stop_sim_time
 
     # Main simulation loop
