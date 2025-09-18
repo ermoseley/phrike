@@ -9,7 +9,6 @@ from phrike.grid import Grid2D
 from phrike.equations import EulerEquations2D
 from phrike.initial_conditions import kelvin_helmholtz_2d
 from phrike.solver import SpectralSolver2D
-from phrike.io import save_solution_snapshot
 from .base import BaseProblem
 
 
@@ -96,12 +95,6 @@ class KHI2DProblem(BaseProblem):
         frames_dir = os.path.join(self.outdir, "frames")
         fig.savefig(os.path.join(frames_dir, f"frame_{t:08.3f}.png"), dpi=120)
         plt.close(fig)
-
-        # Save snapshot
-        snapshot_path = save_solution_snapshot(
-            self.outdir, t, U=U, grid=solver.grid, equations=solver.equations
-        )
-        print(f"Saved snapshot at t={t:.3f}: {snapshot_path}")
 
     def create_final_visualization(self, solver) -> None:
         """Create final visualization plots."""

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Sod shock tube simulation using Dedalus with proper boundary conditions.
-Domain: x ∈ [0, 1] with Dirichlet boundary conditions (u = 0 at walls).
+Sod shock tube simulation using Dedalus with spectral filtering instead of artificial viscosity.
+This approach may preserve sharper features while controlling oscillations.
 """
 
 import numpy as np
@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 def main():
-    """Run the Sod shock tube simulation with proper boundary conditions."""
+    """Run the Sod shock tube simulation with spectral filtering."""
     
     # Parameters
     Lx = 1.0  # Domain length [0, 1]
@@ -23,10 +23,10 @@ def main():
     dealias = 3/2  # Dealiasing factor
     stop_sim_time = 0.2  # Simulation end time
     timestep = 1e-6  # Timestep
-    nu = 1e-3  # Moderate artificial viscosity for stability
+    filter_cutoff = 0.8  # Filter out top 20% of modes
     dtype = np.float64
 
-    logger.info(f"Setting up Sod shock tube simulation with {Nx} Chebyshev points on domain [0, {Lx}]")
+    logger.info(f"Setting up Sod shock tube simulation with {Nx} Chebyshev points and spectral filtering")
 
     # Create coordinate and distributor
     xcoord = d3.Coordinate('x')
@@ -69,11 +69,11 @@ def main():
         tau_p1,   tau_p2,
     ], namespace=locals())
     
-    # Euler equations in primitive vars with artificial viscosity (IMEX form)
-    # LHS strictly linear; diffusion implicit with tau terms on LHS
-    problem.add_equation("dt(rho) - nu*rho_xx + lift(tau_rho2) = -dx(rho*u)")
-    problem.add_equation("dt(u)   - nu*u_xx   + lift(tau_u2)   = -u*u_x - p_x/rho")
-    problem.add_equation("dt(p)   - nu*p_xx   + lift(tau_p2)   = -gamma*p*u_x - u*p_x")
+    # Euler equations in primitive vars (no artificial viscosity)
+    # LHS strictly linear; all nonlinear terms on RHS
+    problem.add_equation("dt(rho) + lift(tau_rho2) = -dx(rho*u)")
+    problem.add_equation("dt(u)   + lift(tau_u2)   = -u*u_x - p_x/rho")
+    problem.add_equation("dt(p)   + lift(tau_p2)   = -gamma*p*u_x - u*p_x")
     
     # Boundary conditions:
     # Reflecting walls: u=0 at both ends (Dirichlet);
@@ -88,7 +88,7 @@ def main():
     # Set initial conditions - smooth transition to avoid discontinuities
     x = dist.local_grid(xbasis)
     x0 = 0.5  # Discontinuity location
-    sigma = 0.001  # Smoothing parameter
+    sigma = 0.001  # Very sharp initial condition
     
     # Sod shock tube initial conditions with smoothing
     rho_left, rho_right = 1.0, 0.125
@@ -104,13 +104,20 @@ def main():
     solver = problem.build_solver(d3.RK443)
     solver.stop_sim_time = stop_sim_time
 
-    # Main simulation loop
+    # Main simulation loop with spectral filtering
     logger.info('Starting simulation...')
     step_count = 0
     
     while solver.proceed:
         solver.step(timestep)
         step_count += 1
+        
+        # Apply spectral filtering every 10 steps to control oscillations
+        if step_count % 10 == 0:
+            # Filter out high-frequency modes
+            rho['c'] = rho['c'] * np.exp(-36 * (np.arange(Nx) / (Nx-1))**16)
+            u['c'] = u['c'] * np.exp(-36 * (np.arange(Nx) / (Nx-1))**16)
+            p['c'] = p['c'] * np.exp(-36 * (np.arange(Nx) / (Nx-1))**16)
         
         if step_count % 10000 == 0:
             logger.info(f'Step {step_count}, Time={solver.sim_time:.6f}, dt={timestep:.2e}')
@@ -145,7 +152,7 @@ def main():
     
     # Create plot
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-    fig.suptitle(f'Sod Shock Tube with Chebyshev Basis (N={Nx}) at t={solver.sim_time:.3f}', fontsize=14)
+    fig.suptitle(f'Sod Shock Tube with Spectral Filtering (N={Nx}) at t={solver.sim_time:.3f}', fontsize=14)
 
     # Plot density
     axes[0, 0].plot(x_final, rho_final, 'b-', linewidth=2, label='Density')
@@ -182,7 +189,7 @@ def main():
     axes[1, 1].legend()
 
     plt.tight_layout()
-    plt.savefig('sod_chebyshev_correct_bc_final.png', dpi=200, bbox_inches='tight')
+    plt.savefig('sod_chebyshev_filtered_final.png', dpi=200, bbox_inches='tight')
     plt.close(fig)
 
     # Plot only density profile
@@ -190,14 +197,14 @@ def main():
     plt.plot(x_final, rho_final, 'b-', linewidth=2, label='Density')
     plt.xlabel('x')
     plt.ylabel('Density')
-    plt.title(f'Sod Shock Tube Density Profile (N={Nx}) at t={solver.sim_time:.3f}')
+    plt.title(f'Sod Shock Tube Density Profile with Filtering (N={Nx}) at t={solver.sim_time:.3f}')
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
-    plt.savefig('sod_chebyshev_correct_bc_density.png', dpi=200, bbox_inches='tight')
+    plt.savefig('sod_chebyshev_filtered_density.png', dpi=200, bbox_inches='tight')
     plt.close()
 
-    logger.info('Plots saved as sod_chebyshev_correct_bc_final.png and sod_chebyshev_correct_bc_density.png')
+    logger.info('Plots saved as sod_chebyshev_filtered_final.png and sod_chebyshev_filtered_density.png')
     
     return x_final, rho_final, u_final, p_final
 

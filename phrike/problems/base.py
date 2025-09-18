@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 
-from phrike.io import load_config, ensure_outdir
+from phrike.io import load_config, ensure_outdir, save_solution_snapshot
 
 
 class BaseProblem(ABC):
@@ -847,12 +847,29 @@ class BaseProblem(ABC):
             def visualization_callback(t, U):
                 self.create_visualization(solver, t, U)
 
+            def snapshot_callback(t, U):
+                # Save snapshot independently of video generation
+                snapshot_path = save_solution_snapshot(
+                    self.outdir, t, U=U, grid=solver.grid, equations=solver.equations
+                )
+                print(f"Saved snapshot at t={t:.3f}: {snapshot_path}")
+
             def monitoring_callback(step_count, dt, U):
                 if (
                     self.monitoring_enabled
                     and step_count % self.monitoring_step_interval == 0
                 ):
                     self.output_monitoring_info(solver, U, step_count, dt)
+
+            # Determine which callbacks to use
+            on_output_callbacks = []
+            if generate_video:
+                on_output_callbacks.append(visualization_callback)
+            on_output_callbacks.append(snapshot_callback)
+            
+            def combined_output_callback(t, U):
+                for callback in on_output_callbacks:
+                    callback(t, U)
 
             history = solver.run(
                 U0,
@@ -861,7 +878,7 @@ class BaseProblem(ABC):
                 output_interval=self.output_interval,
                 checkpoint_interval=self.checkpoint_interval,
                 outdir=self.outdir,
-                on_output=visualization_callback if generate_video else None,
+                on_output=combined_output_callback,
                 on_step=monitoring_callback,
             )
         else:
