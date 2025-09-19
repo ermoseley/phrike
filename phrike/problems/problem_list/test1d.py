@@ -17,11 +17,36 @@ import matplotlib.pyplot as plt
 
 from phrike.grid import Grid1D
 from phrike.equations import EulerEquations1D
-from phrike.initial_conditions import sinusoidal_density
+# Initial condition function moved from phrike.initial_conditions
 from phrike.solver import SpectralSolver1D
 from phrike.visualization import plot_fields, plot_conserved_time_series
 from phrike.io import save_solution_snapshot
-from .base import BaseProblem
+from ..base import BaseProblem
+
+
+def sinusoidal_density(
+    x: np.ndarray,
+    rho0: float = 1.0,
+    u0: float = 0.0,
+    p0: float = 1.0,
+    amplitude: float = 1e-3,
+    k: int = 1,
+    Lx: float = 1.0,
+    gamma: float = 1.4,
+) -> np.ndarray:
+    # Handle both NumPy arrays and Torch tensors
+    if hasattr(x, 'cpu'):  # Torch tensor
+        import torch
+        rho = rho0 * (1.0 + amplitude * torch.sin(2.0 * torch.pi * k * x / Lx))
+        u = u0 * torch.ones_like(x)
+        p = p0 * torch.ones_like(x)
+    else:  # NumPy array
+        rho = rho0 * (1.0 + amplitude * np.sin(2.0 * np.pi * k * x / Lx))
+        u = u0 * np.ones_like(x)
+        p = p0 * np.ones_like(x)
+    
+    eqs = EulerEquations1D(gamma=gamma)
+    return eqs.conservative(rho, u, p)
 
 
 class Acoustic1DProblem(BaseProblem):

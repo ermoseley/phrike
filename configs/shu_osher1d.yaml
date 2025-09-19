@@ -6,7 +6,7 @@ grid:
   Lx: 1.0
   dealias: true
   # basis: fourier        # default periodic basis
-  # bc: null              # set when basis=chebyshev (e.g., dirichlet)
+  # bc: null              # set when basis=legendre (e.g., dirichlet)
 
 physics:
   gamma: 1.4

@@ -7,7 +7,7 @@ grid:
   Lx: 6.283185307179586  # domain length 2π for periodic BCs
   dealias: true     # apply 2/3-rule dealiasing
   # basis: fourier            # default basis
-  # bc: null                  # BC unused for Fourier; set for Chebyshev
+  # bc: null                  # BC unused for Fourier; set for Legendre
 
 physics:
   gamma: 1.4        # adiabatic index

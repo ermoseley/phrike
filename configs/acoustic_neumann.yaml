@@ -5,7 +5,7 @@ grid:
   N: 256
   Lx: 1.0
   x0: 0.5               # wave center
-  basis: chebyshev        # or chebyshev
+  basis: legendre         # Legendre basis for non-periodic BCs
   bc: neumann           # zero-gradient boundaries
   precision: double
 

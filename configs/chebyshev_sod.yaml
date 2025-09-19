@@ -1,12 +1,12 @@
-# Chebyshev-based 1D Sod shock tube (non-periodic BC)
+# Legendre-based 1D Sod shock tube (non-periodic BC)
 problem: sod
 
 grid:
   N: 32             # Low resolution for quick test
   Lx: 1.0
-  basis: chebyshev
+  basis: legendre
   bc: dirichlet     # reflective/dirichlet at endpoints for momentum
-  dealias: false    # not applicable to Chebyshev, left false
+  dealias: false    # not applicable to Legendre, left false
 
 physics:
   gamma: 1.4
@@ -34,7 +34,7 @@ initial_conditions:
     p: 0.1
 
 io:
-  outdir: outputs/sod_cheb
+  outdir: outputs/sod_legendre
   save_spectra: true
 
 monitoring:

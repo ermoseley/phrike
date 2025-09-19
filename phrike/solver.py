@@ -58,31 +58,9 @@ def _compute_rhs(grid: Grid1D, eqs: EulerEquations1D, U: Array,
     # Enforce boundary conditions for non-periodic bases before computing flux
     if hasattr(grid, "apply_boundary_conditions"):
         U = grid.apply_boundary_conditions(U, eqs)
-    # Dealiased flux for Chebyshev via 3/2-rule zero-padding
-    if getattr(grid, "_basis_name", "") == "chebyshev" and getattr(grid, "dealias", False):
-        try:
-            # Oversample conservative variables
-            N = grid.N
-            M = max(int(3 * N // 2), N + 2)
-            U_os = np.empty((U.shape[0], M), dtype=U.dtype)
-            basis = getattr(grid, "_basis", None)
-            for i in range(U.shape[0]):
-                U_os[i] = basis.oversample(U[i], M)  # type: ignore[attr-defined]
-            # Compute flux at oversampled resolution
-            F_os = eqs.flux(U_os)
-            # Project flux back to N
-            F = np.empty((U.shape[0], N), dtype=U.dtype)
-            for i in range(F_os.shape[0]):
-                F[i] = basis.project_to_N(F_os[i], M)  # type: ignore[attr-defined]
-            dFdx = grid.dx1(F)
-        except Exception:
-            # Fallback to standard path if oversampling path fails
-            F = eqs.flux(U)
-            dFdx = grid.dx1(F)
-    else:
-        F = eqs.flux(U)
-        # Batched spectral derivative across components (shape (3, N))
-        dFdx = grid.dx1(F)
+    F = eqs.flux(U)
+    # Batched spectral derivative across components (shape (3, N))
+    dFdx = grid.dx1(F)
     # Euler in conservation form: dU/dt = - dF/dx
     rhs = -dFdx
     
@@ -124,7 +102,7 @@ def _rk4_step(grid: Grid1D, eqs: EulerEquations1D, U: Array, dt: float,
 def _apply_physical_filters(grid: Grid1D, U: Array, equations: Optional[EulerEquations1D] = None) -> Array:
     # Apply optional spectral filter to each component to suppress Gibbs/aliasing
     U_filtered = grid.apply_spectral_filter(U)
-    # Re-apply boundary conditions after filtering to prevent endpoint drift (Chebyshev)
+    # Re-apply boundary conditions after filtering to prevent endpoint drift
     if equations is not None and hasattr(grid, "apply_boundary_conditions"):
         try:
             U_filtered = grid.apply_boundary_conditions(U_filtered, equations)

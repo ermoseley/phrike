@@ -4,9 +4,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
-PHRIKE is a high-performance pseudo-spectral solver for compressible Euler equations, designed for computational fluid dynamics research and education. It features exponential convergence, dual backend support (CPU/GPU), and comprehensive monitoring capabilities.
+PHRIKE is a high-performance pseudo-spectral solver for compressible Euler equations, designed for computational fluid dynamics research and education. The solver provides exponential convergence, dual backend support (CPU/GPU), and comprehensive monitoring capabilities.
 
-## ✨ Features
+## Features
 
 - **Multi-dimensional**: 1D, 2D, and 3D Euler equation solvers
 - **Spectral Accuracy**: Pseudo-spectral methods with exponential convergence for smooth solutions
@@ -17,7 +17,7 @@ PHRIKE is a high-performance pseudo-spectral solver for compressible Euler equat
 - **Monitoring**: Built-in conservation tracking and real-time statistics
 - **Visualization**: Automatic frame generation and video creation
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Installation
 
@@ -62,7 +62,7 @@ print(f"Final time: {solver.t}")
 print(f"Final density range: {solver.U[0].min():.3f} to {solver.U[0].max():.3f}")
 ```
 
-## 📚 Documentation
+## Documentation
 
 - [Installation Guide](docs/installation.rst)
 - [Quick Start Guide](docs/quickstart.rst)
@@ -78,7 +78,7 @@ cd docs
 make html
 ```
 
-## 🧪 Available Problems
+## Available Problems
 
 ### 1D Problems
 - **Sod Shock Tube** (`sod`): Classic Riemann problem for shock wave validation
@@ -92,7 +92,7 @@ make html
 - **Taylor-Green Vortex** (`tgv3d`): Decaying vortex for turbulence validation
 - **3D Turbulence** (`turb3d`): Forced turbulence for statistical analysis
 
-## ⚙️ Configuration
+## Configuration
 
 PHRIKE uses YAML configuration files. Here's a basic example:
 
@@ -124,7 +124,7 @@ initial_conditions:
     p: 0.1
 ```
 
-## 🔧 Backend Support
+## Backend Support
 
 ### NumPy Backend (Default)
 - CPU-only computation
@@ -142,7 +142,7 @@ phrike sod --backend torch --device cuda
 phrike sod --backend torch --device mps  # Apple Silicon
 ```
 
-## 📊 Performance
+## Performance
 
 PHRIKE is optimized for high-performance computing:
 
@@ -159,7 +159,7 @@ PHRIKE is optimized for high-performance computing:
 | 2D KHI | 128² | 45s | 12s | 3.8x |
 | 3D TGV | 64³ | 180s | 35s | 5.1x |
 
-## 🧪 Testing
+## Testing
 
 Run the test suite:
 
@@ -172,7 +172,7 @@ pytest tests/test_1d_solver.py
 pytest tests/test_sod_validation.py
 ```
 
-## 📈 Monitoring
+## Monitoring
 
 PHRIKE includes comprehensive monitoring capabilities:
 
@@ -185,7 +185,7 @@ monitoring:
   include_velocity_stats: true
 ```
 
-## 🎥 Visualization
+## Visualization
 
 Automatic visualization and video generation:
 
@@ -197,7 +197,7 @@ phrike sod --config configs/sod.yaml
 phrike sod --config configs/sod.yaml --no-video
 ```
 
-## 🔬 Scientific Validation
+## Scientific Validation
 
 PHRIKE has been validated against:
 
@@ -206,7 +206,7 @@ PHRIKE has been validated against:
 - **Conservation Properties**: Mass, momentum, energy conservation
 - **Convergence Studies**: Spectral accuracy verification
 
-## 🛠️ Development
+## Development
 
 ### Code Quality
 
@@ -229,11 +229,11 @@ mypy phrike/ --ignore-missing-imports
 4. Add tests
 5. Submit a pull request
 
-## 📄 License
+## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
 - **NumPy/SciPy**: Core numerical computing
 - **PyTorch**: GPU acceleration
@@ -241,13 +241,13 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - **Matplotlib**: Visualization
 - **FFTW**: High-performance FFT (optional)
 
-## 📞 Support
+## Support
 
 - **Issues**: [GitHub Issues](https://github.com/your-username/phrike/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/your-username/phrike/discussions)
 - **Documentation**: [Read the Docs](https://phrike.readthedocs.io/)
 
-## 🔗 Related Projects
+## Related Projects
 
 - [Dedalus](https://dedalus-project.org/): General-purpose spectral PDE solver
 - [SpectralDNS](https://github.com/spectralDNS/spectralDNS): Spectral DNS solver

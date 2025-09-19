@@ -26,7 +26,7 @@ from phrike.equations import EulerEquations1D
 from phrike.solver import SpectralSolver1D
 from phrike.visualization import plot_fields, plot_conserved_time_series
 from phrike.io import save_solution_snapshot
-from .base import BaseProblem
+from ..base import BaseProblem
 
 
 class GaussianWave1DProblem(BaseProblem):

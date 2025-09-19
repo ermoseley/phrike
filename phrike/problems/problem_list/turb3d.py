@@ -9,10 +9,187 @@ import numpy as np
 
 from phrike.grid import Grid3D
 from phrike.equations import EulerEquations3D
-from phrike.initial_conditions import turbulent_velocity_3d
+# Initial condition function moved from phrike.initial_conditions
 from phrike.solver import SpectralSolver3D
 from phrike.io import save_solution_snapshot
-from .base import BaseProblem
+from ..base import BaseProblem
+
+
+def turbulent_velocity_3d(
+    X: np.ndarray,
+    Y: np.ndarray,
+    Z: np.ndarray,
+    rho0: float = 1.0,
+    p0: float = 1.0,
+    vrms: float = 0.1,
+    kmin: float = 2.0,
+    kmax: float = 16.0,
+    alpha: float = 0.3333,  # Compressive fraction (0=solenoidal, 1=compressive)
+    spectrum_type: str = "parabolic",  # "parabolic" or "power_law"
+    power_law_slope: float = -5.0 / 3.0,  # Kolmogorov slope
+    seed: int = 42,
+    gamma: float = 1.4,
+) -> np.ndarray:
+    """3D turbulent velocity initial condition matching RAMSES turb.py.
+
+    Generates a divergence/rotation-controlled random velocity field using
+    spectral filtering between k_min and k_max.
+
+    Args:
+        X, Y, Z: 3D coordinate arrays (shape: Nz, Ny, Nx)
+        rho0: Uniform density
+        p0: Uniform pressure
+        vrms: Target RMS velocity magnitude
+        kmin: Minimum wavenumber for band-pass
+        kmax: Maximum wavenumber for band-pass
+        alpha: Compressive fraction [0..1] (1=compressive, 0=solenoidal)
+        spectrum_type: "parabolic" (band-limited) or "power_law"
+        power_law_slope: Power law slope for spectrum='power_law'
+        seed: Random seed for reproducibility
+        gamma: Adiabatic index
+    """
+    # Torch interop if needed
+    try:
+        import torch  # type: ignore
+
+        _TORCH_AVAILABLE = True
+    except Exception:
+        _TORCH_AVAILABLE = False
+        torch = None  # type: ignore
+
+    is_torch = _TORCH_AVAILABLE and any(
+        isinstance(a, (torch.Tensor,)) for a in (X, Y, Z)
+    )
+
+    # Get grid dimensions
+    if is_torch:
+        nz, ny, nx = X.shape
+    else:
+        nz, ny, nx = X.shape
+
+    # Set up random number generator
+    rng = np.random.default_rng(seed)
+
+    # Generate k-grid for FFT
+    def generate_k_grid(n1, n2, n3):
+        kx = np.fft.fftfreq(n1, d=1.0 / n1).reshape(n1, 1, 1)
+        ky = np.fft.fftfreq(n2, d=1.0 / n2).reshape(1, n2, 1)
+        kz = np.fft.fftfreq(n3, d=1.0 / n3).reshape(1, 1, n3)
+        kmag = np.sqrt(kx * kx + ky * ky + kz * kz)
+        return kx, ky, kz, kmag
+
+    # Generate turbulent velocity field
+    def build_turbulent_velocity(
+        n1, n2, n3, kmin, kmax, alpha, vrms, rng, spectrum_type, power_law_slope
+    ):
+        # Real-space Gaussian noise
+        u0 = rng.standard_normal((n1, n2, n3)).astype(np.float64)
+        v0 = rng.standard_normal((n1, n2, n3)).astype(np.float64)
+        w0 = rng.standard_normal((n1, n2, n3)).astype(np.float64)
+
+        # FFT to spectral domain
+        U = np.fft.fftn(u0)
+        V = np.fft.fftn(v0)
+        W = np.fft.fftn(w0)
+
+        # k-grid and spectral envelope
+        kx, ky, kz, kmag = generate_k_grid(n1, n2, n3)
+        with np.errstate(invalid="ignore"):
+            band = (kmag >= kmin) & (kmag <= kmax)
+
+            if spectrum_type == "parabolic":
+                # Parabolic band-pass: w(k) ∝ (k - kmin)(kmax - k) within [kmin,kmax]
+                envelope = (kmag - kmin) * (kmax - kmag)
+                envelope = np.where(band, envelope, 0.0)
+                envelope = np.clip(envelope, 0.0, None)
+            elif spectrum_type == "power_law":
+                # Power law: w(k) ∝ k^slope within [kmin,kmax]
+                kmag_safe = np.where(kmag == 0.0, 1.0, kmag)
+                envelope = np.where(band, kmag_safe**power_law_slope, 0.0)
+                # Apply smooth cutoff at boundaries
+                k_transition = 0.1
+                dk = kmax - kmin
+                k1 = kmin + k_transition * dk
+                k2 = kmax - k_transition * dk
+                low_transition = np.where(
+                    (kmag >= kmin) & (kmag < k1),
+                    0.5 * (1.0 + np.cos(np.pi * (kmag - kmin) / (k1 - kmin))),
+                    1.0,
+                )
+                high_transition = np.where(
+                    (kmag > k2) & (kmag <= kmax),
+                    0.5 * (1.0 + np.cos(np.pi * (kmag - k2) / (kmax - k2))),
+                    1.0,
+                )
+                envelope *= low_transition * high_transition
+            else:
+                raise ValueError(f"Unknown spectrum_type: {spectrum_type}")
+
+            filt = np.sqrt(envelope, dtype=np.float64)
+
+        # Avoid division by zero at k=0
+        kmag_safe = np.where(kmag == 0.0, 1.0, kmag)
+
+        # Projection to compressive (parallel) and solenoidal (perpendicular)
+        dot = kx * U + ky * V + kz * W
+        U_par = kx * dot / (kmag_safe * kmag_safe)
+        V_par = ky * dot / (kmag_safe * kmag_safe)
+        W_par = kz * dot / (kmag_safe * kmag_safe)
+        U_perp = U - U_par
+        V_perp = V - V_par
+        W_perp = W - W_par
+
+        # Mix
+        a = float(alpha)
+        U_mix = a * U_par + (1.0 - a) * U_perp
+        V_mix = a * V_par + (1.0 - a) * V_perp
+        W_mix = a * W_par + (1.0 - a) * W_perp
+
+        # Apply spectral envelope
+        U_mix *= filt
+        V_mix *= filt
+        W_mix *= filt
+
+        # Enforce zero at k=0
+        U_mix[0, 0, 0] = 0.0
+        V_mix[0, 0, 0] = 0.0
+        W_mix[0, 0, 0] = 0.0
+
+        # Back to real space
+        u = np.fft.ifftn(U_mix).real.astype(np.float32)
+        v = np.fft.ifftn(V_mix).real.astype(np.float32)
+        w = np.fft.ifftn(W_mix).real.astype(np.float32)
+
+        # Normalize to desired vrms
+        speed2 = u * u + v * v + w * w
+        rms = float(np.sqrt(np.mean(speed2)))
+        if rms > 0:
+            s = float(vrms) / rms
+            u *= s
+            v *= s
+            w *= s
+
+        return u, v, w
+
+    # Generate velocity field
+    u, v, w = build_turbulent_velocity(
+        nx, ny, nz, kmin, kmax, alpha, vrms, rng, spectrum_type, power_law_slope
+    )
+
+    # Convert to torch if needed
+    if is_torch:
+        assert torch is not None
+        u = torch.from_numpy(u).to(device=X.device, dtype=X.dtype)
+        v = torch.from_numpy(v).to(device=X.device, dtype=X.dtype)
+        w = torch.from_numpy(w).to(device=X.device, dtype=X.dtype)
+        rho = torch.full_like(X, float(rho0))
+        p = torch.full_like(X, float(p0))
+    else:
+        rho = rho0 * np.ones_like(X)
+        p = p0 * np.ones_like(X)
+
+    eqs = EulerEquations3D(gamma=gamma)
+    return eqs.conservative(rho, u, v, w, p)
 
 
 class Turb3DProblem(BaseProblem):

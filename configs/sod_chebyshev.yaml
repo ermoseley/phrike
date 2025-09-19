@@ -1,13 +1,13 @@
-# Configuration for 1D Sod shock tube problem with Chebyshev basis
+# Configuration for 1D Sod shock tube problem with Legendre basis
 problem: sod
 
 grid:
   N: 256                    # Match Dedalus resolution
   Lx: 1.0
   x0: 0.5                   # discontinuity location
-  basis: chebyshev          # Use Chebyshev basis for non-periodic BCs
+  basis: legendre           # Use Legendre basis for non-periodic BCs
   bc: dirichlet             # Reflecting walls: u=0 at both ends (Dirichlet)
-  dealias: false          # Disable dealiasing to match Legendre approach
+  dealias: false          # Disable dealiasing for Legendre approach
   precision: double
 
 physics:
@@ -59,7 +59,7 @@ adaptive:
 
 # Constant artificial viscosity (matching Dedalus value)
 artificial_viscosity:
-  enabled: true             # Re-enable after fixing Chebyshev issue
+  enabled: true             # Re-enable after fixing Legendre issue
   mode: constant
   nu_constant: 0.0003       # Match Dedalus nu = 3e-4
   variable_weights:
@@ -69,7 +69,7 @@ artificial_viscosity:
   diagnostic_output: true
 
 io:
-  outdir: outputs/sod_chebyshev
+  outdir: outputs/sod_legendre
   save_spectra: true
 
 monitoring:

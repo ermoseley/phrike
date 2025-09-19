@@ -2,9 +2,9 @@ problem: sod
 grid:
   N: 256
   Lx: 1.0
-  basis: chebyshev
+  basis: legendre
   bc: dirichlet
-  dealias: true
+  dealias: false
   precision: single
 equations:
   gamma: 1.4

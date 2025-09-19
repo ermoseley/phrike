@@ -1,4 +1,4 @@
-"""Command-line interface for SpectralHydro."""
+"""Command-line interface for PHRIKE."""
 
 import argparse
 import os
@@ -47,8 +47,8 @@ Examples:
         "--basis",
         type=str,
         default=None,
-        choices=["fourier", "chebyshev", "legendre"],
-        help="Spectral basis (1D problems): fourier|chebyshev|legendre",
+        choices=["fourier", "legendre"],
+        help="Spectral basis (1D problems): fourier|legendre",
     )
     parser.add_argument(
         "--bc",

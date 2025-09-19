@@ -1,17 +1,50 @@
 """1D Sod shock tube problem."""
 
 import os
-from typing import Optional
+from typing import Optional, Dict
 
 import matplotlib.pyplot as plt
+import numpy as np
 
 from phrike.grid import Grid1D
 from phrike.equations import EulerEquations1D
-from phrike.initial_conditions import sod_shock_tube
+# Initial condition function moved from phrike.initial_conditions
 from phrike.solver import SpectralSolver1D
 from phrike.visualization import plot_fields, plot_conserved_time_series
 from phrike.io import save_solution_snapshot
-from .base import BaseProblem
+from ..base import BaseProblem
+
+
+def sod_shock_tube(
+    x: np.ndarray,
+    x0: float,
+    left: Dict[str, float],
+    right: Dict[str, float],
+    gamma: float,
+) -> np.ndarray:
+    """Return conservative state U for the Sod shock tube initial condition.
+
+    left/right dictionaries should include keys: rho, u, p
+    """
+    # Support both NumPy arrays and Torch tensors for x
+    try:
+        import torch  # type: ignore
+
+        _TORCH_AVAILABLE = True
+    except Exception:
+        _TORCH_AVAILABLE = False
+        torch = None  # type: ignore
+
+    if _TORCH_AVAILABLE and isinstance(x, (torch.Tensor,)):
+        rho = torch.where(x < x0, torch.tensor(left["rho"], dtype=x.dtype, device=x.device), torch.tensor(right["rho"], dtype=x.dtype, device=x.device))
+        u = torch.where(x < x0, torch.tensor(left["u"], dtype=x.dtype, device=x.device), torch.tensor(right["u"], dtype=x.dtype, device=x.device))
+        p = torch.where(x < x0, torch.tensor(left["p"], dtype=x.dtype, device=x.device), torch.tensor(right["p"], dtype=x.dtype, device=x.device))
+    else:
+        rho = np.where(x < x0, left["rho"], right["rho"])  # type: ignore[index]
+        u = np.where(x < x0, left["u"], right["u"])  # type: ignore[index]
+        p = np.where(x < x0, left["p"], right["p"])  # type: ignore[index]
+    eqs = EulerEquations1D(gamma=gamma)
+    return eqs.conservative(rho, u, p)
 
 
 class SodProblem(BaseProblem):

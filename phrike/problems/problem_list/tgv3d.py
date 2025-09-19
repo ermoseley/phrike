@@ -4,13 +4,63 @@ import os
 from typing import Optional
 
 import matplotlib.pyplot as plt
+import numpy as np
 
 from phrike.grid import Grid3D
 from phrike.equations import EulerEquations3D
-from phrike.initial_conditions import taylor_green_vortex_3d
+# Initial condition function moved from phrike.initial_conditions
 from phrike.solver import SpectralSolver3D
 from phrike.io import save_solution_snapshot
-from .base import BaseProblem
+from ..base import BaseProblem
+
+
+def taylor_green_vortex_3d(
+    X: np.ndarray,
+    Y: np.ndarray,
+    Z: np.ndarray,
+    rho0: float = 1.0,
+    p0: float = 100.0,
+    U0: float = 1.0,
+    k: int = 1,
+    gamma: float = 1.4,
+) -> np.ndarray:
+    """3D Taylor-Green vortex initial condition (compressible variant).
+
+    Velocity field:
+        u =  U0 * sin(k x) cos(k y) cos(k z)
+        v = -U0 * cos(k x) sin(k y) cos(k z)
+        w =  0
+    Constant density rho0 and pressure p0.
+    """
+    # Torch interop if needed
+    try:
+        import torch  # type: ignore
+
+        _TORCH_AVAILABLE = True
+    except Exception:
+        _TORCH_AVAILABLE = False
+        torch = None  # type: ignore
+
+    is_torch = _TORCH_AVAILABLE and any(
+        isinstance(a, (torch.Tensor,)) for a in (X, Y, Z)
+    )
+
+    if is_torch:
+        assert torch is not None
+        ux = U0 * torch.sin(k * X) * torch.cos(k * Y) * torch.cos(k * Z)
+        uy = -U0 * torch.cos(k * X) * torch.sin(k * Y) * torch.cos(k * Z)
+        uz = torch.zeros_like(X)
+        rho = torch.full_like(X, float(rho0))
+        p = torch.full_like(X, float(p0))
+    else:
+        ux = U0 * np.sin(k * X) * np.cos(k * Y) * np.cos(k * Z)
+        uy = -U0 * np.cos(k * X) * np.sin(k * Y) * np.cos(k * Z)
+        uz = np.zeros_like(X)
+        rho = rho0 * np.ones_like(X)
+        p = p0 * np.ones_like(X)
+
+    eqs = EulerEquations3D(gamma=gamma)
+    return eqs.conservative(rho, ux, uy, uz, p)
 
 
 class TGV3DProblem(BaseProblem):

@@ -126,8 +126,8 @@ def _build_exponential_filter_3d(
 class Grid1D:
     """1D grid and spectral operators with pluggable basis.
 
-    Default is periodic Fourier basis on a uniform grid, preserving existing
-    behavior. Optionally, a Chebyshev basis with non-periodic BCs can be used.
+    Default is periodic Fourier basis on a uniform grid. Optionally, a
+    Legendre–Gauss–Lobatto collocation basis with non-periodic BCs can be used.
 
     Attributes
     ----------
@@ -136,7 +136,7 @@ class Grid1D:
     Lx : float
         Domain length.
     basis : str
-        Spectral basis: "fourier" (default) or "chebyshev".
+        Spectral basis: "fourier" (default) or "legendre".
     bc : Optional[str]
         Boundary condition for non-periodic bases (e.g., "dirichlet").
     dealias : bool
@@ -222,25 +222,6 @@ class Grid1D:
                 self._basis = FourierBasis1D(self.N, self.Lx, fft_workers=self.fft_workers)
             except Exception:
                 self._basis = None  # Fallback to direct FFT wrappers below
-        elif self._basis_name == "chebyshev":
-            # Chebyshev–Gauss–Lobatto nodes on [0, Lx]
-            try:
-                from .basis.chebyshev import ChebyshevBasis1D
-
-                bc = self.bc or "dirichlet"
-                self._basis = ChebyshevBasis1D(self.N, self.Lx, bc=bc, fft_workers=self.fft_workers)
-                self.x = self._basis.nodes()
-                # Use min spacing as stability proxy for CFL
-                x_np = np.asarray(self.x)
-                if self.N > 1:
-                    self.dx = float(np.min(np.diff(x_np)))
-                else:
-                    self.dx = self.Lx
-                # No Fourier dealias/filter masks in Chebyshev mode
-                self.dealias_mask = np.ones(self.N, dtype=float)
-                self.filter_sigma = np.ones(self.N, dtype=float)
-            except Exception as e:
-                raise RuntimeError(f"Chebyshev basis initialization failed: {e}")
         elif self._basis_name == "legendre":
             # Legendre–Gauss–Lobatto nodes on [0, Lx]
             try:
@@ -290,11 +271,11 @@ class Grid1D:
             except Exception:
                 pass
 
-        # Torch backend setup (Fourier, Chebyshev, Legendre supported)
+        # Torch backend setup (Fourier, Legendre supported)
         self._use_torch = (
             (self.backend.lower() == "torch")
             and _TORCH_AVAILABLE
-            and (self._basis_name in ("fourier", "chebyshev", "legendre"))
+            and (self._basis_name in ("fourier", "legendre"))
         )
         if self._use_torch:
             # Choose device if not provided
@@ -386,158 +367,7 @@ class Grid1D:
         except TypeError:
             return scipy_fft.ifft(F, axis=-1).real
 
-    # DCT wrappers (Chebyshev basis only)
-    def dct(self, f: np.ndarray) -> np.ndarray:
-        """DCT-I forward transform for Chebyshev basis."""
-        if getattr(self, "_use_torch", False):
-            assert torch is not None
-            # Convert to torch if needed
-            if not isinstance(f, torch.Tensor):
-                f = torch.from_numpy(np.asarray(f)).to(
-                    dtype=self.x.dtype, device=self.x.device
-                )
-            return self._dct1_ortho_torch(f)
-        try:
-            return scipy_fft.dct(f, type=1, axis=-1, norm="ortho", workers=self.fft_workers)  # type: ignore[call-arg]
-        except TypeError:
-            return scipy_fft.dct(f, type=1, axis=-1, norm="ortho")
-
-    def idct(self, F: np.ndarray) -> np.ndarray:
-        """DCT-I inverse transform for Chebyshev basis."""
-        if getattr(self, "_use_torch", False):
-            assert torch is not None
-            # Convert to torch if needed
-            if not isinstance(F, torch.Tensor):
-                F = torch.from_numpy(np.asarray(F)).to(
-                    dtype=self.x.dtype, device=self.x.device
-                )
-            return self._idct1_ortho_torch(F)
-        try:
-            return scipy_fft.idct(F, type=1, axis=-1, norm="ortho", workers=self.fft_workers)  # type: ignore[call-arg]
-        except TypeError:
-            return scipy_fft.idct(F, type=1, axis=-1, norm="ortho")
-
-    def _dct1_ortho_torch(self, x):
-        """Torch implementation of orthonormal DCT-I."""
-        assert torch is not None
-        n = x.shape[-1]
-        if n == 1:
-            return x.clone()
-        
-        # DCT-I orthonormal scaling factors
-        dn, dout = self._torch_dct_scales(n, device=x.device, dtype=x.dtype)
-        
-        # Pre-scale input
-        x_scaled = x * dn
-        # Mirror without duplicating endpoints: [x0, x1, ..., xN-1, xN-2, ..., x1]
-        tail = x_scaled[..., 1:-1]
-        if tail.shape[-1] > 0:
-            tail = torch.flip(tail, dims=(-1,))
-        y = torch.cat([x_scaled, tail], dim=-1)
-        
-        # Real FFT
-        c_none = torch.fft.rfft(y, dim=-1).real
-        return c_none * dout
-
-    def _idct1_ortho_torch(self, c):
-        """Torch implementation of orthonormal IDCT-I."""
-        assert torch is not None
-        n = c.shape[-1]
-        if n == 1:
-            return c.clone()
-        
-        # Undo output scaling
-        _, dout = self._torch_dct_scales(n, device=c.device, dtype=c.dtype)
-        c_none = c / dout
-        
-        # Inverse via mirrored irfft
-        y = torch.fft.irfft(torch.complex(c_none, torch.zeros_like(c_none)), n=max(2 * n - 2, 1), dim=-1)
-        x_scaled = y[..., :n]
-        
-        # Undo input scaling
-        dn, _ = self._torch_dct_scales(n, device=c.device, dtype=c.dtype)
-        return x_scaled / dn
-
-    def _torch_dct_scales(self, n: int, *, device, dtype):
-        """Compute DCT-I orthonormal scaling factors for torch."""
-        assert torch is not None
-        # D_in (pre-scale columns / input samples), D_out (post-scale rows / output coeffs)
-        # These diagonals satisfy: A_ortho = diag(D_out) @ A_none @ diag(D_in)
-        if n <= 0:
-            raise ValueError("Invalid size for DCT-I scales")
-        dn = torch.full((n,), 0.5, device=device, dtype=dtype)
-        if n >= 2:
-            sqrt2 = torch.sqrt(torch.tensor(2.0, device=device, dtype=dtype))
-            dn[0] = 1.0 / sqrt2
-            dn[-1] = 1.0 / sqrt2
-        dout = torch.full((n,), float(np.sqrt(2.0 / max(n - 1, 1))), device=device, dtype=dtype)
-        if n >= 2:
-            dout[0] = float(np.sqrt(1.0 / (n - 1)))
-            dout[-1] = float(np.sqrt(1.0 / (n - 1)))
-        return dn, dout
-
-    def _chebyshev_dx(self, f: np.ndarray) -> np.ndarray:
-        """Chebyshev spectral derivative using DCT methods (mirrors Fourier pattern)."""
-        # Forward transform
-        a = self.dct(f)
-        N = a.shape[-1]
-        if N <= 1:
-            if getattr(self, "_use_torch", False) and isinstance(f, (torch.Tensor,)):
-                return torch.zeros_like(f)
-            return np.zeros_like(f)
-        
-        # Differentiate coefficients w.r.t y via recurrence
-        if getattr(self, "_use_torch", False) and isinstance(a, (torch.Tensor,)):
-            assert torch is not None
-            b = torch.zeros_like(a)
-            if N >= 2:
-                b[..., -2] = 2.0 * (N - 1) * a[..., -1]
-                for k in range(N - 3, -1, -1):
-                    b[..., k] = b[..., k + 2] + 2.0 * (k + 1) * a[..., k + 1]
-                b[..., 0] = 0.5 * b[..., 0]
-            # Map dy->dx
-            b = b * float(self._basis._dy_dx)
-            return self.idct(b)
-        else:
-            b = np.zeros_like(a)
-            if N >= 2:
-                b[..., -2] = 2.0 * (N - 1) * a[..., -1]
-                for k in range(N - 3, -1, -1):
-                    b[..., k] = b[..., k + 2] + 2.0 * (k + 1) * a[..., k + 1]
-                b[..., 0] *= 0.5
-            # Map dy->dx
-            b *= self._basis._dy_dx
-            return self.idct(b)
-
-    def _chebyshev_spectral_filter(self, f: np.ndarray, *, p: int = 8, alpha: float = 36.0) -> np.ndarray:
-        """Chebyshev spectral filter using DCT methods (mirrors Fourier pattern)."""
-        # Forward transform
-        F = self.dct(f)
-        N = F.shape[-1]
-        
-        # Build filter in spectral space
-        k = np.arange(N, dtype=float)
-        kmax = max(float(N - 1), 1.0)
-        eta = k / kmax
-        sigma_np = np.exp(-float(alpha) * eta**int(p))
-        
-        # Match backend of F (torch or numpy)
-        try:
-            import torch  # type: ignore
-            is_torch = isinstance(F, torch.Tensor)
-        except Exception:
-            is_torch = False
-            torch = None  # type: ignore
-            
-        if is_torch:  # type: ignore[truthy-bool]
-            sigma = torch.from_numpy(sigma_np).to(dtype=F.dtype, device=F.device)  # type: ignore[attr-defined]
-            shape = (1,) * (F.ndim - 1) + (N,)
-            sigma = sigma.reshape(shape)
-            F_filtered = F * sigma
-            return self.idct(F_filtered)
-        else:
-            F_filtered = F * sigma_np.reshape((1,) * (F.ndim - 1) + (N,))
-            return self.idct(F_filtered)
+    # (Chebyshev-specific DCT helpers removed)
 
     # Spectral derivative
     def dx1(self, f: np.ndarray) -> np.ndarray:
@@ -548,9 +378,6 @@ class Grid1D:
             F *= self.filter_sigma
             dF = self.ik * F
             return self.irfft(dF)
-        elif self._basis_name == "chebyshev":
-            # Delegate to basis implementation to avoid normalization drift
-            return self._basis.dx(f)  # type: ignore[union-attr]
         else:
             # Generic basis path (e.g., Legendre): delegate to basis implementation
             return self._basis.dx(f)  # type: ignore[union-attr]
@@ -567,7 +394,7 @@ class Grid1D:
             if self.filter_params and bool(self.filter_params.get("enabled", False)):
                 p = int(self.filter_params.get("p", 8))
                 alpha = float(self.filter_params.get("alpha", 36.0))
-                # Delegate to basis filter (Chebyshev/Legendre implement modal filters)
+                # Delegate to basis filter (e.g., Legendre implements modal filters)
                 return self._basis.apply_spectral_filter(f, p=p, alpha=alpha)  # type: ignore[union-attr]
             return f
 
@@ -590,7 +417,7 @@ class Grid1D:
         - "neumann" (alias: open): zero-gradient for all selected variables.
         Variable keys accepted: density|rho, momentum|velocity|u, pressure|p.
         """
-        if self._basis_name not in ("chebyshev", "legendre"):
+        if self._basis_name != "legendre":
             return U
         # Determine BCs for each variable
         def _get_var_bc(var: str) -> str:

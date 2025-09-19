@@ -12,7 +12,7 @@ non-oscillatory shock-capturing schemes"
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import Dict, Any, Optional, Tuple
-from phrike.problems.base import BaseProblem
+from ..base import BaseProblem
 from phrike.equations import EulerEquations1D
 from phrike.grid import Grid1D
 from phrike.solver import SpectralSolver1D
