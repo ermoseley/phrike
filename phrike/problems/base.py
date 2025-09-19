@@ -161,6 +161,19 @@ class BaseProblem(ABC):
         else:
             self.ic_smoothing_config = None
 
+        # Gravity parameters
+        gravity_raw = self.config.get("gravity", None)
+        if gravity_raw:
+            self.gravity_config = {
+                "enabled": bool(gravity_raw.get("enabled", False)),
+                "type": str(gravity_raw.get("type", "linear")),
+                "gx": float(gravity_raw.get("gx", 0.0)),
+                "gy": float(gravity_raw.get("gy", 0.0)),
+                "gz": float(gravity_raw.get("gz", 0.0))
+            }
+        else:
+            self.gravity_config = None
+
         # Threading / FFT workers (unified via runtime.num_threads, fallback to grid.fft_workers)
         runtime_cfg = self.config.get("runtime", {})
         num_threads_cfg = runtime_cfg.get("num_threads", None)
@@ -832,7 +845,9 @@ class BaseProblem(ABC):
         solver_class = self.get_solver_class()
         solver = solver_class(
             grid=grid, equations=equations, scheme=self.scheme, cfl=self.cfl,
-            adaptive_config=self.adaptive_config
+            adaptive_config=self.adaptive_config,
+            artificial_viscosity_config=self.artificial_viscosity_config,
+            gravity_config=self.gravity_config
         )
 
         # Setup visualization

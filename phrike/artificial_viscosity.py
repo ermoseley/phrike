@@ -48,18 +48,20 @@ class ArtificialViscosityConfig:
     
     Attributes:
         enabled: Whether artificial viscosity is enabled
-        nu_max: Maximum viscosity coefficient
-        s_ref: Reference smoothness threshold
-        s_min: Minimum smoothness for applying viscosity
-        p: Exponent for smoothness scaling
-        epsilon: Small number to avoid division by zero
+        mode: Viscosity mode - "sensor" for gradient-based or "constant" for uniform
+        nu_constant: Constant viscosity coefficient (used when mode="constant")
+        nu_max: Maximum viscosity coefficient (used when mode="sensor")
+        s_ref: Reference smoothness threshold (used when mode="sensor")
+        s_min: Minimum smoothness for applying viscosity (used when mode="sensor")
+        p: Exponent for smoothness scaling (used when mode="sensor")
+        epsilon: Small number to avoid division by zero (used when mode="sensor")
         variable_weights: Weights for different conserved variables
-        sensor_variable: Which variable to use for smoothness sensing
+        sensor_variable: Which variable to use for smoothness sensing (used when mode="sensor")
         diagnostic_output: Whether to output diagnostic information
-    mode: str = "sensor"  # "sensor" or "constant"
-    nu_constant: float = 0.0  # used when mode == "constant"
     """
     enabled: bool = True
+    mode: str = "sensor"  # "sensor" or "constant"
+    nu_constant: float = 0.0  # used when mode == "constant"
     nu_max: float = 1e-3
     s_ref: float = 1.0
     s_min: float = 0.1
@@ -79,10 +81,18 @@ class ArtificialViscosityConfig:
                 "energy": 1.0
             }
         # Normalize mode value
-        if hasattr(self, "mode") and isinstance(self.mode, str):
+        if isinstance(self.mode, str):
             self.mode = self.mode.lower().strip()
         else:
             self.mode = "sensor"
+        
+        # Validate mode
+        if self.mode not in ["sensor", "constant"]:
+            raise ValueError(f"Invalid mode '{self.mode}'. Must be 'sensor' or 'constant'")
+        
+        # Validate nu_constant for constant mode
+        if self.mode == "constant" and self.nu_constant < 0:
+            raise ValueError("nu_constant must be non-negative")
 
 
 class SmoothnessSensor(ABC):
@@ -227,10 +237,10 @@ class SpectralArtificialViscosity:
             return [np.zeros_like(U[i]) for i in range(len(U))]
         
         # Compute viscosity field
-        if getattr(self.config, "mode", "sensor") == "constant":
+        if self.config.mode == "constant":
             # Use a uniform constant viscosity everywhere
-            nu_val = float(getattr(self.config, "nu_constant", 0.0))
-            # Backward compatibility: if nu_constant is 0, fall back to nu_max
+            nu_val = float(self.config.nu_constant)
+            # If nu_constant is 0, fall back to nu_max for backward compatibility
             if nu_val == 0.0:
                 nu_val = float(self.config.nu_max)
             viscosity = np.full_like(U[0], nu_val)

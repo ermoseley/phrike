@@ -8,6 +8,7 @@ from .problem_list.turb3d import Turb3DProblem
 from .problem_list.acoustic1d import Acoustic1DProblem
 from .problem_list.gaussian_wave1d import GaussianWave1DProblem
 from .problem_list.shu_osher1d import ShuOsher1DProblem
+from .problem_list.rti import RTIProblem
 
 
 # Register all problems
@@ -18,3 +19,4 @@ ProblemRegistry.register("turb3d", Turb3DProblem)
 ProblemRegistry.register("acoustic1d", Acoustic1DProblem)
 ProblemRegistry.register("gaussian_wave1d", GaussianWave1DProblem)
 ProblemRegistry.register("shu_osher1d", ShuOsher1DProblem)
+ProblemRegistry.register("rti", RTIProblem)

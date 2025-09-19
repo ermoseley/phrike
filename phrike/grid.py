@@ -161,7 +161,7 @@ class Grid1D:
     debug: bool = False
 
     def __post_init__(self) -> None:
-        # Normalize/parse boundary condition configuration (string or dict)
+        # Normalize/parse boundary condition configuration (string, dict, or per-boundary dict)
         def _normalize_bc_value(name: str) -> str:
             n = str(name).strip().lower()
             if n in ("reflective", "dirichlet", "wall"):
@@ -180,15 +180,46 @@ class Grid1D:
                 return "momentum"
             return n
 
-        # bc may be a string or a dict mapping variables to bc types
+        def _normalize_boundary_name(b: str) -> str:
+            n = str(b).strip().lower()
+            if n in ("left", "x0", "x_min", "start"):
+                return "left"
+            if n in ("right", "x1", "x_max", "end"):
+                return "right"
+            return n
+
+        # bc may be a string, per-variable dict, or per-boundary dict
         self._bc_global: str | None = None
         self._bc_map: dict[str, str] | None = None
+        self._bc_boundary_map: dict[str, dict[str, str]] | None = None  # {boundary: {var: bc}}
         self._dirichlet_values_map: dict[str, tuple[float, float]] | None = None
+        
         if isinstance(self.bc, dict):
-            # Per-variable map
-            self._bc_map = {}
-            for k, v in self.bc.items():  # type: ignore[union-attr]
-                self._bc_map[_normalize_var_name(k)] = _normalize_bc_value(v)
+            # Check if this is a per-boundary configuration
+            if any(k.lower() in ("left", "right", "x0", "x1", "x_min", "x_max", "start", "end") 
+                   for k in self.bc.keys()):
+                # Per-boundary configuration: {left: {var: bc}, right: {var: bc}}
+                self._bc_boundary_map = {}
+                for boundary_key, var_bc_dict in self.bc.items():
+                    boundary = _normalize_boundary_name(boundary_key)
+                    if isinstance(var_bc_dict, dict):
+                        self._bc_boundary_map[boundary] = {}
+                        for var_key, bc_value in var_bc_dict.items():
+                            var = _normalize_var_name(var_key)
+                            self._bc_boundary_map[boundary][var] = _normalize_bc_value(bc_value)
+                    else:
+                        # Single BC for all variables on this boundary
+                        bc_value = _normalize_bc_value(var_bc_dict)
+                        self._bc_boundary_map[boundary] = {
+                            "density": bc_value,
+                            "momentum": bc_value,
+                            "pressure": bc_value
+                        }
+            else:
+                # Per-variable configuration: {var: bc}
+                self._bc_map = {}
+                for k, v in self.bc.items():
+                    self._bc_map[_normalize_var_name(k)] = _normalize_bc_value(v)
         elif isinstance(self.bc, str) and self.bc:
             self._bc_global = _normalize_bc_value(self.bc)
         else:
@@ -411,19 +442,29 @@ class Grid1D:
     def apply_boundary_conditions(self, U: np.ndarray, equations) -> np.ndarray:
         """Apply boundary conditions to conservative variables U in-place.
 
-        Supports global or per-variable BCs for non-periodic bases. Semantics:
+        Supports global, per-variable, or per-boundary BCs for non-periodic bases. Semantics:
         - "wall" (alias: reflective, dirichlet): velocity Dirichlet (u=0),
           scalars density/pressure use zero-gradient (Neumann).
         - "neumann" (alias: open): zero-gradient for all selected variables.
         Variable keys accepted: density|rho, momentum|velocity|u, pressure|p.
+        Boundary keys accepted: left|x0|x_min|start, right|x1|x_max|end.
         """
         if self._basis_name != "legendre":
             return U
-        # Determine BCs for each variable
-        def _get_var_bc(var: str) -> str:
+        
+        # Determine BCs for each variable and boundary
+        def _get_var_bc(var: str, boundary: str = None) -> str:
             var_n = var
+            
+            # Check per-boundary configuration first
+            if boundary and self._bc_boundary_map is not None:
+                if boundary in self._bc_boundary_map:
+                    return self._bc_boundary_map[boundary].get(var_n, self._bc_global or "wall")
+            
+            # Fall back to per-variable configuration
             if self._bc_map is not None:
                 return self._bc_map.get(var_n, self._bc_global or "wall")
+            
             # No per-var map: interpret global
             g = self._bc_global or "wall"
             # For global "wall": momentum Dirichlet, scalars Neumann
@@ -439,53 +480,79 @@ class Grid1D:
         if U.shape[0] < 2:
             return U
 
-        # Resolve per-variable BCs
-        bc_rho = _get_var_bc("density")
-        bc_mom = _get_var_bc("momentum")
-        bc_p   = _get_var_bc("pressure")
+        # Resolve per-variable BCs for each boundary
+        bc_rho_left = _get_var_bc("density", "left")
+        bc_rho_right = _get_var_bc("density", "right")
+        bc_mom_left = _get_var_bc("momentum", "left")
+        bc_mom_right = _get_var_bc("momentum", "right")
+        bc_p_left = _get_var_bc("pressure", "left")
+        bc_p_right = _get_var_bc("pressure", "right")
 
         # Helper: apply zero-gradient (copy nearest interior) on a component idx
-        def _apply_neumann(comp_idx: int) -> None:
-            if self.N >= 3:
-                U[..., comp_idx, 0] = U[..., comp_idx, 1]
-                U[..., comp_idx, -1] = U[..., comp_idx, -2]
-            elif self.N == 2:
-                avg = 0.5 * (U[..., comp_idx, 0] + U[..., comp_idx, 1])
-                U[..., comp_idx, 0] = avg
-                U[..., comp_idx, 1] = avg
+        def _apply_neumann(comp_idx: int, boundary: str) -> None:
+            if boundary == "left":
+                if self.N >= 2:
+                    U[..., comp_idx, 0] = U[..., comp_idx, 1]
+            elif boundary == "right":
+                if self.N >= 2:
+                    U[..., comp_idx, -1] = U[..., comp_idx, -2]
 
         # Helpers for Dirichlet using configured values
-        def _apply_dirichlet(comp_idx: int, var_key: str) -> None:
+        def _apply_dirichlet(comp_idx: int, var_key: str, boundary: str) -> None:
             if self._dirichlet_values_map is not None and var_key in self._dirichlet_values_map:
                 left_val, right_val = self._dirichlet_values_map[var_key]
-                U[..., comp_idx, 0] = left_val
-                U[..., comp_idx, -1] = right_val
+                if boundary == "left":
+                    U[..., comp_idx, 0] = left_val
+                elif boundary == "right":
+                    U[..., comp_idx, -1] = right_val
             else:
                 # Fallback: zero for momentum, else copy interior (approximate Neumann)
                 if var_key == "momentum":
-                    U[..., comp_idx, 0] = 0
-                    U[..., comp_idx, -1] = 0
+                    if boundary == "left":
+                        U[..., comp_idx, 0] = 0
+                    elif boundary == "right":
+                        U[..., comp_idx, -1] = 0
                 else:
-                    _apply_neumann(comp_idx)
+                    _apply_neumann(comp_idx, boundary)
 
+        # Apply boundary conditions for each variable and boundary
         # Density
-        if bc_rho in ("neumann", "open", "wall"):
-            _apply_neumann(0)
-        elif bc_rho == "dirichlet":
-            _apply_dirichlet(0, "density")
+        if bc_rho_left in ("neumann", "open", "wall"):
+            _apply_neumann(0, "left")
+        elif bc_rho_left == "dirichlet":
+            _apply_dirichlet(0, "density", "left")
+            
+        if bc_rho_right in ("neumann", "open", "wall"):
+            _apply_neumann(0, "right")
+        elif bc_rho_right == "dirichlet":
+            _apply_dirichlet(0, "density", "right")
+            
         # Momentum / velocity
-        if bc_mom in ("wall", "reflective"):
+        if bc_mom_left in ("wall", "reflective"):
             U[..., 1, 0] = 0
+        elif bc_mom_left == "dirichlet":
+            _apply_dirichlet(1, "momentum", "left")
+        elif bc_mom_left in ("neumann", "open"):
+            _apply_neumann(1, "left")
+            
+        if bc_mom_right in ("wall", "reflective"):
             U[..., 1, -1] = 0
-        elif bc_mom == "dirichlet":
-            _apply_dirichlet(1, "momentum")
-        elif bc_mom in ("neumann", "open"):
-            _apply_neumann(1)
+        elif bc_mom_right == "dirichlet":
+            _apply_dirichlet(1, "momentum", "right")
+        elif bc_mom_right in ("neumann", "open"):
+            _apply_neumann(1, "right")
+            
         # Pressure: approximate by applying to energy component
-        if bc_p in ("neumann", "open", "wall"):
-            _apply_neumann(2)
-        elif bc_p == "dirichlet":
-            _apply_dirichlet(2, "pressure")
+        if bc_p_left in ("neumann", "open", "wall"):
+            _apply_neumann(2, "left")
+        elif bc_p_left == "dirichlet":
+            _apply_dirichlet(2, "pressure", "left")
+            
+        if bc_p_right in ("neumann", "open", "wall"):
+            _apply_neumann(2, "right")
+        elif bc_p_right == "dirichlet":
+            _apply_dirichlet(2, "pressure", "right")
+            
         return U
 
 
