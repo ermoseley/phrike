@@ -17,4 +17,6 @@ frames/
 colormaps.py
 ramses-utils/
 example.py
-dedalus/
+dedalus_dir/
+vids/
+.mypy_cache/

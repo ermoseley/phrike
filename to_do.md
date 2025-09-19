@@ -2,8 +2,11 @@ Add new basis functions
     - Chebyshev + Filtering near discontinuities
 Compare our Chebyshev/Legendre implementation to Dedalus. What aren't we getting right, if anything?
 Run a convection problem. Set pressure BCs for a stratified medium.
-Compare Dedalus to PHRIKE
-
+RTI with legendre polynomials
+problems/problem_list
+move all initial_conditions.py into the problems so it is self-contained.
+Fix video so that it uses ffmpeg-python
+  - It should also have an enbled: flag. 
 
 After the fork:
 Add turbulent driving
