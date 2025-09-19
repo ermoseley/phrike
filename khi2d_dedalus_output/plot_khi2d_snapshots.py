@@ -37,6 +37,7 @@ def plot_khi2d_snapshots(snapshots_dir):
             for i in range(0, n_times, step):
                        # Get data for this time step
                        # Note: Transpose x and y axes for correct plotting
+                       # Dedalus stores data as [time, y, x], so transpose to get [x, y]
                        density = f['tasks']['density'][i, :, :].T
                        velocity = f['tasks']['velocity'][i, :, :, :].T  # [2, Nx, Ny] after transpose
                        pressure = f['tasks']['pressure'][i, :, :].T
