@@ -1,0 +1,97 @@
+# Configuration for 2D Rayleigh-Taylor Instability problem
+problem: rti
+
+grid:
+  Nx: 64                    # Width resolution
+  Ny: 128                   # Height resolution (2x width)
+  Lx: 1.0                   # Width of box
+  Ly: 2.0                   # Height of box (2x width)
+  basis_x: legendre         # Use Legendre in x (non-periodic/outflow)
+  basis_y: legendre         # Use Legendre in y (wall/outflow)
+  dealias: true
+  precision: double
+  fft_workers: 4
+
+physics:
+  gamma: 1.4
+
+integration:
+  t0: 0.0
+  t_end: 0.5                # Run for 0.5 time units for testing
+  cfl: 0.01
+  scheme: rk4
+  rtol: 1e-6
+  atol: 1e-8
+  output_interval: 0.1      # Frequent outputs for video
+  checkpoint_interval: 1.0
+  spectral_filter:
+    enabled: true
+    p: 10
+    alpha: 72.0
+    interval: 5
+
+# Initial conditions smoothing (optional Gaussian smoothing)
+initial_conditions_smoothing:
+  enabled: false
+
+# Adaptive time-stepping configuration
+adaptive:
+  enabled: true
+  scheme: rk78
+  rtol: 1e-6
+  atol: 1e-8
+  safety_factor: 0.5
+  min_dt_factor: 0.1
+  max_dt_factor: 2.0
+  max_rejections: 10
+  fallback_scheme: rk4
+
+# Artificial viscosity for stability (disabled for RTI)
+artificial_viscosity:
+  enabled: true
+  mode: constant
+  nu_constant: 1e-4
+
+# Gravity configuration - downward gravity
+gravity:
+  enabled: true
+  type: "linear"
+  gx: 0.0
+  gy: -1.0                   # Downward gravity
+  gz: 0.0
+
+# Initial conditions for RTI
+initial_conditions:
+  rho_bottom: 1.0            # Light fluid at bottom
+  rho_top: 2.0               # Heavy fluid at top (RT-unstable)
+  pressure_bottom: 2.0       # Base pressure at bottom
+  shear_thickness: 0.02      # Thickness of density transition
+  perturb_eps: 0.005         # Smaller perturbation for stability
+  perturb_sigma: 0.04        # Slightly broader to avoid ringing
+  perturb_kx: 2              # Horizontal wavenumber
+  perturb_ky: 1              # Vertical wavenumber
+
+io:
+  outdir: outputs/rti
+  save_spectra: true
+
+monitoring:
+  enabled: true
+  step_interval: 50
+  include_conservation: true
+  include_timestep: true
+  include_time: true
+  include_velocity_stats: true
+  include_density_stats: true
+
+video:
+  fps: 30
+  width: 1920
+  height: 1080
+  scale: 2.0
+  frame_dpi: 150
+  quality: high
+  codec: h264_videotoolbox
+  crf: 23
+  preset: medium
+  pix_fmt: yuv420p

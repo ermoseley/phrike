@@ -1,0 +1,63 @@
+# Test configuration for constant artificial viscosity
+problem: sod
+
+grid:
+  N: 256
+  Lx: 1.0
+  x0: 0.5
+  dealias: true
+  precision: double
+
+physics:
+  gamma: 1.4
+
+# Artificial viscosity configuration - constant mode
+artificial_viscosity:
+  enabled: true
+  mode: "constant"
+  nu_constant: 0.01  # Constant viscosity coefficient
+  nu_max: 1e-3       # Not used in constant mode
+  s_ref: 1.0         # Not used in constant mode
+  s_min: 0.1         # Not used in constant mode
+  p: 2.0             # Not used in constant mode
+  epsilon: 1e-12     # Not used in constant mode
+  variable_weights:
+    density: 1.0
+    momentum_x: 1.0
+    energy: 1.0
+  sensor_variable: "density"  # Not used in constant mode
+  diagnostic_output: true
+
+integration:
+  t0: 0.0
+  t_end: 0.1
+  cfl: 0.4
+  scheme: rk4
+  output_interval: 0.02
+  checkpoint_interval: 0.0
+  spectral_filter:
+    enabled: true
+    p: 8
+    alpha: 36.0
+
+# Initial conditions
+initial_conditions:
+  left:
+    rho: 1.0
+    u: 0.0
+    p: 1.0
+  right:
+    rho: 0.125
+    u: 0.0
+    p: 0.1
+
+io:
+  outdir: outputs/test_constant_viscosity
+  save_spectra: false
+
+monitoring:
+  enabled: true
+  step_interval: 50
+  include_conservation: true
+  include_timestep: true
+  include_time: true

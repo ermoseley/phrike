@@ -691,12 +691,22 @@ class BaseProblem(ABC):
                 "rho_std": float(torch.std(rho).item()),
             }
         else:
-            return {
+            stats = {
                 "rho_mean": float(np.mean(rho)),
                 "rho_max": float(np.max(rho)),
                 "rho_min": float(np.min(rho)),
                 "rho_std": float(np.std(rho)),
             }
+            # Also report pressure min/max for positivity diagnostics
+            try:
+                rho_np, ux_np, uy_np, p_np = primitive_vars
+                stats.update({
+                    "p_max": float(np.max(p_np)),
+                    "p_min": float(np.min(p_np)),
+                })
+            except Exception:
+                pass
+            return stats
 
     def output_monitoring_info(self, solver, U, step_count, dt):
         """Output monitoring information."""
@@ -713,6 +723,33 @@ class BaseProblem(ABC):
             info_lines.append(f"Step: {step_count}, dt: {dt:.2e}")
 
         if self.monitoring_include_conservation:
+            # If Legendre weights are available, compute weighted conserved quantities
+            wy = getattr(solver.grid, "wy", None)
+            wx = getattr(solver.grid, "wx", None)
+            if wy is not None and wx is not None:
+                try:
+                    rho, ux, uy, p = solver.equations.primitive(U)
+                    import numpy as _np
+                    if 'torch' in globals() and isinstance(rho, (torch.Tensor,)):
+                        wyt = torch.from_numpy(_np.asarray(wy)).to(rho.device, rho.dtype)
+                        wxt = torch.from_numpy(_np.asarray(wx)).to(rho.device, rho.dtype)
+                        w2d = wyt[:, None] * wxt[None, :]
+                        mass_w = float(torch.sum(w2d * rho).item())
+                        momx_w = float(torch.sum(w2d * rho * ux).item())
+                        momy_w = float(torch.sum(w2d * rho * uy).item())
+                        energy_w = float(torch.sum(w2d * (p / (solver.equations.gamma - 1.0) + 0.5 * rho * (ux * ux + uy * uy))).item())
+                    else:
+                        w2d = _np.outer(wy, wx)
+                        mass_w = float((w2d * rho).sum())
+                        momx_w = float((w2d * rho * ux).sum())
+                        momy_w = float((w2d * rho * uy).sum())
+                        energy_w = float((w2d * (p / (solver.equations.gamma - 1.0) + 0.5 * rho * (ux * ux + uy * uy))).sum())
+                    info_lines.append(f"mass_w: {mass_w:.6e}")
+                    info_lines.append(f"momentum_x_w: {momx_w:.6e}")
+                    info_lines.append(f"momentum_y_w: {momy_w:.6e}")
+                    info_lines.append(f"energy_w: {energy_w:.6e}")
+                except Exception:
+                    pass
             errors = self.compute_conservation_errors(solver, U)
             for key, error in errors.items():
                 info_lines.append(f"{key}: {error:.2e}")

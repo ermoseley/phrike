@@ -412,18 +412,155 @@ class SpectralSolver1D:
 def _compute_rhs_2d(grid: Grid2D, eqs: EulerEquations2D, U: Array, 
                    artificial_viscosity: Optional[SpectralArtificialViscosity] = None,
                    gravity_config: Optional[Dict] = None) -> Array:
-    # Apply boundary conditions if the grid provides them (e.g., hybrid Legendre/Fourier grid)
-    try:
-        if hasattr(grid, "apply_boundary_conditions"):
-            U = grid.apply_boundary_conditions(U, eqs)
-    except Exception:
-        pass
+    # Optionally apply simple strong-form pre-enforcement for Legendre grids (stabilization)
+    if getattr(grid, "_legendre_basis", None) is not None:
+        try:
+            gamma = getattr(eqs, "gamma", 1.4)
+            # Bottom wall: v=0; copy rho,u from interior and recompute energy
+            U[2, 0, :] = 0.0
+            U[0, 0, :] = U[0, 1, :]
+            U[1, 0, :] = U[1, 1, :]
+            rho_b = U[0, 0, :]
+            ux_b = U[1, 0, :] / rho_b
+            rho_i, ux_i, uy_i, p_i = eqs.primitive(U)
+            p_b = p_i[1, :]
+            U[3, 0, :] = p_b / (gamma - 1.0) + 0.5 * rho_b * (ux_b**2)
+            # Neumann on other faces
+            U[:, -1, :] = U[:, -2, :]
+            U[:, :, 0] = U[:, :, 1]
+            U[:, :, -1] = U[:, :, -2]
+        except Exception:
+            pass
     # Fluxes in x and y
     Fx, Fy = eqs.flux(U)
     dFdx = grid.dx1(Fx)
     dFdy = grid.dy1(Fy)
     # dU/dt = -(dFx/dx + dFy/dy)
     rhs = -(dFdx + dFdy)
+
+    # SAT boundary terms for Legendre grids (weak imposition via Rusanov flux)
+    if getattr(grid, "_legendre_basis", None) is not None:
+        try:
+            wy = getattr(grid, "wy", None)
+            wx = getattr(grid, "wx", None)
+            if wy is not None and wx is not None:
+                gamma = getattr(eqs, "gamma", 1.4)
+                # Primitives for interior state
+                rho, ux, uy, p = eqs.primitive(U)
+                # Clamp for wave speed evaluation to avoid NaNs
+                rho_c = np.maximum(_ensure_numpy(rho), 1e-12) if 'np' in globals() else np.maximum(rho, 1e-12)  # type: ignore[name-defined]
+                p_c = np.maximum(_ensure_numpy(p), 1e-12) if 'np' in globals() else np.maximum(p, 1e-12)  # type: ignore[name-defined]
+                a = (gamma * p_c / rho_c) ** 0.5
+                # y-bottom (j=0), normal is +y outward at top, for bottom use minus sign per SAT
+                j0 = 0
+                jN = U.shape[-2] - 1
+                i0 = 0
+                iN = U.shape[-1] - 1
+                # Bottom boundary states (v=0 wall, copy rho,ux,p)
+                rho_b = rho[j0, :]
+                ux_b = ux[j0, :]
+                uy_b = 0.0 * uy[j0, :]
+                p_b = p[j0, :]
+                Eb = p_b / (gamma - 1.0) + 0.5 * rho_b * (ux_b**2 + 0.0)
+                U_b = np.stack([rho_b, rho_b * ux_b, rho_b * uy_b, Eb], axis=0)  # (4, Nx)
+                # Interior bottom slice
+                U_in_bot = U[:, j0, :]
+                # Fluxes Fy for interior and bc
+                momy_in = U_in_bot[2]
+                Fy_in = np.empty_like(U_in_bot)
+                Fy_in[0] = momy_in
+                Fy_in[1] = momy_in * (U_in_bot[1] / U_in_bot[0])
+                Fy_in[2] = momy_in * (U_in_bot[2] / U_in_bot[0]) + p[j0, :]
+                Fy_in[3] = (U_in_bot[3] + p[j0, :]) * (U_in_bot[2] / U_in_bot[0])
+                momy_bc = U_b[2]
+                Fy_bc = np.empty_like(U_b)
+                Fy_bc[0] = momy_bc
+                Fy_bc[1] = momy_bc * (U_b[1] / U_b[0])
+                Fy_bc[2] = momy_bc * (U_b[2] / U_b[0]) + p_b
+                Fy_bc[3] = (U_b[3] + p_b) * (U_b[2] / U_b[0])
+                # Rusanov alpha (pointwise)
+                alpha_y_bot = np.abs(uy[j0, :]) + a[j0, :]
+                Fstar_bot = 0.5 * (Fy_in + Fy_bc) - 0.5 * alpha_y_bot[None, :] * (U_in_bot - U_b)
+                # SAT contribution: - W_y^{-1}(0) * (F* - F_in)
+                scale_y0 = 1.0 / float(wy[0])
+                rhs[:, j0, :] += -scale_y0 * (Fstar_bot - Fy_in)
+
+                # Top boundary (outflow copy interior)
+                U_in_top = U[:, jN, :]
+                rho_t = rho[jN, :]
+                ux_t = ux[jN, :]
+                uy_t = uy[jN, :]
+                p_t = p[jN, :]
+                Et = p_t / (gamma - 1.0) + 0.5 * rho_t * (ux_t**2 + uy_t**2)
+                U_t = np.stack([rho_t, rho_t * ux_t, rho_t * uy_t, Et], axis=0)
+                momy_in_t = U_in_top[2]
+                Fy_in_t = np.empty_like(U_in_top)
+                Fy_in_t[0] = momy_in_t
+                Fy_in_t[1] = momy_in_t * (U_in_top[1] / U_in_top[0])
+                Fy_in_t[2] = momy_in_t * (U_in_top[2] / U_in_top[0]) + p_t
+                Fy_in_t[3] = (U_in_top[3] + p_t) * (U_in_top[2] / U_in_top[0])
+                momy_bc_t = U_t[2]
+                Fy_bc_t = np.empty_like(U_t)
+                Fy_bc_t[0] = momy_bc_t
+                Fy_bc_t[1] = momy_bc_t * (U_t[1] / U_t[0])
+                Fy_bc_t[2] = momy_bc_t * (U_t[2] / U_t[0]) + p_t
+                Fy_bc_t[3] = (U_t[3] + p_t) * (U_t[2] / U_t[0])
+                alpha_y_top = np.abs(uy[jN, :]) + a[jN, :]
+                Fstar_top = 0.5 * (Fy_in_t + Fy_bc_t) - 0.5 * alpha_y_top[None, :] * (U_in_top - U_t)
+                scale_yN = 1.0 / float(wy[-1])
+                rhs[:, jN, :] += +scale_yN * (Fstar_top - Fy_in_t)
+
+                # Left boundary (outflow)
+                U_in_left = U[:, :, i0]
+                rho_l = rho[:, i0]
+                ux_l = ux[:, i0]
+                uy_l = uy[:, i0]
+                p_l = p[:, i0]
+                El = p_l / (gamma - 1.0) + 0.5 * rho_l * (ux_l**2 + uy_l**2)
+                U_l = np.stack([rho_l, rho_l * ux_l, rho_l * uy_l, El], axis=0)  # (4, Ny)
+                momx_in_l = U_in_left[1]
+                Fx_in_l = np.empty_like(U_in_left)
+                Fx_in_l[0] = momx_in_l
+                Fx_in_l[1] = momx_in_l * (U_in_left[1] / U_in_left[0]) + p_l
+                Fx_in_l[2] = momx_in_l * (U_in_left[2] / U_in_left[0])
+                Fx_in_l[3] = (U_in_left[3] + p_l) * (U_in_left[1] / U_in_left[0])
+                momx_bc_l = U_l[1]
+                Fx_bc_l = np.empty_like(U_l)
+                Fx_bc_l[0] = momx_bc_l
+                Fx_bc_l[1] = momx_bc_l * (U_l[1] / U_l[0]) + p_l
+                Fx_bc_l[2] = momx_bc_l * (U_l[2] / U_l[0])
+                Fx_bc_l[3] = (U_l[3] + p_l) * (U_l[1] / U_l[0])
+                alpha_x_left = np.abs(ux[:, i0]) + a[:, i0]
+                Fstar_left = 0.5 * (Fx_in_l + Fx_bc_l) - 0.5 * alpha_x_left[None, :] * (U_in_left - U_l)
+                scale_x0 = 1.0 / float(wx[0])
+                rhs[:, :, i0] += -scale_x0 * (Fstar_left - Fx_in_l)
+
+                # Right boundary (outflow)
+                U_in_right = U[:, :, iN]
+                rho_r = rho[:, iN]
+                ux_r = ux[:, iN]
+                uy_r = uy[:, iN]
+                p_r = p[:, iN]
+                Er = p_r / (gamma - 1.0) + 0.5 * rho_r * (ux_r**2 + uy_r**2)
+                U_r = np.stack([rho_r, rho_r * ux_r, rho_r * uy_r, Er], axis=0)
+                momx_in_r = U_in_right[1]
+                Fx_in_r = np.empty_like(U_in_right)
+                Fx_in_r[0] = momx_in_r
+                Fx_in_r[1] = momx_in_r * (U_in_right[1] / U_in_right[0]) + p_r
+                Fx_in_r[2] = momx_in_r * (U_in_right[2] / U_in_right[0])
+                Fx_in_r[3] = (U_in_right[3] + p_r) * (U_in_right[1] / U_in_right[0])
+                momx_bc_r = U_r[1]
+                Fx_bc_r = np.empty_like(U_r)
+                Fx_bc_r[0] = momx_bc_r
+                Fx_bc_r[1] = momx_bc_r * (U_r[1] / U_r[0]) + p_r
+                Fx_bc_r[2] = momx_bc_r * (U_r[2] / U_r[0])
+                Fx_bc_r[3] = (U_r[3] + p_r) * (U_r[1] / U_r[0])
+                alpha_x_right = np.abs(ux[:, iN]) + a[:, iN]
+                Fstar_right = 0.5 * (Fx_in_r + Fx_bc_r) - 0.5 * alpha_x_right[None, :] * (U_in_right - U_r)
+                scale_xN = 1.0 / float(wx[-1])
+                rhs[:, :, iN] += +scale_xN * (Fstar_right - Fx_in_r)
+        except Exception:
+            pass
     
     # Add artificial viscosity if enabled
     if artificial_viscosity is not None:
@@ -446,28 +583,53 @@ def _compute_rhs_2d(grid: Grid2D, eqs: EulerEquations2D, U: Array,
         rhs[3] += rho * (gx * ux + gy * uy)
     
     return rhs
+def _positivity_clamp_2d(U: Array, eqs: EulerEquations2D, rho_min: float = 1e-8, p_min: float = 1e-10) -> Array:
+    """Clamp density and pressure to small positive bounds in 2D.
+
+    Rebuilds conservative state from clamped (rho, ux, uy, p) to avoid negative pressure blow-ups.
+    """
+    try:
+        import torch  # type: ignore
+        is_torch = isinstance(U, torch.Tensor)
+    except Exception:
+        is_torch = False
+        torch = None  # type: ignore
+
+    rho, ux, uy, p = eqs.primitive(U)
+    if is_torch:  # type: ignore[truthy-bool]
+        rho_c = torch.clamp(rho, min=float(rho_min))
+        p_c = torch.clamp(p, min=float(p_min))
+        Uc = eqs.conservative(rho_c, ux, uy, p_c)
+    else:
+        rho_c = np.maximum(rho, rho_min)
+        p_c = np.maximum(p, p_min)
+        Uc = eqs.conservative(rho_c, ux, uy, p_c)
+    return Uc
+
 
 
 def _rk2_step_2d(grid: Grid2D, eqs: EulerEquations2D, U: Array, dt: float,
                  artificial_viscosity: Optional[SpectralArtificialViscosity] = None,
                  gravity_config: Optional[Dict] = None) -> Array:
     k1 = _compute_rhs_2d(grid, eqs, U, artificial_viscosity, gravity_config)
-    U1 = U + dt * 0.5 * k1
+    U1 = _positivity_clamp_2d(U + dt * 0.5 * k1, eqs)
     k2 = _compute_rhs_2d(grid, eqs, U1, artificial_viscosity, gravity_config)
-    return U + dt * k2
+    Unew = _positivity_clamp_2d(U + dt * k2, eqs)
+    return Unew
 
 
 def _rk4_step_2d(grid: Grid2D, eqs: EulerEquations2D, U: Array, dt: float,
                  artificial_viscosity: Optional[SpectralArtificialViscosity] = None,
                  gravity_config: Optional[Dict] = None) -> Array:
     k1 = _compute_rhs_2d(grid, eqs, U, artificial_viscosity, gravity_config)
-    U2 = U + 0.5 * dt * k1
+    U2 = _positivity_clamp_2d(U + 0.5 * dt * k1, eqs)
     k2 = _compute_rhs_2d(grid, eqs, U2, artificial_viscosity, gravity_config)
-    U3 = U + 0.5 * dt * k2
+    U3 = _positivity_clamp_2d(U + 0.5 * dt * k2, eqs)
     k3 = _compute_rhs_2d(grid, eqs, U3, artificial_viscosity, gravity_config)
-    U4 = U + dt * k3
+    U4 = _positivity_clamp_2d(U + dt * k3, eqs)
     k4 = _compute_rhs_2d(grid, eqs, U4, artificial_viscosity, gravity_config)
-    return U + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+    Unew = U + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+    return _positivity_clamp_2d(Unew, eqs)
 
 
 def _apply_physical_filters_2d(grid: Grid2D, U: Array) -> Array:
@@ -558,12 +720,23 @@ class SpectralSolver2D:
         # Setup gravity if configured
         self.gravity_config = gravity_config
 
+        # Filter interval cadence (default 1; if AV enabled, can be more frequent)
+        self.filter_interval: int = 1
+        cfg = getattr(self.grid, "filter_params", None)
+        if isinstance(cfg, dict):
+            try:
+                self.filter_interval = max(1, int(cfg.get("interval", 1)))
+            except Exception:
+                self.filter_interval = 1
+
     def compute_dt(self, U: Array) -> float:
         max_speed = self.equations.max_wave_speed(U)
         if max_speed <= 0.0:
             return 1e-6
-        # CFL for 2D: use min(dx, dy)
-        return self.cfl * min(self.grid.dx, self.grid.dy) / max_speed
+        # Use true minimum node spacing if available (Legendre/nonuniform)
+        dx_eff = getattr(self.grid, "dx_min", None) or self.grid.dx
+        dy_eff = getattr(self.grid, "dy_min", None) or self.grid.dy
+        return self.cfl * min(dx_eff, dy_eff) / max_speed
 
     def step(self, U: Array, dt: float) -> Array:
         """Perform one time step using the configured scheme.
@@ -588,7 +761,9 @@ class SpectralSolver2D:
             Un = _rk2_step_2d(self.grid, self.equations, U, dt, self.artificial_viscosity, self.gravity_config)
         else:
             Un = _rk4_step_2d(self.grid, self.equations, U, dt, self.artificial_viscosity, self.gravity_config)
-        Un = _apply_physical_filters_2d(self.grid, Un)
+        if (getattr(self, "_step_counter", 0) % self.filter_interval) == 0:
+            Un = _apply_physical_filters_2d(self.grid, Un)
+        self._step_counter = getattr(self, "_step_counter", 0) + 1
         return Un
     
     def _adaptive_step(self, U: Array, dt: float) -> Array:

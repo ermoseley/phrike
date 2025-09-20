@@ -20,3 +20,5 @@ example.py
 dedalus_dir/
 vids/
 .mypy_cache/
+dgpy/
+FastGaussQuadrature.jl/

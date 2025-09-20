@@ -1,0 +1,57 @@
+# Test configuration for mixed boundary conditions with Legendre basis
+problem: sod
+
+grid:
+  N: 256
+  Lx: 1.0
+  x0: 0.5
+  basis: legendre
+  # Mixed boundary conditions: Dirichlet on left, Neumann on right
+  bc:
+    left:
+      density: neumann      # Zero gradient for density on left
+      momentum: dirichlet   # Zero velocity on left (wall)
+      pressure: neumann     # Zero gradient for pressure on left
+    right:
+      density: neumann      # Zero gradient for density on right
+      momentum: neumann     # Zero gradient for momentum on right (open)
+      pressure: neumann     # Zero gradient for pressure on right
+  dealias: true
+  precision: double
+
+physics:
+  gamma: 1.4
+
+integration:
+  t0: 0.0
+  t_end: 0.1
+  cfl: 0.4
+  scheme: rk4
+  output_interval: 0.02
+  checkpoint_interval: 0.0
+  spectral_filter:
+    enabled: true
+    p: 8
+    alpha: 36.0
+
+# Initial conditions
+initial_conditions:
+  left:
+    rho: 1.0
+    u: 0.0
+    p: 1.0
+  right:
+    rho: 0.125
+    u: 0.0
+    p: 0.1
+
+io:
+  outdir: outputs/test_mixed_bc
+  save_spectra: false
+
+monitoring:
+  enabled: true
+  step_interval: 50
+  include_conservation: true
+  include_timestep: true
+  include_time: true

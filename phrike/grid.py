@@ -259,7 +259,7 @@ class Grid1D:
                 from .basis.legendre import LegendreLobattoBasis1D
 
                 bc = self.bc or "dirichlet"
-                self._basis = LegendreLobattoBasis1D(self.N, self.Lx, bc=bc)
+                self._basis = LegendreLobattoBasis1D(self.N, self.Lx, bc=bc, precision=self.precision)
                 self.x = self._basis.nodes()
                 x_np = np.asarray(self.x)
                 if self.N > 1:
@@ -556,6 +556,43 @@ class Grid1D:
         return U
 
 
+def _build_legendre_diff_matrix_1d(x: np.ndarray, L: float) -> np.ndarray:
+    """Build Legendre differentiation matrix for 1D.
+    
+    Args:
+        x: Legendre-Gauss-Lobatto points
+        L: Domain length
+        
+    Returns:
+        Differentiation matrix D with shape (N, N)
+    """
+    N = len(x)
+    D = np.zeros((N, N))
+    
+    # Map x from [0, L] to [-1, 1]
+    xi = 2.0 * x / L - 1.0
+    
+    # Legendre differentiation matrix on [-1, 1]
+    for i in range(N):
+        for j in range(N):
+            if i != j:
+                # Standard Legendre differentiation formula
+                D[i, j] = (1.0 / (xi[i] - xi[j])) * np.sqrt((1 - xi[j]**2) / (1 - xi[i]**2))
+            else:
+                # Diagonal elements
+                if i == 0:
+                    D[i, i] = -N * (N - 1) / 4.0
+                elif i == N - 1:
+                    D[i, i] = N * (N - 1) / 4.0
+                else:
+                    D[i, i] = 0.0
+    
+    # Scale by 2/L to account for mapping from [-1,1] to [0,L]
+    D *= 2.0 / L
+    
+    return D
+
+
 @dataclass
 class Grid2D:
     """Uniform periodic 2D grid and spectral operators.
@@ -574,20 +611,94 @@ class Grid2D:
     torch_device: Optional[str] = None
     precision: str = "double"  # "single" or "double"
     debug: bool = False
+    basis_x: str = "fourier"  # "fourier" or "legendre"
+    basis_y: str = "fourier"  # "fourier" or "legendre"
 
     def __post_init__(self) -> None:
         self.dx = self.Lx / self.Nx
         self.dy = self.Ly / self.Ny
-        self.x = np.linspace(0.0, self.Lx, num=self.Nx, endpoint=False)
-        self.y = np.linspace(0.0, self.Ly, num=self.Ny, endpoint=False)
-
-        # Wave numbers for derivatives
-        kx_index = np.fft.fftfreq(self.Nx, d=self.dx)
-        ky_index = np.fft.fftfreq(self.Ny, d=self.dy)
-        self.kx = 2.0 * np.pi * kx_index  # shape (Nx,)
-        self.ky = 2.0 * np.pi * ky_index  # shape (Ny,)
-        self.ikx = 1j * self.kx[None, :]  # shape (1, Nx)
-        self.iky = 1j * self.ky[:, None]  # shape (Ny, 1)
+        # Precompute minimum node spacings for CFL with nonuniform grids (Legendre)
+        self.dx_min = None
+        self.dy_min = None
+        
+        # Check if we're using a pure Legendre basis
+        if self.basis_x == "legendre" and self.basis_y == "legendre":
+            # Use the existing 2D Legendre basis
+            from .basis.legendre import LegendreLobattoBasis2D
+            self._legendre_basis = LegendreLobattoBasis2D(
+                Nx=self.Nx, Ny=self.Ny, Lx=self.Lx, Ly=self.Ly, bc="dirichlet", precision=self.precision
+            )
+            self.x, self.y = self._legendre_basis.nodes()
+            # Compute actual minimum spacings
+            try:
+                import numpy as _np
+                self.dx_min = float(_np.min(_np.diff(self.x))) if len(self.x) > 1 else self.dx
+                self.dy_min = float(_np.min(_np.diff(self.y))) if len(self.y) > 1 else self.dy
+            except Exception:
+                self.dx_min = self.dx
+                self.dy_min = self.dy
+            # Expose quadrature weights for monitoring integrations
+            try:
+                self.wy, self.wx = self._legendre_basis.quadrature_weights()
+            except Exception:
+                self.wy, self.wx = None, None
+            self.kx = None
+            self.ky = None
+            self.ikx = None
+            self.iky = None
+            self.Dx = None
+            self.Dy = None
+        else:
+            # Hybrid or pure Fourier basis
+            self._legendre_basis = None
+            
+            # Set up x-direction (Fourier or Legendre)
+            if self.basis_x == "fourier":
+                self.x = np.linspace(0.0, self.Lx, num=self.Nx, endpoint=False)
+                kx_index = np.fft.fftfreq(self.Nx, d=self.dx)
+                self.kx = 2.0 * np.pi * kx_index  # shape (Nx,)
+                self.ikx = 1j * self.kx[None, :]  # shape (1, Nx)
+                self.Dx = None  # Will use FFT for derivatives
+            elif self.basis_x == "legendre":
+                # Legendre-Gauss-Lobatto points
+                from scipy.special import roots_legendre
+                xi, _ = roots_legendre(self.Nx)
+                self.x = 0.5 * self.Lx * (xi + 1.0)  # Map [-1,1] to [0, Lx]
+                # Legendre differentiation matrix
+                self.Dx = _build_legendre_diff_matrix_1d(self.x, self.Lx)
+                self.kx = None
+                self.ikx = None
+                try:
+                    import numpy as _np
+                    self.dx_min = float(_np.min(_np.diff(self.x))) if len(self.x) > 1 else self.dx
+                except Exception:
+                    self.dx_min = self.dx
+            else:
+                raise ValueError(f"Unknown basis_x: {self.basis_x}")
+            
+            # Set up y-direction (Fourier or Legendre)
+            if self.basis_y == "fourier":
+                self.y = np.linspace(0.0, self.Ly, num=self.Ny, endpoint=False)
+                ky_index = np.fft.fftfreq(self.Ny, d=self.dy)
+                self.ky = 2.0 * np.pi * ky_index  # shape (Ny,)
+                self.iky = 1j * self.ky[:, None]  # shape (Ny, 1)
+                self.Dy = None  # Will use FFT for derivatives
+            elif self.basis_y == "legendre":
+                # Legendre-Gauss-Lobatto points
+                from scipy.special import roots_legendre
+                xi, _ = roots_legendre(self.Ny)
+                self.y = 0.5 * self.Ly * (xi + 1.0)  # Map [-1,1] to [0, Ly]
+                # Legendre differentiation matrix
+                self.Dy = _build_legendre_diff_matrix_1d(self.y, self.Ly)
+                self.ky = None
+                self.iky = None
+                try:
+                    import numpy as _np
+                    self.dy_min = float(_np.min(_np.diff(self.y))) if len(self.y) > 1 else self.dy
+                except Exception:
+                    self.dy_min = self.dy
+            else:
+                raise ValueError(f"Unknown basis_y: {self.basis_y}")
 
         # Dealias and filter
         self.dealias_mask = _build_filter_mask_2d(self.Nx, self.Ny, self.dealias)
@@ -688,22 +799,66 @@ class Grid2D:
 
     def dx1(self, f: np.ndarray) -> np.ndarray:
         # derivative along x on last spatial axis
-        F = self.fft2(f)
-        F = self._apply_masks(F)
-        dF = F * self.ikx  # broadcast over (Ny, Nx)
-        return self.ifft2(dF)
+        if self._legendre_basis is not None:
+            # Use 2D Legendre basis
+            return self._legendre_basis.dx(f)
+        elif self.basis_x == "fourier":
+            F = self.fft2(f)
+            F = self._apply_masks(F)
+            dF = F * self.ikx  # broadcast over (Ny, Nx)
+            return self.ifft2(dF)
+        elif self.basis_x == "legendre":
+            # Use Legendre differentiation matrix
+            # f has shape (..., Ny, Nx), we need to apply Dx to the last axis
+            return np.tensordot(f, self.Dx, axes=([-1], [1]))
+        else:
+            raise ValueError(f"Unknown basis_x: {self.basis_x}")
 
     def dy1(self, f: np.ndarray) -> np.ndarray:
         # derivative along y on second-to-last spatial axis
-        F = self.fft2(f)
-        F = self._apply_masks(F)
-        dF = F * self.iky
-        return self.ifft2(dF)
+        if self._legendre_basis is not None:
+            # Use 2D Legendre basis
+            return self._legendre_basis.dy(f)
+        elif self.basis_y == "fourier":
+            F = self.fft2(f)
+            F = self._apply_masks(F)
+            dF = F * self.iky
+            return self.ifft2(dF)
+        elif self.basis_y == "legendre":
+            # Use Legendre differentiation matrix
+            # f has shape (..., Ny, Nx), we need to apply Dy to the second-to-last axis
+            return np.tensordot(f, self.Dy, axes=([-2], [1]))
+        else:
+            raise ValueError(f"Unknown basis_y: {self.basis_y}")
 
     def apply_spectral_filter(self, f: np.ndarray) -> np.ndarray:
-        F = self.fft2(f)
-        F = self._apply_masks(F)
-        return self.ifft2(F)
+        if self._legendre_basis is not None:
+            # Use 2D Legendre basis filtering
+            if self.filter_params and bool(self.filter_params.get("enabled", False)):
+                p = int(self.filter_params.get("p", 8))
+                alpha = float(self.filter_params.get("alpha", 36.0))
+                return self._legendre_basis.apply_spectral_filter(f, p=p, alpha=alpha)
+            else:
+                return f
+        elif self.basis_x == "fourier" and self.basis_y == "fourier":
+            F = self.fft2(f)
+            F = self._apply_masks(F)
+            return self.ifft2(F)
+        else:
+            # For hybrid basis, only apply filter to Fourier directions
+            if self.basis_x == "fourier" and self.basis_y == "legendre":
+                # Apply FFT in x, then apply filter
+                F = self.fft2(f)
+                F = self._apply_masks(F)
+                return self.ifft2(F)
+            elif self.basis_x == "legendre" and self.basis_y == "fourier":
+                # Apply FFT in y, then apply filter
+                F = self.fft2(f)
+                F = self._apply_masks(F)
+                return self.ifft2(F)
+            else:
+                # Both Legendre - no spectral filtering
+                return f
 
     def xy_mesh(self) -> tuple[np.ndarray, np.ndarray]:
         if getattr(self, "_use_torch", False):

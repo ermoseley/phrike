@@ -1,0 +1,74 @@
+# Example configuration demonstrating mixed boundary conditions with Legendre basis
+# This shows how to use different boundary conditions on left and right boundaries
+problem: sod
+
+grid:
+  N: 256
+  Lx: 1.0
+  x0: 0.5
+  basis: legendre
+  # Mixed boundary conditions: different BCs for left and right boundaries
+  bc:
+    left:
+      density: neumann      # Zero gradient for density on left
+      momentum: dirichlet   # Zero velocity on left (wall)
+      pressure: neumann     # Zero gradient for pressure on left
+    right:
+      density: neumann      # Zero gradient for density on right
+      momentum: neumann     # Zero gradient for momentum on right (open)
+      pressure: neumann     # Zero gradient for pressure on right
+  dealias: true
+  precision: double
+
+physics:
+  gamma: 1.4
+
+integration:
+  t0: 0.0
+  t_end: 0.2
+  cfl: 0.4
+  scheme: rk45
+  rtol: 1e-6
+  atol: 1e-8
+  output_interval: 0.01
+  checkpoint_interval: 0.05
+  spectral_filter:
+    enabled: true
+    p: 8
+    alpha: 36.0
+
+# Initial conditions
+initial_conditions:
+  left:
+    rho: 1.0
+    u: 0.0
+    p: 1.0
+  right:
+    rho: 0.125
+    u: 0.0
+    p: 0.1
+
+io:
+  outdir: outputs/sod_mixed_bc_example
+  save_spectra: true
+
+monitoring:
+  enabled: true
+  step_interval: 100
+  include_conservation: true
+  include_timestep: true
+  include_time: true
+  include_velocity_stats: true
+  include_density_stats: true
+
+video:
+  fps: 30
+  width: 1920
+  height: 1080
+  scale: 2.0
+  frame_dpi: 150
+  quality: high
+  codec: h264_videotoolbox
+  crf: 23
+  preset: medium
+  pix_fmt: yuv420p

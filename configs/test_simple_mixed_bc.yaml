@@ -1,0 +1,51 @@
+# Simple test for mixed boundary conditions
+problem: sod
+
+grid:
+  N: 64
+  Lx: 1.0
+  x0: 0.5
+  basis: legendre
+  # Simple mixed BC: Dirichlet left, Neumann right
+  bc:
+    left: dirichlet
+    right: neumann
+  dealias: true
+  precision: double
+
+physics:
+  gamma: 1.4
+
+integration:
+  t0: 0.0
+  t_end: 0.05
+  cfl: 0.4
+  scheme: rk4
+  output_interval: 0.01
+  checkpoint_interval: 0.0
+  spectral_filter:
+    enabled: true
+    p: 8
+    alpha: 36.0
+
+# Initial conditions
+initial_conditions:
+  left:
+    rho: 1.0
+    u: 0.0
+    p: 1.0
+  right:
+    rho: 0.125
+    u: 0.0
+    p: 0.1
+
+io:
+  outdir: outputs/test_simple_mixed_bc
+  save_spectra: false
+
+monitoring:
+  enabled: true
+  step_interval: 25
+  include_conservation: true
+  include_timestep: true
+  include_time: true

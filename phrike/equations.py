@@ -381,6 +381,174 @@ class EulerEquations2D:
         }
 
 
+# -------------------- 2D split-form and boundary helper utilities --------------------
+
+def _ensure_numpy(a: Array) -> np.ndarray:
+    """Convert input to numpy array without copying if already numpy."""
+    if _TORCH_AVAILABLE and isinstance(a, (torch.Tensor,)):
+        return a.detach().cpu().numpy()
+    return np.asarray(a)
+
+
+def build_wall_state_y(U_row: Array, gamma: float) -> Array:
+    """Build bottom-wall boundary state for a y-normal face (v=0, recompute E).
+
+    Args:
+        U_row: Conservative variables on the interior boundary row, shape (4, Nx)
+        gamma: Adiabatic index
+    Returns:
+        U_bc: Wall state with v=0 and consistent energy, shape (4, Nx)
+    """
+    U = _ensure_numpy(U_row)
+    rho = U[0]
+    momx = U[1]
+    ux = momx / rho
+    # Estimate pressure from interior conservative vars
+    E = U[3]
+    p = (gamma - 1.0) * (E - 0.5 * rho * ux * ux)
+    uy = np.zeros_like(ux)
+    momy = rho * uy
+    Eb = p / (gamma - 1.0) + 0.5 * rho * (ux * ux + uy * uy)
+    return np.stack([rho, rho * ux, momy, Eb], axis=0)
+
+
+def flux_x_from_U(U: Array, gamma: float) -> Array:
+    """Return physical x-flux Fx(U) for 2D Euler. U shape (4, Ny, Nx) or (4, N)."""
+    U_np = _ensure_numpy(U)
+    rho = U_np[0]
+    momx = U_np[1]
+    momy = U_np[2]
+    E = U_np[3]
+    ux = momx / rho
+    uy = momy / rho
+    p = (gamma - 1.0) * (E - 0.5 * rho * (ux * ux + uy * uy))
+    Fx0 = momx
+    Fx1 = momx * ux + p
+    Fx2 = momx * uy
+    Fx3 = (E + p) * ux
+    return np.stack([Fx0, Fx1, Fx2, Fx3], axis=0)
+
+
+def flux_y_from_U(U: Array, gamma: float) -> Array:
+    """Return physical y-flux Fy(U) for 2D Euler. U shape (4, Ny, Nx) or (4, N)."""
+    U_np = _ensure_numpy(U)
+    rho = U_np[0]
+    momx = U_np[1]
+    momy = U_np[2]
+    E = U_np[3]
+    ux = momx / rho
+    uy = momy / rho
+    p = (gamma - 1.0) * (E - 0.5 * rho * (ux * ux + uy * uy))
+    Fy0 = momy
+    Fy1 = momy * ux
+    Fy2 = momy * uy + p
+    Fy3 = (E + p) * uy
+    return np.stack([Fy0, Fy1, Fy2, Fy3], axis=0)
+
+
+def rusanov_flux_x(U_L: Array, U_R: Array, gamma: float) -> Array:
+    """Rusanov (local Lax-Friedrichs) numerical flux for x-normal interfaces.
+
+    Args:
+        U_L, U_R: Left/right conservative states, shape (4, N)
+        gamma: Adiabatic index
+    Returns:
+        F*: Numerical flux, shape (4, N)
+    """
+    UL = _ensure_numpy(U_L)
+    UR = _ensure_numpy(U_R)
+    FxL = flux_x_from_U(UL, gamma)
+    FxR = flux_x_from_U(UR, gamma)
+    rhoL = UL[0]; uxL = UL[1] / rhoL; pL = (gamma - 1.0) * (UL[3] - 0.5 * rhoL * (uxL * uxL + (UL[2] / rhoL) ** 2))
+    rhoR = UR[0]; uxR = UR[1] / rhoR; pR = (gamma - 1.0) * (UR[3] - 0.5 * rhoR * (uxR * uxR + (UR[2] / rhoR) ** 2))
+    aL = np.sqrt(gamma * pL / rhoL)
+    aR = np.sqrt(gamma * pR / rhoR)
+    alpha = np.maximum(np.abs(uxL) + aL, np.abs(uxR) + aR)
+    return 0.5 * (FxL + FxR) - 0.5 * alpha[None, :] * (UR - UL)
+
+
+def rusanov_flux_y(U_D: Array, U_U: Array, gamma: float) -> Array:
+    """Rusanov (local Lax-Friedrichs) numerical flux for y-normal interfaces.
+
+    Args:
+        U_D: Downwind/interior state (at j=0 row), shape (4, N)
+        U_U: Upwind/boundary/exterior state, shape (4, N)
+        gamma: Adiabatic index
+    Returns:
+        F*: Numerical flux, shape (4, N)
+    """
+    UD = _ensure_numpy(U_D)
+    UU = _ensure_numpy(U_U)
+    FyD = flux_y_from_U(UD, gamma)
+    FyU = flux_y_from_U(UU, gamma)
+    rhoD = UD[0]; uyD = UD[2] / rhoD; pD = (gamma - 1.0) * (UD[3] - 0.5 * rhoD * ((UD[1] / rhoD) ** 2 + uyD * uyD))
+    rhoU = UU[0]; uyU = UU[2] / rhoU; pU = (gamma - 1.0) * (UU[3] - 0.5 * rhoU * ((UU[1] / rhoU) ** 2 + uyU * uyU))
+    aD = np.sqrt(gamma * pD / rhoD)
+    aU = np.sqrt(gamma * pU / rhoU)
+    alpha = np.maximum(np.abs(uyD) + aD, np.abs(uyU) + aU)
+    return 0.5 * (FyD + FyU) - 0.5 * alpha[None, :] * (UU - UD)
+
+
+def skew_symmetric_flux_divergence_2d(grid, eqs: EulerEquations2D, U: Array) -> Array:
+    """Compute skew-symmetric split-form flux divergence for 2D Euler.
+
+    Args:
+        grid: Grid2D providing dx1, dy1
+        eqs: EulerEquations2D with gamma
+        U: Conservative state, shape (4, Ny, Nx)
+    Returns:
+        rhs_div: Flux divergence contribution (no sources/BCs), shape (4, Ny, Nx)
+    """
+    U_np = _ensure_numpy(U)
+    rho, ux, uy, p = eqs.primitive(U_np)
+    E = U_np[3]
+
+    # Derivatives of primitives and products
+    dx = grid.dx1; dy = grid.dy1
+    drx = dx(rho); dry = dy(rho)
+    dux = dx(ux); duy = dy(ux)
+    dvy = dy(uy); dvx = dx(uy)
+    dpx = dx(p); dpy = dy(p)
+
+    rhou = U_np[1]
+    rhov = U_np[2]
+    drhou_dx = dx(rhou); drhov_dy = dy(rhov)
+
+    # Mass
+    div_mass = 0.5 * (drhou_dx + ux * drx + rho * dux) + 0.5 * (drhov_dy + uy * dry + rho * dvy)
+
+    # Momentum x: ∂x(ρu^2 + p) + ∂y(ρuv)
+    rho_u2 = rho * ux * ux
+    dx_rho_u2 = dx(rho_u2)
+    term_x_mx = 0.5 * (dx_rho_u2 + (ux * ux) * drx + 2.0 * rho * ux * dux) + dpx
+    rho_uv = rho * ux * uy
+    dy_rho_uv = dy(rho_uv)
+    term_y_mx = 0.5 * (dy_rho_uv + (ux * uy) * dry + rho * (uy * duy + ux * dvy))
+    div_mx = term_x_mx + term_y_mx
+
+    # Momentum y: ∂x(ρuv) + ∂y(ρv^2 + p)
+    dx_rho_uv = dx(rho_uv)
+    term_x_my = 0.5 * (dx_rho_uv + (ux * uy) * drx + rho * (uy * dux + ux * dvx))
+    rho_v2 = rho * uy * uy
+    dy_rho_v2 = dy(rho_v2)
+    term_y_my = 0.5 * (dy_rho_v2 + (uy * uy) * dry + 2.0 * rho * uy * dvy) + dpy
+    div_my = term_x_my + term_y_my
+
+    # Energy: ∂x((E+p)u) + ∂y((E+p)v)
+    H = E + p
+    dHdx = dx(H); dHdy = dy(H)
+    term_x_E = 0.5 * (dx(H * ux) + H * dux + ux * dHdx)
+    term_y_E = 0.5 * (dy(H * uy) + H * dvy + uy * dHdy)
+    div_E = term_x_E + term_y_E
+
+    rhs_div = np.empty_like(U_np)
+    rhs_div[0] = -div_mass
+    rhs_div[1] = -div_mx
+    rhs_div[2] = -div_my
+    rhs_div[3] = -div_E
+    return rhs_div
+
+
 @dataclass
 class EulerEquations3D:
     gamma: float = 1.4

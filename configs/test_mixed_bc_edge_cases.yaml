@@ -1,0 +1,54 @@
+# Test edge cases for mixed boundary conditions
+problem: sod
+
+grid:
+  N: 64
+  Lx: 1.0
+  x0: 0.5
+  basis: legendre
+  # Test edge cases: only specify one boundary, use aliases
+  bc:
+    left: wall  # Should apply to all variables on left
+    right:
+      density: open  # Alias for neumann
+      momentum: dirichlet  # Should set u=0
+      pressure: neumann
+  dealias: true
+  precision: double
+
+physics:
+  gamma: 1.4
+
+integration:
+  t0: 0.0
+  t_end: 0.02
+  cfl: 0.4
+  scheme: rk4
+  output_interval: 0.01
+  checkpoint_interval: 0.0
+  spectral_filter:
+    enabled: true
+    p: 8
+    alpha: 36.0
+
+# Initial conditions
+initial_conditions:
+  left:
+    rho: 1.0
+    u: 0.0
+    p: 1.0
+  right:
+    rho: 0.125
+    u: 0.0
+    p: 0.1
+
+io:
+  outdir: outputs/test_mixed_bc_edge_cases
+  save_spectra: false
+
+monitoring:
+  enabled: true
+  step_interval: 10
+  include_conservation: true
+  include_timestep: true
+  include_time: true
