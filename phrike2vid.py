@@ -37,6 +37,11 @@ PLOTTING OPTIONS:
   --no-decorations        Remove axes, labels, colorbar and whitespace for clean output
   --aspect-ratio          Force specific aspect ratio: "16:9", "4:3", "1:1", "auto" (default: auto)
 
+QUALITY ENHANCEMENT OPTIONS:
+  --interpolation         Interpolation method: "nearest", "bilinear", "bicubic", "spline16", "spline36", "hanning", "hamming", "hermite", "kaiser", "quadric", "catrom", "gaussian", "bessel", "mitchell", "sinc", "lanczos" (default: nearest)
+  --antialias             Enable antialiasing for smoother rendering
+  --high-quality          Enable high-quality rendering with optimized settings (higher DPI, better interpolation)
+
 PARALLEL PROCESSING:
   --parallel              Enable MPI parallel processing for faster frame generation
                           Requires mpi4py: pip install mpi4py
@@ -67,6 +72,12 @@ EXAMPLES:
 
 8. Generate clean 4K movie (will notify if 4K grid is detected but 4K mode not enabled):
    python phrike2vid.py 0.0 1.0 --no-decorations --quality high
+
+9. Generate high-quality 4K movie with smooth interpolation:
+   python phrike2vid.py 0.0 1.0 --4k --no-decorations --high-quality --interpolation bicubic
+
+10. Generate smooth artistic frames with antialiasing:
+    python phrike2vid.py 0.0 1.0 --4k --no-decorations --antialias --interpolation lanczos
 
 OUTPUT:
   - Creates a frames/ directory with individual PNG frames
@@ -272,16 +283,30 @@ def generate_phrike_frame(snapshot_path, args, frame_dir, frame_index):
         elif is_4k_grid and not use_4k_mode:
             print(f"4K grid detected ({grid_width}x{grid_height}) but 4K mode not enabled. Use --4k to enable 4K rendering.")
         
-        # Set up figure parameters based on mode
+        # Set up figure parameters based on mode and quality settings
+        high_quality = args.__dict__.get('high_quality', False)
+        
         if use_4k_mode:
-            # For 4K mode, use 1 pixel per grid point
-            fig_width, fig_height = get_4k_figure_size(grid_width, grid_height, target_dpi=1)
-            dpi = 1  # 1 pixel per grid point
-            print(f"4K mode detected: {grid_width}x{grid_height} grid -> {fig_width:.1f}x{fig_height:.1f} inches at {dpi} DPI")
+            if high_quality:
+                # High-quality 4K mode: use higher DPI for smoother rendering
+                # This allows for better interpolation and antialiasing
+                fig_width, fig_height = get_4k_figure_size(grid_width, grid_height, target_dpi=2)
+                dpi = 2  # 2x DPI for smoother rendering
+                print(f"High-quality 4K mode: {grid_width}x{grid_height} grid -> {fig_width:.1f}x{fig_height:.1f} inches at {dpi} DPI")
+            else:
+                # Standard 4K mode: use 1 pixel per grid point
+                fig_width, fig_height = get_4k_figure_size(grid_width, grid_height, target_dpi=1)
+                dpi = 1  # 1 pixel per grid point
+                print(f"4K mode detected: {grid_width}x{grid_height} grid -> {fig_width:.1f}x{fig_height:.1f} inches at {dpi} DPI")
         else:
             # Standard mode
-            fig_width, fig_height = (10, 10)
-            dpi = args.dpi
+            if high_quality:
+                fig_width, fig_height = (12, 12)  # Larger figure for better quality
+                dpi = max(args.dpi, 600)  # Higher DPI for better quality
+                print(f"High-quality mode: {fig_width}x{fig_height} inches at {dpi} DPI")
+            else:
+                fig_width, fig_height = (10, 10)
+                dpi = args.dpi
         
         # Create the plot
         fig, ax = plt.subplots(1, 1, figsize=(fig_width, fig_height), dpi=dpi)
@@ -289,7 +314,16 @@ def generate_phrike_frame(snapshot_path, args, frame_dir, frame_index):
         # Set up colormap
         colormap = args.col if args.col else 'viridis'
         
-        # Create the image with high resolution (no interpolation between grid points)
+        # Determine interpolation method based on quality settings
+        interpolation_method = args.__dict__.get('interpolation', 'nearest')
+        if high_quality and interpolation_method == 'nearest':
+            # For high-quality mode, use smoother interpolation by default
+            interpolation_method = 'bilinear'
+        
+        # Enable antialiasing if requested
+        antialias = args.__dict__.get('antialias', False)
+        
+        # Create the image with quality settings
         im = ax.imshow(
             var_data,
             origin="lower",
@@ -298,7 +332,8 @@ def generate_phrike_frame(snapshot_path, args, frame_dir, frame_index):
             cmap=colormap,
             vmin=args.min,
             vmax=args.max,
-            interpolation='nearest'  # No interpolation to preserve grid resolution
+            interpolation=interpolation_method,
+            antialiased=antialias or high_quality  # Enable antialiasing for high quality
         )
         
         # Configure plot based on mode
@@ -553,6 +588,11 @@ Examples:
     parser.add_argument("--4k", action="store_true", help="enable 4K rendering mode (3840x2160)")
     parser.add_argument("--no-decorations", action="store_true", help="remove axes, labels, colorbar and whitespace for clean output")
     parser.add_argument("--aspect-ratio", choices=["16:9", "4:3", "1:1", "auto"], default="auto", help="force specific aspect ratio (default: auto)")
+    
+    # Quality enhancement options
+    parser.add_argument("--interpolation", choices=["nearest", "bilinear", "bicubic", "spline16", "spline36", "hanning", "hamming", "hermite", "kaiser", "quadric", "catrom", "gaussian", "bessel", "mitchell", "sinc", "lanczos"], default="nearest", help="interpolation method for rendering (default: nearest)")
+    parser.add_argument("--antialias", action="store_true", help="enable antialiasing for smoother rendering")
+    parser.add_argument("--high-quality", action="store_true", help="enable high-quality rendering with optimized settings")
     
     args = parser.parse_args()
     
