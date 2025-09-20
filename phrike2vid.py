@@ -39,7 +39,7 @@ PLOTTING OPTIONS:
 
 QUALITY ENHANCEMENT OPTIONS:
   --interpolation         Interpolation method: "nearest", "bilinear", "bicubic", "spline16", "spline36", "hanning", "hamming", "hermite", "kaiser", "quadric", "catrom", "gaussian", "bessel", "mitchell", "sinc", "lanczos" (default: nearest)
-  --antialias             Enable antialiasing for smoother rendering
+  --antialias             Use smooth interpolation for antialiasing effect
   --high-quality          Enable high-quality rendering with optimized settings (higher DPI, better interpolation)
 
 PARALLEL PROCESSING:
@@ -287,17 +287,12 @@ def generate_phrike_frame(snapshot_path, args, frame_dir, frame_index):
         high_quality = args.__dict__.get('high_quality', False)
         
         if use_4k_mode:
-            if high_quality:
-                # High-quality 4K mode: use higher DPI for smoother rendering
-                # This allows for better interpolation and antialiasing
-                fig_width, fig_height = get_4k_figure_size(grid_width, grid_height, target_dpi=2)
-                dpi = 2  # 2x DPI for smoother rendering
-                print(f"High-quality 4K mode: {grid_width}x{grid_height} grid -> {fig_width:.1f}x{fig_height:.1f} inches at {dpi} DPI")
-            else:
-                # Standard 4K mode: use 1 pixel per grid point
-                fig_width, fig_height = get_4k_figure_size(grid_width, grid_height, target_dpi=1)
-                dpi = 1  # 1 pixel per grid point
-                print(f"4K mode detected: {grid_width}x{grid_height} grid -> {fig_width:.1f}x{fig_height:.1f} inches at {dpi} DPI")
+            # For 4K mode, always use 1 pixel per grid point for true 1:1 mapping
+            # High quality comes from interpolation, not DPI scaling
+            fig_width, fig_height = get_4k_figure_size(grid_width, grid_height, target_dpi=1)
+            dpi = 1  # 1 pixel per grid point - this is the correct approach
+            quality_note = " (high-quality interpolation)" if high_quality else ""
+            print(f"4K mode: {grid_width}x{grid_height} grid -> {fig_width:.1f}x{fig_height:.1f} inches at {dpi} DPI{quality_note}")
         else:
             # Standard mode
             if high_quality:
@@ -319,22 +314,26 @@ def generate_phrike_frame(snapshot_path, args, frame_dir, frame_index):
         if high_quality and interpolation_method == 'nearest':
             # For high-quality mode, use smoother interpolation by default
             interpolation_method = 'bilinear'
+        elif antialias and interpolation_method == 'nearest':
+            # For antialiasing, use smooth interpolation
+            interpolation_method = 'bicubic'
         
-        # Enable antialiasing if requested
-        antialias = args.__dict__.get('antialias', False)
         
         # Create the image with quality settings
-        im = ax.imshow(
-            var_data,
-            origin="lower",
-            extent=[x.min(), x.max(), y.min(), y.max()],
-            aspect="equal",
-            cmap=colormap,
-            vmin=args.min,
-            vmax=args.max,
-            interpolation=interpolation_method,
-            antialiased=antialias or high_quality  # Enable antialiasing for high quality
-        )
+        imshow_kwargs = {
+            'origin': "lower",
+            'extent': [x.min(), x.max(), y.min(), y.max()],
+            'aspect': "equal",
+            'cmap': colormap,
+            'vmin': args.min,
+            'vmax': args.max,
+            'interpolation': interpolation_method
+        }
+        
+        # Note: antialiasing is handled through interpolation methods
+        # The 'antialiased' parameter is not available in imshow
+        
+        im = ax.imshow(var_data, **imshow_kwargs)
         
         # Configure plot based on mode
         if use_clean_output or use_4k_mode:
