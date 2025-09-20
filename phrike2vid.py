@@ -284,8 +284,8 @@ def generate_phrike_frame(snapshot_path, args, frame_dir, frame_index):
             print(f"4K grid detected ({grid_width}x{grid_height}) but 4K mode not enabled. Use --4k to enable 4K rendering.")
         
         # Set up figure parameters based on mode and quality settings
-        high_quality = args.__dict__.get('high_quality', False)
-        antialias = args.__dict__.get('antialias', False)
+        high_quality = getattr(args, 'high_quality', False)
+        antialias = getattr(args, 'antialias', False)
         
         if use_4k_mode:
             # For 4K mode, always use 1 pixel per grid point for true 1:1 mapping
@@ -311,7 +311,7 @@ def generate_phrike_frame(snapshot_path, args, frame_dir, frame_index):
         colormap = args.col if args.col else 'viridis'
         
         # Determine interpolation method based on quality settings
-        interpolation_method = args.__dict__.get('interpolation', 'nearest')
+        interpolation_method = getattr(args, 'interpolation', 'nearest')
         if high_quality and interpolation_method == 'nearest':
             # For high-quality mode, use smoother interpolation by default
             interpolation_method = 'bilinear'
