@@ -263,11 +263,13 @@ def generate_phrike_frame(snapshot_path, args, frame_dir, frame_index):
         is_4k_grid, is_16_9, (grid_width, grid_height) = detect_4k_grid(var_data)
         # Only use 4K mode if explicitly requested with --4k flag
         # Auto-detection is disabled for backwards compatibility
-        use_4k_mode = getattr(args, '_4k', False)  # argparse converts --4k to _4k
+        use_4k_mode = getattr(args, '4k', False)  # argparse keeps the original name
         use_clean_output = args.__dict__.get('no_decorations', False)
         
-        # Print info about detected grid but don't auto-enable 4K mode
-        if is_4k_grid and not use_4k_mode:
+        # Print info about detected grid and 4K mode status
+        if is_4k_grid and use_4k_mode:
+            print(f"4K mode enabled: {grid_width}x{grid_height} grid -> 4K rendering")
+        elif is_4k_grid and not use_4k_mode:
             print(f"4K grid detected ({grid_width}x{grid_height}) but 4K mode not enabled. Use --4k to enable 4K rendering.")
         
         # Set up figure parameters based on mode
@@ -712,7 +714,7 @@ Examples:
         print(f"Generated {len(generated_frames)} frames")
         
         # Check if 4K mode was explicitly requested
-        is_4k_generated = getattr(args, '_4k', False)  # argparse converts --4k to _4k
+        is_4k_generated = getattr(args, '4k', False)  # argparse keeps the original name
         
         # Create movie
         success = create_movie(frame_dir, args.output, args.fps, args.quality, is_4k_generated)
