@@ -32,6 +32,11 @@ PLOTTING OPTIONS:
   --min, --max            Minimum/maximum values for colorbar scaling
   --dpi                   DPI for output frames (default: 300 for high quality)
 
+4K RENDERING OPTIONS:
+  --4k                    Enable 4K rendering mode (3840x2160) - must be explicitly enabled
+  --no-decorations        Remove axes, labels, colorbar and whitespace for clean output
+  --aspect-ratio          Force specific aspect ratio: "16:9", "4:3", "1:1", "auto" (default: auto)
+
 PARALLEL PROCESSING:
   --parallel              Enable MPI parallel processing for faster frame generation
                           Requires mpi4py: pip install mpi4py
@@ -56,6 +61,12 @@ EXAMPLES:
 
 6. Keep frames after movie creation:
    python phrike2vid.py 0.0 1.0 --keep-frames
+
+7. Generate 4K movie with clean output (no axes, labels, colorbar):
+   python phrike2vid.py 0.0 1.0 --4k --no-decorations --quality high
+
+8. Generate clean 4K movie (will notify if 4K grid is detected but 4K mode not enabled):
+   python phrike2vid.py 0.0 1.0 --no-decorations --quality high
 
 OUTPUT:
   - Creates a frames/ directory with individual PNG frames
@@ -192,6 +203,29 @@ def get_variable_label(variable):
     }
     return labels.get(variable, variable)
 
+def detect_4k_grid(var_data):
+    """Detect if the grid size corresponds to 4K resolution."""
+    if len(var_data.shape) == 2:
+        height, width = var_data.shape
+        # Check for 4K resolution (3840x2160) or close approximations
+        is_4k = (width == 3840 and height == 2160)
+        # Also check for common variations like 4096x2160 (DCI 4K)
+        is_dci_4k = (width == 4096 and height == 2160)
+        # Check if aspect ratio is approximately 16:9
+        aspect_ratio = width / height
+        is_16_9 = abs(aspect_ratio - 16/9) < 0.01
+        
+        return is_4k or is_dci_4k, is_16_9, (width, height)
+    return False, False, (0, 0)
+
+def get_4k_figure_size(grid_width, grid_height, target_dpi=1):
+    """Calculate figure size for 4K rendering with 1 pixel per grid point."""
+    # For 4K rendering with 1 pixel per grid point, we want the figure size
+    # to be exactly the grid dimensions in inches at the specified DPI
+    width_inches = grid_width / target_dpi
+    height_inches = grid_height / target_dpi
+    return (width_inches, height_inches)
+
 def generate_phrike_frame(snapshot_path, args, frame_dir, frame_index):
     """Generate a single frame from phrike snapshot."""
     
@@ -225,8 +259,30 @@ def generate_phrike_frame(snapshot_path, args, frame_dir, frame_index):
             # Avoid log(0) by adding small epsilon
             var_data = np.log10(np.maximum(var_data, 1e-10))
         
+        # Detect if this is a 4K grid and check if 4K mode should be used
+        is_4k_grid, is_16_9, (grid_width, grid_height) = detect_4k_grid(var_data)
+        # Only use 4K mode if explicitly requested with --4k flag
+        # Auto-detection is disabled for backwards compatibility
+        use_4k_mode = getattr(args, '_4k', False)  # argparse converts --4k to _4k
+        use_clean_output = args.__dict__.get('no_decorations', False)
+        
+        # Print info about detected grid but don't auto-enable 4K mode
+        if is_4k_grid and not use_4k_mode:
+            print(f"4K grid detected ({grid_width}x{grid_height}) but 4K mode not enabled. Use --4k to enable 4K rendering.")
+        
+        # Set up figure parameters based on mode
+        if use_4k_mode:
+            # For 4K mode, use 1 pixel per grid point
+            fig_width, fig_height = get_4k_figure_size(grid_width, grid_height, target_dpi=1)
+            dpi = 1  # 1 pixel per grid point
+            print(f"4K mode detected: {grid_width}x{grid_height} grid -> {fig_width:.1f}x{fig_height:.1f} inches at {dpi} DPI")
+        else:
+            # Standard mode
+            fig_width, fig_height = (10, 10)
+            dpi = args.dpi
+        
         # Create the plot
-        fig, ax = plt.subplots(1, 1, figsize=(10, 10), dpi=args.dpi)
+        fig, ax = plt.subplots(1, 1, figsize=(fig_width, fig_height), dpi=dpi)
         
         # Set up colormap
         colormap = args.col if args.col else 'viridis'
@@ -243,27 +299,49 @@ def generate_phrike_frame(snapshot_path, args, frame_dir, frame_index):
             interpolation='nearest'  # No interpolation to preserve grid resolution
         )
         
-        # Set labels and title
-        ax.set_xlabel("x", fontsize=12)
-        ax.set_ylabel("y", fontsize=12)
-        ax.set_title(f"{get_variable_label(args.var)} at t = {data['t']:.4f}", fontsize=14)
+        # Configure plot based on mode
+        if use_clean_output or use_4k_mode:
+            # Clean mode: no decorations, no whitespace
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_xticklabels([])
+            ax.set_yticklabels([])
+            ax.axis('off')  # Turn off all axes
+            
+            # Remove all spines (borders)
+            for spine in ax.spines.values():
+                spine.set_visible(False)
+        else:
+            # Standard mode: include labels and title
+            ax.set_xlabel("x", fontsize=12)
+            ax.set_ylabel("y", fontsize=12)
+            ax.set_title(f"{get_variable_label(args.var)} at t = {data['t']:.4f}", fontsize=14)
         
-        # Add colorbar
-        cbar = plt.colorbar(im, ax=ax)
-        label = get_variable_label(args.var)
-        if args.log:
-            label = f"log₁₀({label})"
-        cbar.set_label(label, fontsize=12)
+        # Add colorbar only if not in clean mode
+        if not use_clean_output and not use_4k_mode:
+            cbar = plt.colorbar(im, ax=ax)
+            label = get_variable_label(args.var)
+            if args.log:
+                label = f"log₁₀({label})"
+            cbar.set_label(label, fontsize=12)
         
         # Set output filename for this frame
         frame_filename = f"frame_{frame_index:05d}.png"
         frame_path = frame_dir / frame_filename
         
-        # Save the frame
-        fig.savefig(frame_path, dpi=args.dpi, bbox_inches='tight', pad_inches=0.1)
+        # Save the frame with appropriate settings
+        if use_clean_output or use_4k_mode:
+            # Clean mode: no padding, tight bounding box
+            fig.savefig(frame_path, dpi=dpi, bbox_inches='tight', pad_inches=0)
+        else:
+            # Standard mode: small padding
+            fig.savefig(frame_path, dpi=dpi, bbox_inches='tight', pad_inches=0.1)
+        
         plt.close(fig)
         
-        print(f"Generated frame {frame_index:05d} from snapshot at t={data['t']:.6f}")
+        mode_info = "4K" if use_4k_mode else "standard"
+        clean_info = " (clean)" if use_clean_output else ""
+        print(f"Generated {mode_info} frame {frame_index:05d}{clean_info} from snapshot at t={data['t']:.6f}")
         return str(frame_path)
         
     except Exception as e:
@@ -303,7 +381,7 @@ def detect_frame_pattern(frame_dir):
     
     return format_str, len(frames)
 
-def create_movie(frame_dir, output_movie, fps=30, quality="high"):
+def create_movie(frame_dir, output_movie, fps=30, quality="high", is_4k=False):
     """Create a movie from the generated frames using ffmpeg."""
     
     # Check if ffmpeg is available
@@ -322,12 +400,14 @@ def create_movie(frame_dir, output_movie, fps=30, quality="high"):
     
     print(f"Detected frame pattern: {format_str}")
     print(f"Number of frames: {num_frames}")
+    if is_4k:
+        print("4K video encoding enabled")
     
     # Try different encoding options based on what's available
     encoding_options = [
-        # Option 1: H.264 with libx264
+        # Option 1: H.264 with libx264 (4K optimized)
         {
-            "name": "H.264 (libx264)",
+            "name": "H.264 (libx264)" + (" 4K" if is_4k else ""),
             "cmd": [
                 "ffmpeg", "-y",
                 "-framerate", str(fps),
@@ -335,25 +415,44 @@ def create_movie(frame_dir, output_movie, fps=30, quality="high"):
                 "-c:v", "libx264",
                 "-crf", "18" if quality == "high" else "23" if quality == "medium" else "28",
                 "-pix_fmt", "yuv420p",
+                "-preset", "slow" if is_4k else "medium",  # Slower preset for 4K
+                "-profile:v", "high" if is_4k else "main",
+                "-level", "5.1" if is_4k else "4.1",  # Higher level for 4K
                 output_movie
             ]
         },
-        # Option 2: H.264 with h264_videotoolbox (macOS)
+        # Option 2: H.264 with h264_videotoolbox (macOS, 4K optimized)
         {
-            "name": "H.264 (videotoolbox)",
+            "name": "H.264 (videotoolbox)" + (" 4K" if is_4k else ""),
             "cmd": [
                 "ffmpeg", "-y",
                 "-framerate", str(fps),
                 "-i", str(Path(frame_dir) / format_str),
                 "-c:v", "h264_videotoolbox",
-                "-b:v", "20M" if quality == "high" else "10M" if quality == "medium" else "5M",
+                "-b:v", "50M" if is_4k and quality == "high" else "25M" if is_4k and quality == "medium" else "15M" if is_4k else "20M" if quality == "high" else "10M" if quality == "medium" else "5M",
                 "-pix_fmt", "yuv420p",
+                "-profile:v", "high" if is_4k else "main",
+                "-level", "5.1" if is_4k else "4.1",
                 output_movie
             ]
         },
-        # Option 3: MPEG-4 (more widely supported)
+        # Option 3: H.265/HEVC (better for 4K)
         {
-            "name": "MPEG-4",
+            "name": "H.265/HEVC" + (" 4K" if is_4k else ""),
+            "cmd": [
+                "ffmpeg", "-y",
+                "-framerate", str(fps),
+                "-i", str(Path(frame_dir) / format_str),
+                "-c:v", "libx265",
+                "-crf", "20" if quality == "high" else "25" if quality == "medium" else "30",
+                "-pix_fmt", "yuv420p",
+                "-preset", "slow" if is_4k else "medium",
+                output_movie
+            ]
+        },
+        # Option 4: MPEG-4 (more widely supported, fallback)
+        {
+            "name": "MPEG-4" + (" 4K" if is_4k else ""),
             "cmd": [
                 "ffmpeg", "-y",
                 "-framerate", str(fps),
@@ -448,6 +547,11 @@ Examples:
     parser.add_argument("--max", type=float, help="specify a maximum variable value for colorbar")
     parser.add_argument("--dpi", type=int, default=300, help="DPI for output frames (default: 300)")
     
+    # 4K rendering options
+    parser.add_argument("--4k", action="store_true", help="enable 4K rendering mode (3840x2160)")
+    parser.add_argument("--no-decorations", action="store_true", help="remove axes, labels, colorbar and whitespace for clean output")
+    parser.add_argument("--aspect-ratio", choices=["16:9", "4:3", "1:1", "auto"], default="auto", help="force specific aspect ratio (default: auto)")
+    
     args = parser.parse_args()
     
     # Check MPI availability
@@ -504,8 +608,23 @@ Examples:
                 sys.exit(1)
             
             print(f"Found {len(existing_frames)} existing frames")
+            # Detect if existing frames are 4K by checking the first frame
+            is_4k_frames = False
+            if existing_frames:
+                try:
+                    from PIL import Image
+                    with Image.open(existing_frames[0]) as img:
+                        width, height = img.size
+                        is_4k_frames = (width >= 3840 and height >= 2160)
+                        if is_4k_frames:
+                            print(f"Detected 4K frames: {width}x{height}")
+                except ImportError:
+                    print("PIL not available for frame detection, assuming standard resolution")
+                except Exception as e:
+                    print(f"Could not detect frame resolution: {e}")
+            
             # Create movie from existing frames
-            success = create_movie(frame_dir, args.output, args.fps, args.quality)
+            success = create_movie(frame_dir, args.output, args.fps, args.quality, is_4k_frames)
             if success:
                 print(f"Movie created successfully: {args.output}")
             else:
@@ -592,8 +711,11 @@ Examples:
     if is_root and generated_frames:
         print(f"Generated {len(generated_frames)} frames")
         
+        # Check if 4K mode was explicitly requested
+        is_4k_generated = getattr(args, '_4k', False)  # argparse converts --4k to _4k
+        
         # Create movie
-        success = create_movie(frame_dir, args.output, args.fps, args.quality)
+        success = create_movie(frame_dir, args.output, args.fps, args.quality, is_4k_generated)
         
         # Clean up frames if requested
         if success and not args.keep_frames:
