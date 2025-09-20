@@ -285,6 +285,7 @@ def generate_phrike_frame(snapshot_path, args, frame_dir, frame_index):
         
         # Set up figure parameters based on mode and quality settings
         high_quality = args.__dict__.get('high_quality', False)
+        antialias = args.__dict__.get('antialias', False)
         
         if use_4k_mode:
             # For 4K mode, always use 1 pixel per grid point for true 1:1 mapping
@@ -366,14 +367,17 @@ def generate_phrike_frame(snapshot_path, args, frame_dir, frame_index):
         frame_path = frame_dir / frame_filename
         
         # Save the frame with appropriate settings
-        if use_clean_output or use_4k_mode:
-            # Clean mode: no padding, tight bounding box
-            fig.savefig(frame_path, dpi=dpi, bbox_inches='tight', pad_inches=0)
-        else:
-            # Standard mode: small padding
-            fig.savefig(frame_path, dpi=dpi, bbox_inches='tight', pad_inches=0.1)
-        
-        plt.close(fig)
+        try:
+            if use_clean_output or use_4k_mode:
+                # Clean mode: no padding, tight bounding box
+                fig.savefig(frame_path, dpi=dpi, bbox_inches='tight', pad_inches=0)
+            else:
+                # Standard mode: small padding
+                fig.savefig(frame_path, dpi=dpi, bbox_inches='tight', pad_inches=0.1)
+        finally:
+            # Ensure cleanup happens even if savefig fails
+            plt.close(fig)
+            plt.close('all')  # Close all figures to prevent memory leaks
         
         mode_info = "4K" if use_4k_mode else "standard"
         clean_info = " (clean)" if use_clean_output else ""
@@ -382,6 +386,11 @@ def generate_phrike_frame(snapshot_path, args, frame_dir, frame_index):
         
     except Exception as e:
         print(f"Error generating frame from {os.path.basename(snapshot_path)}: {e}")
+        # Ensure cleanup even on error
+        try:
+            plt.close('all')
+        except:
+            pass
         return None
 
 def detect_frame_pattern(frame_dir):
