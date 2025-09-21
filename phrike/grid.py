@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 
 import numpy as np
 
@@ -159,6 +159,7 @@ class Grid1D:
     torch_device: Optional[str] = None
     precision: str = "double"  # "single" or "double"
     debug: bool = False
+    problem_config: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         # Normalize/parse boundary condition configuration (string, dict, or per-boundary dict)
@@ -259,7 +260,15 @@ class Grid1D:
                 from .basis.legendre import LegendreLobattoBasis1D
 
                 bc = self.bc or "dirichlet"
-                self._basis = LegendreLobattoBasis1D(self.N, self.Lx, bc=bc, precision=self.precision)
+                # Check if parallel threading is enabled via runtime.num_threads
+                use_parallel = False
+                if self.problem_config:
+                    runtime_cfg = self.problem_config.get("runtime", {})
+                    num_threads_cfg = runtime_cfg.get("num_threads", None)
+                    if num_threads_cfg is not None and num_threads_cfg != 1:
+                        use_parallel = True
+                self._basis = LegendreLobattoBasis1D(self.N, self.Lx, bc=bc, precision=self.precision, 
+                                                   use_parallel=use_parallel)
                 self.x = self._basis.nodes()
                 x_np = np.asarray(self.x)
                 if self.N > 1:
@@ -269,6 +278,11 @@ class Grid1D:
                 # No Fourier masks in non-periodic modal bases
                 self.dealias_mask = np.ones(self.N, dtype=float)
                 self.filter_sigma = np.ones(self.N, dtype=float)
+                # Expose quadrature weights for monitoring integrations
+                try:
+                    self.wx = self._basis.quadrature_weights()
+                except Exception:
+                    self.wx = None
             except Exception as e:
                 raise RuntimeError(f"Legendre basis initialization failed: {e}")
         else:
@@ -613,6 +627,8 @@ class Grid2D:
     debug: bool = False
     basis_x: str = "fourier"  # "fourier" or "legendre"
     basis_y: str = "fourier"  # "fourier" or "legendre"
+    # Boundary condition configuration
+    bc_config: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         self.dx = self.Lx / self.Nx
@@ -717,6 +733,9 @@ class Grid2D:
             except Exception:
                 pass
 
+        # Parse boundary condition configuration
+        self._parse_boundary_conditions()
+
         # Torch backend setup
         self._use_torch = (self.backend.lower() == "torch") and _TORCH_AVAILABLE
         if self._use_torch:
@@ -756,22 +775,156 @@ class Grid2D:
                 dtype=torch_dtype, device=self.torch_device
             )
 
-            kx_t = torch.from_numpy(np.asarray(self.kx)).to(
-                dtype=torch_dtype, device=self.torch_device
-            )
-            ky_t = torch.from_numpy(np.asarray(self.ky)).to(
-                dtype=torch_dtype, device=self.torch_device
-            )
-            self.kx = kx_t
-            self.ky = ky_t
-            self.ikx = kx_t.to(dtype=torch_cdtype)[None, :] * (1j)
-            self.iky = ky_t.to(dtype=torch_cdtype)[:, None] * (1j)
+            # Only convert kx, ky to torch if they exist (not None for Legendre basis)
+            if self.kx is not None:
+                kx_t = torch.from_numpy(np.asarray(self.kx)).to(
+                    dtype=torch_dtype, device=self.torch_device
+                )
+                self.kx = kx_t
+                self.ikx = kx_t.to(dtype=torch_cdtype)[None, :] * (1j)
+            else:
+                self.ikx = None
+                
+            if self.ky is not None:
+                ky_t = torch.from_numpy(np.asarray(self.ky)).to(
+                    dtype=torch_dtype, device=self.torch_device
+                )
+                self.ky = ky_t
+                self.iky = ky_t.to(dtype=torch_cdtype)[:, None] * (1j)
+            else:
+                self.iky = None
             self.dealias_mask = torch.from_numpy(np.asarray(self.dealias_mask)).to(
                 dtype=torch_dtype, device=self.torch_device
             )
             self.filter_sigma = torch.from_numpy(np.asarray(self.filter_sigma)).to(
                 dtype=torch_dtype, device=self.torch_device
             )
+
+    def _parse_boundary_conditions(self) -> None:
+        """Parse boundary condition configuration for 2D grid."""
+        # Initialize boundary condition maps
+        self._bc_boundary_map = {}
+        self._dirichlet_values_map = {}
+        
+        if not self.bc_config:
+            return
+            
+        # Parse boundary-specific configurations
+        for boundary, config in self.bc_config.items():
+            if boundary in ["left", "right", "top", "bottom"]:
+                if isinstance(config, dict):
+                    # Dirichlet boundary with specific values
+                    self._bc_boundary_map[boundary] = {}
+                    self._dirichlet_values_map[f"{boundary}_density"] = config.get("density", 1.0)
+                    self._dirichlet_values_map[f"{boundary}_momentum_x"] = config.get("momentum_x", 0.0)
+                    self._dirichlet_values_map[f"{boundary}_momentum_y"] = config.get("momentum_y", 0.0)
+                    self._dirichlet_values_map[f"{boundary}_pressure"] = config.get("pressure", 1.0)
+                    
+                    # Set boundary conditions for each variable
+                    self._bc_boundary_map[boundary]["density"] = "dirichlet"
+                    self._bc_boundary_map[boundary]["momentum_x"] = "dirichlet"
+                    self._bc_boundary_map[boundary]["momentum_y"] = "dirichlet"
+                    self._bc_boundary_map[boundary]["pressure"] = "dirichlet"
+                elif config == "neumann":
+                    # Neumann boundary
+                    self._bc_boundary_map[boundary] = {
+                        "density": "neumann",
+                        "momentum_x": "neumann", 
+                        "momentum_y": "neumann",
+                        "pressure": "neumann"
+                    }
+                elif config == "dirichlet":
+                    # Default Dirichlet boundary
+                    self._bc_boundary_map[boundary] = {
+                        "density": "dirichlet",
+                        "momentum_x": "dirichlet",
+                        "momentum_y": "dirichlet", 
+                        "pressure": "dirichlet"
+                    }
+
+    def apply_boundary_conditions(self, U: np.ndarray, equations) -> np.ndarray:
+        """Apply boundary conditions to conservative variables U in-place for 2D grid.
+        
+        Args:
+            U: Conservative variables array with shape (4, Ny, Nx)
+            equations: Equations object for variable interpretation
+            
+        Returns:
+            U with boundary conditions applied
+        """
+        if self._legendre_basis is None:
+            # Only apply BCs for Legendre basis
+            return U
+            
+        if U.shape[-2:] != (self.Ny, self.Nx):
+            return U
+        if U.shape[0] < 4:
+            return U
+
+        # Helper function to apply zero-gradient (Neumann)
+        def _apply_neumann(comp_idx: int, boundary: str) -> None:
+            if boundary == "left":
+                if self.Nx >= 2:
+                    U[comp_idx, :, 0] = U[comp_idx, :, 1]
+            elif boundary == "right":
+                if self.Nx >= 2:
+                    U[comp_idx, :, -1] = U[comp_idx, :, -2]
+            elif boundary == "bottom":
+                if self.Ny >= 2:
+                    U[comp_idx, 0, :] = U[comp_idx, 1, :]
+            elif boundary == "top":
+                if self.Ny >= 2:
+                    U[comp_idx, -1, :] = U[comp_idx, -2, :]
+
+        # Helper function to apply Dirichlet values
+        def _apply_dirichlet(comp_idx: int, var_key: str, boundary: str) -> None:
+            value_key = f"{boundary}_{var_key}"
+            if value_key in self._dirichlet_values_map:
+                value = self._dirichlet_values_map[value_key]
+                if boundary == "left":
+                    U[comp_idx, :, 0] = value
+                elif boundary == "right":
+                    U[comp_idx, :, -1] = value
+                elif boundary == "bottom":
+                    U[comp_idx, 0, :] = value
+                elif boundary == "top":
+                    U[comp_idx, -1, :] = value
+            else:
+                # Fallback to Neumann
+                _apply_neumann(comp_idx, boundary)
+
+        # Apply boundary conditions for each boundary
+        for boundary in ["left", "right", "top", "bottom"]:
+            if boundary not in self._bc_boundary_map:
+                continue
+                
+            bc_config = self._bc_boundary_map[boundary]
+            
+            # Density (component 0)
+            if bc_config.get("density") == "neumann":
+                _apply_neumann(0, boundary)
+            elif bc_config.get("density") == "dirichlet":
+                _apply_dirichlet(0, "density", boundary)
+                
+            # Momentum x (component 1)
+            if bc_config.get("momentum_x") == "neumann":
+                _apply_neumann(1, boundary)
+            elif bc_config.get("momentum_x") == "dirichlet":
+                _apply_dirichlet(1, "momentum_x", boundary)
+                
+            # Momentum y (component 2)
+            if bc_config.get("momentum_y") == "neumann":
+                _apply_neumann(2, boundary)
+            elif bc_config.get("momentum_y") == "dirichlet":
+                _apply_dirichlet(2, "momentum_y", boundary)
+                
+            # Pressure (component 3 - energy)
+            if bc_config.get("pressure") == "neumann":
+                _apply_neumann(3, boundary)
+            elif bc_config.get("pressure") == "dirichlet":
+                _apply_dirichlet(3, "pressure", boundary)
+
+        return U
 
     # 2D FFT wrappers
     def fft2(self, f: np.ndarray) -> np.ndarray:
@@ -801,6 +954,16 @@ class Grid2D:
         # derivative along x on last spatial axis
         if self._legendre_basis is not None:
             # Use 2D Legendre basis
+            # If using torch backend, convert to numpy, apply, then convert back
+            if getattr(self, "_use_torch", False):
+                try:
+                    import torch  # type: ignore
+                    if isinstance(f, torch.Tensor):
+                        f_np = f.detach().cpu().numpy()
+                        g_np = self._legendre_basis.dx(f_np)
+                        return torch.from_numpy(g_np).to(dtype=f.dtype, device=self.torch_device)
+                except Exception:
+                    pass
             return self._legendre_basis.dx(f)
         elif self.basis_x == "fourier":
             F = self.fft2(f)
@@ -818,6 +981,16 @@ class Grid2D:
         # derivative along y on second-to-last spatial axis
         if self._legendre_basis is not None:
             # Use 2D Legendre basis
+            # If using torch backend, convert to numpy, apply, then convert back
+            if getattr(self, "_use_torch", False):
+                try:
+                    import torch  # type: ignore
+                    if isinstance(f, torch.Tensor):
+                        f_np = f.detach().cpu().numpy()
+                        g_np = self._legendre_basis.dy(f_np)
+                        return torch.from_numpy(g_np).to(dtype=f.dtype, device=self.torch_device)
+                except Exception:
+                    pass
             return self._legendre_basis.dy(f)
         elif self.basis_y == "fourier":
             F = self.fft2(f)
@@ -837,6 +1010,16 @@ class Grid2D:
             if self.filter_params and bool(self.filter_params.get("enabled", False)):
                 p = int(self.filter_params.get("p", 8))
                 alpha = float(self.filter_params.get("alpha", 36.0))
+                # If using torch backend, convert to numpy, apply, then convert back
+                if getattr(self, "_use_torch", False):
+                    try:
+                        import torch  # type: ignore
+                        if isinstance(f, torch.Tensor):
+                            f_np = f.detach().cpu().numpy()
+                            g_np = self._legendre_basis.apply_spectral_filter(f_np, p=p, alpha=alpha)
+                            return torch.from_numpy(g_np).to(dtype=f.dtype, device=self.torch_device)
+                    except Exception:
+                        pass
                 return self._legendre_basis.apply_spectral_filter(f, p=p, alpha=alpha)
             else:
                 return f

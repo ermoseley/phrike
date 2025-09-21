@@ -511,52 +511,114 @@ class BaseProblem(ABC):
                 rho = primitive_vars[0]
                 if len(rho.shape) == 1:  # 1D: rho, u, p, a
                     rho, u, p, a = primitive_vars
-                    if is_torch:
-                        current_cons = {
-                            "mass": float(torch.sum(rho).item()),
-                            "momentum": float(torch.sum(rho * u).item()),
-                            "energy": float(
-                                torch.sum(
-                                    p / (solver.equations.gamma - 1.0) + 0.5 * rho * u**2
-                                ).item()
-                            ),
-                        }
+                    
+                    # Check if we have quadrature weights for Legendre basis
+                    wx = getattr(solver.grid, 'wx', None)
+                    if wx is not None:
+                        # Use quadrature weights for proper integration
+                        if is_torch:
+                            import torch
+                            wx_tensor = torch.from_numpy(wx).to(dtype=rho.dtype, device=rho.device)
+                            current_cons = {
+                                "mass": float(torch.sum(rho * wx_tensor).item()),
+                                "momentum": float(torch.sum(rho * u * wx_tensor).item()),
+                                "energy": float(
+                                    torch.sum(
+                                        (p / (solver.equations.gamma - 1.0) + 0.5 * rho * u**2) * wx_tensor
+                                    ).item()
+                                ),
+                            }
+                        else:
+                            current_cons = {
+                                "mass": float((rho * wx).sum()),
+                                "momentum": float((rho * u * wx).sum()),
+                                "energy": float(
+                                    ((p / (solver.equations.gamma - 1.0) + 0.5 * rho * u**2) * wx).sum()
+                                ),
+                            }
                     else:
-                        current_cons = {
-                            "mass": float(rho.sum()),
-                            "momentum": float((rho * u).sum()),
-                            "energy": float(
-                                (
-                                    p / (solver.equations.gamma - 1.0) + 0.5 * rho * u**2
-                                ).sum()
-                            ),
-                        }
+                        # Fallback to simple sum for Fourier basis
+                        if is_torch:
+                            current_cons = {
+                                "mass": float(torch.sum(rho).item()),
+                                "momentum": float(torch.sum(rho * u).item()),
+                                "energy": float(
+                                    torch.sum(
+                                        p / (solver.equations.gamma - 1.0) + 0.5 * rho * u**2
+                                    ).item()
+                                ),
+                            }
+                        else:
+                            current_cons = {
+                                "mass": float(rho.sum()),
+                                "momentum": float((rho * u).sum()),
+                                "energy": float(
+                                    (
+                                        p / (solver.equations.gamma - 1.0) + 0.5 * rho * u**2
+                                    ).sum()
+                                ),
+                            }
                 else:  # 2D: rho, ux, uy, p
                     rho, ux, uy, p = primitive_vars
-                    if is_torch:
-                        current_cons = {
-                            "mass": float(torch.sum(rho).item()),
-                            "momentum_x": float(torch.sum(rho * ux).item()),
-                            "momentum_y": float(torch.sum(rho * uy).item()),
-                            "energy": float(
-                                torch.sum(
-                                    p / (solver.equations.gamma - 1.0)
-                                    + 0.5 * rho * (ux**2 + uy**2)
-                                ).item()
-                            ),
-                        }
+                    
+                    # Check if we have quadrature weights for Legendre basis
+                    wx = getattr(solver.grid, 'wx', None)
+                    wy = getattr(solver.grid, 'wy', None)
+                    if wx is not None and wy is not None:
+                        # Use 2D quadrature weights for proper integration
+                        if is_torch:
+                            import torch
+                            wx_tensor = torch.from_numpy(wx).to(dtype=rho.dtype, device=rho.device)
+                            wy_tensor = torch.from_numpy(wy).to(dtype=rho.dtype, device=rho.device)
+                            # Create 2D weight matrix
+                            w2d = wy_tensor.unsqueeze(-1) * wx_tensor.unsqueeze(-2)
+                            current_cons = {
+                                "mass": float(torch.sum(rho * w2d).item()),
+                                "momentum_x": float(torch.sum(rho * ux * w2d).item()),
+                                "momentum_y": float(torch.sum(rho * uy * w2d).item()),
+                                "energy": float(
+                                    torch.sum(
+                                        (p / (solver.equations.gamma - 1.0) + 0.5 * rho * (ux**2 + uy**2)) * w2d
+                                    ).item()
+                                ),
+                            }
+                        else:
+                            # Create 2D weight matrix
+                            w2d = wy[:, np.newaxis] * wx[np.newaxis, :]
+                            current_cons = {
+                                "mass": float((rho * w2d).sum()),
+                                "momentum_x": float((rho * ux * w2d).sum()),
+                                "momentum_y": float((rho * uy * w2d).sum()),
+                                "energy": float(
+                                    ((p / (solver.equations.gamma - 1.0) + 0.5 * rho * (ux**2 + uy**2)) * w2d).sum()
+                                ),
+                            }
                     else:
-                        current_cons = {
-                            "mass": float(rho.sum()),
-                            "momentum_x": float((rho * ux).sum()),
-                            "momentum_y": float((rho * uy).sum()),
-                            "energy": float(
-                                (
-                                    p / (solver.equations.gamma - 1.0)
-                                    + 0.5 * rho * (ux**2 + uy**2)
-                                ).sum()
-                            ),
-                        }
+                        # Fallback to simple sum for Fourier basis
+                        if is_torch:
+                            current_cons = {
+                                "mass": float(torch.sum(rho).item()),
+                                "momentum_x": float(torch.sum(rho * ux).item()),
+                                "momentum_y": float(torch.sum(rho * uy).item()),
+                                "energy": float(
+                                    torch.sum(
+                                        p / (solver.equations.gamma - 1.0)
+                                        + 0.5 * rho * (ux**2 + uy**2)
+                                    ).item()
+                                ),
+                            }
+                        else:
+                            current_cons = {
+                                "mass": float(rho.sum()),
+                                "momentum_x": float((rho * ux).sum()),
+                                "momentum_y": float((rho * uy).sum()),
+                                "energy": float(
+                                    (
+                                        p / (solver.equations.gamma - 1.0)
+                                        + 0.5 * rho * (ux**2 + uy**2)
+                                    ).sum()
+                                ),
+                            }
             elif len(primitive_vars) == 5:  # 3D: rho, ux, uy, uz, p
                 rho, ux, uy, uz, p = primitive_vars
                 if is_torch:

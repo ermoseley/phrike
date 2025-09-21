@@ -122,19 +122,39 @@ def _legendre_2d_derivative_kernel_numba(f: np.ndarray, D: np.ndarray, axis: int
     Returns:
         Derivative values of shape (..., Ny, Nx)
     """
-    if axis == -1:  # x-derivative
-        return f @ D.T
-    else:  # y-derivative (axis == -2)
-        # For y-derivative, we need to apply along the y-axis
-        # This is more complex in Numba, so we'll use a simpler approach
+    # Handle 3D arrays (components, Ny, Nx) or 2D arrays (Ny, Nx)
+    if f.ndim == 3:
+        ncomp, Ny, Nx = f.shape
+        result = np.zeros_like(f)
+        
+        if axis == -1:  # x-derivative
+            for c in range(ncomp):
+                for i in range(Ny):
+                    for j in range(Nx):
+                        for k in range(Nx):
+                            result[c, i, j] += f[c, i, k] * D[k, j]
+        else:  # y-derivative (axis == -2)
+            for c in range(ncomp):
+                for i in range(Ny):
+                    for j in range(Nx):
+                        for k in range(Ny):
+                            result[c, i, j] += f[c, k, j] * D[k, i]
+        return result
+    else:
+        # Handle 2D arrays (Ny, Nx)
         Ny, Nx = f.shape[-2], f.shape[-1]
         result = np.zeros_like(f)
         
-        # Apply differentiation matrix manually
-        for i in range(Ny):
-            for j in range(Nx):
-                for k in range(Ny):
-                    result[..., i, j] += f[..., k, j] * D[k, i]
+        if axis == -1:  # x-derivative
+            for i in range(Ny):
+                for j in range(Nx):
+                    for k in range(Nx):
+                        result[i, j] += f[i, k] * D[k, j]
+        else:  # y-derivative (axis == -2)
+            for i in range(Ny):
+                for j in range(Nx):
+                    for k in range(Ny):
+                        result[i, j] += f[k, j] * D[k, i]
         return result
 
 
@@ -150,18 +170,39 @@ def _legendre_2d_filter_kernel_numba(f: np.ndarray, Fm: np.ndarray, axis: int) -
     Returns:
         Filtered nodal values of shape (..., Ny, Nx)
     """
-    if axis == -1:  # x-filter
-        return f @ Fm.T
-    else:  # y-filter (axis == -2)
-        # For y-filter, apply manually
+    # Handle 3D arrays (components, Ny, Nx) or 2D arrays (Ny, Nx)
+    if f.ndim == 3:
+        ncomp, Ny, Nx = f.shape
+        result = np.zeros_like(f)
+        
+        if axis == -1:  # x-filter
+            for c in range(ncomp):
+                for i in range(Ny):
+                    for j in range(Nx):
+                        for k in range(Nx):
+                            result[c, i, j] += f[c, i, k] * Fm[k, j]
+        else:  # y-filter (axis == -2)
+            for c in range(ncomp):
+                for i in range(Ny):
+                    for j in range(Nx):
+                        for k in range(Ny):
+                            result[c, i, j] += f[c, k, j] * Fm[k, i]
+        return result
+    else:
+        # Handle 2D arrays (Ny, Nx)
         Ny, Nx = f.shape[-2], f.shape[-1]
         result = np.zeros_like(f)
         
-        # Apply filter matrix manually
-        for i in range(Ny):
-            for j in range(Nx):
-                for k in range(Ny):
-                    result[..., i, j] += f[..., k, j] * Fm[k, i]
+        if axis == -1:  # x-filter
+            for i in range(Ny):
+                for j in range(Nx):
+                    for k in range(Nx):
+                        result[i, j] += f[i, k] * Fm[k, j]
+        else:  # y-filter (axis == -2)
+            for i in range(Ny):
+                for j in range(Nx):
+                    for k in range(Ny):
+                        result[i, j] += f[k, j] * Fm[k, i]
         return result
 
 
@@ -203,6 +244,280 @@ def _legendre_3d_derivative_kernel_numba(f: np.ndarray, D: np.ndarray, axis: int
                         result[..., i, j, k] += f[..., l, j, k] * D[l, i]
     
     return result
+
+
+# --- Parallel Numba JIT-compiled kernels for Legendre operations ---
+
+@njit(cache=True, fastmath=True, parallel=True)
+def _legendre_forward_kernel_numba_parallel(fw: np.ndarray, V: np.ndarray, proj_scale: np.ndarray) -> np.ndarray:
+    """JIT-compiled parallel kernel for Legendre forward transform.
+    
+    Args:
+        fw: Weighted nodal values of shape (..., N)
+        V: Vandermonde matrix of shape (N, N)
+        proj_scale: Projection scaling factors of shape (N,)
+        
+    Returns:
+        Modal coefficients of shape (..., N)
+    """
+    # Use matrix multiplication for efficiency
+    a = fw @ V
+    # Apply projection scaling
+    for i in range(a.shape[-1]):
+        a[..., i] *= proj_scale[i]
+    return a
+
+
+@njit(cache=True, fastmath=True, parallel=True)
+def _legendre_inverse_kernel_numba_parallel(F: np.ndarray, V: np.ndarray) -> np.ndarray:
+    """JIT-compiled parallel kernel for Legendre inverse transform.
+    
+    Args:
+        F: Modal coefficients of shape (..., N)
+        V: Vandermonde matrix of shape (N, N)
+        
+    Returns:
+        Nodal values of shape (..., N)
+    """
+    return F @ V.T
+
+
+@njit(cache=True, fastmath=True, parallel=True)
+def _legendre_derivative_kernel_numba_parallel(f: np.ndarray, D: np.ndarray) -> np.ndarray:
+    """JIT-compiled parallel kernel for Legendre differentiation.
+    
+    Args:
+        f: Nodal values of shape (..., N)
+        D: Differentiation matrix of shape (N, N)
+        
+    Returns:
+        Derivative values of shape (..., N)
+    """
+    return f @ D.T
+
+
+@njit(cache=True, fastmath=True, parallel=True)
+def _legendre_filter_kernel_numba_parallel(f: np.ndarray, Fn: np.ndarray) -> np.ndarray:
+    """JIT-compiled parallel kernel for Legendre spectral filtering.
+    
+    Args:
+        f: Nodal values of shape (..., N)
+        Fn: Filter matrix of shape (N, N)
+        
+    Returns:
+        Filtered nodal values of shape (..., N)
+    """
+    return f @ Fn.T
+
+
+@njit(cache=True, fastmath=True, parallel=True)
+def _legendre_2d_derivative_kernel_numba_parallel(f: np.ndarray, D: np.ndarray, axis: int) -> np.ndarray:
+    """JIT-compiled parallel kernel for 2D Legendre differentiation.
+    
+    Args:
+        f: Nodal values of shape (..., Ny, Nx)
+        D: Differentiation matrix of shape (N, N)
+        axis: Axis along which to differentiate (-1 for x, -2 for y)
+        
+    Returns:
+        Derivative values of shape (..., Ny, Nx)
+    """
+    # Handle 3D arrays (components, Ny, Nx) or 2D arrays (Ny, Nx)
+    if f.ndim == 3:
+        ncomp, Ny, Nx = f.shape
+        result = np.zeros_like(f)
+        
+        if axis == -1:  # x-derivative
+            for c in prange(ncomp):
+                for i in range(Ny):
+                    for j in range(Nx):
+                        for k in range(Nx):
+                            result[c, i, j] += f[c, i, k] * D[k, j]
+        else:  # y-derivative (axis == -2)
+            for c in prange(ncomp):
+                for i in range(Ny):
+                    for j in range(Nx):
+                        for k in range(Ny):
+                            result[c, i, j] += f[c, k, j] * D[k, i]
+        return result
+    else:
+        # Handle 2D arrays (Ny, Nx)
+        Ny, Nx = f.shape[-2], f.shape[-1]
+        result = np.zeros_like(f)
+        
+        if axis == -1:  # x-derivative
+            for i in prange(Ny):
+                for j in range(Nx):
+                    for k in range(Nx):
+                        result[i, j] += f[i, k] * D[k, j]
+        else:  # y-derivative (axis == -2)
+            for i in prange(Ny):
+                for j in range(Nx):
+                    for k in range(Ny):
+                        result[i, j] += f[k, j] * D[k, i]
+        return result
+
+
+@njit(cache=True, fastmath=True, parallel=True)
+def _legendre_2d_filter_kernel_numba_parallel(f: np.ndarray, Fm: np.ndarray, axis: int) -> np.ndarray:
+    """JIT-compiled parallel kernel for 2D Legendre spectral filtering.
+    
+    Args:
+        f: Nodal values of shape (..., Ny, Nx)
+        Fm: Filter matrix of shape (N, N)
+        axis: Axis along which to apply filter (-1 for x, -2 for y)
+        
+    Returns:
+        Filtered nodal values of shape (..., Ny, Nx)
+    """
+    # Handle 3D arrays (components, Ny, Nx) or 2D arrays (Ny, Nx)
+    if f.ndim == 3:
+        ncomp, Ny, Nx = f.shape
+        result = np.zeros_like(f)
+        
+        if axis == -1:  # x-filter
+            for c in prange(ncomp):
+                for i in range(Ny):
+                    for j in range(Nx):
+                        for k in range(Nx):
+                            result[c, i, j] += f[c, i, k] * Fm[k, j]
+        else:  # y-filter (axis == -2)
+            for c in prange(ncomp):
+                for i in range(Ny):
+                    for j in range(Nx):
+                        for k in range(Ny):
+                            result[c, i, j] += f[c, k, j] * Fm[k, i]
+        return result
+    else:
+        # Handle 2D arrays (Ny, Nx)
+        Ny, Nx = f.shape[-2], f.shape[-1]
+        result = np.zeros_like(f)
+        
+        if axis == -1:  # x-filter
+            for i in prange(Ny):
+                for j in range(Nx):
+                    for k in range(Nx):
+                        result[i, j] += f[i, k] * Fm[k, j]
+        else:  # y-filter (axis == -2)
+            for i in prange(Ny):
+                for j in range(Nx):
+                    for k in range(Ny):
+                        result[i, j] += f[k, j] * Fm[k, i]
+        return result
+
+
+@njit(cache=True, fastmath=True, parallel=True)
+def _legendre_3d_derivative_kernel_numba_parallel(f: np.ndarray, D: np.ndarray, axis: int) -> np.ndarray:
+    """JIT-compiled parallel kernel for 3D Legendre differentiation.
+    
+    Args:
+        f: Nodal values of shape (..., Nz, Ny, Nx)
+        D: Differentiation matrix of shape (N, N)
+        axis: Axis along which to differentiate (-1 for x, -2 for y, -3 for z)
+        
+    Returns:
+        Derivative values of shape (..., Nz, Ny, Nx)
+    """
+    if axis == -1:  # x-derivative
+        return f @ D.T
+    elif axis == -2:  # y-derivative
+        # Apply along y-axis manually with parallel loops
+        Nz, Ny, Nx = f.shape[-3], f.shape[-2], f.shape[-1]
+        result = np.zeros_like(f)
+        
+        for i in range(Nz):
+            for j in range(Ny):
+                for k in range(Nx):
+                    for l in range(Ny):
+                        result[..., i, j, k] += f[..., i, l, k] * D[l, j]
+        return result
+    else:  # z-derivative (axis == -3)
+        # Apply along z-axis manually with parallel loops
+        Nz, Ny, Nx = f.shape[-3], f.shape[-2], f.shape[-1]
+        result = np.zeros_like(f)
+        
+        for i in range(Nz):
+            for j in range(Ny):
+                for k in range(Nx):
+                    for l in range(Nz):
+                        result[..., i, j, k] += f[..., l, j, k] * D[l, i]
+        return result
+
+
+@njit(cache=True, fastmath=True, parallel=True)
+def _legendre_3d_filter_kernel_numba_parallel(f: np.ndarray, Fm: np.ndarray, axis: int) -> np.ndarray:
+    """JIT-compiled parallel kernel for 3D Legendre spectral filtering.
+    
+    Args:
+        f: Nodal values of shape (..., Nz, Ny, Nx)
+        Fm: Filter matrix of shape (N, N)
+        axis: Axis along which to apply filter (-1 for x, -2 for y, -3 for z)
+        
+    Returns:
+        Filtered nodal values of shape (..., Nz, Ny, Nx)
+    """
+    if axis == -1:  # x-filter
+        return f @ Fm.T
+    elif axis == -2:  # y-filter
+        # Apply along y-axis manually with parallel loops
+        Nz, Ny, Nx = f.shape[-3], f.shape[-2], f.shape[-1]
+        result = np.zeros_like(f)
+        
+        for i in range(Nz):
+            for j in range(Ny):
+                for k in range(Nx):
+                    for l in range(Ny):
+                        result[..., i, j, k] += f[..., i, l, k] * Fm[l, j]
+        return result
+    else:  # z-filter (axis == -3)
+        # Apply along z-axis manually with parallel loops
+        Nz, Ny, Nx = f.shape[-3], f.shape[-2], f.shape[-1]
+        result = np.zeros_like(f)
+        
+        for i in range(Nz):
+            for j in range(Ny):
+                for k in range(Nx):
+                    for l in range(Nz):
+                        result[..., i, j, k] += f[..., l, j, k] * Fm[l, i]
+        return result
+
+
+@njit(cache=True, fastmath=True)
+def _legendre_3d_filter_kernel_numba(f: np.ndarray, Fm: np.ndarray, axis: int) -> np.ndarray:
+    """JIT-compiled kernel for 3D Legendre spectral filtering.
+    
+    Args:
+        f: Nodal values of shape (..., Nz, Ny, Nx)
+        Fm: Filter matrix of shape (N, N)
+        axis: Axis along which to apply filter (-1 for x, -2 for y, -3 for z)
+        
+    Returns:
+        Filtered nodal values of shape (..., Nz, Ny, Nx)
+    """
+    if axis == -1:  # x-filter
+        return f @ Fm.T
+    elif axis == -2:  # y-filter
+        # Apply along y-axis manually with loops
+        Nz, Ny, Nx = f.shape[-3], f.shape[-2], f.shape[-1]
+        result = np.zeros_like(f)
+        
+        for i in range(Nz):
+            for j in range(Ny):
+                for k in range(Nx):
+                    for l in range(Ny):
+                        result[..., i, j, k] += f[..., i, l, k] * Fm[l, j]
+        return result
+    else:  # z-filter (axis == -3)
+        # Apply along z-axis manually with loops
+        Nz, Ny, Nx = f.shape[-3], f.shape[-2], f.shape[-1]
+        result = np.zeros_like(f)
+        
+        for i in range(Nz):
+            for j in range(Ny):
+                for k in range(Nx):
+                    for l in range(Nz):
+                        result[..., i, j, k] += f[..., l, j, k] * Fm[l, i]
+        return result
 
 
 def _legendre_gauss_lobatto_nodes_weights(N: int, precision: str = "double") -> tuple[np.ndarray, np.ndarray]:
@@ -376,9 +691,11 @@ class LegendreLobattoBasis1D(Basis1D):
     - batched tensordot evaluations for transforms and derivatives
     """
 
-    def __init__(self, N: int, Lx: float, *, bc: str = "dirichlet", precision: str = "double") -> None:
+    def __init__(self, N: int, Lx: float, *, bc: str = "dirichlet", precision: str = "double", 
+                 use_parallel: bool = False) -> None:
         super().__init__(N=N, Lx=Lx, bc=bc)
         self.precision = precision
+        self.use_parallel = use_parallel
 
         # Nodes and quadrature on reference domain [-1, 1]
         y, w_ref = _legendre_gauss_lobatto_nodes_weights(self.N, precision=self.precision)
@@ -437,7 +754,10 @@ class LegendreLobattoBasis1D(Basis1D):
         
         # Use JIT-compiled kernel for NumPy backend if available
         if _NUMBA_AVAILABLE:
-            return _legendre_forward_kernel_numba(fw, V, self._proj_scale)
+            if self.use_parallel:
+                return _legendre_forward_kernel_numba_parallel(fw, V, self._proj_scale)
+            else:
+                return _legendre_forward_kernel_numba(fw, V, self._proj_scale)
         else:
             a = np.tensordot(fw, V, axes=([-1], [0]))
             a = a * self._proj_scale.reshape((1,) * (a.ndim - 1) + (self.N,))
@@ -456,7 +776,10 @@ class LegendreLobattoBasis1D(Basis1D):
         
         # Use JIT-compiled kernel for NumPy backend if available
         if _NUMBA_AVAILABLE:
-            return _legendre_inverse_kernel_numba(F_arr, V)
+            if self.use_parallel:
+                return _legendre_inverse_kernel_numba_parallel(F_arr, V)
+            else:
+                return _legendre_inverse_kernel_numba(F_arr, V)
         else:
             return np.tensordot(F_arr, V.T, axes=([-1], [0]))
 
@@ -469,7 +792,10 @@ class LegendreLobattoBasis1D(Basis1D):
         
         # Use JIT-compiled kernel for NumPy backend if available
         if _NUMBA_AVAILABLE:
-            return _legendre_derivative_kernel_numba(f, self._D_x)
+            if self.use_parallel:
+                return _legendre_derivative_kernel_numba_parallel(f, self._D_x)
+            else:
+                return _legendre_derivative_kernel_numba(f, self._D_x)
         else:
             return _as_last_axis_matrix_apply(self._D_x.T, f)
 
@@ -485,7 +811,10 @@ class LegendreLobattoBasis1D(Basis1D):
         if _NUMBA_AVAILABLE:
             # Precompute D2_x for efficiency
             D2_x = self._D_x @ self._D_x
-            return _legendre_derivative_kernel_numba(f, D2_x)
+            if self.use_parallel:
+                return _legendre_derivative_kernel_numba_parallel(f, D2_x)
+            else:
+                return _legendre_derivative_kernel_numba(f, D2_x)
         else:
             return _as_last_axis_matrix_apply((self._D_x @ self._D_x).T, f)
 
@@ -530,7 +859,10 @@ class LegendreLobattoBasis1D(Basis1D):
         
         # Use JIT-compiled kernel for NumPy backend if available
         if _NUMBA_AVAILABLE:
-            return _legendre_filter_kernel_numba(f, Fn_np)
+            if self.use_parallel:
+                return _legendre_filter_kernel_numba_parallel(f, Fn_np)
+            else:
+                return _legendre_filter_kernel_numba(f, Fn_np)
         else:
             return _as_last_axis_matrix_apply(Fn_np.T, f)
 
@@ -560,13 +892,15 @@ class LegendreLobattoBasis2D:
     Last two axes are (..., Ny, Nx). Derivatives via precomputed Dx,Dy.
     """
 
-    def __init__(self, Nx: int, Ny: int, Lx: float, Ly: float, *, bc: str = "dirichlet", precision: str = "double") -> None:
+    def __init__(self, Nx: int, Ny: int, Lx: float, Ly: float, *, bc: str = "dirichlet", precision: str = "double", 
+                 use_parallel: bool = False) -> None:
         self.Nx = int(Nx)
         self.Ny = int(Ny)
         self.Lx = float(Lx)
         self.Ly = float(Ly)
         self.bc = str(bc).lower()
         self.precision = precision
+        self.use_parallel = use_parallel
 
         yx, wx = _legendre_gauss_lobatto_nodes_weights(self.Nx, precision=self.precision)
         yy, wy = _legendre_gauss_lobatto_nodes_weights(self.Ny, precision=self.precision)
@@ -601,14 +935,20 @@ class LegendreLobattoBasis2D:
     def dx(self, f: np.ndarray) -> np.ndarray:
         # Apply along x (last axis)
         if _NUMBA_AVAILABLE:
-            return _legendre_2d_derivative_kernel_numba(f, self._Dx, -1)
+            if self.use_parallel:
+                return _legendre_2d_derivative_kernel_numba_parallel(f, self._Dx, -1)
+            else:
+                return _legendre_2d_derivative_kernel_numba(f, self._Dx, -1)
         else:
             return np.tensordot(f, self._Dx.T, axes=([-1], [0]))
 
     def dy(self, f: np.ndarray) -> np.ndarray:
         # Apply along y (second-to-last axis)
         if _NUMBA_AVAILABLE:
-            return _legendre_2d_derivative_kernel_numba(f, self._Dy, -2)
+            if self.use_parallel:
+                return _legendre_2d_derivative_kernel_numba_parallel(f, self._Dy, -2)
+            else:
+                return _legendre_2d_derivative_kernel_numba(f, self._Dy, -2)
         else:
             # Use moveaxis to ensure correct axis order
             f_moved = np.moveaxis(f, -2, -1)  # Move y axis to last position
@@ -629,7 +969,10 @@ class LegendreLobattoBasis2D:
         
         # Use JIT-compiled kernel for NumPy backend if available
         if _NUMBA_AVAILABLE:
-            return _legendre_2d_filter_kernel_numba(f, Fm, axis)
+            if self.use_parallel:
+                return _legendre_2d_filter_kernel_numba_parallel(f, Fm, axis)
+            else:
+                return _legendre_2d_filter_kernel_numba(f, Fm, axis)
         else:
             f_move = np.moveaxis(f, axis, -1)
             g = np.tensordot(f_move, Fm.T, axes=([-1], [0]))
@@ -642,11 +985,13 @@ class LegendreLobattoBasis2D:
 
 
 class LegendreLobattoBasis3D:
-    def __init__(self, Nx: int, Ny: int, Nz: int, Lx: float, Ly: float, Lz: float, *, bc: str = "dirichlet", precision: str = "double") -> None:
+    def __init__(self, Nx: int, Ny: int, Nz: int, Lx: float, Ly: float, Lz: float, *, bc: str = "dirichlet", precision: str = "double", 
+                 use_parallel: bool = False) -> None:
         self.Nx = int(Nx); self.Ny = int(Ny); self.Nz = int(Nz)
         self.Lx = float(Lx); self.Ly = float(Ly); self.Lz = float(Lz)
         self.bc = str(bc).lower()
         self.precision = precision
+        self.use_parallel = use_parallel
 
         yx, _ = _legendre_gauss_lobatto_nodes_weights(self.Nx, precision=self.precision)
         yy, _ = _legendre_gauss_lobatto_nodes_weights(self.Ny, precision=self.precision)
@@ -669,19 +1014,28 @@ class LegendreLobattoBasis3D:
 
     def dx(self, f: np.ndarray) -> np.ndarray:
         if _NUMBA_AVAILABLE:
-            return _legendre_3d_derivative_kernel_numba(f, self._Dx, -1)
+            if self.use_parallel:
+                return _legendre_3d_derivative_kernel_numba_parallel(f, self._Dx, -1)
+            else:
+                return _legendre_3d_derivative_kernel_numba(f, self._Dx, -1)
         else:
             return np.tensordot(f, self._Dx.T, axes=([-1], [0]))
 
     def dy(self, f: np.ndarray) -> np.ndarray:
         if _NUMBA_AVAILABLE:
-            return _legendre_3d_derivative_kernel_numba(f, self._Dy, -2)
+            if self.use_parallel:
+                return _legendre_3d_derivative_kernel_numba_parallel(f, self._Dy, -2)
+            else:
+                return _legendre_3d_derivative_kernel_numba(f, self._Dy, -2)
         else:
             return np.tensordot(self._Dy, f, axes=([1], [-2]))
 
     def dz(self, f: np.ndarray) -> np.ndarray:
         if _NUMBA_AVAILABLE:
-            return _legendre_3d_derivative_kernel_numba(f, self._Dz, -3)
+            if self.use_parallel:
+                return _legendre_3d_derivative_kernel_numba_parallel(f, self._Dz, -3)
+            else:
+                return _legendre_3d_derivative_kernel_numba(f, self._Dz, -3)
         else:
             return np.tensordot(self._Dz, f, axes=([1], [-3]))
 
@@ -691,9 +1045,17 @@ class LegendreLobattoBasis3D:
         kmax = max(float(N - 1), 1.0)
         sigma = np.exp(-float(alpha) * (k / kmax) ** int(p))
         Fm = (V * ((2.0 * k + 1.0) / 2.0 * sigma).reshape(1, -1)) @ V.T
-        f_move = np.moveaxis(f, axis, -1)
-        g = np.tensordot(f_move, Fm.T, axes=([-1], [0]))
-        return np.moveaxis(g, -1, axis)
+        
+        # Use JIT-compiled kernel for NumPy backend if available
+        if _NUMBA_AVAILABLE:
+            if self.use_parallel:
+                return _legendre_3d_filter_kernel_numba_parallel(f, Fm, axis)
+            else:
+                return _legendre_3d_filter_kernel_numba(f, Fm, axis)
+        else:
+            f_move = np.moveaxis(f, axis, -1)
+            g = np.tensordot(f_move, Fm.T, axes=([-1], [0]))
+            return np.moveaxis(g, -1, axis)
 
     def apply_spectral_filter(self, f: np.ndarray, *, p: int = 8, alpha: float = 36.0) -> np.ndarray:
         g = self._filter_axis(f, self._Vx, p, alpha, axis=-1)

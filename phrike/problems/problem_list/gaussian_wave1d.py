@@ -61,6 +61,7 @@ class GaussianWave1DProblem(BaseProblem):
             backend=backend,
             torch_device=device,
             precision=self.precision,
+            problem_config=self.config,
         )
 
     def create_equations(self) -> EulerEquations1D:

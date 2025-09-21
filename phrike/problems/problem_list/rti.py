@@ -54,8 +54,12 @@ def rti_initial_conditions(
 
     # Create smooth density stratification with tanh transition centered at mid-height
     # Heavy-over-light for RTI: rho increases with height if rho_top > rho_bottom
-    Ymin = float(np.min(y))
-    Ymax = float(np.max(y))
+    if _TORCH_AVAILABLE and isinstance(y, torch.Tensor):
+        Ymin = float(torch.min(y).item())
+        Ymax = float(torch.max(y).item())
+    else:
+        Ymin = float(np.min(y))
+        Ymax = float(np.max(y))
     Ly = Ymax - Ymin
     y0 = Ymin + 0.5 * Ly
     delta = max(1e-6, shear_thickness * Ly)
@@ -64,12 +68,18 @@ def rti_initial_conditions(
         # Torch path
         y_centered = y - y0
         tanh_arg = y_centered / delta
-        rho = rho_bottom + 0.5 * (rho_top - rho_bottom) * (1.0 + torch.tanh(tanh_arg))
+        # Use tensor constants to maintain precision
+        half = torch.tensor(0.5, dtype=x.dtype, device=x.device)
+        one = torch.tensor(1.0, dtype=x.dtype, device=x.device)
+        rho = rho_bottom + half * (rho_top - rho_bottom) * (one + torch.tanh(tanh_arg))
         
         # Velocity perturbation: vertical component localized near interface
         u = torch.zeros_like(x)
-        v = perturb_eps * torch.sin(perturb_kx * 2.0 * np.pi * x / (x.max() - x.min() + 1e-12)) * \
-            torch.exp(-0.5 * ((y_centered) / max(1e-12, perturb_sigma * Ly)) ** 2)
+        # Use tensor constants to maintain precision
+        two_pi = torch.tensor(2.0 * np.pi, dtype=x.dtype, device=x.device)
+        neg_half = torch.tensor(-0.5, dtype=x.dtype, device=x.device)
+        v = perturb_eps * torch.sin(perturb_kx * two_pi * x / (torch.max(x) - torch.min(x) + 1e-12)) * \
+            torch.exp(neg_half * ((y_centered) / torch.max(torch.tensor(1e-12, dtype=x.dtype, device=x.device), torch.tensor(perturb_sigma * Ly, dtype=x.dtype, device=x.device))) ** 2)
         
         # Hydrostatic pressure integration: dp/dy = rho * gy
         # Work along y for each x column using trapezoidal rule
@@ -81,9 +91,10 @@ def rti_initial_conditions(
         p_line = torch.zeros(Ny, dtype=x.dtype, device=x.device)
         p_line[0] = float(pressure_bottom)
         rho_line = rho[:, 0]
+        gy_tensor = torch.tensor(float(gy), dtype=x.dtype, device=x.device)
         for j in range(1, Ny):
-            rho_mid = 0.5 * (rho_line[j - 1] + rho_line[j])
-            p_line[j] = p_line[j - 1] + rho_mid * float(gy) * dy_line[j - 1]
+            rho_mid = half * (rho_line[j - 1] + rho_line[j])
+            p_line[j] = p_line[j - 1] + rho_mid * gy_tensor * dy_line[j - 1]
         p = p_line[:, None].repeat(1, Nx)
     else:
         # Numpy path
@@ -144,6 +155,9 @@ class RTIProblem(BaseProblem):
         basis_x = str(self.config["grid"].get("basis_x", "legendre")).lower()
         basis_y = str(self.config["grid"].get("basis_y", "legendre")).lower()
 
+        # Get boundary condition configuration
+        bc_config = self.config.get("boundary_conditions", {})
+        
         grid = Grid2D(
             Nx=Nx,
             Ny=Ny,
@@ -157,6 +171,7 @@ class RTIProblem(BaseProblem):
             precision=self.precision,
             basis_x=basis_x,
             basis_y=basis_y,
+            bc_config=bc_config,
         )
 
         # With Legendre basis in y, boundary conditions are naturally enforced
@@ -171,10 +186,10 @@ class RTIProblem(BaseProblem):
     def apply_boundary_conditions(self, U: np.ndarray) -> np.ndarray:
         """Apply boundary conditions for RTI problem.
         
-        With Legendre basis in y, boundary conditions are naturally enforced.
-        This method is kept for compatibility but does nothing.
+        Applies mixed boundary conditions: Dirichlet on bottom, Neumann on top/left/right.
         """
-        return U
+        # Apply boundary conditions using the grid's method
+        return self.grid.apply_boundary_conditions(U, self.equations)
 
     def create_initial_conditions(self, grid: Grid2D):
         """Create Rayleigh-Taylor instability initial conditions."""
@@ -237,7 +252,7 @@ class RTIProblem(BaseProblem):
         fig.suptitle(f"Rayleigh-Taylor Instability at t={t:.3f}", fontsize=14)
         
         x, y = solver.grid.xy_mesh()
-        rho, u, v, p, _ = solver.equations.primitive(U)
+        rho, u, v, p = solver.equations.primitive(U)
         
         # Convert to numpy if needed
         x = self.convert_torch_to_numpy(x)[0]
@@ -304,14 +319,46 @@ class RTIProblem(BaseProblem):
         )
         print(f"Saved final snapshot: {snapshot_path}")
 
-        # Plot fields
-        plot_fields(
-            grid=solver.grid,
-            U=solver.U,
-            equations=solver.equations,
-            title=f"Rayleigh-Taylor Instability at t={solver.t:.3f}",
-            outpath=os.path.join(self.outdir, f"fields_t{solver.t:.3f}.png"),
-        )
+        # Final 2D visualization (contours), compatible with 2D fields
+        try:
+            import matplotlib.pyplot as plt
+            import numpy as _np
+
+            x, y = solver.grid.xy_mesh()
+            rho, u, v, p = solver.equations.primitive(solver.U)
+
+            # Convert to numpy if tensors
+            x = self.convert_torch_to_numpy(x)[0]
+            y = self.convert_torch_to_numpy(y)[0]
+            rho = self.convert_torch_to_numpy(rho)[0]
+            u = self.convert_torch_to_numpy(u)[0]
+            v = self.convert_torch_to_numpy(v)[0]
+            p = self.convert_torch_to_numpy(p)[0]
+
+            # Figure
+            fig, axs = plt.subplots(2, 2, figsize=(12, 8), constrained_layout=True)
+            fig.suptitle(f"Rayleigh-Taylor Instability at t={solver.t:.3f}")
+
+            im1 = axs[0, 0].contourf(x, y, rho, levels=20, cmap='viridis')
+            axs[0, 0].set_title('Density'); axs[0, 0].set_aspect('equal'); plt.colorbar(im1, ax=axs[0, 0])
+
+            vel_mag = _np.sqrt(u**2 + v**2)
+            im2 = axs[0, 1].contourf(x, y, vel_mag, levels=20, cmap='plasma')
+            axs[0, 1].set_title('Velocity Magnitude'); axs[0, 1].set_aspect('equal'); plt.colorbar(im2, ax=axs[0, 1])
+
+            im3 = axs[1, 0].contourf(x, y, p, levels=20, cmap='coolwarm')
+            axs[1, 0].set_title('Pressure'); axs[1, 0].set_aspect('equal'); plt.colorbar(im3, ax=axs[1, 0])
+
+            skip = max(1, min(x.shape[0]//16, x.shape[1]//16))
+            axs[1, 1].quiver(x[::skip, ::skip], y[::skip, ::skip], u[::skip, ::skip], v[::skip, ::skip], scale=50, alpha=0.7)
+            axs[1, 1].set_title('Velocity Vectors'); axs[1, 1].set_aspect('equal')
+
+            outpath = os.path.join(self.outdir, f"fields_t{solver.t:.3f}.png")
+            fig.savefig(outpath, dpi=150)
+            plt.close(fig)
+        except Exception:
+            # If plotting fails, continue silently after snapshot
+            pass
 
         # Plot conserved quantities if history is available
         if (
