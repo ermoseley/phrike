@@ -291,14 +291,14 @@ def generate_phrike_frame(snapshot_path, args, frame_dir, frame_index):
             # For 4K mode, always use 1 pixel per grid point for true 1:1 mapping
             # High quality comes from interpolation, not DPI scaling
             fig_width, fig_height = get_4k_figure_size(grid_width, grid_height, target_dpi=1)
-            dpi = 1  # 1 pixel per grid point - this is the correct approach
+            dpi = 4  # 1 pixel per grid point - this is the correct approach
             quality_note = " (high-quality interpolation)" if high_quality else ""
             print(f"4K mode: {grid_width}x{grid_height} grid -> {fig_width:.1f}x{fig_height:.1f} inches at {dpi} DPI{quality_note}")
         else:
             # Standard mode
             if high_quality:
                 fig_width, fig_height = (12, 12)  # Larger figure for better quality
-                dpi = max(args.dpi, 600)  # Higher DPI for better quality
+                dpi = max(args.dpi, 1200)  # Higher DPI for better quality
                 print(f"High-quality mode: {fig_width}x{fig_height} inches at {dpi} DPI")
             else:
                 fig_width, fig_height = (10, 10)
