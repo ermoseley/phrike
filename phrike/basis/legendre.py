@@ -127,34 +127,34 @@ def _legendre_2d_derivative_kernel_numba(f: np.ndarray, D: np.ndarray, axis: int
         ncomp, Ny, Nx = f.shape
         result = np.zeros_like(f)
         
-        if axis == -1:  # x-derivative
+        if axis == -1:  # x-derivative (apply D^T along last axis)
             for c in range(ncomp):
                 for i in range(Ny):
                     for j in range(Nx):
                         for k in range(Nx):
-                            result[c, i, j] += f[c, i, k] * D[k, j]
-        else:  # y-derivative (axis == -2)
+                            result[c, i, j] += f[c, i, k] * D[j, k]
+        else:  # y-derivative (axis == -2), apply D^T along second-to-last axis
             for c in range(ncomp):
                 for i in range(Ny):
                     for j in range(Nx):
                         for k in range(Ny):
-                            result[c, i, j] += f[c, k, j] * D[k, i]
+                            result[c, i, j] += f[c, k, j] * D[i, k]
         return result
     else:
         # Handle 2D arrays (Ny, Nx)
         Ny, Nx = f.shape[-2], f.shape[-1]
         result = np.zeros_like(f)
         
-        if axis == -1:  # x-derivative
+        if axis == -1:  # x-derivative (apply D^T along last axis)
             for i in range(Ny):
                 for j in range(Nx):
                     for k in range(Nx):
-                        result[i, j] += f[i, k] * D[k, j]
-        else:  # y-derivative (axis == -2)
+                        result[i, j] += f[i, k] * D[j, k]
+        else:  # y-derivative (axis == -2), apply D^T along second-to-last axis
             for i in range(Ny):
                 for j in range(Nx):
                     for k in range(Ny):
-                        result[i, j] += f[k, j] * D[k, i]
+                        result[i, j] += f[k, j] * D[i, k]
         return result
 
 
@@ -175,34 +175,34 @@ def _legendre_2d_filter_kernel_numba(f: np.ndarray, Fm: np.ndarray, axis: int) -
         ncomp, Ny, Nx = f.shape
         result = np.zeros_like(f)
         
-        if axis == -1:  # x-filter
+        if axis == -1:  # x-filter (apply Fn^T along last axis)
             for c in range(ncomp):
                 for i in range(Ny):
                     for j in range(Nx):
                         for k in range(Nx):
-                            result[c, i, j] += f[c, i, k] * Fm[k, j]
-        else:  # y-filter (axis == -2)
+                            result[c, i, j] += f[c, i, k] * Fm[j, k]
+        else:  # y-filter (axis == -2), apply Fn^T along second-to-last axis
             for c in range(ncomp):
                 for i in range(Ny):
                     for j in range(Nx):
                         for k in range(Ny):
-                            result[c, i, j] += f[c, k, j] * Fm[k, i]
+                            result[c, i, j] += f[c, k, j] * Fm[i, k]
         return result
     else:
         # Handle 2D arrays (Ny, Nx)
         Ny, Nx = f.shape[-2], f.shape[-1]
         result = np.zeros_like(f)
         
-        if axis == -1:  # x-filter
+        if axis == -1:  # x-filter (apply Fn^T along last axis)
             for i in range(Ny):
                 for j in range(Nx):
                     for k in range(Nx):
-                        result[i, j] += f[i, k] * Fm[k, j]
-        else:  # y-filter (axis == -2)
+                        result[i, j] += f[i, k] * Fm[j, k]
+        else:  # y-filter (axis == -2), apply Fn^T along second-to-last axis
             for i in range(Ny):
                 for j in range(Nx):
                     for k in range(Ny):
-                        result[i, j] += f[k, j] * Fm[k, i]
+                        result[i, j] += f[k, j] * Fm[i, k]
         return result
 
 
@@ -327,34 +327,34 @@ def _legendre_2d_derivative_kernel_numba_parallel(f: np.ndarray, D: np.ndarray, 
         ncomp, Ny, Nx = f.shape
         result = np.zeros_like(f)
         
-        if axis == -1:  # x-derivative
+        if axis == -1:  # x-derivative (apply D^T along last axis)
             for c in prange(ncomp):
                 for i in range(Ny):
                     for j in range(Nx):
                         for k in range(Nx):
-                            result[c, i, j] += f[c, i, k] * D[k, j]
-        else:  # y-derivative (axis == -2)
+                            result[c, i, j] += f[c, i, k] * D[j, k]
+        else:  # y-derivative (axis == -2), apply D^T along second-to-last axis
             for c in prange(ncomp):
                 for i in range(Ny):
                     for j in range(Nx):
                         for k in range(Ny):
-                            result[c, i, j] += f[c, k, j] * D[k, i]
+                            result[c, i, j] += f[c, k, j] * D[i, k]
         return result
     else:
         # Handle 2D arrays (Ny, Nx)
         Ny, Nx = f.shape[-2], f.shape[-1]
         result = np.zeros_like(f)
         
-        if axis == -1:  # x-derivative
+        if axis == -1:  # x-derivative (apply D^T along last axis)
             for i in prange(Ny):
                 for j in range(Nx):
                     for k in range(Nx):
-                        result[i, j] += f[i, k] * D[k, j]
-        else:  # y-derivative (axis == -2)
+                        result[i, j] += f[i, k] * D[j, k]
+        else:  # y-derivative (axis == -2), apply D^T along second-to-last axis
             for i in prange(Ny):
                 for j in range(Nx):
                     for k in range(Ny):
-                        result[i, j] += f[k, j] * D[k, i]
+                        result[i, j] += f[k, j] * D[i, k]
         return result
 
 
@@ -375,34 +375,34 @@ def _legendre_2d_filter_kernel_numba_parallel(f: np.ndarray, Fm: np.ndarray, axi
         ncomp, Ny, Nx = f.shape
         result = np.zeros_like(f)
         
-        if axis == -1:  # x-filter
+        if axis == -1:  # x-filter (apply Fn^T along last axis)
             for c in prange(ncomp):
                 for i in range(Ny):
                     for j in range(Nx):
                         for k in range(Nx):
-                            result[c, i, j] += f[c, i, k] * Fm[k, j]
-        else:  # y-filter (axis == -2)
+                            result[c, i, j] += f[c, i, k] * Fm[j, k]
+        else:  # y-filter (axis == -2), apply Fn^T along second-to-last axis
             for c in prange(ncomp):
                 for i in range(Ny):
                     for j in range(Nx):
                         for k in range(Ny):
-                            result[c, i, j] += f[c, k, j] * Fm[k, i]
+                            result[c, i, j] += f[c, k, j] * Fm[i, k]
         return result
     else:
         # Handle 2D arrays (Ny, Nx)
         Ny, Nx = f.shape[-2], f.shape[-1]
         result = np.zeros_like(f)
         
-        if axis == -1:  # x-filter
+        if axis == -1:  # x-filter (apply Fn^T along last axis)
             for i in prange(Ny):
                 for j in range(Nx):
                     for k in range(Nx):
-                        result[i, j] += f[i, k] * Fm[k, j]
-        else:  # y-filter (axis == -2)
+                        result[i, j] += f[i, k] * Fm[j, k]
+        else:  # y-filter (axis == -2), apply Fn^T along second-to-last axis
             for i in prange(Ny):
                 for j in range(Nx):
                     for k in range(Ny):
-                        result[i, j] += f[k, j] * Fm[k, i]
+                        result[i, j] += f[k, j] * Fm[i, k]
         return result
 
 
@@ -907,34 +907,218 @@ class LegendreLobattoBasis2D:
         self.precision = precision
         self.use_parallel = use_parallel
 
-        # Temporarily disabled 2D Legendre; keep constructor minimal to allow future re-implementation
-        self._x = np.linspace(0.0, self.Lx, self.Nx)
-        self._y = np.linspace(0.0, self.Ly, self.Ny)
-        self._w_x = None
-        self._w_y = None
-        self._Dx = None
-        self._Dy = None
-        self._Vx = None
-        self._Vy = None
-        self._filter_cache_np = {}
+        # Build 1D bases for each axis (reuses high-precision nodes/weights and matrices)
+        self._basis_x = LegendreLobattoBasis1D(self.Nx, self.Lx, bc=self.bc, precision=self.precision, use_parallel=self.use_parallel)
+        self._basis_y = LegendreLobattoBasis1D(self.Ny, self.Ly, bc=self.bc, precision=self.precision, use_parallel=self.use_parallel)
 
-    def quadrature_weights(self) -> Tuple[np.ndarray, np.ndarray]:
-        raise NotImplementedError("2D Legendre quadrature weights are not implemented yet.")
+        # Nodes and quadrature (1D)
+        self._x = self._basis_x.nodes()
+        self._y = self._basis_y.nodes()
+        self._w_x = self._basis_x._w_x  # physical-domain weights (Nx,)
+        self._w_y = self._basis_y._w_x  # physical-domain weights (Ny,)
 
+        # Differentiation and Vandermonde matrices for each axis
+        self._Dx = self._basis_x._D_x  # (Nx, Nx)
+        self._Dy = self._basis_y._D_x  # (Ny, Ny)
+        self._Vx = self._basis_x._V    # (Nx, Nx)
+        self._Vy = self._basis_y._V    # (Ny, Ny)
+
+        # Reference LGL weights and projection scales for transforms
+        self._w_ref_x = self._basis_x._w_ref  # (Nx,)
+        self._w_ref_y = self._basis_y._w_ref  # (Ny,)
+        self._proj_x = self._basis_x._proj_scale  # (Nx,)
+        self._proj_y = self._basis_y._proj_scale  # (Ny,)
+
+        # Caches
+        self._filter_cache_np: Dict[Tuple[int, float, str], np.ndarray] = {}
+        self._torch_cache: Dict[Tuple[str, str], Dict[str, "torch.Tensor"]] = {}  # type: ignore[name-defined]
+
+    # Grid and weights
     def nodes(self) -> Tuple[np.ndarray, np.ndarray]:
         return self._x, self._y
 
+    def quadrature_weights(self) -> Tuple[np.ndarray, np.ndarray]:
+        # Return separable 1D weights for convenience
+        return self._w_x.copy(), self._w_y.copy()
+
+    # Transforms
+    def forward(self, f: np.ndarray) -> np.ndarray:
+        """Compute 2D modal coefficients from nodal values f(..., Ny, Nx).
+
+        Uses tensor-product LGL projection with reference weights.
+        """
+        # Torch path
+        if _TORCH_AVAILABLE and isinstance(f, torch.Tensor):  # type: ignore[arg-type]
+            mats = self._get_torch_mats(f)
+            # Apply reference weights separably
+            shape_x = (1,) * (f.ndim - 1) + (self.Nx,)
+            shape_y = (1,) * (f.ndim - 2) + (self.Ny, 1)
+            fw = f * mats["w_ref_x"].reshape(shape_x)
+            fw = fw * mats["w_ref_y"].reshape(shape_y)
+            # First along x (last axis)
+            a = torch.matmul(fw, mats["Vx"])  # (..., Ny, Nx)
+            # Then along y (second-to-last axis): reshape to combine leading dims
+            leading = int(np.prod(list(f.shape[:-2]))) if f.ndim > 2 else 1
+            a2 = a.reshape(leading, self.Ny, self.Nx)
+            a2 = torch.matmul(a2.transpose(1, 2), mats["Vy"]).transpose(1, 2)
+            a = a2.reshape(f.shape)
+            # Apply projection scaling on both modal indices
+            a = a * mats["proj_x"].reshape(shape_x)
+            a = a * mats["proj_y"].reshape(shape_y)
+            return a
+
+        # NumPy path
+        f_arr = np.asarray(f)
+        # Apply reference weights along both axes
+        fw = f_arr * self._w_ref_x.reshape((1,) * (f_arr.ndim - 1) + (self.Nx,))
+        fw = fw * self._w_ref_y.reshape((1,) * (f_arr.ndim - 2) + (self.Ny, 1))
+        # Along x (last axis)
+        ax = np.tensordot(fw, self._Vx, axes=([-1], [0]))  # (..., Ny, Nx)
+        # Along y (second-to-last axis)
+        ay = np.tensordot(ax, self._Vy, axes=([-2], [0]))  # (..., Ny, Nx)
+        # Apply projection scaling along both axes
+        ay *= self._proj_x.reshape((1,) * (ay.ndim - 1) + (self.Nx,))
+        ay *= self._proj_y.reshape((1,) * (ay.ndim - 2) + (self.Ny, 1))
+        return ay
+
+    def inverse(self, F: np.ndarray) -> np.ndarray:
+        """Evaluate 2D nodal values from modal coefficients F(..., Ny, Nx)."""
+        if _TORCH_AVAILABLE and isinstance(F, torch.Tensor):  # type: ignore[arg-type]
+            mats = self._get_torch_mats(F)
+            # Along y then x (order doesn't matter as long as axes match)
+            leading = int(np.prod(list(F.shape[:-2]))) if F.ndim > 2 else 1
+            A = F.reshape(leading, self.Ny, self.Nx)
+            A = torch.matmul(A.transpose(1, 2), mats["Vy"].T).transpose(1, 2)
+            A = torch.matmul(A, mats["Vx"].T)
+            return A.reshape(F.shape)
+
+        F_arr = np.asarray(F)
+        tmp = np.tensordot(F_arr, self._Vy.T, axes=([-2], [0]))
+        f = np.tensordot(tmp, self._Vx.T, axes=([-1], [0]))
+        return f
+
+    # Derivatives
     def dx(self, f: np.ndarray) -> np.ndarray:
-        raise NotImplementedError("2D Legendre derivative dx is not implemented yet.")
+        if _TORCH_AVAILABLE and isinstance(f, torch.Tensor):  # type: ignore[arg-type]
+            mats = self._get_torch_mats(f)
+            # Apply along last axis with matrix transpose
+            leading = int(np.prod(list(f.shape[:-1]))) if f.ndim > 1 else 1
+            f2 = f.reshape(leading, self.Nx)
+            g2 = torch.matmul(f2, mats["Dx"].T)
+            return g2.reshape(f.shape)
+
+        D_typed = self._Dx.astype(np.asarray(f).dtype)
+        if _NUMBA_AVAILABLE:
+            if self.use_parallel:
+                return _legendre_2d_derivative_kernel_numba_parallel(np.asarray(f), D_typed, -1)  # type: ignore[arg-type]
+            else:
+                return _legendre_2d_derivative_kernel_numba(np.asarray(f), D_typed, -1)  # type: ignore[arg-type]
+        else:
+            # tensordot along last axis by D^T
+            return np.tensordot(f, D_typed.T, axes=([-1], [0]))
 
     def dy(self, f: np.ndarray) -> np.ndarray:
-        raise NotImplementedError("2D Legendre derivative dy is not implemented yet.")
+        if _TORCH_AVAILABLE and isinstance(f, torch.Tensor):  # type: ignore[arg-type]
+            mats = self._get_torch_mats(f)
+            # Apply along second-to-last axis
+            shape = f.shape
+            leading = int(np.prod(list(shape[:-2]))) if f.ndim > 2 else 1
+            f2 = f.reshape(leading, self.Ny, self.Nx)
+            g2 = torch.matmul(f2.transpose(1, 2), mats["Dy"].T).transpose(1, 2)
+            return g2.reshape(shape)
 
-    def _filter_axis(self, f: np.ndarray, V: np.ndarray, p: int, alpha: float, axis: int) -> np.ndarray:
-        raise NotImplementedError("2D Legendre spectral filter is not implemented yet.")
+        D_typed = self._Dy.astype(np.asarray(f).dtype)
+        if _NUMBA_AVAILABLE:
+            if self.use_parallel:
+                return _legendre_2d_derivative_kernel_numba_parallel(np.asarray(f), D_typed, -2)  # type: ignore[arg-type]
+            else:
+                return _legendre_2d_derivative_kernel_numba(np.asarray(f), D_typed, -2)  # type: ignore[arg-type]
+        else:
+            # tensordot along second-to-last axis by D^T
+            return np.tensordot(f, D_typed.T, axes=([-2], [0]))
 
+    # Filtering
     def apply_spectral_filter(self, f: np.ndarray, *, p: int = 8, alpha: float = 36.0) -> np.ndarray:
-        raise NotImplementedError("2D Legendre spectral filter is not implemented yet.")
+        # Build nodal filter matrices for each axis (cached via 1D bases)
+        if _TORCH_AVAILABLE and isinstance(f, torch.Tensor):  # type: ignore[arg-type]
+            mats = self._get_torch_mats(f)
+            kname_x = f"Fnx_{p}_{alpha}"
+            kname_y = f"Fny_{p}_{alpha}"
+            cache = mats
+            if kname_x not in cache:
+                # Build via 1D sigma-projection recipe on device
+                sigma_x = torch.from_numpy(self._basis_x._sigma(p, alpha)).to(dtype=f.dtype, device=f.device)
+                sigma_proj_x = sigma_x * mats["proj_x"]
+                M1x = mats["Vx"] * sigma_proj_x.reshape((1, self.Nx))
+                M2x = torch.matmul(M1x, mats["Vx"].T)
+                Fnx = M2x * mats["w_ref_x"].reshape((1, self.Nx))
+                cache[kname_x] = Fnx
+            if kname_y not in cache:
+                sigma_y = torch.from_numpy(self._basis_y._sigma(p, alpha)).to(dtype=f.dtype, device=f.device)
+                sigma_proj_y = sigma_y * mats["proj_y"]
+                M1y = mats["Vy"] * sigma_proj_y.reshape((1, self.Ny))
+                M2y = torch.matmul(M1y, mats["Vy"].T)
+                Fny = M2y * mats["w_ref_y"].reshape((1, self.Ny))
+                cache[kname_y] = Fny
+
+            # Apply along x then y
+            shape = f.shape
+            if shape[-1] != self.Nx or shape[-2] != self.Ny:
+                raise ValueError("Input shape does not match basis dimensions")
+            # x-axis
+            leading = int(np.prod(list(shape[:-2]))) if f.ndim > 2 else 1
+            f2 = f.reshape(leading, self.Ny, self.Nx)
+            g2 = torch.matmul(f2, cache[kname_x].T)
+            # y-axis
+            g2 = torch.matmul(g2.transpose(1, 2), cache[kname_y].T).transpose(1, 2)
+            return g2.reshape(shape)
+
+        # NumPy path
+        Fn_x = self._basis_x._build_nodal_filter_np(p, alpha)
+        Fn_y = self._basis_y._build_nodal_filter_np(p, alpha)
+        Fn_x_typed = Fn_x.astype(np.asarray(f).dtype)
+        Fn_y_typed = Fn_y.astype(np.asarray(f).dtype)
+        out = np.asarray(f)
+        # Apply along x and y via JIT kernels if available
+        if _NUMBA_AVAILABLE:
+            if self.use_parallel:
+                out = _legendre_2d_filter_kernel_numba_parallel(out, Fn_x_typed, -1)
+                out = _legendre_2d_filter_kernel_numba_parallel(out, Fn_y_typed, -2)
+            else:
+                out = _legendre_2d_filter_kernel_numba(out, Fn_x_typed, -1)
+                out = _legendre_2d_filter_kernel_numba(out, Fn_y_typed, -2)
+            return out
+        else:
+            out = np.tensordot(out, Fn_x_typed.T, axes=([-1], [0]))
+            # For y, need to apply along second-to-last axis
+            out = np.tensordot(out, Fn_y_typed.T, axes=([-2], [0]))
+            return out
+
+    # Torch helpers
+    def _get_torch_mats(self, ref: "torch.Tensor") -> Dict[str, "torch.Tensor"]:  # type: ignore[name-defined]
+        assert _TORCH_AVAILABLE and torch is not None
+        dev_key = (ref.device.type + (str(ref.device.index) if ref.device.index is not None else ""), str(ref.dtype))
+        cache = self._torch_cache.get(dev_key)
+        if cache is None:
+            cache = {}
+            self._torch_cache[dev_key] = cache
+        if "Vx" not in cache:
+            cache["Vx"] = torch.from_numpy(self._Vx).to(dtype=ref.dtype, device=ref.device, non_blocking=True)
+        if "Vy" not in cache:
+            cache["Vy"] = torch.from_numpy(self._Vy).to(dtype=ref.dtype, device=ref.device, non_blocking=True)
+        if "Dx" not in cache:
+            cache["Dx"] = torch.from_numpy(self._Dx).to(dtype=ref.dtype, device=ref.device, non_blocking=True)
+        if "Dy" not in cache:
+            cache["Dy"] = torch.from_numpy(self._Dy).to(dtype=ref.dtype, device=ref.device, non_blocking=True)
+        if "w_ref_x" not in cache:
+            cache["w_ref_x"] = torch.from_numpy(self._w_ref_x).to(dtype=ref.dtype, device=ref.device, non_blocking=True)
+        if "w_ref_y" not in cache:
+            cache["w_ref_y"] = torch.from_numpy(self._w_ref_y).to(dtype=ref.dtype, device=ref.device, non_blocking=True)
+        if "proj_x" not in cache:
+            cache["proj_x"] = torch.from_numpy(self._proj_x).to(dtype=ref.dtype, device=ref.device, non_blocking=True)
+        if "proj_y" not in cache:
+            cache["proj_y"] = torch.from_numpy(self._proj_y).to(dtype=ref.dtype, device=ref.device, non_blocking=True)
+        return cache
 
 
 class LegendreLobattoBasis3D:

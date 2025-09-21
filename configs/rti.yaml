@@ -93,7 +93,7 @@ io:
 
 monitoring:
   enabled: true
-  step_interval: 50
+  step_interval: 1
   include_conservation: true
   include_timestep: true
   include_time: true

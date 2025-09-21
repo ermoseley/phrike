@@ -640,8 +640,39 @@ class Grid2D:
         
         # Check if we're using a pure Legendre basis
         if self.basis_x == "legendre" and self.basis_y == "legendre":
-            # Temporarily disable 2D Legendre basis; keep structure ready for re-implementation
-            raise NotImplementedError("2D Legendre basis is temporarily disabled for rework.")
+            # Enable 2D Legendre tensor-product basis
+            try:
+                from .basis.legendre import LegendreLobattoBasis2D
+                # Determine parallel option from problem_config
+                use_parallel = False
+                if hasattr(self, "problem_config") and self.problem_config:
+                    runtime_cfg = self.problem_config.get("runtime", {})
+                    num_threads_cfg = runtime_cfg.get("num_threads", None)
+                    if num_threads_cfg is not None and num_threads_cfg != 1:
+                        use_parallel = True
+
+                self._legendre_basis = LegendreLobattoBasis2D(
+                    self.Nx, self.Ny, self.Lx, self.Ly,
+                    bc=self.bc, precision=self.precision, use_parallel=use_parallel
+                )
+
+                # Nodes from basis
+                self.x, self.y = self._legendre_basis.nodes()
+                try:
+                    import numpy as _np
+                    self.dx_min = float(_np.min(_np.diff(_np.asarray(self.x)))) if self.Nx > 1 else self.Lx
+                    self.dy_min = float(_np.min(_np.diff(_np.asarray(self.y)))) if self.Ny > 1 else self.Ly
+                except Exception:
+                    self.dx_min = self.Lx / max(self.Nx, 1)
+                    self.dy_min = self.Ly / max(self.Ny, 1)
+
+                # No Fourier wave numbers in Legendre-Legendre mode
+                self.kx = None
+                self.ky = None
+                self.ikx = None
+                self.iky = None
+            except Exception as e:
+                raise RuntimeError(f"2D Legendre basis initialization failed: {e}")
         else:
             # Hybrid or pure Fourier basis
             self._legendre_basis = None
@@ -785,6 +816,17 @@ class Grid2D:
         self._dirichlet_values_map = {}
         
         if not self.bc_config:
+            # Default all boundaries to global bc if provided
+            # Accept strings: "dirichlet" or "neumann"
+            if isinstance(self.bc, str) and self.bc in ("dirichlet", "neumann"):
+                default = self.bc
+                for boundary in ["left", "right", "top", "bottom"]:
+                    self._bc_boundary_map[boundary] = {
+                        "density": default,
+                        "momentum_x": default,
+                        "momentum_y": default,
+                        "pressure": default,
+                    }
             return
             
         # Parse boundary-specific configurations
@@ -931,17 +973,7 @@ class Grid2D:
     def dx1(self, f: np.ndarray) -> np.ndarray:
         # derivative along x on last spatial axis
         if self._legendre_basis is not None:
-            # Use 2D Legendre basis
-            # If using torch backend, convert to numpy, apply, then convert back
-            if getattr(self, "_use_torch", False):
-                try:
-                    import torch  # type: ignore
-                    if isinstance(f, torch.Tensor):
-                        f_np = f.detach().cpu().numpy()
-                        g_np = self._legendre_basis.dx(f_np)
-                        return torch.from_numpy(g_np).to(dtype=f.dtype, device=self.torch_device)
-                except Exception:
-                    pass
+            # Use 2D Legendre basis directly (supports NumPy and Torch)
             return self._legendre_basis.dx(f)
         elif self.basis_x == "fourier":
             F = self.fft2(f)
@@ -958,17 +990,7 @@ class Grid2D:
     def dy1(self, f: np.ndarray) -> np.ndarray:
         # derivative along y on second-to-last spatial axis
         if self._legendre_basis is not None:
-            # Use 2D Legendre basis
-            # If using torch backend, convert to numpy, apply, then convert back
-            if getattr(self, "_use_torch", False):
-                try:
-                    import torch  # type: ignore
-                    if isinstance(f, torch.Tensor):
-                        f_np = f.detach().cpu().numpy()
-                        g_np = self._legendre_basis.dy(f_np)
-                        return torch.from_numpy(g_np).to(dtype=f.dtype, device=self.torch_device)
-                except Exception:
-                    pass
+            # Use 2D Legendre basis directly (supports NumPy and Torch)
             return self._legendre_basis.dy(f)
         elif self.basis_y == "fourier":
             F = self.fft2(f)
@@ -984,20 +1006,10 @@ class Grid2D:
 
     def apply_spectral_filter(self, f: np.ndarray) -> np.ndarray:
         if self._legendre_basis is not None:
-            # Use 2D Legendre basis filtering
+            # Use 2D Legendre basis filtering (supports NumPy and Torch)
             if self.filter_params and bool(self.filter_params.get("enabled", False)):
                 p = int(self.filter_params.get("p", 8))
                 alpha = float(self.filter_params.get("alpha", 36.0))
-                # If using torch backend, convert to numpy, apply, then convert back
-                if getattr(self, "_use_torch", False):
-                    try:
-                        import torch  # type: ignore
-                        if isinstance(f, torch.Tensor):
-                            f_np = f.detach().cpu().numpy()
-                            g_np = self._legendre_basis.apply_spectral_filter(f_np, p=p, alpha=alpha)
-                            return torch.from_numpy(g_np).to(dtype=f.dtype, device=self.torch_device)
-                    except Exception:
-                        pass
                 return self._legendre_basis.apply_spectral_filter(f, p=p, alpha=alpha)
             else:
                 return f
