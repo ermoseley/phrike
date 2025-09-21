@@ -9,6 +9,9 @@ from .problem_list.acoustic1d import Acoustic1DProblem
 from .problem_list.gaussian_wave1d import GaussianWave1DProblem
 from .problem_list.shu_osher1d import ShuOsher1DProblem
 from .problem_list.rti import RTIProblem
+from .problem_list.hse_1d import HSE1DProblem
+from .problem_list.rti_1d import RTI1DProblem
+from .problem_list.uniform2d import Uniform2DProblem
 
 
 # Register all problems
@@ -20,3 +23,6 @@ ProblemRegistry.register("acoustic1d", Acoustic1DProblem)
 ProblemRegistry.register("gaussian_wave1d", GaussianWave1DProblem)
 ProblemRegistry.register("shu_osher1d", ShuOsher1DProblem)
 ProblemRegistry.register("rti", RTIProblem)
+ProblemRegistry.register("hse_1d", HSE1DProblem)
+ProblemRegistry.register("rti_1d", RTI1DProblem)
+ProblemRegistry.register("uniform_2d", Uniform2DProblem)

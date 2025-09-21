@@ -10,7 +10,8 @@ grid:
   Ly: 2.0                   # Height of box (2x width)
   basis_x: legendre         # Use Legendre in x (non-periodic/outflow)
   basis_y: legendre         # Use Legendre in y (wall/outflow)
-  dealias: true
+  bc: dirichlet             # Simple Dirichlet BCs like SOD
+  dealias: false            # Not applicable for Legendre
   precision: single
   fft_workers: 4
 
@@ -63,37 +64,24 @@ artificial_viscosity:
 
 # Gravity configuration - downward gravity
 gravity:
-  enabled: true
+  enabled: false
   type: "linear"
   gx: 0.0
-  gy: -1.0                   # Downward gravity
+  gy: 0.0                    # No gravity for testing
   gz: 0.0
 
 # Initial conditions for RTI (similar to KHI2D structure)
 initial_conditions:
-  rho_bottom: 1.0            # Light fluid at bottom
-  rho_top: 2.0               # Heavy fluid at top (RT-unstable)
-  pressure_bottom: 2.0       # Base pressure at bottom
+  rho_bottom: 1.0            # Uniform density for HSE test
+  rho_top: 1.0              # Uniform density for HSE test
+  pressure_bottom: 1.0       # Base pressure at bottom
   shear_thickness: 0.02      # Similar to KHI2D
-  perturb_eps: 0.01          # Similar to KHI2D
+  perturb_eps: 0.0           # No perturbations for testing
   perturb_sigma: 0.02        # Similar to KHI2D
   perturb_kx: 2              # Similar to KHI2D
   perturb_ky: 1              # Vertical wavenumber
 
-# Boundary conditions (mixed as requested)
-# boundary_conditions:
-#   # Bottom boundary (Dirichlet - solid wall)
-#   bottom:
-#     density: 1.0             # Light fluid at bottom
-#     momentum_x: 0.0          # No slip
-#     momentum_y: 0.0          # No slip
-#     pressure: 2.0            # Base pressure
-#   # Top boundary (Neumann - outflow)
-#   top: neumann
-#   # Left boundary (Neumann - outflow)
-#   left: neumann
-#   # Right boundary (Neumann - outflow)
-#   right: neumann
+# Boundary conditions handled by Legendre basis (simple Dirichlet like SOD)
 
 # Runtime configuration for GPU acceleration
 runtime:

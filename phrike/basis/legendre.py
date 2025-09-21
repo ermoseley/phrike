@@ -792,10 +792,12 @@ class LegendreLobattoBasis1D(Basis1D):
         
         # Use JIT-compiled kernel for NumPy backend if available
         if _NUMBA_AVAILABLE:
+            # Ensure matrix has same dtype as input to avoid Numba dtype mismatch
+            D_x_typed = self._D_x.astype(f.dtype)
             if self.use_parallel:
-                return _legendre_derivative_kernel_numba_parallel(f, self._D_x)
+                return _legendre_derivative_kernel_numba_parallel(f, D_x_typed)
             else:
-                return _legendre_derivative_kernel_numba(f, self._D_x)
+                return _legendre_derivative_kernel_numba(f, D_x_typed)
         else:
             return _as_last_axis_matrix_apply(self._D_x.T, f)
 
@@ -809,12 +811,13 @@ class LegendreLobattoBasis1D(Basis1D):
         
         # Use JIT-compiled kernel for NumPy backend if available
         if _NUMBA_AVAILABLE:
-            # Precompute D2_x for efficiency
+            # Precompute D2_x for efficiency and ensure dtype match
             D2_x = self._D_x @ self._D_x
+            D2_x_typed = D2_x.astype(f.dtype)
             if self.use_parallel:
-                return _legendre_derivative_kernel_numba_parallel(f, D2_x)
+                return _legendre_derivative_kernel_numba_parallel(f, D2_x_typed)
             else:
-                return _legendre_derivative_kernel_numba(f, D2_x)
+                return _legendre_derivative_kernel_numba(f, D2_x_typed)
         else:
             return _as_last_axis_matrix_apply((self._D_x @ self._D_x).T, f)
 
@@ -859,10 +862,12 @@ class LegendreLobattoBasis1D(Basis1D):
         
         # Use JIT-compiled kernel for NumPy backend if available
         if _NUMBA_AVAILABLE:
+            # Ensure filter matrix has same dtype as input to avoid Numba dtype mismatch
+            Fn_np_typed = Fn_np.astype(f.dtype)
             if self.use_parallel:
-                return _legendre_filter_kernel_numba_parallel(f, Fn_np)
+                return _legendre_filter_kernel_numba_parallel(f, Fn_np_typed)
             else:
-                return _legendre_filter_kernel_numba(f, Fn_np)
+                return _legendre_filter_kernel_numba(f, Fn_np_typed)
         else:
             return _as_last_axis_matrix_apply(Fn_np.T, f)
 
@@ -902,86 +907,34 @@ class LegendreLobattoBasis2D:
         self.precision = precision
         self.use_parallel = use_parallel
 
-        yx, wx = _legendre_gauss_lobatto_nodes_weights(self.Nx, precision=self.precision)
-        yy, wy = _legendre_gauss_lobatto_nodes_weights(self.Ny, precision=self.precision)
-        orderx = np.argsort(-yx)
-        ordery = np.argsort(-yy)
-        yx = yx[orderx]; wx = wx[orderx]
-        yy = yy[ordery]; wy = wy[ordery]
-        self._x = (1.0 - yx) * (self.Lx / 2.0)
-        self._y = (1.0 - yy) * (self.Ly / 2.0)
-        # Quadrature weights on x and y (scale by mapping dx = (L/2) dy)
-        self._w_x = wx * (self.Lx / 2.0)
-        self._w_y = wy * (self.Ly / 2.0)
-        Vx = npleg.legvander(yx, self.Nx - 1)
-        Vy = npleg.legvander(yy, self.Ny - 1)
-        Dx_y = np.linalg.solve(Vx.T, npleg.legvander( yx, self.Nx - 1).deriv(1) if hasattr(npleg.legvander( yx, self.Nx - 1), 'deriv') else _stable_legendre_diff_matrix(yx).T).T  # fallback
-        Dx_y = _stable_legendre_diff_matrix(yx)
-        Dy_y = _stable_legendre_diff_matrix(yy)
-        self._Dx = (-2.0 / self.Lx) * Dx_y
-        self._Dy = (-2.0 / self.Ly) * Dy_y
-        self._Vx = Vx
-        self._Vy = Vy
-        # Cache for modal filters: keys (axis, p, alpha) -> Fm matrix
-        self._filter_cache_np: Dict[Tuple[str, int, float], np.ndarray] = {}
+        # Temporarily disabled 2D Legendre; keep constructor minimal to allow future re-implementation
+        self._x = np.linspace(0.0, self.Lx, self.Nx)
+        self._y = np.linspace(0.0, self.Ly, self.Ny)
+        self._w_x = None
+        self._w_y = None
+        self._Dx = None
+        self._Dy = None
+        self._Vx = None
+        self._Vy = None
+        self._filter_cache_np = {}
 
     def quadrature_weights(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Return (w_y, w_x) 1D quadrature weights for tensor-product integrals."""
-        return self._w_y, self._w_x
+        raise NotImplementedError("2D Legendre quadrature weights are not implemented yet.")
 
     def nodes(self) -> Tuple[np.ndarray, np.ndarray]:
         return self._x, self._y
 
     def dx(self, f: np.ndarray) -> np.ndarray:
-        # Apply along x (last axis)
-        if _NUMBA_AVAILABLE:
-            if self.use_parallel:
-                return _legendre_2d_derivative_kernel_numba_parallel(f, self._Dx, -1)
-            else:
-                return _legendre_2d_derivative_kernel_numba(f, self._Dx, -1)
-        else:
-            return np.tensordot(f, self._Dx.T, axes=([-1], [0]))
+        raise NotImplementedError("2D Legendre derivative dx is not implemented yet.")
 
     def dy(self, f: np.ndarray) -> np.ndarray:
-        # Apply along y (second-to-last axis)
-        if _NUMBA_AVAILABLE:
-            if self.use_parallel:
-                return _legendre_2d_derivative_kernel_numba_parallel(f, self._Dy, -2)
-            else:
-                return _legendre_2d_derivative_kernel_numba(f, self._Dy, -2)
-        else:
-            # Use moveaxis to ensure correct axis order
-            f_moved = np.moveaxis(f, -2, -1)  # Move y axis to last position
-            result = np.tensordot(f_moved, self._Dy.T, axes=([-1], [0]))
-            return np.moveaxis(result, -1, -2)  # Move back to original position
+        raise NotImplementedError("2D Legendre derivative dy is not implemented yet.")
 
     def _filter_axis(self, f: np.ndarray, V: np.ndarray, p: int, alpha: float, axis: int) -> np.ndarray:
-        N = V.shape[0]
-        k = np.arange(N, dtype=float)
-        kmax = max(float(N - 1), 1.0)
-        sigma = np.exp(-float(alpha) * (k / kmax) ** int(p))
-        axis_key = 'x' if axis == -1 else 'y'
-        cache_key = (axis_key, int(p), float(alpha))
-        Fm = self._filter_cache_np.get(cache_key)
-        if Fm is None:
-            Fm = (V * ((2.0 * k + 1.0) / 2.0 * sigma).reshape(1, -1)) @ V.T
-            self._filter_cache_np[cache_key] = Fm
-        
-        # Use JIT-compiled kernel for NumPy backend if available
-        if _NUMBA_AVAILABLE:
-            if self.use_parallel:
-                return _legendre_2d_filter_kernel_numba_parallel(f, Fm, axis)
-            else:
-                return _legendre_2d_filter_kernel_numba(f, Fm, axis)
-        else:
-            f_move = np.moveaxis(f, axis, -1)
-            g = np.tensordot(f_move, Fm.T, axes=([-1], [0]))
-            return np.moveaxis(g, -1, axis)
+        raise NotImplementedError("2D Legendre spectral filter is not implemented yet.")
 
     def apply_spectral_filter(self, f: np.ndarray, *, p: int = 8, alpha: float = 36.0) -> np.ndarray:
-        g = self._filter_axis(f, self._Vx, p, alpha, axis=-1)
-        g = self._filter_axis(g, self._Vy, p, alpha, axis=-2)
-        return g
+        raise NotImplementedError("2D Legendre spectral filter is not implemented yet.")
 
 
 class LegendreLobattoBasis3D:
@@ -993,72 +946,31 @@ class LegendreLobattoBasis3D:
         self.precision = precision
         self.use_parallel = use_parallel
 
-        yx, _ = _legendre_gauss_lobatto_nodes_weights(self.Nx, precision=self.precision)
-        yy, _ = _legendre_gauss_lobatto_nodes_weights(self.Ny, precision=self.precision)
-        yz, _ = _legendre_gauss_lobatto_nodes_weights(self.Nz, precision=self.precision)
-        orderx = np.argsort(-yx); yx = yx[orderx]
-        ordery = np.argsort(-yy); yy = yy[ordery]
-        orderz = np.argsort(-yz); yz = yz[orderz]
-        self._x = (1.0 - yx) * (self.Lx / 2.0)
-        self._y = (1.0 - yy) * (self.Ly / 2.0)
-        self._z = (1.0 - yz) * (self.Lz / 2.0)
-        self._Dx = (-2.0 / self.Lx) * _stable_legendre_diff_matrix(yx)
-        self._Dy = (-2.0 / self.Ly) * _stable_legendre_diff_matrix(yy)
-        self._Dz = (-2.0 / self.Lz) * _stable_legendre_diff_matrix(yz)
-        self._Vx = npleg.legvander(yx, self.Nx - 1)
-        self._Vy = npleg.legvander(yy, self.Ny - 1)
-        self._Vz = npleg.legvander(yz, self.Nz - 1)
+        # Temporarily disabled 3D Legendre; keep minimal placeholders
+        self._x = np.linspace(0.0, self.Lx, self.Nx)
+        self._y = np.linspace(0.0, self.Ly, self.Ny)
+        self._z = np.linspace(0.0, self.Lz, self.Nz)
+        self._Dx = None
+        self._Dy = None
+        self._Dz = None
+        self._Vx = None
+        self._Vy = None
+        self._Vz = None
 
     def nodes(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        return self._x, self._y, self._z
+        raise NotImplementedError("3D Legendre nodes are not implemented yet.")
 
     def dx(self, f: np.ndarray) -> np.ndarray:
-        if _NUMBA_AVAILABLE:
-            if self.use_parallel:
-                return _legendre_3d_derivative_kernel_numba_parallel(f, self._Dx, -1)
-            else:
-                return _legendre_3d_derivative_kernel_numba(f, self._Dx, -1)
-        else:
-            return np.tensordot(f, self._Dx.T, axes=([-1], [0]))
+        raise NotImplementedError("3D Legendre derivative dx is not implemented yet.")
 
     def dy(self, f: np.ndarray) -> np.ndarray:
-        if _NUMBA_AVAILABLE:
-            if self.use_parallel:
-                return _legendre_3d_derivative_kernel_numba_parallel(f, self._Dy, -2)
-            else:
-                return _legendre_3d_derivative_kernel_numba(f, self._Dy, -2)
-        else:
-            return np.tensordot(self._Dy, f, axes=([1], [-2]))
+        raise NotImplementedError("3D Legendre derivative dy is not implemented yet.")
 
     def dz(self, f: np.ndarray) -> np.ndarray:
-        if _NUMBA_AVAILABLE:
-            if self.use_parallel:
-                return _legendre_3d_derivative_kernel_numba_parallel(f, self._Dz, -3)
-            else:
-                return _legendre_3d_derivative_kernel_numba(f, self._Dz, -3)
-        else:
-            return np.tensordot(self._Dz, f, axes=([1], [-3]))
+        raise NotImplementedError("3D Legendre derivative dz is not implemented yet.")
 
     def _filter_axis(self, f: np.ndarray, V: np.ndarray, p: int, alpha: float, axis: int) -> np.ndarray:
-        N = V.shape[0]
-        k = np.arange(N, dtype=float)
-        kmax = max(float(N - 1), 1.0)
-        sigma = np.exp(-float(alpha) * (k / kmax) ** int(p))
-        Fm = (V * ((2.0 * k + 1.0) / 2.0 * sigma).reshape(1, -1)) @ V.T
-        
-        # Use JIT-compiled kernel for NumPy backend if available
-        if _NUMBA_AVAILABLE:
-            if self.use_parallel:
-                return _legendre_3d_filter_kernel_numba_parallel(f, Fm, axis)
-            else:
-                return _legendre_3d_filter_kernel_numba(f, Fm, axis)
-        else:
-            f_move = np.moveaxis(f, axis, -1)
-            g = np.tensordot(f_move, Fm.T, axes=([-1], [0]))
-            return np.moveaxis(g, -1, axis)
+        raise NotImplementedError("3D Legendre spectral filter is not implemented yet.")
 
     def apply_spectral_filter(self, f: np.ndarray, *, p: int = 8, alpha: float = 36.0) -> np.ndarray:
-        g = self._filter_axis(f, self._Vx, p, alpha, axis=-1)
-        g = self._filter_axis(g, self._Vy, p, alpha, axis=-2)
-        g = self._filter_axis(g, self._Vz, p, alpha, axis=-3)
-        return g
+        raise NotImplementedError("3D Legendre spectral filter is not implemented yet.")

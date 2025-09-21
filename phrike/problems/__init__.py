@@ -12,6 +12,9 @@ from .problem_list.acoustic1d import Acoustic1DProblem
 from .problem_list.shu_osher1d import ShuOsher1DProblem
 from .problem_list.gaussian_wave1d import GaussianWave1DProblem
 from .problem_list.rti import RTIProblem
+from .problem_list.hse_1d import HSE1DProblem
+from .problem_list.rti_1d import RTI1DProblem
+from .problem_list.uniform2d import Uniform2DProblem
 
 __all__ = [
     "BaseProblem", 
@@ -23,5 +26,8 @@ __all__ = [
     "Acoustic1DProblem",
     "ShuOsher1DProblem",
     "GaussianWave1DProblem",
-    "RTIProblem"
+    "RTIProblem",
+    "HSE1DProblem",
+    "RTI1DProblem",
+    "Uniform2DProblem"
 ]

@@ -627,6 +627,7 @@ class Grid2D:
     debug: bool = False
     basis_x: str = "fourier"  # "fourier" or "legendre"
     basis_y: str = "fourier"  # "fourier" or "legendre"
+    bc: str = "dirichlet"     # Simple boundary condition like SOD
     # Boundary condition configuration
     bc_config: Optional[Dict[str, Any]] = None
 
@@ -639,31 +640,8 @@ class Grid2D:
         
         # Check if we're using a pure Legendre basis
         if self.basis_x == "legendre" and self.basis_y == "legendre":
-            # Use the existing 2D Legendre basis
-            from .basis.legendre import LegendreLobattoBasis2D
-            self._legendre_basis = LegendreLobattoBasis2D(
-                Nx=self.Nx, Ny=self.Ny, Lx=self.Lx, Ly=self.Ly, bc="dirichlet", precision=self.precision
-            )
-            self.x, self.y = self._legendre_basis.nodes()
-            # Compute actual minimum spacings
-            try:
-                import numpy as _np
-                self.dx_min = float(_np.min(_np.diff(self.x))) if len(self.x) > 1 else self.dx
-                self.dy_min = float(_np.min(_np.diff(self.y))) if len(self.y) > 1 else self.dy
-            except Exception:
-                self.dx_min = self.dx
-                self.dy_min = self.dy
-            # Expose quadrature weights for monitoring integrations
-            try:
-                self.wy, self.wx = self._legendre_basis.quadrature_weights()
-            except Exception:
-                self.wy, self.wx = None, None
-            self.kx = None
-            self.ky = None
-            self.ikx = None
-            self.iky = None
-            self.Dx = None
-            self.Dy = None
+            # Temporarily disable 2D Legendre basis; keep structure ready for re-implementation
+            raise NotImplementedError("2D Legendre basis is temporarily disabled for rework.")
         else:
             # Hybrid or pure Fourier basis
             self._legendre_basis = None

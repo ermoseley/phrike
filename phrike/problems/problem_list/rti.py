@@ -1,7 +1,15 @@
-"""2D Rayleigh-Taylor instability problem with gravity and mixed boundary conditions."""
+"""2D Rayleigh-Taylor Instability problem following Athena++ conventions.
+
+This implementation closely follows the standard RTI setup used in Athena++ with:
+- Heavy fluid on top, light fluid on bottom (unstable configuration)
+- Hydrostatic equilibrium initial conditions
+- Small amplitude perturbations to trigger instability
+- Dirichlet boundary conditions on all four sides
+- Compatible with both NumPy and PyTorch backends
+"""
 
 import os
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -17,29 +25,35 @@ from ..base import BaseProblem
 def rti_initial_conditions(
     x: np.ndarray,
     y: np.ndarray,
-    rho_bottom: float,
-    rho_top: float,
-    pressure_bottom: float,
+    rho_heavy: float,
+    rho_light: float,
+    pressure_top: float,
     gamma: float,
-    shear_thickness: float,
-    perturb_eps: float,
-    perturb_sigma: float,
-    perturb_kx: int,
-    perturb_ky: int,
-    gy: float,
+    gravity: float,
+    interface_thickness: float,
+    perturb_amplitude: float,
+    perturb_wavelength: float,
+    grid=None,
 ) -> np.ndarray:
-    """Create Rayleigh-Taylor instability initial conditions with smooth density transition.
+    """Create Rayleigh-Taylor instability initial conditions following Athena++ conventions.
+    
+    Standard RTI setup:
+    - Heavy fluid (high density) on top, light fluid (low density) on bottom
+    - Gravity points downward (negative y direction)
+    - Hydrostatic equilibrium: dp/dy = -rho * g
+    - Small amplitude perturbations at the interface
     
     Args:
         x, y: 2D coordinate arrays (Ny, Nx)
-        rho_bottom: Density at bottom of box
-        rho_top: Density at top of box
-        pressure_bottom: Pressure at bottom of box
+        rho_heavy: Density of heavy fluid (top)
+        rho_light: Density of light fluid (bottom)
+        pressure_top: Pressure at top boundary
         gamma: Adiabatic index
-        shear_thickness: Thickness of density transition layer
-        perturb_eps: Amplitude of initial perturbation
-        perturb_sigma: Width of perturbation
-        perturb_kx, perturb_ky: Wavenumbers for perturbation
+        gravity: Gravitational acceleration (positive value, points downward)
+        interface_thickness: Thickness of density transition layer
+        perturb_amplitude: Amplitude of initial perturbation
+        perturb_wavelength: Wavelength of perturbation
+        grid: Grid object (unused but kept for compatibility)
         
     Returns:
         Conservative variables array U with shape (4, Ny, Nx)
@@ -52,71 +66,92 @@ def rti_initial_conditions(
         _TORCH_AVAILABLE = False
         torch = None
 
-    # Create smooth density stratification with tanh transition centered at mid-height
-    # Heavy-over-light for RTI: rho increases with height if rho_top > rho_bottom
+    # Get domain dimensions
     if _TORCH_AVAILABLE and isinstance(y, torch.Tensor):
         Ymin = float(torch.min(y).item())
         Ymax = float(torch.max(y).item())
+        Xmin = float(torch.min(x).item())
+        Xmax = float(torch.max(x).item())
     else:
         Ymin = float(np.min(y))
         Ymax = float(np.max(y))
+        Xmin = float(np.min(x))
+        Xmax = float(np.max(x))
+    
     Ly = Ymax - Ymin
-    y0 = Ymin + 0.5 * Ly
-    delta = max(1e-6, shear_thickness * Ly)
-
+    Lx = Xmax - Xmin
+    
+    # Interface location (typically at mid-height)
+    y_interface = Ymin + 0.5 * Ly
+    
     if _TORCH_AVAILABLE and isinstance(x, torch.Tensor):
         # Torch path
-        y_centered = y - y0
-        tanh_arg = y_centered / delta
-        # Use tensor constants to maintain precision
+        # Create smooth density stratification using tanh
+        # Heavy fluid on top (y > y_interface), light fluid on bottom (y < y_interface)
+        y_centered = y - y_interface
+        tanh_arg = y_centered / interface_thickness
+        
+        # Tensor constants for precision
         half = torch.tensor(0.5, dtype=x.dtype, device=x.device)
         one = torch.tensor(1.0, dtype=x.dtype, device=x.device)
-        rho = rho_bottom + half * (rho_top - rho_bottom) * (one + torch.tanh(tanh_arg))
         
-        # Velocity perturbation: vertical component localized near interface
+        # Density profile: rho = rho_light + 0.5 * (rho_heavy - rho_light) * (1 + tanh(y/delta))
+        rho = rho_light + half * (rho_heavy - rho_light) * (one + torch.tanh(tanh_arg))
+        
+        # Initial velocity perturbations (small amplitude)
         u = torch.zeros_like(x)
-        # Use tensor constants to maintain precision
         two_pi = torch.tensor(2.0 * np.pi, dtype=x.dtype, device=x.device)
-        neg_half = torch.tensor(-0.5, dtype=x.dtype, device=x.device)
-        v = perturb_eps * torch.sin(perturb_kx * two_pi * x / (torch.max(x) - torch.min(x) + 1e-12)) * \
-            torch.exp(neg_half * ((y_centered) / torch.max(torch.tensor(1e-12, dtype=x.dtype, device=x.device), torch.tensor(perturb_sigma * Ly, dtype=x.dtype, device=x.device))) ** 2)
+        v = perturb_amplitude * torch.sin(two_pi * x / perturb_wavelength) * \
+            torch.exp(-half * (y_centered / interface_thickness) ** 2)
         
-        # Hydrostatic pressure integration: dp/dy = rho * gy
-        # Work along y for each x column using trapezoidal rule
+        # Hydrostatic pressure integration: dp/dy = -rho * g
+        # Integrate from top to bottom: p(y) = p_top - integral(rho * g * dy)
         Ny, Nx = y.shape
         p = torch.zeros_like(x)
-        # Build base y-line and dy (uniform assumed)
+        g_tensor = torch.tensor(gravity, dtype=x.dtype, device=x.device)
+        
+        # Integrate pressure from top boundary downward
         y_line = y[:, 0]
-        dy_line = y_line[1:] - y_line[:-1]
+        dy_line = y_line[1:] - y_line[:-1]  # Forward differences
         p_line = torch.zeros(Ny, dtype=x.dtype, device=x.device)
-        p_line[0] = float(pressure_bottom)
+        p_line[-1] = pressure_top  # Start from top
+        
         rho_line = rho[:, 0]
-        gy_tensor = torch.tensor(float(gy), dtype=x.dtype, device=x.device)
-        for j in range(1, Ny):
-            rho_mid = half * (rho_line[j - 1] + rho_line[j])
-            p_line[j] = p_line[j - 1] + rho_mid * gy_tensor * dy_line[j - 1]
+        for j in range(Ny - 2, -1, -1):  # Integrate downward from top
+            rho_mid = half * (rho_line[j] + rho_line[j + 1])
+            p_line[j] = p_line[j + 1] - rho_mid * g_tensor * dy_line[j]
+        
         p = p_line[:, None].repeat(1, Nx)
+        
     else:
-        # Numpy path
-        y_centered = y - y0
-        tanh_arg = y_centered / delta
-        rho = rho_bottom + 0.5 * (rho_top - rho_bottom) * (1.0 + np.tanh(tanh_arg))
+        # NumPy path
+        # Create smooth density stratification using tanh
+        y_centered = y - y_interface
+        tanh_arg = y_centered / interface_thickness
         
-        # Velocity perturbation
+        # Density profile: heavy on top, light on bottom
+        rho = rho_light + 0.5 * (rho_heavy - rho_light) * (1.0 + np.tanh(tanh_arg))
+        
+        # Initial velocity perturbations
         u = np.zeros_like(x)
-        v = perturb_eps * np.sin(perturb_kx * 2.0 * np.pi * x / (np.max(x) - np.min(x) + 1e-12)) * \
-            np.exp(-0.5 * ((y_centered) / max(1e-12, perturb_sigma * Ly)) ** 2)
+        v = perturb_amplitude * np.sin(2.0 * np.pi * x / perturb_wavelength) * \
+            np.exp(-0.5 * (y_centered / interface_thickness) ** 2)
         
-        # Hydrostatic pressure integration: dp/dy = rho * gy
+        # Hydrostatic pressure integration: dp/dy = -rho * g
         Ny, Nx = y.shape
+        p = np.zeros_like(x)
+        
+        # Integrate pressure from top boundary downward
         y_line = y[:, 0]
         dy_line = np.diff(y_line)
         p_line = np.zeros(Ny, dtype=x.dtype)
-        p_line[0] = float(pressure_bottom)
+        p_line[-1] = pressure_top  # Start from top
+        
         rho_line = rho[:, 0]
-        for j in range(1, Ny):
-            rho_mid = 0.5 * (rho_line[j - 1] + rho_line[j])
-            p_line[j] = p_line[j - 1] + rho_mid * float(gy) * dy_line[j - 1]
+        for j in range(Ny - 2, -1, -1):  # Integrate downward from top
+            rho_mid = 0.5 * (rho_line[j] + rho_line[j + 1])
+            p_line[j] = p_line[j + 1] - rho_mid * gravity * dy_line[j]
+        
         p = np.repeat(p_line[:, None], Nx, axis=1)
 
     # Convert to conservative variables
@@ -125,12 +160,12 @@ def rti_initial_conditions(
 
 
 class RTIProblem(BaseProblem):
-    """2D Rayleigh-Taylor instability problem with gravity and mixed boundary conditions."""
+    """2D Rayleigh-Taylor instability problem following Athena++ conventions."""
 
     def create_grid(
         self, backend: str = "numpy", device: Optional[str] = None, debug: bool = False
     ) -> Grid2D:
-        """Create 2D grid for RTI problem."""
+        """Create 2D grid for RTI problem with Dirichlet boundary conditions."""
         # Debug mode: validate backend and device availability
         if debug:
             if backend == "torch":
@@ -151,12 +186,13 @@ class RTIProblem(BaseProblem):
         Ly = float(self.config["grid"]["Ly"])
         dealias = bool(self.config["grid"].get("dealias", True))
         fft_workers = int(self.config["grid"].get("fft_workers", 1))
-        # Basis selection (default to Legendre for RTI)
+        
+        # Use Legendre basis for non-periodic boundary conditions
         basis_x = str(self.config["grid"].get("basis_x", "legendre")).lower()
         basis_y = str(self.config["grid"].get("basis_y", "legendre")).lower()
 
-        # Get boundary condition configuration
-        bc_config = self.config.get("boundary_conditions", {})
+        # Dirichlet boundary conditions on all four sides
+        bc = self.config["grid"].get("bc", "dirichlet")
         
         grid = Grid2D(
             Nx=Nx,
@@ -171,11 +207,8 @@ class RTIProblem(BaseProblem):
             precision=self.precision,
             basis_x=basis_x,
             basis_y=basis_y,
-            bc_config=bc_config,
+            bc=bc,
         )
-
-        # With Legendre basis in y, boundary conditions are naturally enforced
-        # No manual BC application needed
 
         return grid
 
@@ -186,55 +219,54 @@ class RTIProblem(BaseProblem):
     def apply_boundary_conditions(self, U: np.ndarray) -> np.ndarray:
         """Apply boundary conditions for RTI problem.
         
-        Applies mixed boundary conditions: Dirichlet on bottom, Neumann on top/left/right.
+        With Legendre basis and Dirichlet BCs, the boundary conditions are handled
+        naturally by the spectral method. No manual application needed.
         """
-        # Apply boundary conditions using the grid's method
-        return self.grid.apply_boundary_conditions(U, self.equations)
+        return U
+
+    def get_solver_class(self):
+        """Get the solver class for this problem."""
+        return SpectralSolver2D
 
     def create_initial_conditions(self, grid: Grid2D):
-        """Create Rayleigh-Taylor instability initial conditions."""
-        # Get configuration parameters
+        """Create RTI initial conditions following Athena++ conventions."""
+        # Extract parameters from configuration
         ic_config = self.config["initial_conditions"]
-        rho_bottom = float(ic_config["rho_bottom"])
-        rho_top = float(ic_config["rho_top"])
-        pressure_bottom = float(ic_config["pressure_bottom"])
-        shear_thickness = float(ic_config.get("shear_thickness", 0.02))
-        perturb_eps = float(ic_config.get("perturb_eps", 0.01))
-        perturb_sigma = float(ic_config.get("perturb_sigma", 0.02))
-        perturb_kx = int(ic_config.get("perturb_kx", 2))
-        perturb_ky = int(ic_config.get("perturb_ky", 1))
-
-        X, Y = grid.xy_mesh()
-        # Gravity from config
-        gy = 0.0
+        rho_heavy = float(ic_config.get("rho_heavy", 2.0))
+        rho_light = float(ic_config.get("rho_light", 1.0))
+        pressure_top = float(ic_config.get("pressure_top", 2.5))
+        
+        # Perturbation parameters
+        perturb_amplitude = float(ic_config.get("perturb_amplitude", 0.01))
+        perturb_wavelength = float(ic_config.get("perturb_wavelength", 1.0))
+        interface_thickness = float(ic_config.get("interface_thickness", 0.05))
+        
+        # Gravity configuration
+        gravity = 0.0
         if self.gravity_config and self.gravity_config.get("enabled", False):
-            gy = float(self.gravity_config.get("gy", 0.0))
+            gravity = float(self.gravity_config.get("gy", 1.0))
+        
+        # Get coordinate arrays
+        X, Y = grid.xy_mesh()
+        
         U = rti_initial_conditions(
             x=X,
             y=Y,
-            rho_bottom=rho_bottom,
-            rho_top=rho_top,
-            pressure_bottom=pressure_bottom,
+            rho_heavy=rho_heavy,
+            rho_light=rho_light,
+            pressure_top=pressure_top,
             gamma=self.gamma,
-            shear_thickness=shear_thickness,
-            perturb_eps=perturb_eps,
-            perturb_sigma=perturb_sigma,
-            perturb_kx=perturb_kx,
-            perturb_ky=perturb_ky,
-            gy=gy,
+            gravity=gravity,
+            interface_thickness=interface_thickness,
+            perturb_amplitude=perturb_amplitude,
+            perturb_wavelength=perturb_wavelength,
+            grid=grid,
         )
-        
-        # With Legendre basis, boundary conditions are naturally enforced
-        # No manual BC application needed
         
         return U
 
     def create_visualization(self, solver, t: float, U):
         """Create visualization for current state."""
-        # With Legendre basis, boundary conditions are naturally enforced
-        # No manual BC application needed
-        
-        # Save frame for video generation
         frames_dir = os.path.join(self.outdir, "frames")
         os.makedirs(frames_dir, exist_ok=True)
         
@@ -243,13 +275,9 @@ class RTIProblem(BaseProblem):
         frame_dpi = int(video_config.get("frame_dpi", 150))
         frame_scale = float(video_config.get("scale", 1.0))
         
-        # Calculate figure size based on scale
-        base_size = 12
-        figsize = (base_size * frame_scale, 8 * frame_scale)
-        
         # Create frame plot
-        fig, axs = plt.subplots(2, 2, figsize=figsize, constrained_layout=True)
-        fig.suptitle(f"Rayleigh-Taylor Instability at t={t:.3f}", fontsize=14)
+        fig, axs = plt.subplots(2, 2, figsize=(12 * frame_scale, 10 * frame_scale), constrained_layout=True)
+        fig.suptitle(f"RTI at t={t:.3f}", fontsize=14)
         
         x, y = solver.grid.xy_mesh()
         rho, u, v, p = solver.equations.primitive(U)
@@ -327,7 +355,7 @@ class RTIProblem(BaseProblem):
             x, y = solver.grid.xy_mesh()
             rho, u, v, p = solver.equations.primitive(solver.U)
 
-            # Convert to numpy if tensors
+            # Convert to numpy if needed
             x = self.convert_torch_to_numpy(x)[0]
             y = self.convert_torch_to_numpy(y)[0]
             rho = self.convert_torch_to_numpy(rho)[0]
@@ -335,41 +363,49 @@ class RTIProblem(BaseProblem):
             v = self.convert_torch_to_numpy(v)[0]
             p = self.convert_torch_to_numpy(p)[0]
 
-            # Figure
+            # Create figure and axes
             fig, axs = plt.subplots(2, 2, figsize=(12, 8), constrained_layout=True)
-            fig.suptitle(f"Rayleigh-Taylor Instability at t={solver.t:.3f}")
+            fig.suptitle(f"Final RTI State at t={solver.t:.3f}", fontsize=14)
 
+            # Density
             im1 = axs[0, 0].contourf(x, y, rho, levels=20, cmap='viridis')
-            axs[0, 0].set_title('Density'); axs[0, 0].set_aspect('equal'); plt.colorbar(im1, ax=axs[0, 0])
+            axs[0, 0].set_xlabel("x")
+            axs[0, 0].set_ylabel("y")
+            axs[0, 0].set_title("Density")
+            axs[0, 0].set_aspect('equal')
+            plt.colorbar(im1, ax=axs[0, 0])
 
+            # Velocity magnitude
             vel_mag = _np.sqrt(u**2 + v**2)
             im2 = axs[0, 1].contourf(x, y, vel_mag, levels=20, cmap='plasma')
-            axs[0, 1].set_title('Velocity Magnitude'); axs[0, 1].set_aspect('equal'); plt.colorbar(im2, ax=axs[0, 1])
+            axs[0, 1].set_xlabel("x")
+            axs[0, 1].set_ylabel("y")
+            axs[0, 1].set_title("Velocity Magnitude")
+            axs[0, 1].set_aspect('equal')
+            plt.colorbar(im2, ax=axs[0, 1])
 
+            # Pressure
             im3 = axs[1, 0].contourf(x, y, p, levels=20, cmap='coolwarm')
-            axs[1, 0].set_title('Pressure'); axs[1, 0].set_aspect('equal'); plt.colorbar(im3, ax=axs[1, 0])
+            axs[1, 0].set_xlabel("x")
+            axs[1, 0].set_ylabel("y")
+            axs[1, 0].set_title("Pressure")
+            axs[1, 0].set_aspect('equal')
+            plt.colorbar(im3, ax=axs[1, 0])
 
+            # Velocity vectors (subsampled for clarity)
             skip = max(1, min(x.shape[0]//16, x.shape[1]//16))
-            axs[1, 1].quiver(x[::skip, ::skip], y[::skip, ::skip], u[::skip, ::skip], v[::skip, ::skip], scale=50, alpha=0.7)
-            axs[1, 1].set_title('Velocity Vectors'); axs[1, 1].set_aspect('equal')
+            axs[1, 1].quiver(x[::skip, ::skip], y[::skip, ::skip], 
+                            u[::skip, ::skip], v[::skip, ::skip], 
+                            scale=50, alpha=0.7)
+            axs[1, 1].set_xlabel("x")
+            axs[1, 1].set_ylabel("y")
+            axs[1, 1].set_title("Velocity Vectors")
+            axs[1, 1].set_aspect('equal')
 
-            outpath = os.path.join(self.outdir, f"fields_t{solver.t:.3f}.png")
-            fig.savefig(outpath, dpi=150)
+            final_plot_path = os.path.join(self.outdir, "final_state.png")
+            fig.savefig(final_plot_path, dpi=150)
             plt.close(fig)
-        except Exception:
-            # If plotting fails, continue silently after snapshot
-            pass
+            print(f"Saved final visualization: {final_plot_path}")
 
-        # Plot conserved quantities if history is available
-        if (
-            hasattr(solver, "history")
-            and solver.history
-            and len(solver.history.get("time", [])) > 0
-        ):
-            plot_conserved_time_series(
-                solver.history, outpath=os.path.join(self.outdir, "conserved.png")
-            )
-
-    def get_solver_class(self):
-        """Get 2D solver class."""
-        return SpectralSolver2D
+        except Exception as e:
+            print(f"Error creating final visualization: {e}")

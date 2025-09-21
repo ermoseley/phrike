@@ -291,9 +291,11 @@ class SpectralArtificialViscosity:
             # Preserve tensor type/device if U is a torch tensor
             try:
                 import torch  # type: ignore
-                if isinstance(U, torch.Tensor) or (isinstance(U, (list, tuple)) and len(U) > 0 and hasattr(U[0], 'device')):
-                    base = U if isinstance(U, torch.Tensor) else U[0]
-                    viscosity = torch.full_like(base, nu_val)
+                if isinstance(U, torch.Tensor):
+                    # Create a per-cell scalar viscosity field matching a single component's shape
+                    viscosity = torch.full_like(U[0], nu_val)
+                elif isinstance(U, (list, tuple)) and len(U) > 0 and hasattr(U[0], 'device'):
+                    viscosity = torch.full_like(U[0], nu_val)
                 else:
                     viscosity = np.full_like(U[0], nu_val)
             except Exception:
@@ -351,12 +353,13 @@ class SpectralArtificialViscosity:
         Returns:
             Viscosity term ∇·(ν ∇U)
         """
-        if hasattr(grid, 'dx1'):  # 1D
-            return self._compute_viscosity_term_1d(U_component, viscosity, grid)
+        # Prefer most-specific dimensionality detection first
+        if hasattr(grid, 'dx1') and hasattr(grid, 'dy1') and hasattr(grid, 'dz1'):  # 3D
+            return self._compute_viscosity_term_3d(U_component, viscosity, grid)
         elif hasattr(grid, 'dx1') and hasattr(grid, 'dy1'):  # 2D
             return self._compute_viscosity_term_2d(U_component, viscosity, grid)
-        elif hasattr(grid, 'dx1') and hasattr(grid, 'dy1') and hasattr(grid, 'dz1'):  # 3D
-            return self._compute_viscosity_term_3d(U_component, viscosity, grid)
+        elif hasattr(grid, 'dx1'):  # 1D
+            return self._compute_viscosity_term_1d(U_component, viscosity, grid)
         else:
             raise ValueError("Grid does not support required differentiation methods")
     
