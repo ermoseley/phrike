@@ -1,0 +1,63 @@
+# 1D Gaussian Wave Packet Test Configuration
+# Simple traveling wave to understand proper setup
+
+problem:
+  name: "gaussian_wave1d"
+  description: "1D Gaussian traveling wave packet test"
+
+# Grid configuration
+grid:
+  N: 64                    # Number of modes
+  Lx: 1.0                  # Domain length
+  basis: "legendre"        # Use Legendre basis
+  bc: "dirichlet"          # Dirichlet boundary conditions
+  dealias: false           # No dealiasing for Legendre
+  precision: "double"      # Use double precision
+
+# Initial conditions
+initial_conditions:
+  rho0: 1.0                # Background density
+  u0: 0.0                  # Background velocity
+  p0: 1.0                  # Background pressure
+  amplitude: 0.1           # Wave amplitude
+  sigma: 0.05              # Wave packet width
+  x0: 0.5                  # Initial position (center)
+  wave_type: "traveling"   # Traveling wave
+
+# Physics
+physics:
+  gamma: 1.4               # Adiabatic index
+
+# Integration
+integration:
+  t0: 0.0                  # Start time
+  t_end: 1.0               # End time
+  dt: 1e-4                 # Initial time step
+  scheme: "rk4"            # 4th order Runge-Kutta
+  cfl: 0.5                 # CFL number
+  adaptive_dt: true        # Use adaptive time stepping
+
+# Artificial viscosity (small amount for stability)
+artificial_viscosity:
+  enabled: true
+  nu_max: 1e-4             # Maximum viscosity
+  s_ref: 1.0               # Reference strain rate
+  s_min: 0.1               # Minimum strain rate
+  p: 2.0                   # Viscosity power law
+  epsilon: 1e-12           # Small number to avoid division by zero
+  variable_weights:
+    density: 1.0
+    momentum: 1.0
+    energy: 1.0
+  sensor_variable: "density"
+  diagnostic_output: false
+
+# Output
+io:
+  outdir: "outputs/gaussian_wave1d_test"
+  output_interval: 0.1     # Output every 0.1 time units
+
+# Monitoring
+monitoring:
+  step_interval: 10        # Print status every 10 steps
+  verbose: true            # Verbose output

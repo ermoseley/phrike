@@ -817,16 +817,41 @@ class Grid2D:
         
         if not self.bc_config:
             # Default all boundaries to global bc if provided
-            # Accept strings: "dirichlet" or "neumann"
-            if isinstance(self.bc, str) and self.bc in ("dirichlet", "neumann"):
+            # Accept strings: "dirichlet" (treated as reflective wall) or "neumann"
+            if isinstance(self.bc, str) and self.bc in ("dirichlet", "neumann", "wall", "reflective"):
                 default = self.bc
-                for boundary in ["left", "right", "top", "bottom"]:
-                    self._bc_boundary_map[boundary] = {
-                        "density": default,
-                        "momentum_x": default,
-                        "momentum_y": default,
-                        "pressure": default,
-                    }
+                if default in ("neumann",):
+                    for boundary in ["left", "right", "top", "bottom"]:
+                        self._bc_boundary_map[boundary] = {
+                            "density": "neumann",
+                            "momentum_x": "neumann",
+                            "momentum_y": "neumann",
+                            "pressure": "neumann",
+                        }
+                else:
+                    # Treat "dirichlet"/"wall"/"reflective" as solid reflective walls:
+                    # - zero normal momentum (Dirichlet u_n=0)
+                    # - zero-gradient for tangential momentum, density, and pressure (Neumann)
+                    # Left/right: normal is x
+                    for boundary in ["left", "right"]:
+                        self._bc_boundary_map[boundary] = {
+                            "density": "neumann",
+                            "momentum_x": "dirichlet",  # u_n = 0
+                            "momentum_y": "neumann",    # tangential
+                            "pressure": "neumann",
+                        }
+                        # Provide Dirichlet value for momentum_x → 0
+                        self._dirichlet_values_map[f"{boundary}_momentum_x"] = 0.0
+                    # Bottom/top: normal is y
+                    for boundary in ["bottom", "top"]:
+                        self._bc_boundary_map[boundary] = {
+                            "density": "neumann",
+                            "momentum_x": "neumann",    # tangential
+                            "momentum_y": "dirichlet",  # u_n = 0
+                            "pressure": "neumann",
+                        }
+                        # Provide Dirichlet value for momentum_y → 0
+                        self._dirichlet_values_map[f"{boundary}_momentum_y"] = 0.0
             return
             
         # Parse boundary-specific configurations

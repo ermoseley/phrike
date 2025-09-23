@@ -22,3 +22,4 @@ vids/
 .mypy_cache/
 dgpy/
 FastGaussQuadrature.jl/
+quail/

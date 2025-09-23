@@ -1,0 +1,72 @@
+problem:
+  name: "gaussian_wave2d"
+  description: "2D Gaussian density and pressure profile in center - Fourier basis"
+
+grid:
+  Nx: 128
+  Ny: 128
+  Lx: 1.0
+  Ly: 1.0
+  basis_x: "fourier"
+  basis_y: "fourier"
+  bc: "periodic"
+  dealias: true
+  precision: "double"
+
+initial_conditions:
+  rho0: 1.0
+  u0: 0.0
+  v0: 0.0
+  p0: 1.0
+  amplitude: 0.1
+  sigma: 0.05
+  x0: 0.5
+  y0: 0.5
+  angle: 0.0 # Zero velocity case
+
+physics:
+  gamma: 1.4
+  gravity:
+    enabled: false
+
+integration:
+  t0: 0.0
+  t_end: 1.0
+  dt: 1e-4
+  scheme: "rk4"
+  cfl: 0.5
+  adaptive_dt: true
+  spectral_filter:
+    enabled: true
+    p: 8
+    alpha: 36.0
+
+artificial_viscosity:
+  enabled: true
+  nu_max: 1e-4
+  s_ref: 1.0
+  s_min: 0.1
+  p: 2.0
+  epsilon: 1e-12
+  variable_weights:
+    density: 1.0
+    momentum_x: 1.0
+    momentum_y: 1.0
+    energy: 1.0
+  sensor_variable: "density"
+  diagnostic_output: false
+
+io:
+  outdir: "outputs/gaussian_center_fourier"
+  output_interval: 0.1
+  save_frames: true
+  frames_dir: "frames"
+
+monitoring:
+  step_interval: 10
+  verbose: true
+
+visualization:
+  create_plots: true
+  plot_interval: 0.1
+  save_plots: true

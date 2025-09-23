@@ -12,6 +12,8 @@ from .problem_list.rti import RTIProblem
 from .problem_list.hse_1d import HSE1DProblem
 from .problem_list.rti_1d import RTI1DProblem
 from .problem_list.uniform2d import Uniform2DProblem
+from .problem_list.gaussian_wave2d import GaussianWave2DProblem
+from .problem_list.gaussian_wave2d_y import GaussianWave2DYProblem
 
 
 # Register all problems
@@ -26,3 +28,5 @@ ProblemRegistry.register("rti", RTIProblem)
 ProblemRegistry.register("hse_1d", HSE1DProblem)
 ProblemRegistry.register("rti_1d", RTI1DProblem)
 ProblemRegistry.register("uniform_2d", Uniform2DProblem)
+ProblemRegistry.register("gaussian_wave2d", GaussianWave2DProblem)
+ProblemRegistry.register("gaussian_wave2d_y", GaussianWave2DYProblem)
