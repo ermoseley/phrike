@@ -14,6 +14,10 @@ from .problem_list.rti_1d import RTI1DProblem
 from .problem_list.uniform2d import Uniform2DProblem
 from .problem_list.gaussian_wave2d import GaussianWave2DProblem
 from .problem_list.gaussian_wave2d_y import GaussianWave2DYProblem
+from .problem_list.alfven1d import Alfven1DProblem
+from .problem_list.orszag_tang2d import OrszagTang2DProblem
+from .problem_list.alfven3d import Alfven3DProblem
+from .problem_list.mhd_turb3d import MHDTurb3DProblem
 
 
 # Register all problems
@@ -30,3 +34,7 @@ ProblemRegistry.register("rti_1d", RTI1DProblem)
 ProblemRegistry.register("uniform_2d", Uniform2DProblem)
 ProblemRegistry.register("gaussian_wave2d", GaussianWave2DProblem)
 ProblemRegistry.register("gaussian_wave2d_y", GaussianWave2DYProblem)
+ProblemRegistry.register("alfven1d", Alfven1DProblem)
+ProblemRegistry.register("orszag_tang2d", OrszagTang2DProblem)
+ProblemRegistry.register("alfven3d", Alfven3DProblem)
+ProblemRegistry.register("mhd_turb3d", MHDTurb3DProblem)

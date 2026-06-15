@@ -1,0 +1,52 @@
+# 3D circularly polarized Alfven wave (propagating along x) — 3D MHD validation.
+#   python -m phrike alfven3d --config configs/alfven3d.yaml --backend torch --device mps
+problem: alfven3d
+
+grid:
+  Nx: 64
+  Ny: 8
+  Nz: 8
+  Lx: 1.0
+  Ly: 1.0
+  Lz: 1.0
+  dealias: true
+  precision: double
+
+physics:
+  gamma: 1.6666666666666667
+  mhd:
+    enabled: true
+    resistivity: 0.0
+    viscosity: 0.0
+    divergence_clean: projection
+    project_each_substage: true
+
+integration:
+  t0: 0.0
+  t_end: 1.0
+  cfl: 0.3
+  scheme: rk4
+  output_interval: 0.25
+  checkpoint_interval: 0.0
+  spectral_filter:
+    enabled: true
+    p: 8
+    alpha: 36.0
+
+initial_conditions:
+  rho0: 1.0
+  p0: 0.1
+  B0: 1.0
+  b1: 0.1
+  m: 1
+  direction: 1
+
+io:
+  outdir: outputs/alfven3d
+
+monitoring:
+  enabled: true
+  step_interval: 25
+  include_conservation: true
+  include_timestep: true
+  include_time: true

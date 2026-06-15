@@ -635,3 +635,466 @@ class EulerEquations3D:
             "momentum_z": momz,
             "energy": total_energy,
         }
+
+
+# ===================== Ideal MHD (mu0 = 1) =====================
+#
+# State vector (8 components), chosen so the first 5 match the Euler classes:
+#   U = [ rho, rho*ux, rho*uy, rho*uz, E, Bx, By, Bz ]
+# with total energy and total (thermal+magnetic) pressure
+#   E  = p/(gamma-1) + 0.5*rho*|u|^2 + 0.5*|B|^2
+#   p* = p + 0.5*|B|^2
+# Thermal pressure recovery subtracts the magnetic energy:
+#   p  = (gamma-1) * ( E - 0.5*rho*|u|^2 - 0.5*|B|^2 )
+#
+# The magnetic-flux rows form the antisymmetric (uB - Bu) tensor, i.e. the
+# induction equation  dB/dt + div(uB - Bu) = 0  <=>  dB/dt = curl(u x B).
+# See mhd_plan.md for the full derivation and references.
+
+
+def _is_torch(x: Array) -> bool:
+    return _TORCH_AVAILABLE and isinstance(x, torch.Tensor)
+
+
+@dataclass
+class MHDEquations1D:
+    """Ideal compressible MHD in 1D (variation along x only), conservative form.
+
+    State U has shape (8, N): [rho, rho*ux, rho*uy, rho*uz, E, Bx, By, Bz].
+    Only the x-flux is needed; the Bx flux row is identically zero so Bx stays
+    constant (the 1D solenoidal constraint d(Bx)/dx = 0).
+    """
+
+    gamma: float = 5.0 / 3.0
+
+    def primitive(self, U: Array):
+        rho = U[0]
+        ux = U[1] / rho
+        uy = U[2] / rho
+        uz = U[3] / rho
+        E = U[4]
+        Bx = U[5]
+        By = U[6]
+        Bz = U[7]
+        kinetic = 0.5 * rho * (ux * ux + uy * uy + uz * uz)
+        magnetic = 0.5 * (Bx * Bx + By * By + Bz * Bz)
+        p = (self.gamma - 1.0) * (E - kinetic - magnetic)
+        return rho, ux, uy, uz, p, Bx, By, Bz
+
+    def conservative(self, rho, ux, uy, uz, p, Bx, By, Bz) -> Array:
+        momx = rho * ux
+        momy = rho * uy
+        momz = rho * uz
+        E = (
+            p / (self.gamma - 1.0)
+            + 0.5 * rho * (ux * ux + uy * uy + uz * uz)
+            + 0.5 * (Bx * Bx + By * By + Bz * Bz)
+        )
+        if _is_torch(rho):
+            return torch.stack([rho, momx, momy, momz, E, Bx, By, Bz], dim=0)
+        return np.array([rho, momx, momy, momz, E, Bx, By, Bz])
+
+    def flux(self, U: Array) -> Array:
+        rho, ux, uy, uz, p, Bx, By, Bz = self.primitive(U)
+        E = U[4]
+        uB = ux * Bx + uy * By + uz * Bz
+        pstar = p + 0.5 * (Bx * Bx + By * By + Bz * Bz)
+        mx = rho * ux
+        if _is_torch(U):
+            Fx = torch.stack(
+                [
+                    mx,
+                    mx * ux + pstar - Bx * Bx,
+                    mx * uy - Bx * By,
+                    mx * uz - Bx * Bz,
+                    (E + pstar) * ux - Bx * uB,
+                    torch.zeros_like(rho),
+                    ux * By - uy * Bx,
+                    ux * Bz - uz * Bx,
+                ],
+                dim=0,
+            )
+            return Fx
+        Fx = np.stack(
+            [
+                mx,
+                mx * ux + pstar - Bx * Bx,
+                mx * uy - Bx * By,
+                mx * uz - Bx * Bz,
+                (E + pstar) * ux - Bx * uB,
+                np.zeros_like(rho),
+                ux * By - uy * Bx,
+                ux * Bz - uz * Bx,
+            ],
+            axis=0,
+        )
+        return Fx
+
+    def max_wave_speed(self, U: Array) -> float:
+        """Max signal speed in x: |ux| + c_f,x (exact fast magnetosonic in x)."""
+        rho, ux, uy, uz, p, Bx, By, Bz = self.primitive(U)
+        if _is_torch(U):
+            a2 = self.gamma * p / rho
+            b2 = (Bx * Bx + By * By + Bz * Bz) / rho
+            cax2 = (Bx * Bx) / rho
+            disc = torch.clamp((a2 + b2) * (a2 + b2) - 4.0 * a2 * cax2, min=0.0)
+            cf = torch.sqrt(0.5 * (a2 + b2 + torch.sqrt(disc)))
+            return float(torch.max(torch.abs(ux) + cf).item())
+        a2 = self.gamma * p / rho
+        b2 = (Bx * Bx + By * By + Bz * Bz) / rho
+        cax2 = (Bx * Bx) / rho
+        disc = np.maximum((a2 + b2) ** 2 - 4.0 * a2 * cax2, 0.0)
+        cf = np.sqrt(0.5 * (a2 + b2 + np.sqrt(disc)))
+        return float(np.max(np.abs(ux) + cf))
+
+    def conserved_quantities(self, U: Array) -> Dict[str, float]:
+        rho, ux, uy, uz, p, Bx, By, Bz = self.primitive(U)
+        b2 = Bx * Bx + By * By + Bz * Bz
+        total_energy = (
+            p / (self.gamma - 1.0)
+            + 0.5 * rho * (ux * ux + uy * uy + uz * uz)
+            + 0.5 * b2
+        )
+        cross_hel = ux * Bx + uy * By + uz * Bz
+        return {
+            "mass": float(rho.sum()),
+            "momentum_x": float((rho * ux).sum()),
+            "momentum_y": float((rho * uy).sum()),
+            "momentum_z": float((rho * uz).sum()),
+            "energy": float(total_energy.sum()),
+            "magnetic_energy": float((0.5 * b2).sum()),
+            "cross_helicity": float(cross_hel.sum()),
+        }
+
+
+@dataclass
+class MHDEquations2D:
+    """Ideal compressible MHD in 2D (a.k.a. 2.5D: fields depend on x,y only,
+    but all three vector components are retained), conservative form.
+
+    State U has shape (8, Ny, Nx): [rho, rho*ux, rho*uy, rho*uz, E, Bx, By, Bz].
+    flux() returns (Fx, Fy) (the x- and y-flux tensors); Bz is advected via the
+    in-plane induction terms. The solenoidal constraint div(B)=dxBx+dyBy=0 is
+    maintained by Helmholtz projection in the solver (Grid2D.project_solenoidal).
+    """
+
+    gamma: float = 5.0 / 3.0
+
+    def primitive(self, U: Array):
+        rho = U[0]
+        ux = U[1] / rho
+        uy = U[2] / rho
+        uz = U[3] / rho
+        E = U[4]
+        Bx = U[5]
+        By = U[6]
+        Bz = U[7]
+        kinetic = 0.5 * rho * (ux * ux + uy * uy + uz * uz)
+        magnetic = 0.5 * (Bx * Bx + By * By + Bz * Bz)
+        p = (self.gamma - 1.0) * (E - kinetic - magnetic)
+        return rho, ux, uy, uz, p, Bx, By, Bz
+
+    def conservative(self, rho, ux, uy, uz, p, Bx, By, Bz) -> Array:
+        momx = rho * ux
+        momy = rho * uy
+        momz = rho * uz
+        E = (
+            p / (self.gamma - 1.0)
+            + 0.5 * rho * (ux * ux + uy * uy + uz * uz)
+            + 0.5 * (Bx * Bx + By * By + Bz * Bz)
+        )
+        if _is_torch(rho):
+            return torch.stack([rho, momx, momy, momz, E, Bx, By, Bz], dim=0)
+        return np.array([rho, momx, momy, momz, E, Bx, By, Bz])
+
+    def flux(self, U: Array):
+        rho, ux, uy, uz, p, Bx, By, Bz = self.primitive(U)
+        E = U[4]
+        uB = ux * Bx + uy * By + uz * Bz
+        pstar = p + 0.5 * (Bx * Bx + By * By + Bz * Bz)
+        mx = rho * ux
+        my = rho * uy
+        if _is_torch(U):
+            zero = torch.zeros_like(rho)
+            Fx = torch.stack(
+                [
+                    mx,
+                    mx * ux + pstar - Bx * Bx,
+                    mx * uy - Bx * By,
+                    mx * uz - Bx * Bz,
+                    (E + pstar) * ux - Bx * uB,
+                    zero,
+                    ux * By - uy * Bx,
+                    ux * Bz - uz * Bx,
+                ],
+                dim=0,
+            )
+            Fy = torch.stack(
+                [
+                    my,
+                    my * ux - By * Bx,
+                    my * uy + pstar - By * By,
+                    my * uz - By * Bz,
+                    (E + pstar) * uy - By * uB,
+                    uy * Bx - ux * By,
+                    zero,
+                    uy * Bz - uz * By,
+                ],
+                dim=0,
+            )
+            return Fx, Fy
+        zero = np.zeros_like(rho)
+        Fx = np.stack(
+            [
+                mx,
+                mx * ux + pstar - Bx * Bx,
+                mx * uy - Bx * By,
+                mx * uz - Bx * Bz,
+                (E + pstar) * ux - Bx * uB,
+                zero,
+                ux * By - uy * Bx,
+                ux * Bz - uz * Bx,
+            ],
+            axis=0,
+        )
+        Fy = np.stack(
+            [
+                my,
+                my * ux - By * Bx,
+                my * uy + pstar - By * By,
+                my * uz - By * Bz,
+                (E + pstar) * uy - By * uB,
+                uy * Bx - ux * By,
+                zero,
+                uy * Bz - uz * By,
+            ],
+            axis=0,
+        )
+        return Fx, Fy
+
+    def max_wave_speed(self, U: Array) -> float:
+        """Conservative isotropic bound: max(|ux|,|uy|) + sqrt(a^2 + b^2)."""
+        rho, ux, uy, uz, p, Bx, By, Bz = self.primitive(U)
+        if _is_torch(U):
+            a2 = self.gamma * p / rho
+            b2 = (Bx * Bx + By * By + Bz * Bz) / rho
+            fast = torch.sqrt(torch.clamp(a2 + b2, min=0.0))
+            comp = torch.maximum(torch.abs(ux), torch.abs(uy)) + fast
+            return float(torch.max(comp).item())
+        a2 = self.gamma * p / rho
+        b2 = (Bx * Bx + By * By + Bz * Bz) / rho
+        fast = np.sqrt(np.maximum(a2 + b2, 0.0))
+        comp = np.maximum(np.abs(ux), np.abs(uy)) + fast
+        return float(np.max(comp))
+
+    def conserved_quantities(self, U: Array) -> Dict[str, float]:
+        rho, ux, uy, uz, p, Bx, By, Bz = self.primitive(U)
+        b2 = Bx * Bx + By * By + Bz * Bz
+        total_energy = (
+            p / (self.gamma - 1.0)
+            + 0.5 * rho * (ux * ux + uy * uy + uz * uz)
+            + 0.5 * b2
+        )
+        cross_hel = ux * Bx + uy * By + uz * Bz
+        return {
+            "mass": float(rho.sum()),
+            "momentum_x": float((rho * ux).sum()),
+            "momentum_y": float((rho * uy).sum()),
+            "momentum_z": float((rho * uz).sum()),
+            "energy": float(total_energy.sum()),
+            "magnetic_energy": float((0.5 * b2).sum()),
+            "cross_helicity": float(cross_hel.sum()),
+        }
+
+
+@dataclass
+class MHDEquations3D:
+    """Ideal compressible MHD in 3D, conservative form.
+
+    State U has shape (8, Nz, Ny, Nx): [rho, rho*ux, rho*uy, rho*uz, E, Bx, By, Bz].
+    flux() returns the 8-component tensors (Fx, Fy, Fz). The solenoidal
+    constraint div(B)=0 is maintained by Helmholtz projection in the solver
+    (see Grid3D.project_solenoidal), not by the flux itself.
+    """
+
+    gamma: float = 5.0 / 3.0
+
+    def primitive(self, U: Array):
+        rho = U[0]
+        ux = U[1] / rho
+        uy = U[2] / rho
+        uz = U[3] / rho
+        E = U[4]
+        Bx = U[5]
+        By = U[6]
+        Bz = U[7]
+        kinetic = 0.5 * rho * (ux * ux + uy * uy + uz * uz)
+        magnetic = 0.5 * (Bx * Bx + By * By + Bz * Bz)
+        p = (self.gamma - 1.0) * (E - kinetic - magnetic)
+        return rho, ux, uy, uz, p, Bx, By, Bz
+
+    def conservative(self, rho, ux, uy, uz, p, Bx, By, Bz) -> Array:
+        momx = rho * ux
+        momy = rho * uy
+        momz = rho * uz
+        E = (
+            p / (self.gamma - 1.0)
+            + 0.5 * rho * (ux * ux + uy * uy + uz * uz)
+            + 0.5 * (Bx * Bx + By * By + Bz * Bz)
+        )
+        if _is_torch(rho):
+            return torch.stack([rho, momx, momy, momz, E, Bx, By, Bz], dim=0)
+        return np.array([rho, momx, momy, momz, E, Bx, By, Bz])
+
+    def flux(self, U: Array):
+        rho, ux, uy, uz, p, Bx, By, Bz = self.primitive(U)
+        E = U[4]
+        uB = ux * Bx + uy * By + uz * Bz
+        pstar = p + 0.5 * (Bx * Bx + By * By + Bz * Bz)
+        mx = rho * ux
+        my = rho * uy
+        mz = rho * uz
+        if _is_torch(U):
+            zero = torch.zeros_like(rho)
+            Fx = torch.stack(
+                [
+                    mx,
+                    mx * ux + pstar - Bx * Bx,
+                    mx * uy - Bx * By,
+                    mx * uz - Bx * Bz,
+                    (E + pstar) * ux - Bx * uB,
+                    zero,
+                    ux * By - uy * Bx,
+                    ux * Bz - uz * Bx,
+                ],
+                dim=0,
+            )
+            Fy = torch.stack(
+                [
+                    my,
+                    my * ux - By * Bx,
+                    my * uy + pstar - By * By,
+                    my * uz - By * Bz,
+                    (E + pstar) * uy - By * uB,
+                    uy * Bx - ux * By,
+                    zero,
+                    uy * Bz - uz * By,
+                ],
+                dim=0,
+            )
+            Fz = torch.stack(
+                [
+                    mz,
+                    mz * ux - Bz * Bx,
+                    mz * uy - Bz * By,
+                    mz * uz + pstar - Bz * Bz,
+                    (E + pstar) * uz - Bz * uB,
+                    uz * Bx - ux * Bz,
+                    uz * By - uy * Bz,
+                    zero,
+                ],
+                dim=0,
+            )
+            return Fx, Fy, Fz
+        zero = np.zeros_like(rho)
+        Fx = np.stack(
+            [
+                mx,
+                mx * ux + pstar - Bx * Bx,
+                mx * uy - Bx * By,
+                mx * uz - Bx * Bz,
+                (E + pstar) * ux - Bx * uB,
+                zero,
+                ux * By - uy * Bx,
+                ux * Bz - uz * Bx,
+            ],
+            axis=0,
+        )
+        Fy = np.stack(
+            [
+                my,
+                my * ux - By * Bx,
+                my * uy + pstar - By * By,
+                my * uz - By * Bz,
+                (E + pstar) * uy - By * uB,
+                uy * Bx - ux * By,
+                zero,
+                uy * Bz - uz * By,
+            ],
+            axis=0,
+        )
+        Fz = np.stack(
+            [
+                mz,
+                mz * ux - Bz * Bx,
+                mz * uy - Bz * By,
+                mz * uz + pstar - Bz * Bz,
+                (E + pstar) * uz - Bz * uB,
+                uz * Bx - ux * Bz,
+                uz * By - uy * Bz,
+                zero,
+            ],
+            axis=0,
+        )
+        return Fx, Fy, Fz
+
+    def max_wave_speed(self, U: Array) -> float:
+        """Conservative isotropic bound: max(|ux|,|uy|,|uz|) + sqrt(a^2 + b^2).
+
+        Uses c_f <= sqrt(a^2 + b^2) (a = sound speed, b = total Alfven speed).
+        """
+        rho, ux, uy, uz, p, Bx, By, Bz = self.primitive(U)
+        if _is_torch(U):
+            a2 = self.gamma * p / rho
+            b2 = (Bx * Bx + By * By + Bz * Bz) / rho
+            fast = torch.sqrt(torch.clamp(a2 + b2, min=0.0))
+            comp = (
+                torch.maximum(
+                    torch.maximum(torch.abs(ux), torch.abs(uy)), torch.abs(uz)
+                )
+                + fast
+            )
+            return float(torch.max(comp).item())
+        a2 = self.gamma * p / rho
+        b2 = (Bx * Bx + By * By + Bz * Bz) / rho
+        fast = np.sqrt(np.maximum(a2 + b2, 0.0))
+        comp = np.maximum(np.maximum(np.abs(ux), np.abs(uy)), np.abs(uz)) + fast
+        return float(np.max(comp))
+
+    def fast_speed_directional(self, U: Array, axis: int) -> float:
+        """Exact fast magnetosonic speed |u_n| + c_f,n along axis (0=x,1=y,2=z)."""
+        rho, ux, uy, uz, p, Bx, By, Bz = self.primitive(U)
+        un = (ux, uy, uz)[axis]
+        Bn = (Bx, By, Bz)[axis]
+        if _is_torch(U):
+            a2 = self.gamma * p / rho
+            b2 = (Bx * Bx + By * By + Bz * Bz) / rho
+            can2 = (Bn * Bn) / rho
+            disc = torch.clamp((a2 + b2) * (a2 + b2) - 4.0 * a2 * can2, min=0.0)
+            cf = torch.sqrt(0.5 * (a2 + b2 + torch.sqrt(disc)))
+            return float(torch.max(torch.abs(un) + cf).item())
+        a2 = self.gamma * p / rho
+        b2 = (Bx * Bx + By * By + Bz * Bz) / rho
+        can2 = (Bn * Bn) / rho
+        disc = np.maximum((a2 + b2) ** 2 - 4.0 * a2 * can2, 0.0)
+        cf = np.sqrt(0.5 * (a2 + b2 + np.sqrt(disc)))
+        return float(np.max(np.abs(un) + cf))
+
+    def conserved_quantities(self, U: Array) -> Dict[str, float]:
+        rho, ux, uy, uz, p, Bx, By, Bz = self.primitive(U)
+        b2 = Bx * Bx + By * By + Bz * Bz
+        total_energy = (
+            p / (self.gamma - 1.0)
+            + 0.5 * rho * (ux * ux + uy * uy + uz * uz)
+            + 0.5 * b2
+        )
+        cross_hel = ux * Bx + uy * By + uz * Bz
+        return {
+            "mass": float(rho.sum()),
+            "momentum_x": float((rho * ux).sum()),
+            "momentum_y": float((rho * uy).sum()),
+            "momentum_z": float((rho * uz).sum()),
+            "energy": float(total_energy.sum()),
+            "magnetic_energy": float((0.5 * b2).sum()),
+            "cross_helicity": float(cross_hel.sum()),
+        }

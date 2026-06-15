@@ -24,6 +24,25 @@ except Exception:  # Fallback to SciPy's FFT
     scipy_fft_cache_enabled = False
     fftw_cache = None  # type: ignore
 
+try:
+    import os as _os
+    _os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    import finufft as _finufft  # type: ignore
+    _FINUFFT_AVAILABLE = True
+except Exception:
+    _FINUFFT_AVAILABLE = False
+    _finufft = None  # type: ignore
+
+_FINUFFT_NTHREADS = 1 if _TORCH_AVAILABLE else 0  # 0 = auto; 1 avoids OMP conflicts with torch
+_FINUFFT_OPTS: Dict[str, Any] = dict(isign=1, eps=1e-6, modeord=1, nthreads=_FINUFFT_NTHREADS)
+
+
+def _to_np(x: Any) -> np.ndarray:
+    """Convert tensor or array to numpy, handling MPS/CUDA tensors."""
+    if _TORCH_AVAILABLE and torch is not None and isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
 
 def _build_filter_mask(N: int, dealias: bool) -> np.ndarray:
     if not dealias:
@@ -288,6 +307,81 @@ class Grid1D:
         else:
             raise ValueError(f"Unknown basis: {self.basis}")
 
+        # Backend (torch/numpy) setup for periodic Fourier grids. Non-Fourier
+        # bases keep the legacy path (backend set up in set_dirichlet_bc_values).
+        if self._basis_name == "fourier":
+            self._setup_fourier_backend()
+
+    def _setup_fourier_backend(self) -> None:
+        """Set up the array backend (torch device / numpy) for a Fourier grid.
+
+        This was historically (and erroneously) only executed inside
+        ``set_dirichlet_bc_values`` — which is never called for periodic Fourier
+        problems — so a Fourier ``Grid1D`` silently ignored ``backend='torch'``.
+        It is now invoked from ``__post_init__`` so the torch/MPS (Metal) backend
+        works for periodic 1D problems (Euler and MHD).
+        """
+        # Enable FFTW planning cache if available (no-op with SciPy backend)
+        if scipy_fft_cache_enabled and fftw_cache is not None:
+            try:
+                fftw_cache.enable()
+                fftw_cache.set_keepalive_time(60.0)
+            except Exception:
+                pass
+
+        self._use_torch = (
+            (self.backend.lower() == "torch")
+            and _TORCH_AVAILABLE
+            and (self._basis_name == "fourier")
+        )
+        if self._use_torch:
+            assert torch is not None
+            if self.torch_device is None:
+                dev = "cpu"
+                try:
+                    if (
+                        hasattr(torch.backends, "mps")
+                        and torch.backends.mps.is_available()
+                    ):
+                        dev = "mps"
+                    elif torch.cuda.is_available():
+                        dev = "cuda"
+                except Exception:
+                    dev = "cpu"
+                self.torch_device = dev
+
+            _validate_torch_device(self.torch_device, self.debug)
+
+            if self.precision == "single":
+                torch_dtype = torch.float32
+                torch_cdtype = torch.complex64
+            else:
+                torch_dtype = torch.float64
+                torch_cdtype = torch.complex128
+            if self.torch_device == "mps":
+                torch_dtype = torch.float32
+                torch_cdtype = torch.complex64
+
+            self.x = torch.from_numpy(np.asarray(self.x)).to(
+                dtype=torch_dtype, device=self.torch_device
+            )
+            k_t = torch.from_numpy(np.asarray(self.k)).to(
+                dtype=torch_dtype, device=self.torch_device
+            )
+            self.k = k_t
+            self.ik = k_t.to(dtype=torch_cdtype) * (1j)
+            self.dealias_mask = torch.from_numpy(np.asarray(self.dealias_mask)).to(
+                dtype=torch_dtype, device=self.torch_device
+            )
+            self.filter_sigma = torch.from_numpy(np.asarray(self.filter_sigma)).to(
+                dtype=torch_dtype, device=self.torch_device
+            )
+        else:
+            self.k = np.asarray(self.k)
+            self.ik = self.k * (1j)
+            self.dealias_mask = np.asarray(self.dealias_mask)
+            self.filter_sigma = np.asarray(self.filter_sigma)
+
     def set_dirichlet_bc_values(self, values: dict[str, tuple[float, float]]) -> None:
         """Set per-variable Dirichlet boundary values.
 
@@ -351,11 +445,11 @@ class Grid1D:
                 torch_dtype = torch.float64
                 torch_cdtype = torch.complex128
             else:
-                # Fallback to device-based logic (MPS only supports float32)
-                torch_dtype = torch.float32 if self.torch_device == "mps" else torch.float64
-                torch_cdtype = (
-                    torch.complex64 if self.torch_device == "mps" else torch.complex128
-                )
+                torch_dtype = torch.float64
+                torch_cdtype = torch.complex128
+            if self.torch_device == "mps":
+                torch_dtype = torch.float32
+                torch_cdtype = torch.complex64
 
             # Move arrays to torch (including CPU device)
             assert torch is not None
@@ -451,6 +545,77 @@ class Grid1D:
         """
         h = f * g
         return self.apply_spectral_filter(h)
+
+    # --- MHD solenoidal helpers (1D) ---
+    def divergence_x(self, Bx: np.ndarray) -> np.ndarray:
+        """1D spectral divergence d(Bx)/dx using the masked derivative operator."""
+        return self.dx1(Bx)
+
+    def project_solenoidal_x(self, Bx: np.ndarray) -> np.ndarray:
+        """1D Helmholtz (Leray) projection of the x-magnetic field.
+
+        In 1D the only solenoidal constraint is d(Bx)/dx = 0, whose unique
+        periodic solution is Bx = const. The projection therefore keeps only the
+        k=0 (mean) mode of Bx so that div(B) is zero to machine precision. The
+        transverse components By, Bz are unconstrained in 1D and untouched here.
+        """
+        if self._basis_name != "fourier":
+            raise ValueError("project_solenoidal_x requires Fourier basis")
+        if getattr(self, "_use_torch", False) and torch is not None and isinstance(Bx, torch.Tensor):
+            return torch.ones_like(Bx) * torch.mean(Bx)
+        Bx = np.asarray(Bx)
+        return np.full_like(Bx, float(Bx.mean()))
+
+    def laplacian(self, f: np.ndarray) -> np.ndarray:
+        """1D spectral Laplacian d^2/dx^2 (for explicit resistivity/viscosity)."""
+        if self._basis_name != "fourier":
+            raise ValueError("laplacian requires Fourier basis")
+        F = self.rfft(f)
+        F = F * self.dealias_mask * self.filter_sigma
+        if getattr(self, "_use_torch", False) and torch is not None and isinstance(F, torch.Tensor):
+            k2 = (self.k ** 2).to(F.dtype)
+        else:
+            k2 = np.asarray(self.k) ** 2
+        return self.irfft(-k2 * F)
+
+    def evaluate_fourier_at_points_1d(self, f: np.ndarray, xp: np.ndarray) -> np.ndarray:
+        """Evaluate a Fourier-represented field at arbitrary points (Fourier basis only).
+
+        f(x) = (1/N) * Re( sum_k F_k exp(i*k*x) ) with dealias and filter applied.
+        Supports NumPy and PyTorch (including MPS/CUDA); keeps tensors on same device.
+
+        Args:
+            f: Field on grid, shape (..., N); last axis is spatial.
+            xp: Query points, shape (P,).
+
+        Returns:
+            Values at xp, shape (P,). Same dtype/device as f (real).
+        """
+        if self._basis_name != "fourier":
+            raise ValueError("evaluate_fourier_at_points_1d requires Fourier basis")
+        is_torch_input = _TORCH_AVAILABLE and torch is not None and getattr(self, "_use_torch", False) and isinstance(f, torch.Tensor)
+        if is_torch_input:
+            f_np = f.detach().cpu().numpy().astype(np.float64)
+            xp_np = np.asarray(xp.detach().cpu().numpy() if isinstance(xp, torch.Tensor) else xp, dtype=np.float64)
+            device, dtype = f.device, f.dtype
+        else:
+            f_np = np.asarray(f)
+            xp_np = np.asarray(xp, dtype=np.float64)
+        dealias = _to_np(self.dealias_mask)
+        sigma = _to_np(self.filter_sigma)
+        f_flat = np.reshape(f_np, (-1, self.N))
+        F = np.fft.fft(f_flat, axis=-1)
+        F = np.ascontiguousarray((F * dealias * sigma)[0], dtype=np.complex128)
+        if _FINUFFT_AVAILABLE:
+            x_fin = np.ascontiguousarray((2.0 * np.pi / self.Lx) * xp_np)
+            vals = np.real(_finufft.nufft1d2(x_fin, F, **_FINUFFT_OPTS)) / self.N
+        else:
+            k = np.asarray(self.k)
+            E = np.exp(1j * xp_np[:, None] * k[None, :])
+            vals = np.real((E * F[None, :]).sum(axis=1)) / self.N
+        if is_torch_input:
+            return torch.from_numpy(vals.astype(np.float32 if dtype == torch.float32 else np.float64)).to(device=device)
+        return vals.astype(f_np.dtype)
 
     # --- Boundary conditions (1D) ---
     def apply_boundary_conditions(self, U: np.ndarray, equations) -> np.ndarray:
@@ -725,6 +890,16 @@ class Grid2D:
             else:
                 raise ValueError(f"Unknown basis_y: {self.basis_y}")
 
+        # Solenoidal-projection wavenumbers (Fourier x & y only; None otherwise)
+        if self.kx is not None and self.ky is not None:
+            kx_np = np.asarray(self.kx)
+            ky_np = np.asarray(self.ky)
+            self.k2 = kx_np[None, :] ** 2 + ky_np[:, None] ** 2
+            self.k2_safe = np.where(self.k2 == 0.0, 1.0, self.k2)
+        else:
+            self.k2 = None
+            self.k2_safe = None
+
         # Dealias and filter
         self.dealias_mask = _build_filter_mask_2d(self.Nx, self.Ny, self.dealias)
         self.filter_sigma = np.ones((self.Ny, self.Nx), dtype=float)
@@ -771,11 +946,11 @@ class Grid2D:
                 torch_dtype = torch.float64
                 torch_cdtype = torch.complex128
             else:
-                # Fallback to device-based logic (MPS only supports float32)
-                torch_dtype = torch.float32 if self.torch_device == "mps" else torch.float64
-                torch_cdtype = (
-                    torch.complex64 if self.torch_device == "mps" else torch.complex128
-                )
+                torch_dtype = torch.float64
+                torch_cdtype = torch.complex128
+            if self.torch_device == "mps":
+                torch_dtype = torch.float32
+                torch_cdtype = torch.complex64
 
             self.x = torch.from_numpy(np.asarray(self.x)).to(
                 dtype=torch_dtype, device=self.torch_device
@@ -808,6 +983,13 @@ class Grid2D:
             self.filter_sigma = torch.from_numpy(np.asarray(self.filter_sigma)).to(
                 dtype=torch_dtype, device=self.torch_device
             )
+            if self.k2_safe is not None:
+                self.k2 = torch.from_numpy(np.asarray(self.k2)).to(
+                    dtype=torch_dtype, device=self.torch_device
+                )
+                self.k2_safe = torch.from_numpy(np.asarray(self.k2_safe)).to(
+                    dtype=torch_dtype, device=self.torch_device
+                )
 
     def _parse_boundary_conditions(self) -> None:
         """Parse boundary condition configuration for 2D grid."""
@@ -995,6 +1177,52 @@ class Grid2D:
         F *= self.filter_sigma
         return F
 
+    def evaluate_fourier_at_points(self, f: np.ndarray, xp: np.ndarray, yp: np.ndarray) -> np.ndarray:
+        """Evaluate a Fourier-represented 2D field at arbitrary points (Fourier x and y only).
+
+        f(x,y) = (1/(Nx*Ny)) * Re( sum_{kx,ky} F exp(i*kx*x + i*ky*y) ) with dealias and filter.
+        Supports NumPy and PyTorch (including MPS/CUDA); keeps tensors on same device.
+
+        Args:
+            f: Field on grid, shape (Ny, Nx).
+            xp: Query x coordinates, shape (P,).
+            yp: Query y coordinates, shape (P,).
+
+        Returns:
+            Values at (xp, yp), shape (P,).
+        """
+        if self.basis_x != "fourier" or self.basis_y != "fourier":
+            raise ValueError("evaluate_fourier_at_points requires Fourier basis in both x and y")
+        is_torch_input = _TORCH_AVAILABLE and torch is not None and getattr(self, "_use_torch", False) and isinstance(f, torch.Tensor)
+        if is_torch_input:
+            f_np = f.detach().cpu().numpy().astype(np.float64)
+            xp_np = np.asarray(xp.detach().cpu().numpy() if isinstance(xp, torch.Tensor) else xp, dtype=np.float64)
+            yp_np = np.asarray(yp.detach().cpu().numpy() if isinstance(yp, torch.Tensor) else yp, dtype=np.float64)
+            device, dtype = f.device, f.dtype
+        else:
+            f_np = np.asarray(f)
+            xp_np = np.asarray(xp, dtype=np.float64)
+            yp_np = np.asarray(yp, dtype=np.float64)
+        dealias = _to_np(self.dealias_mask)
+        sigma = _to_np(self.filter_sigma)
+        F = np.ascontiguousarray(np.fft.fft2(f_np, axes=(-2, -1)) * dealias * sigma, dtype=np.complex128)
+        N_total = self.Nx * self.Ny
+        if _FINUFFT_AVAILABLE:
+            # F is (Ny, Nx): first axis=y, second=x -> nufft2d2(y, x, F)
+            y_fin = np.ascontiguousarray((2.0 * np.pi / self.Ly) * yp_np)
+            x_fin = np.ascontiguousarray((2.0 * np.pi / self.Lx) * xp_np)
+            vals = np.real(_finufft.nufft2d2(y_fin, x_fin, F, **_FINUFFT_OPTS)) / N_total
+        else:
+            kx = np.asarray(self.kx).reshape(-1)
+            ky = np.asarray(self.ky).reshape(-1)
+            E_ky = np.exp(1j * yp_np[:, None] * ky[None, :])
+            E_kx = np.exp(1j * xp_np[:, None] * kx[None, :])
+            M = E_ky @ F
+            vals = np.real((M * E_kx).sum(axis=1)) / N_total
+        if is_torch_input:
+            return torch.from_numpy(vals.astype(np.float32 if dtype == torch.float32 else np.float64)).to(device=device)
+        return vals.astype(f_np.dtype)
+
     def dx1(self, f: np.ndarray) -> np.ndarray:
         # derivative along x on last spatial axis
         if self._legendre_basis is not None:
@@ -1058,6 +1286,57 @@ class Grid2D:
                 # Both Legendre - no spectral filtering
                 return f
 
+    # --- MHD solenoidal helpers (2D) ---
+    def divergence(self, Bx: np.ndarray, By: np.ndarray) -> np.ndarray:
+        """2D spectral divergence dxBx + dyBy using the masked derivative operator."""
+        Fx = self._apply_masks(self.fft2(Bx))
+        Fy = self._apply_masks(self.fft2(By))
+        div_hat = self.ikx * Fx + self.iky * Fy
+        return self.ifft2(div_hat)
+
+    def project_solenoidal(self, Bx: np.ndarray, By: np.ndarray):
+        """2D Helmholtz (Leray) projection of the in-plane field (Bx, By).
+
+        Removes the longitudinal part so that kx*Bx_hat + ky*By_hat = 0 for every
+        mode, i.e. div(B) = 0 to machine precision. Bz (out-of-plane) does not
+        enter the 2D divergence and is left untouched by the caller.
+        """
+        if self.kx is None or self.ky is None:
+            raise ValueError("project_solenoidal requires Fourier basis in x and y")
+        Fx = self.fft2(Bx)
+        Fy = self.fft2(By)
+        # Zero the Nyquist mode(s) to preserve Hermitian symmetry under the
+        # per-mode projection (see Grid3D.project_solenoidal for the rationale).
+        for F in (Fx, Fy):
+            if self.Nx % 2 == 0:
+                F[:, self.Nx // 2] = 0
+            if self.Ny % 2 == 0:
+                F[self.Ny // 2, :] = 0
+        if getattr(self, "_use_torch", False) and torch is not None and isinstance(Fx, torch.Tensor):
+            kx = self.kx.to(Fx.dtype)[None, :]
+            ky = self.ky.to(Fx.dtype)[:, None]
+            k2_safe = self.k2_safe.to(Fx.real.dtype)
+        else:
+            kx = np.asarray(self.kx)[None, :]
+            ky = np.asarray(self.ky)[:, None]
+            k2_safe = self.k2_safe
+        kdotB = kx * Fx + ky * Fy
+        coef = kdotB / k2_safe
+        Fx = Fx - kx * coef
+        Fy = Fy - ky * coef
+        return self.ifft2(Fx), self.ifft2(Fy)
+
+    def laplacian(self, f: np.ndarray) -> np.ndarray:
+        """2D spectral Laplacian (for explicit resistivity/viscosity)."""
+        if self.kx is None or self.ky is None:
+            raise ValueError("laplacian requires Fourier basis in x and y")
+        F = self._apply_masks(self.fft2(f))
+        if getattr(self, "_use_torch", False) and torch is not None and isinstance(F, torch.Tensor):
+            k2 = self.k2.to(F.dtype)
+        else:
+            k2 = self.k2
+        return self.ifft2(-k2 * F)
+
     def xy_mesh(self) -> tuple[np.ndarray, np.ndarray]:
         if getattr(self, "_use_torch", False):
             assert torch is not None
@@ -1115,6 +1394,14 @@ class Grid3D:
         self.iky = 1j * self.ky[None, :, None]
         self.ikz = 1j * self.kz[:, None, None]
 
+        # Squared wavenumber for the Helmholtz/Leray projection (div-free B)
+        self.k2 = (
+            self.kx[None, None, :] ** 2
+            + self.ky[None, :, None] ** 2
+            + self.kz[:, None, None] ** 2
+        )
+        self.k2_safe = np.where(self.k2 == 0.0, 1.0, self.k2)
+
         # Dealias and filter
         self.dealias_mask = _build_filter_mask_3d(
             self.Nx, self.Ny, self.Nz, self.dealias
@@ -1160,11 +1447,11 @@ class Grid3D:
                 torch_dtype = torch.float64
                 torch_cdtype = torch.complex128
             else:
-                # Fallback to device-based logic (MPS only supports float32)
-                torch_dtype = torch.float32 if self.torch_device == "mps" else torch.float64
-                torch_cdtype = (
-                    torch.complex64 if self.torch_device == "mps" else torch.complex128
-                )
+                torch_dtype = torch.float64
+                torch_cdtype = torch.complex128
+            if self.torch_device == "mps":
+                torch_dtype = torch.float32
+                torch_cdtype = torch.complex64
 
             self.x = torch.from_numpy(np.asarray(self.x)).to(
                 dtype=torch_dtype, device=self.torch_device
@@ -1191,6 +1478,14 @@ class Grid3D:
             self.ikx = kx_t.to(dtype=torch_cdtype)[None, None, :] * (1j)
             self.iky = ky_t.to(dtype=torch_cdtype)[None, :, None] * (1j)
             self.ikz = kz_t.to(dtype=torch_cdtype)[:, None, None] * (1j)
+            self.k2 = (
+                kx_t[None, None, :] ** 2
+                + ky_t[None, :, None] ** 2
+                + kz_t[:, None, None] ** 2
+            )
+            self.k2_safe = torch.where(
+                self.k2 == 0, torch.ones_like(self.k2), self.k2
+            )
             self.dealias_mask = torch.from_numpy(np.asarray(self.dealias_mask)).to(
                 dtype=torch_dtype, device=self.torch_device
             )
@@ -1221,6 +1516,191 @@ class Grid3D:
         F *= self.dealias_mask
         F *= self.filter_sigma
         return F
+
+    def evaluate_fourier_at_points(
+        self, f: np.ndarray, xp: np.ndarray, yp: np.ndarray, zp: np.ndarray
+    ) -> np.ndarray:
+        """Evaluate a Fourier-represented 3D field at arbitrary points.
+
+        f(x,y,z) = (1/(Nx*Ny*Nz)) * Re( sum F exp(i*kx*x + i*ky*y + i*kz*z) ) with dealias and filter.
+        Supports NumPy and PyTorch (including MPS/CUDA); keeps tensors on same device.
+
+        Args:
+            f: Field on grid, shape (Nz, Ny, Nx).
+            xp, yp, zp: Query coordinates, each shape (P,).
+
+        Returns:
+            Values at (xp, yp, zp), shape (P,).
+        """
+        is_torch_input = _TORCH_AVAILABLE and torch is not None and getattr(self, "_use_torch", False) and isinstance(f, torch.Tensor)
+        if is_torch_input:
+            f_np = f.detach().cpu().numpy().astype(np.float64)
+            xp_np = np.asarray(xp.detach().cpu().numpy() if isinstance(xp, torch.Tensor) else xp, dtype=np.float64)
+            yp_np = np.asarray(yp.detach().cpu().numpy() if isinstance(yp, torch.Tensor) else yp, dtype=np.float64)
+            zp_np = np.asarray(zp.detach().cpu().numpy() if isinstance(zp, torch.Tensor) else zp, dtype=np.float64)
+            device, dtype = f.device, f.dtype
+        else:
+            f_np = np.asarray(f)
+            xp_np = np.asarray(xp, dtype=np.float64)
+            yp_np = np.asarray(yp, dtype=np.float64)
+            zp_np = np.asarray(zp, dtype=np.float64)
+        dealias = _to_np(self.dealias_mask)
+        sigma = _to_np(self.filter_sigma)
+        F = np.ascontiguousarray(np.fft.fftn(f_np, axes=(-3, -2, -1)) * dealias * sigma, dtype=np.complex128)
+        N_total = self.Nx * self.Ny * self.Nz
+        if _FINUFFT_AVAILABLE:
+            z_fin = np.ascontiguousarray((2.0 * np.pi / self.Lz) * zp_np)
+            y_fin = np.ascontiguousarray((2.0 * np.pi / self.Ly) * yp_np)
+            x_fin = np.ascontiguousarray((2.0 * np.pi / self.Lx) * xp_np)
+            vals = np.real(_finufft.nufft3d2(z_fin, y_fin, x_fin, F, **_FINUFFT_OPTS)) / N_total
+        else:
+            kx = np.asarray(self.kx).reshape(-1)
+            ky = np.asarray(self.ky).reshape(-1)
+            kz = np.asarray(self.kz).reshape(-1)
+            E_kz = np.exp(1j * zp_np[:, None] * kz[None, :])
+            E_ky = np.exp(1j * yp_np[:, None] * ky[None, :])
+            E_kx = np.exp(1j * xp_np[:, None] * kx[None, :])
+            T = (E_kz @ F.reshape(self.Nz, -1)).reshape(-1, self.Ny, self.Nx)
+            vals = np.real((T * E_ky[:, :, None] * E_kx[:, None, :]).sum(axis=(-2, -1))) / N_total
+        if is_torch_input:
+            return torch.from_numpy(vals.astype(np.float32 if dtype == torch.float32 else np.float64)).to(device=device)
+        return vals.astype(f_np.dtype)
+
+    def evaluate_fourier_at_points_batched_3d(
+        self,
+        fx: np.ndarray,
+        fy: np.ndarray,
+        fz: np.ndarray,
+        xp: np.ndarray,
+        yp: np.ndarray,
+        zp: np.ndarray,
+    ) -> tuple:
+        """Evaluate three Fourier 3D fields at the same points. Returns (vx, vy, vz).
+
+        Same as calling evaluate_fourier_at_points for fx, fy, fz separately but
+        reuses chunk loop and exp(E) matrices, reducing overhead (especially for
+        tracer velocity interpolation).
+        """
+        is_torch_input = _TORCH_AVAILABLE and torch is not None and getattr(self, "_use_torch", False) and isinstance(fx, torch.Tensor)
+        if is_torch_input:
+            fx_np = fx.detach().cpu().numpy().astype(np.float64)
+            fy_np = fy.detach().cpu().numpy().astype(np.float64)
+            fz_np = fz.detach().cpu().numpy().astype(np.float64)
+            xp_np = np.asarray(xp.detach().cpu().numpy() if isinstance(xp, torch.Tensor) else xp, dtype=np.float64)
+            yp_np = np.asarray(yp.detach().cpu().numpy() if isinstance(yp, torch.Tensor) else yp, dtype=np.float64)
+            zp_np = np.asarray(zp.detach().cpu().numpy() if isinstance(zp, torch.Tensor) else zp, dtype=np.float64)
+            device, dtype = fx.device, fx.dtype
+        else:
+            fx_np, fy_np, fz_np = np.asarray(fx), np.asarray(fy), np.asarray(fz)
+            xp_np = np.asarray(xp, dtype=np.float64)
+            yp_np = np.asarray(yp, dtype=np.float64)
+            zp_np = np.asarray(zp, dtype=np.float64)
+        dealias = _to_np(self.dealias_mask)
+        sigma = _to_np(self.filter_sigma)
+        scale = 1.0 / (self.Nx * self.Ny * self.Nz)
+        Fx = np.ascontiguousarray(np.fft.fftn(fx_np, axes=(-3, -2, -1)) * dealias * sigma, dtype=np.complex128)
+        Fy = np.ascontiguousarray(np.fft.fftn(fy_np, axes=(-3, -2, -1)) * dealias * sigma, dtype=np.complex128)
+        Fz = np.ascontiguousarray(np.fft.fftn(fz_np, axes=(-3, -2, -1)) * dealias * sigma, dtype=np.complex128)
+        if _FINUFFT_AVAILABLE:
+            z_fin = np.ascontiguousarray((2.0 * np.pi / self.Lz) * zp_np)
+            y_fin = np.ascontiguousarray((2.0 * np.pi / self.Ly) * yp_np)
+            x_fin = np.ascontiguousarray((2.0 * np.pi / self.Lx) * xp_np)
+            vx = np.real(_finufft.nufft3d2(z_fin, y_fin, x_fin, Fx, **_FINUFFT_OPTS)) * scale
+            vy = np.real(_finufft.nufft3d2(z_fin, y_fin, x_fin, Fy, **_FINUFFT_OPTS)) * scale
+            vz = np.real(_finufft.nufft3d2(z_fin, y_fin, x_fin, Fz, **_FINUFFT_OPTS)) * scale
+        else:
+            kx = np.asarray(self.kx).reshape(-1)
+            ky = np.asarray(self.ky).reshape(-1)
+            kz = np.asarray(self.kz).reshape(-1)
+            E_kz = np.exp(1j * zp_np[:, None] * kz[None, :])
+            E_ky = np.exp(1j * yp_np[:, None] * ky[None, :])
+            E_kx = np.exp(1j * xp_np[:, None] * kx[None, :])
+            Nz, Ny, Nx = self.Nz, self.Ny, self.Nx
+            Tx = (E_kz @ Fx.reshape(Nz, -1)).reshape(-1, Ny, Nx)
+            Ty = (E_kz @ Fy.reshape(Nz, -1)).reshape(-1, Ny, Nx)
+            Tz = (E_kz @ Fz.reshape(Nz, -1)).reshape(-1, Ny, Nx)
+            vx = np.real((Tx * E_ky[:, :, None] * E_kx[:, None, :]).sum(axis=(-2, -1))) * scale
+            vy = np.real((Ty * E_ky[:, :, None] * E_kx[:, None, :]).sum(axis=(-2, -1))) * scale
+            vz = np.real((Tz * E_ky[:, :, None] * E_kx[:, None, :]).sum(axis=(-2, -1))) * scale
+        if is_torch_input:
+            np_dtype = np.float32 if dtype == torch.float32 else np.float64
+            return (
+                torch.from_numpy(vx.astype(np_dtype)).to(device=device),
+                torch.from_numpy(vy.astype(np_dtype)).to(device=device),
+                torch.from_numpy(vz.astype(np_dtype)).to(device=device),
+            )
+        return (vx.astype(fx_np.dtype), vy.astype(fy_np.dtype), vz.astype(fz_np.dtype))
+
+    # --- MHD solenoidal helpers (3D) ---
+    def divergence(self, Vx: np.ndarray, Vy: np.ndarray, Vz: np.ndarray) -> np.ndarray:
+        """3D spectral divergence dxVx + dyVy + dzVz (masked derivative operator).
+
+        Used as the div(B) diagnostic. After project_solenoidal this is zero to
+        machine precision because k.V_hat = 0 on every retained mode and the
+        mask only zeroes high modes.
+        """
+        Fx = self._apply_masks(self.fftn(Vx))
+        Fy = self._apply_masks(self.fftn(Vy))
+        Fz = self._apply_masks(self.fftn(Vz))
+        div_hat = self.ikx * Fx + self.iky * Fy + self.ikz * Fz
+        return self.ifftn(div_hat)
+
+    def project_solenoidal(self, Vx: np.ndarray, Vy: np.ndarray, Vz: np.ndarray):
+        """Helmholtz (Leray) projection: remove the longitudinal part of V.
+
+        After this, k.V_hat = 0 for all k  =>  div(V) = 0 to machine precision.
+        The k=0 (mean) mode is untouched (k.V_hat = 0 there already), so a
+        uniform mean field is preserved exactly.
+        """
+        Fx = self.fftn(Vx)
+        Fy = self.fftn(Vy)
+        Fz = self.fftn(Vz)
+        # Zero the Nyquist mode(s): for an even-length real FFT the Nyquist mode is
+        # its own alias, so the per-mode projection below would break Hermitian
+        # symmetry and ifftn(...).real would silently drop a nonzero imaginary
+        # part, leaving the stored field NOT divergence-free at Nyquist.
+        for F in (Fx, Fy, Fz):
+            if self.Nx % 2 == 0:
+                F[:, :, self.Nx // 2] = 0
+            if self.Ny % 2 == 0:
+                F[:, self.Ny // 2, :] = 0
+            if self.Nz % 2 == 0:
+                F[self.Nz // 2, :, :] = 0
+        if getattr(self, "_use_torch", False) and torch is not None and isinstance(Fx, torch.Tensor):
+            kx = self.kx.to(Fx.dtype)[None, None, :]
+            ky = self.ky.to(Fx.dtype)[None, :, None]
+            kz = self.kz.to(Fx.dtype)[:, None, None]
+            k2_safe = self.k2_safe.to(Fx.real.dtype)
+        else:
+            kx = np.asarray(self.kx)[None, None, :]
+            ky = np.asarray(self.ky)[None, :, None]
+            kz = np.asarray(self.kz)[:, None, None]
+            k2_safe = self.k2_safe
+        kdotV = kx * Fx + ky * Fy + kz * Fz
+        coef = kdotV / k2_safe
+        Fx = Fx - kx * coef
+        Fy = Fy - ky * coef
+        Fz = Fz - kz * coef
+        return self.ifftn(Fx), self.ifftn(Fy), self.ifftn(Fz)
+
+    def curl(self, Vx: np.ndarray, Vy: np.ndarray, Vz: np.ndarray):
+        """3D spectral curl (masked derivative operator). Returns (Cx, Cy, Cz)."""
+        Fx = self._apply_masks(self.fftn(Vx))
+        Fy = self._apply_masks(self.fftn(Vy))
+        Fz = self._apply_masks(self.fftn(Vz))
+        Cx = self.ifftn(self.iky * Fz - self.ikz * Fy)
+        Cy = self.ifftn(self.ikz * Fx - self.ikx * Fz)
+        Cz = self.ifftn(self.ikx * Fy - self.iky * Fx)
+        return Cx, Cy, Cz
+
+    def laplacian(self, f: np.ndarray) -> np.ndarray:
+        """3D spectral Laplacian (used for explicit resistivity/viscosity)."""
+        F = self._apply_masks(self.fftn(f))
+        if getattr(self, "_use_torch", False) and torch is not None and isinstance(F, torch.Tensor):
+            k2 = self.k2.to(F.dtype)
+        else:
+            k2 = self.k2
+        return self.ifftn(-k2 * F)
 
     def dx1(self, f: np.ndarray) -> np.ndarray:
         F = self.fftn(f)
