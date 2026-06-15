@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 from phrike.io import load_config, ensure_outdir, save_solution_snapshot
+from phrike.tracers import FourierTracers1D, FourierTracers2D, FourierTracers3D
 
 
 class BaseProblem(ABC):
@@ -160,6 +161,19 @@ class BaseProblem(ABC):
             }
         else:
             self.ic_smoothing_config = None
+
+        # Gravity parameters
+        gravity_raw = self.config.get("gravity", None)
+        if gravity_raw:
+            self.gravity_config = {
+                "enabled": bool(gravity_raw.get("enabled", False)),
+                "type": str(gravity_raw.get("type", "linear")),
+                "gx": float(gravity_raw.get("gx", 0.0)),
+                "gy": float(gravity_raw.get("gy", 0.0)),
+                "gz": float(gravity_raw.get("gz", 0.0))
+            }
+        else:
+            self.gravity_config = None
 
         # Threading / FFT workers (unified via runtime.num_threads, fallback to grid.fft_workers)
         runtime_cfg = self.config.get("runtime", {})
@@ -498,52 +512,114 @@ class BaseProblem(ABC):
                 rho = primitive_vars[0]
                 if len(rho.shape) == 1:  # 1D: rho, u, p, a
                     rho, u, p, a = primitive_vars
-                    if is_torch:
-                        current_cons = {
-                            "mass": float(torch.sum(rho).item()),
-                            "momentum": float(torch.sum(rho * u).item()),
-                            "energy": float(
-                                torch.sum(
-                                    p / (solver.equations.gamma - 1.0) + 0.5 * rho * u**2
-                                ).item()
-                            ),
-                        }
+                    
+                    # Check if we have quadrature weights for Legendre basis
+                    wx = getattr(solver.grid, 'wx', None)
+                    if wx is not None:
+                        # Use quadrature weights for proper integration
+                        if is_torch:
+                            import torch
+                            wx_tensor = torch.from_numpy(wx).to(dtype=rho.dtype, device=rho.device)
+                            current_cons = {
+                                "mass": float(torch.sum(rho * wx_tensor).item()),
+                                "momentum": float(torch.sum(rho * u * wx_tensor).item()),
+                                "energy": float(
+                                    torch.sum(
+                                        (p / (solver.equations.gamma - 1.0) + 0.5 * rho * u**2) * wx_tensor
+                                    ).item()
+                                ),
+                            }
+                        else:
+                            current_cons = {
+                                "mass": float((rho * wx).sum()),
+                                "momentum": float((rho * u * wx).sum()),
+                                "energy": float(
+                                    ((p / (solver.equations.gamma - 1.0) + 0.5 * rho * u**2) * wx).sum()
+                                ),
+                            }
                     else:
-                        current_cons = {
-                            "mass": float(rho.sum()),
-                            "momentum": float((rho * u).sum()),
-                            "energy": float(
-                                (
-                                    p / (solver.equations.gamma - 1.0) + 0.5 * rho * u**2
-                                ).sum()
-                            ),
-                        }
+                        # Fallback to simple sum for Fourier basis
+                        if is_torch:
+                            current_cons = {
+                                "mass": float(torch.sum(rho).item()),
+                                "momentum": float(torch.sum(rho * u).item()),
+                                "energy": float(
+                                    torch.sum(
+                                        p / (solver.equations.gamma - 1.0) + 0.5 * rho * u**2
+                                    ).item()
+                                ),
+                            }
+                        else:
+                            current_cons = {
+                                "mass": float(rho.sum()),
+                                "momentum": float((rho * u).sum()),
+                                "energy": float(
+                                    (
+                                        p / (solver.equations.gamma - 1.0) + 0.5 * rho * u**2
+                                    ).sum()
+                                ),
+                            }
                 else:  # 2D: rho, ux, uy, p
                     rho, ux, uy, p = primitive_vars
-                    if is_torch:
-                        current_cons = {
-                            "mass": float(torch.sum(rho).item()),
-                            "momentum_x": float(torch.sum(rho * ux).item()),
-                            "momentum_y": float(torch.sum(rho * uy).item()),
-                            "energy": float(
-                                torch.sum(
-                                    p / (solver.equations.gamma - 1.0)
-                                    + 0.5 * rho * (ux**2 + uy**2)
-                                ).item()
-                            ),
-                        }
+                    
+                    # Check if we have quadrature weights for Legendre basis
+                    wx = getattr(solver.grid, 'wx', None)
+                    wy = getattr(solver.grid, 'wy', None)
+                    if wx is not None and wy is not None:
+                        # Use 2D quadrature weights for proper integration
+                        if is_torch:
+                            import torch
+                            wx_tensor = torch.from_numpy(wx).to(dtype=rho.dtype, device=rho.device)
+                            wy_tensor = torch.from_numpy(wy).to(dtype=rho.dtype, device=rho.device)
+                            # Create 2D weight matrix
+                            w2d = wy_tensor.unsqueeze(-1) * wx_tensor.unsqueeze(-2)
+                            current_cons = {
+                                "mass": float(torch.sum(rho * w2d).item()),
+                                "momentum_x": float(torch.sum(rho * ux * w2d).item()),
+                                "momentum_y": float(torch.sum(rho * uy * w2d).item()),
+                                "energy": float(
+                                    torch.sum(
+                                        (p / (solver.equations.gamma - 1.0) + 0.5 * rho * (ux**2 + uy**2)) * w2d
+                                    ).item()
+                                ),
+                            }
+                        else:
+                            # Create 2D weight matrix
+                            w2d = wy[:, np.newaxis] * wx[np.newaxis, :]
+                            current_cons = {
+                                "mass": float((rho * w2d).sum()),
+                                "momentum_x": float((rho * ux * w2d).sum()),
+                                "momentum_y": float((rho * uy * w2d).sum()),
+                                "energy": float(
+                                    ((p / (solver.equations.gamma - 1.0) + 0.5 * rho * (ux**2 + uy**2)) * w2d).sum()
+                                ),
+                            }
                     else:
-                        current_cons = {
-                            "mass": float(rho.sum()),
-                            "momentum_x": float((rho * ux).sum()),
-                            "momentum_y": float((rho * uy).sum()),
-                            "energy": float(
-                                (
-                                    p / (solver.equations.gamma - 1.0)
-                                    + 0.5 * rho * (ux**2 + uy**2)
-                                ).sum()
-                            ),
-                        }
+                        # Fallback to simple sum for Fourier basis
+                        if is_torch:
+                            current_cons = {
+                                "mass": float(torch.sum(rho).item()),
+                                "momentum_x": float(torch.sum(rho * ux).item()),
+                                "momentum_y": float(torch.sum(rho * uy).item()),
+                                "energy": float(
+                                    torch.sum(
+                                        p / (solver.equations.gamma - 1.0)
+                                        + 0.5 * rho * (ux**2 + uy**2)
+                                    ).item()
+                                ),
+                            }
+                        else:
+                            current_cons = {
+                                "mass": float(rho.sum()),
+                                "momentum_x": float((rho * ux).sum()),
+                                "momentum_y": float((rho * uy).sum()),
+                                "energy": float(
+                                    (
+                                        p / (solver.equations.gamma - 1.0)
+                                        + 0.5 * rho * (ux**2 + uy**2)
+                                    ).sum()
+                                ),
+                            }
             elif len(primitive_vars) == 5:  # 3D: rho, ux, uy, uz, p
                 rho, ux, uy, uz, p = primitive_vars
                 if is_torch:
@@ -629,6 +705,12 @@ class BaseProblem(ABC):
                 v_mag = torch.sqrt(ux**2 + uy**2 + uz**2)
             else:
                 v_mag = np.sqrt(ux**2 + uy**2 + uz**2)
+        elif len(primitive_vars) == 8:  # MHD: rho, ux, uy, uz, p, Bx, By, Bz
+            rho, ux, uy, uz, p, Bx, By, Bz = primitive_vars
+            if is_torch:
+                v_mag = torch.sqrt(ux**2 + uy**2 + uz**2)
+            else:
+                v_mag = np.sqrt(ux**2 + uy**2 + uz**2)
         else:
             raise ValueError(
                 f"Unexpected number of primitive variables: {len(primitive_vars)}"
@@ -678,12 +760,66 @@ class BaseProblem(ABC):
                 "rho_std": float(torch.std(rho).item()),
             }
         else:
-            return {
+            stats = {
                 "rho_mean": float(np.mean(rho)),
                 "rho_max": float(np.max(rho)),
                 "rho_min": float(np.min(rho)),
                 "rho_std": float(np.std(rho)),
             }
+            # Also report pressure min/max for positivity diagnostics
+            try:
+                rho_np, ux_np, uy_np, p_np = primitive_vars
+                stats.update({
+                    "p_max": float(np.max(p_np)),
+                    "p_min": float(np.min(p_np)),
+                })
+            except Exception:
+                pass
+            return stats
+
+    def compute_mhd_stats(self, solver, U):
+        """Compute MHD diagnostics for an 8-component state, else empty dict.
+
+        Returns max|div B| (the headline constraint metric), b_rms,
+        magnetic_energy, plasma_beta (= <p> / <B^2/2>), and cross_helicity.
+        """
+        primitive_vars = solver.equations.primitive(U)
+        if len(primitive_vars) != 8:
+            return {}
+        rho, ux, uy, uz, p, Bx, By, Bz = primitive_vars
+        try:
+            import torch
+            is_torch = isinstance(rho, torch.Tensor)
+        except ImportError:
+            is_torch = False
+
+        try:
+            max_div_b = float(solver.max_div_b(U))
+        except Exception:
+            max_div_b = float("nan")
+
+        if is_torch:
+            b2 = Bx * Bx + By * By + Bz * Bz
+            mag_e = float(torch.sum(0.5 * b2).item())
+            b_rms = float(torch.sqrt(torch.mean(b2)).item())
+            p_mean = float(torch.mean(p).item())
+            bmag_mean = float(torch.mean(0.5 * b2).item())
+            cross_h = float(torch.sum(ux * Bx + uy * By + uz * Bz).item())
+        else:
+            b2 = Bx * Bx + By * By + Bz * Bz
+            mag_e = float((0.5 * b2).sum())
+            b_rms = float(np.sqrt(np.mean(b2)))
+            p_mean = float(np.mean(p))
+            bmag_mean = float(np.mean(0.5 * b2))
+            cross_h = float((ux * Bx + uy * By + uz * Bz).sum())
+        beta = p_mean / bmag_mean if bmag_mean > 0 else float("inf")
+        return {
+            "max|divB|": max_div_b,
+            "b_rms": b_rms,
+            "magnetic_energy": mag_e,
+            "plasma_beta": beta,
+            "cross_helicity": cross_h,
+        }
 
     def output_monitoring_info(self, solver, U, step_count, dt):
         """Output monitoring information."""
@@ -700,6 +836,33 @@ class BaseProblem(ABC):
             info_lines.append(f"Step: {step_count}, dt: {dt:.2e}")
 
         if self.monitoring_include_conservation:
+            # If Legendre weights are available, compute weighted conserved quantities
+            wy = getattr(solver.grid, "wy", None)
+            wx = getattr(solver.grid, "wx", None)
+            if wy is not None and wx is not None:
+                try:
+                    rho, ux, uy, p = solver.equations.primitive(U)
+                    import numpy as _np
+                    if 'torch' in globals() and isinstance(rho, (torch.Tensor,)):
+                        wyt = torch.from_numpy(_np.asarray(wy)).to(rho.device, rho.dtype)
+                        wxt = torch.from_numpy(_np.asarray(wx)).to(rho.device, rho.dtype)
+                        w2d = wyt[:, None] * wxt[None, :]
+                        mass_w = float(torch.sum(w2d * rho).item())
+                        momx_w = float(torch.sum(w2d * rho * ux).item())
+                        momy_w = float(torch.sum(w2d * rho * uy).item())
+                        energy_w = float(torch.sum(w2d * (p / (solver.equations.gamma - 1.0) + 0.5 * rho * (ux * ux + uy * uy))).item())
+                    else:
+                        w2d = _np.outer(wy, wx)
+                        mass_w = float((w2d * rho).sum())
+                        momx_w = float((w2d * rho * ux).sum())
+                        momy_w = float((w2d * rho * uy).sum())
+                        energy_w = float((w2d * (p / (solver.equations.gamma - 1.0) + 0.5 * rho * (ux * ux + uy * uy))).sum())
+                    info_lines.append(f"mass_w: {mass_w:.6e}")
+                    info_lines.append(f"momentum_x_w: {momx_w:.6e}")
+                    info_lines.append(f"momentum_y_w: {momy_w:.6e}")
+                    info_lines.append(f"energy_w: {energy_w:.6e}")
+                except Exception:
+                    pass
             errors = self.compute_conservation_errors(solver, U)
             for key, error in errors.items():
                 info_lines.append(f"{key}: {error:.2e}")
@@ -713,6 +876,14 @@ class BaseProblem(ABC):
             rho_stats = self.compute_density_stats(solver, U)
             for key, value in rho_stats.items():
                 info_lines.append(f"{key}: {value:.6f}")
+
+        # MHD diagnostics (only for 8-component states; headline is max|divB|)
+        try:
+            mhd_stats = self.compute_mhd_stats(solver, U)
+            for key, value in mhd_stats.items():
+                info_lines.append(f"{key}: {value:.3e}")
+        except Exception:
+            pass
 
         # Output the information
         output_text = " | ".join(info_lines)
@@ -787,6 +958,69 @@ class BaseProblem(ABC):
         # Reset step counter
         self.monitoring_step_count = 0
 
+    def _create_tracers_from_config(self, grid: Any) -> Optional[Any]:
+        """Create tracer particles from config when tracers.enabled and grid is Fourier.
+
+        Returns FourierTracers1D, FourierTracers2D, or FourierTracers3D, or None.
+        """
+        tcfg = self.config.get("tracers", {})
+        if not tcfg.get("enabled", False):
+            return None
+        num = int(tcfg.get("num", 100))
+        layout = str(tcfg.get("layout", "random")).lower()
+        mass = float(tcfg.get("mass", 1.0))
+        seed = tcfg.get("seed", None)
+        rng = np.random.default_rng(seed)
+
+        # 3D
+        if hasattr(grid, "Nz") and getattr(grid, "Nz", None) is not None:
+            Lx, Ly, Lz = grid.Lx, grid.Ly, grid.Lz
+            if layout == "uniform":
+                n = max(1, int(round(num ** (1.0 / 3.0))))
+                x = np.linspace(0.0, Lx, n, endpoint=False)
+                y = np.linspace(0.0, Ly, n, endpoint=False)
+                z = np.linspace(0.0, Lz, n, endpoint=False)
+                xx, yy, zz = np.meshgrid(x, y, z, indexing="ij")
+                x0 = xx.ravel()
+                y0 = yy.ravel()
+                z0 = zz.ravel()
+                if len(x0) > num:
+                    x0, y0, z0 = x0[:num], y0[:num], z0[:num]
+            else:
+                x0 = rng.uniform(0.0, Lx, size=num).astype(np.float64)
+                y0 = rng.uniform(0.0, Ly, size=num).astype(np.float64)
+                z0 = rng.uniform(0.0, Lz, size=num).astype(np.float64)
+            return FourierTracers3D(x0, y0, z0, mass=mass)
+
+        # 2D
+        if hasattr(grid, "Ny") and getattr(grid, "Ny", None) is not None:
+            if getattr(grid, "basis_x", None) != "fourier" or getattr(grid, "basis_y", None) != "fourier":
+                return None
+            Lx, Ly = grid.Lx, grid.Ly
+            if layout == "uniform":
+                n = max(1, int(round(num ** 0.5)))
+                x = np.linspace(0.0, Lx, n, endpoint=False)
+                y = np.linspace(0.0, Ly, n, endpoint=False)
+                xx, yy = np.meshgrid(x, y, indexing="ij")
+                x0 = xx.ravel()
+                y0 = yy.ravel()
+                if len(x0) > num:
+                    x0, y0 = x0[:num], y0[:num]
+            else:
+                x0 = rng.uniform(0.0, Lx, size=num).astype(np.float64)
+                y0 = rng.uniform(0.0, Ly, size=num).astype(np.float64)
+            return FourierTracers2D(x0, y0, mass=mass)
+
+        # 1D
+        if getattr(grid, "_basis_name", None) != "fourier":
+            return None
+        Lx = grid.Lx
+        if layout == "uniform":
+            x0 = np.linspace(0.0, Lx, num, endpoint=False).astype(np.float64)
+        else:
+            x0 = rng.uniform(0.0, Lx, size=num).astype(np.float64)
+        return FourierTracers1D(x0, mass=mass)
+
     def run(
         self,
         backend: str = "numpy",
@@ -832,7 +1066,9 @@ class BaseProblem(ABC):
         solver_class = self.get_solver_class()
         solver = solver_class(
             grid=grid, equations=equations, scheme=self.scheme, cfl=self.cfl,
-            adaptive_config=self.adaptive_config
+            adaptive_config=self.adaptive_config,
+            artificial_viscosity_config=self.artificial_viscosity_config,
+            gravity_config=self.gravity_config
         )
 
         # Setup visualization
@@ -843,6 +1079,12 @@ class BaseProblem(ABC):
         # Initialize monitoring
         self.initialize_monitoring(solver, U0)
 
+        # Create tracers from config if enabled (Fourier grids only)
+        tracers = self._create_tracers_from_config(grid)
+        if tracers is not None:
+            n_tracers = len(tracers.x)
+            print(f"Tracers enabled: {n_tracers} particles")
+
         # Run simulation
         if hasattr(solver, "run"):
             # New solver interface
@@ -852,7 +1094,12 @@ class BaseProblem(ABC):
             def snapshot_callback(t, U):
                 # Save snapshot independently of video generation
                 snapshot_path = save_solution_snapshot(
-                    self.outdir, t, U=U, grid=solver.grid, equations=solver.equations
+                    self.outdir,
+                    t,
+                    U=U,
+                    grid=solver.grid,
+                    equations=solver.equations,
+                    tracers=tracers,
                 )
                 print(f"Saved snapshot at t={t:.3f}: {snapshot_path}")
 
@@ -882,6 +1129,7 @@ class BaseProblem(ABC):
                 outdir=self.outdir,
                 on_output=combined_output_callback,
                 on_step=monitoring_callback,
+                tracers=tracers,
             )
         else:
             # Legacy solver interface
@@ -895,6 +1143,35 @@ class BaseProblem(ABC):
 
         # Final visualization
         self.create_final_visualization(solver)
+
+        # Tracer density plot if enabled (3D only)
+        tcfg = self.config.get("tracers", {})
+        if (
+            tracers is not None
+            and tcfg.get("plot_density", False)
+            and hasattr(solver.grid, "Nz")
+            and getattr(solver.grid, "Nz", None) is not None
+        ):
+            try:
+                from phrike.tracer_density import tracer_density_3d, plot_tracer_density_3d
+                domain = (solver.grid.Lx, solver.grid.Ly, solver.grid.Lz)
+                layout = str(tcfg.get("layout", "random")).lower()
+                grid_shape = tcfg.get("density_grid")
+                if isinstance(grid_shape, (list, tuple)) and len(grid_shape) == 3:
+                    grid_shape = tuple(int(g) for g in grid_shape)
+                else:
+                    grid_shape = None
+                rho_3d, _ = tracer_density_3d(
+                    tracers, domain, grid_shape=grid_shape, layout=layout
+                )
+                outpath = os.path.join(self.outdir, "tracer_density.png")
+                plot_tracer_density_3d(
+                    rho_3d, domain, outpath=outpath, log=True,
+                    title="Tracer particle density (t={:.3f})".format(solver.t),
+                )
+                print(f"Saved tracer density plot: {outpath}")
+            except Exception as e:
+                print(f"Tracer density plot failed: {e}")
 
         # Generate video if requested
         if generate_video and os.path.exists(frames_dir):

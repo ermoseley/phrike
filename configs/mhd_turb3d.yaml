@@ -1,0 +1,59 @@
+# 3D compressible MHD turbulence (turbulent u + banded solenoidal B).
+#   python -m phrike mhd_turb3d --config configs/mhd_turb3d.yaml --backend torch --device mps
+problem: mhd_turb3d
+
+grid:
+  Nx: 128
+  Ny: 128
+  Nz: 128
+  Lx: 6.283185307179586
+  Ly: 6.283185307179586
+  Lz: 6.283185307179586
+  dealias: true
+  precision: single
+
+physics:
+  gamma: 1.6666666666666667
+  mhd:
+    enabled: true
+    resistivity: 0.0
+    viscosity: 0.0
+    divergence_clean: projection
+    project_each_substage: true
+
+integration:
+  t0: 0.0
+  t_end: 2.0
+  cfl: 0.25
+  scheme: rk4
+  output_interval: 0.1
+  checkpoint_interval: 0.0
+  spectral_filter:
+    enabled: true
+    p: 8
+    alpha: 36.0
+
+initial_conditions:
+  rho0: 1.0
+  p0: 1.0
+  vrms: 0.3
+  kmin: 2.0
+  kmax: 16.0
+  alpha: 0.3333
+  spectrum_type: parabolic
+  seed: 42
+  b_rms: 0.1
+  b_kmin: 1.0
+  b_kmax: 5.0
+  b0: [0.0, 0.0, 1.0]
+  b_seed: 123
+
+io:
+  outdir: outputs/mhd_turb3d
+
+monitoring:
+  enabled: true
+  step_interval: 20
+  include_conservation: true
+  include_timestep: true
+  include_time: true

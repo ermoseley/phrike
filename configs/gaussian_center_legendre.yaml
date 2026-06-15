@@ -1,0 +1,83 @@
+# 2D Gaussian Profile Configuration - Center evolution (Legendre basis)
+# Simple Gaussian density and pressure profile in the center, let it evolve naturally
+
+problem:
+  name: "gaussian_wave2d"
+  description: "2D Gaussian density and pressure profile in center - Legendre basis"
+
+# Grid configuration
+grid:
+  Nx: 128                    # Good resolution
+  Ny: 128                    # Good resolution
+  Lx: 1.0                   # Domain length in x
+  Ly: 1.0                   # Domain length in y
+  basis_x: "legendre"       # Use Legendre basis in x
+  basis_y: "legendre"       # Use Legendre basis in y
+  bc: "dirichlet"           # Dirichlet boundary conditions
+  dealias: false            # No dealiasing for Legendre
+  precision: "double"       # Use double precision
+
+# Initial conditions
+initial_conditions:
+  rho0: 1.0                 # Background density
+  u0: 0.0                   # Background x-velocity
+  v0: 0.0                   # Background y-velocity
+  p0: 1.0                   # Background pressure
+  amplitude: 0.1            # Gaussian amplitude
+  sigma: 0.05                # Gaussian width
+  x0: 0.5                   # Center x position
+  y0: 0.5                   # Center y position
+  angle: 0.0                # No initial angle (just centered)
+
+# Physics
+physics:
+  gamma: 1.4                # Adiabatic index
+  gravity:
+    enabled: false          # No gravity for this test
+
+# Integration
+integration:
+  t0: 0.0                   # Start time
+  t_end: 1.0                # End time
+  dt: 1e-4                  # Initial time step
+  scheme: "rk4"             # 4th order Runge-Kutta
+  cfl: 0.5                  # CFL number
+  adaptive_dt: true         # Use adaptive time stepping
+  spectral_filter:
+    enabled: true           # Enable spectral filtering
+    p: 8                    # Filter order
+    alpha: 36.0             # Filter strength
+
+# Artificial viscosity (small amount for stability)
+artificial_viscosity:
+  enabled: true
+  nu_max: 1e-4              # Maximum viscosity
+  s_ref: 1.0                # Reference strain rate
+  s_min: 0.1                # Minimum strain rate
+  p: 2.0                    # Viscosity power law
+  epsilon: 1e-12            # Small number to avoid division by zero
+  variable_weights:
+    density: 1.0
+    momentum_x: 1.0
+    momentum_y: 1.0
+    energy: 1.0
+  sensor_variable: "density"
+  diagnostic_output: false
+
+# Output
+io:
+  outdir: "outputs/gaussian_center_legendre"
+  output_interval: 0.1      # Output every 0.1 time units
+  save_frames: true         # Save frames for video generation
+  frames_dir: "frames"      # Subdirectory for frames
+
+# Monitoring
+monitoring:
+  step_interval: 10         # Print status every 10 steps
+  verbose: true             # Verbose output
+
+# Visualization
+visualization:
+  create_plots: true        # Create analysis plots
+  plot_interval: 0.1        # Plot every 0.1 time units
+  save_plots: true          # Save plots to disk

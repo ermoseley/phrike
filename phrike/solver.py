@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 
@@ -14,7 +14,14 @@ except Exception:
     torch = None  # type: ignore
 
 from .grid import Grid1D, Grid2D, Grid3D
-from .equations import EulerEquations1D, EulerEquations2D, EulerEquations3D
+from .equations import (
+    EulerEquations1D,
+    EulerEquations2D,
+    EulerEquations3D,
+    MHDEquations1D,
+    MHDEquations2D,
+    MHDEquations3D,
+)
 from .adaptive import AdaptiveTimeStepper, create_adaptive_stepper
 from .artificial_viscosity import SpectralArtificialViscosity, ArtificialViscosityConfig
 
@@ -53,7 +60,8 @@ def _positivity_clamp(U: Array, eqs: EulerEquations1D, rho_min: float = 1e-10, p
 
 
 def _compute_rhs(grid: Grid1D, eqs: EulerEquations1D, U: Array, 
-                artificial_viscosity: Optional[SpectralArtificialViscosity] = None) -> Array:
+                artificial_viscosity: Optional[SpectralArtificialViscosity] = None,
+                gravity_config: Optional[Dict] = None) -> Array:
     # Pseudo-spectral: compute flux in physical space, then differentiate spectrally
     # Enforce boundary conditions for non-periodic bases before computing flux
     if hasattr(grid, "apply_boundary_conditions"):
@@ -71,29 +79,42 @@ def _compute_rhs(grid: Grid1D, eqs: EulerEquations1D, U: Array,
             if i < len(rhs):
                 rhs[i] += term
     
+    # Add gravity source terms if enabled
+    if gravity_config and gravity_config.get("enabled", False):
+        rho, u, p, _ = eqs.primitive(U)
+        gx = gravity_config.get("gx", 0.0)
+        
+        # Momentum equation: d(ρu)/dt += ρgx
+        rhs[1] += rho * gx
+        
+        # Energy equation: dE/dt += ρgx * u (work done by gravity)
+        rhs[2] += rho * gx * u
+    
     return rhs
 
 
 def _rk2_step(grid: Grid1D, eqs: EulerEquations1D, U: Array, dt: float, 
-              artificial_viscosity: Optional[SpectralArtificialViscosity] = None) -> Array:
-    k1 = _compute_rhs(grid, eqs, U, artificial_viscosity)
+              artificial_viscosity: Optional[SpectralArtificialViscosity] = None,
+              gravity_config: Optional[Dict] = None) -> Array:
+    k1 = _compute_rhs(grid, eqs, U, artificial_viscosity, gravity_config)
     U1 = U + dt * 0.5 * k1
     U1 = _positivity_clamp(U1, eqs)
-    k2 = _compute_rhs(grid, eqs, U1, artificial_viscosity)
+    k2 = _compute_rhs(grid, eqs, U1, artificial_viscosity, gravity_config)
     Unew = U + dt * k2
     Unew = _positivity_clamp(Unew, eqs)
     return _apply_physical_filters(grid, Unew, eqs)
 
 
 def _rk4_step(grid: Grid1D, eqs: EulerEquations1D, U: Array, dt: float,
-              artificial_viscosity: Optional[SpectralArtificialViscosity] = None) -> Array:
-    k1 = _compute_rhs(grid, eqs, U, artificial_viscosity)
+              artificial_viscosity: Optional[SpectralArtificialViscosity] = None,
+              gravity_config: Optional[Dict] = None) -> Array:
+    k1 = _compute_rhs(grid, eqs, U, artificial_viscosity, gravity_config)
     U2 = _positivity_clamp(U + 0.5 * dt * k1, eqs)
-    k2 = _compute_rhs(grid, eqs, U2, artificial_viscosity)
+    k2 = _compute_rhs(grid, eqs, U2, artificial_viscosity, gravity_config)
     U3 = _positivity_clamp(U + 0.5 * dt * k2, eqs)
-    k3 = _compute_rhs(grid, eqs, U3, artificial_viscosity)
+    k3 = _compute_rhs(grid, eqs, U3, artificial_viscosity, gravity_config)
     U4 = _positivity_clamp(U + dt * k3, eqs)
-    k4 = _compute_rhs(grid, eqs, U4, artificial_viscosity)
+    k4 = _compute_rhs(grid, eqs, U4, artificial_viscosity, gravity_config)
     Unew = U + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
     Unew = _positivity_clamp(Unew, eqs)
     return _apply_physical_filters(grid, Unew, eqs)
@@ -127,12 +148,14 @@ class SpectralSolver1D:
     
     # Artificial viscosity
     artificial_viscosity: Optional[SpectralArtificialViscosity] = None
+    # Gravity configuration
+    gravity_config: Optional[Dict] = None
     # Filter cadence
     filter_interval: int = 1
 
     def __init__(self, grid: Grid1D, equations: EulerEquations1D, U0: Optional[Array] = None, 
                  scheme: str = "rk4", cfl: float = 0.4, adaptive_config: Optional[Dict] = None,
-                 artificial_viscosity_config: Optional[Dict] = None):
+                 artificial_viscosity_config: Optional[Dict] = None, gravity_config: Optional[Dict] = None):
         """Initialize the 1D spectral solver.
         
         Args:
@@ -143,6 +166,7 @@ class SpectralSolver1D:
             cfl: CFL number
             adaptive_config: Configuration for adaptive time-stepping
             artificial_viscosity_config: Configuration for artificial viscosity
+            gravity_config: Configuration for gravity
         """
         self.grid = grid
         self.equations = equations
@@ -184,6 +208,9 @@ class SpectralSolver1D:
         if artificial_viscosity_config and artificial_viscosity_config.get("enabled", False):
             from .artificial_viscosity import create_artificial_viscosity
             self.artificial_viscosity = create_artificial_viscosity(artificial_viscosity_config)
+
+        # Setup gravity if configured
+        self.gravity_config = gravity_config
 
         # Filter interval: use integration.spectral_filter.interval if present
         # If AV is enabled, default to 5; else 1
@@ -232,9 +259,9 @@ class SpectralSolver1D:
     def _fixed_step(self, U: Array, dt: float) -> Array:
         """Perform one fixed time step."""
         if self.scheme.lower() == "rk2":
-            Un = _rk2_step(self.grid, self.equations, U, dt, self.artificial_viscosity)
+            Un = _rk2_step(self.grid, self.equations, U, dt, self.artificial_viscosity, self.gravity_config)
         else:
-            Un = _rk4_step(self.grid, self.equations, U, dt, self.artificial_viscosity)
+            Un = _rk4_step(self.grid, self.equations, U, dt, self.artificial_viscosity, self.gravity_config)
         # Apply spectral filter with cadence
         if (getattr(self, "_step_counter", 0) % self.filter_interval) == 0:
             Un = _apply_physical_filters(self.grid, Un, self.equations)
@@ -245,7 +272,7 @@ class SpectralSolver1D:
         """Perform one adaptive time step."""
         def rhs_func(U_current: Array) -> Array:
             """RHS function for adaptive stepper."""
-            return _compute_rhs(self.grid, self.equations, U_current, self.artificial_viscosity)
+            return _compute_rhs(self.grid, self.equations, U_current, self.artificial_viscosity, self.gravity_config)
         
         # Compute solution scale for relative error
         if _TORCH_AVAILABLE and isinstance(U, torch.Tensor):
@@ -269,7 +296,7 @@ class SpectralSolver1D:
                           on_step: Optional[Callable[[int, float, Array], None]]) -> float:
         """Perform one step in adaptive run loop."""
         def rhs_func(U_current: Array) -> Array:
-            return _compute_rhs(self.grid, self.equations, U_current, self.artificial_viscosity)
+            return _compute_rhs(self.grid, self.equations, U_current, self.artificial_viscosity, self.gravity_config)
         
         # Compute solution scale for relative error
         if _TORCH_AVAILABLE and isinstance(self.U, torch.Tensor):
@@ -318,6 +345,7 @@ class SpectralSolver1D:
         outdir: Optional[str] = None,
         on_output: Optional[Callable[[float, Array], None]] = None,
         on_step: Optional[Callable[[int, float, Array], None]] = None,
+        tracers: Optional[Any] = None,
     ) -> Dict[str, List[float]]:
         from .io import save_solution_snapshot
 
@@ -358,6 +386,7 @@ class SpectralSolver1D:
         while self.t < t_end - 1e-12:
             # Ensure we don't overshoot the end time
             dt = min(dt, t_end - self.t)
+            dt_used = dt
             
             if self.adaptive_enabled and self.adaptive_stepper is not None:
                 # Adaptive time-stepping
@@ -366,6 +395,8 @@ class SpectralSolver1D:
                 # Fixed time-stepping (original behavior)
                 dt = self._fixed_run_step(dt, step_count, on_step)
             
+            if tracers is not None:
+                tracers.step(self.grid, self.equations, self.U, dt_used)
             step_count += 1
 
             if self.t + 1e-12 >= next_output:
@@ -376,7 +407,12 @@ class SpectralSolver1D:
 
             if outdir and self.t + 1e-12 >= next_checkpoint:
                 save_solution_snapshot(
-                    outdir, self.t, U=self.U, grid=self.grid, equations=self.equations
+                    outdir,
+                    self.t,
+                    U=self.U,
+                    grid=self.grid,
+                    equations=self.equations,
+                    tracers=tracers,
                 )
                 next_checkpoint += checkpoint_interval
 
@@ -390,13 +426,22 @@ class SpectralSolver1D:
 
 
 def _compute_rhs_2d(grid: Grid2D, eqs: EulerEquations2D, U: Array, 
-                   artificial_viscosity: Optional[SpectralArtificialViscosity] = None) -> Array:
+                   artificial_viscosity: Optional[SpectralArtificialViscosity] = None,
+                   gravity_config: Optional[Dict] = None) -> Array:
+    # Mirror 1D: pre-apply BCs via grid if available (Fourier or hybrid). 2D Legendre disabled.
+    if hasattr(grid, "apply_boundary_conditions"):
+        try:
+            U = grid.apply_boundary_conditions(U, eqs)
+        except Exception:
+            pass
     # Fluxes in x and y
     Fx, Fy = eqs.flux(U)
     dFdx = grid.dx1(Fx)
     dFdy = grid.dy1(Fy)
     # dU/dt = -(dFx/dx + dFy/dy)
     rhs = -(dFdx + dFdy)
+
+    # Remove SAT/Rusanov boundary fluxes to mirror 1D behavior
     
     # Add artificial viscosity if enabled
     if artificial_viscosity is not None:
@@ -405,31 +450,78 @@ def _compute_rhs_2d(grid: Grid2D, eqs: EulerEquations2D, U: Array,
             if i < len(rhs):
                 rhs[i] += term
     
+    # Add gravity source terms if enabled
+    if gravity_config and gravity_config.get("enabled", False):
+        rho, ux, uy, p = eqs.primitive(U)
+        gx = gravity_config.get("gx", 0.0)
+        gy = gravity_config.get("gy", 0.0)
+        
+        # Momentum equations: d(ρux)/dt += ρgx, d(ρuy)/dt += ρgy
+        rhs[1] += rho * gx
+        rhs[2] += rho * gy
+        
+        # Energy equation: dE/dt += ρ(gx*ux + gy*uy) (work done by gravity)
+        rhs[3] += rho * (gx * ux + gy * uy)
+    
     return rhs
+def _positivity_clamp_2d(U: Array, eqs: EulerEquations2D, rho_min: float = 1e-8, p_min: float = 1e-10) -> Array:
+    """Clamp density and pressure to small positive bounds in 2D.
+
+    Rebuilds conservative state from clamped (rho, ux, uy, p) to avoid negative pressure blow-ups.
+    """
+    try:
+        import torch  # type: ignore
+        is_torch = isinstance(U, torch.Tensor)
+    except Exception:
+        is_torch = False
+        torch = None  # type: ignore
+
+    rho, ux, uy, p = eqs.primitive(U)
+    if is_torch:  # type: ignore[truthy-bool]
+        rho_c = torch.clamp(rho, min=float(rho_min))
+        p_c = torch.clamp(p, min=float(p_min))
+        Uc = eqs.conservative(rho_c, ux, uy, p_c)
+    else:
+        rho_c = np.maximum(rho, rho_min)
+        p_c = np.maximum(p, p_min)
+        Uc = eqs.conservative(rho_c, ux, uy, p_c)
+    return Uc
+
 
 
 def _rk2_step_2d(grid: Grid2D, eqs: EulerEquations2D, U: Array, dt: float,
-                 artificial_viscosity: Optional[SpectralArtificialViscosity] = None) -> Array:
-    k1 = _compute_rhs_2d(grid, eqs, U, artificial_viscosity)
-    U1 = U + dt * 0.5 * k1
-    k2 = _compute_rhs_2d(grid, eqs, U1, artificial_viscosity)
-    return U + dt * k2
+                 artificial_viscosity: Optional[SpectralArtificialViscosity] = None,
+                 gravity_config: Optional[Dict] = None) -> Array:
+    k1 = _compute_rhs_2d(grid, eqs, U, artificial_viscosity, gravity_config)
+    U1 = _positivity_clamp_2d(U + dt * 0.5 * k1, eqs)
+    k2 = _compute_rhs_2d(grid, eqs, U1, artificial_viscosity, gravity_config)
+    Unew = _positivity_clamp_2d(U + dt * k2, eqs)
+    return Unew
 
 
 def _rk4_step_2d(grid: Grid2D, eqs: EulerEquations2D, U: Array, dt: float,
-                 artificial_viscosity: Optional[SpectralArtificialViscosity] = None) -> Array:
-    k1 = _compute_rhs_2d(grid, eqs, U, artificial_viscosity)
-    U2 = U + 0.5 * dt * k1
-    k2 = _compute_rhs_2d(grid, eqs, U2, artificial_viscosity)
-    U3 = U + 0.5 * dt * k2
-    k3 = _compute_rhs_2d(grid, eqs, U3, artificial_viscosity)
-    U4 = U + dt * k3
-    k4 = _compute_rhs_2d(grid, eqs, U4, artificial_viscosity)
-    return U + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+                 artificial_viscosity: Optional[SpectralArtificialViscosity] = None,
+                 gravity_config: Optional[Dict] = None) -> Array:
+    k1 = _compute_rhs_2d(grid, eqs, U, artificial_viscosity, gravity_config)
+    U2 = _positivity_clamp_2d(U + 0.5 * dt * k1, eqs)
+    k2 = _compute_rhs_2d(grid, eqs, U2, artificial_viscosity, gravity_config)
+    U3 = _positivity_clamp_2d(U + 0.5 * dt * k2, eqs)
+    k3 = _compute_rhs_2d(grid, eqs, U3, artificial_viscosity, gravity_config)
+    U4 = _positivity_clamp_2d(U + dt * k3, eqs)
+    k4 = _compute_rhs_2d(grid, eqs, U4, artificial_viscosity, gravity_config)
+    Unew = U + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+    return _positivity_clamp_2d(Unew, eqs)
 
 
 def _apply_physical_filters_2d(grid: Grid2D, U: Array) -> Array:
-    return grid.apply_spectral_filter(U)
+    U_filtered = grid.apply_spectral_filter(U)
+    # Re-apply BCs after filtering if available
+    try:
+        if hasattr(grid, "apply_boundary_conditions"):
+            return grid.apply_boundary_conditions(U_filtered, None)
+    except Exception:
+        pass
+    return U_filtered
 
 
 @dataclass
@@ -445,9 +537,15 @@ class SpectralSolver2D:
     # Adaptive time-stepping
     adaptive_stepper: Optional[AdaptiveTimeStepper] = None
     adaptive_enabled: bool = False
+    
+    # Artificial viscosity
+    artificial_viscosity: Optional[SpectralArtificialViscosity] = None
+    # Gravity configuration
+    gravity_config: Optional[Dict] = None
 
     def __init__(self, grid: Grid2D, equations: EulerEquations2D, U0: Optional[Array] = None, 
-                 scheme: str = "rk4", cfl: float = 0.3, adaptive_config: Optional[Dict] = None):
+                 scheme: str = "rk4", cfl: float = 0.3, adaptive_config: Optional[Dict] = None,
+                 artificial_viscosity_config: Optional[Dict] = None, gravity_config: Optional[Dict] = None):
         """Initialize the 2D spectral solver.
         
         Args:
@@ -457,6 +555,7 @@ class SpectralSolver2D:
             scheme: Time integration scheme ("rk2", "rk4", "rk23", "rk45", "rk78")
             cfl: CFL number
             adaptive_config: Configuration for adaptive time-stepping
+            gravity_config: Configuration for gravity
         """
         self.grid = grid
         self.equations = equations
@@ -493,12 +592,32 @@ class SpectralSolver2D:
                 # Fall back to non-adaptive scheme
                 self.scheme = adaptive_config.get("fallback_scheme", "rk4")
 
+        # Setup artificial viscosity if configured
+        self.artificial_viscosity = None
+        if artificial_viscosity_config and artificial_viscosity_config.get("enabled", False):
+            from .artificial_viscosity import create_artificial_viscosity
+            self.artificial_viscosity = create_artificial_viscosity(artificial_viscosity_config)
+        
+        # Setup gravity if configured
+        self.gravity_config = gravity_config
+
+        # Filter interval cadence (default 1; if AV enabled, can be more frequent)
+        self.filter_interval: int = 1
+        cfg = getattr(self.grid, "filter_params", None)
+        if isinstance(cfg, dict):
+            try:
+                self.filter_interval = max(1, int(cfg.get("interval", 1)))
+            except Exception:
+                self.filter_interval = 1
+
     def compute_dt(self, U: Array) -> float:
         max_speed = self.equations.max_wave_speed(U)
         if max_speed <= 0.0:
             return 1e-6
-        # CFL for 2D: use min(dx, dy)
-        return self.cfl * min(self.grid.dx, self.grid.dy) / max_speed
+        # Use true minimum node spacing if available (Legendre/nonuniform)
+        dx_eff = getattr(self.grid, "dx_min", None) or self.grid.dx
+        dy_eff = getattr(self.grid, "dy_min", None) or self.grid.dy
+        return self.cfl * min(dx_eff, dy_eff) / max_speed
 
     def step(self, U: Array, dt: float) -> Array:
         """Perform one time step using the configured scheme.
@@ -520,17 +639,19 @@ class SpectralSolver2D:
     def _fixed_step(self, U: Array, dt: float) -> Array:
         """Perform one fixed time step."""
         if self.scheme.lower() == "rk2":
-            Un = _rk2_step_2d(self.grid, self.equations, U, dt)
+            Un = _rk2_step_2d(self.grid, self.equations, U, dt, self.artificial_viscosity, self.gravity_config)
         else:
-            Un = _rk4_step_2d(self.grid, self.equations, U, dt)
-        Un = _apply_physical_filters_2d(self.grid, Un)
+            Un = _rk4_step_2d(self.grid, self.equations, U, dt, self.artificial_viscosity, self.gravity_config)
+        if (getattr(self, "_step_counter", 0) % self.filter_interval) == 0:
+            Un = _apply_physical_filters_2d(self.grid, Un)
+        self._step_counter = getattr(self, "_step_counter", 0) + 1
         return Un
     
     def _adaptive_step(self, U: Array, dt: float) -> Array:
         """Perform one adaptive time step."""
         def rhs_func(U_current: Array) -> Array:
             """RHS function for adaptive stepper."""
-            return _compute_rhs_2d(self.grid, self.equations, U_current)
+            return _compute_rhs_2d(self.grid, self.equations, U_current, self.artificial_viscosity, self.gravity_config)
         
         # Compute solution scale for relative error
         if _TORCH_AVAILABLE and isinstance(U, torch.Tensor):
@@ -551,7 +672,7 @@ class SpectralSolver2D:
                           on_step: Optional[Callable[[int, float, Array], None]]) -> float:
         """Perform one step in adaptive run loop."""
         def rhs_func(U_current: Array) -> Array:
-            return _compute_rhs_2d(self.grid, self.equations, U_current)
+            return _compute_rhs_2d(self.grid, self.equations, U_current, None, self.gravity_config)
         
         if _TORCH_AVAILABLE and isinstance(self.U, torch.Tensor):
             solution_scale = float(torch.max(torch.abs(self.U)).item())
@@ -592,6 +713,7 @@ class SpectralSolver2D:
         outdir: Optional[str] = None,
         on_output: Optional[Callable[[float, Array], None]] = None,
         on_step: Optional[Callable[[int, float, Array], None]] = None,
+        tracers: Optional[Any] = None,
     ) -> Dict[str, List[float]]:
         from .io import save_solution_snapshot
 
@@ -654,6 +776,7 @@ class SpectralSolver2D:
         while self.t < t_end - 1e-12:
             # Ensure we don't overshoot the end time
             dt = min(dt, t_end - self.t)
+            dt_used = dt
             
             if self.adaptive_enabled and self.adaptive_stepper is not None:
                 # Adaptive time-stepping
@@ -662,6 +785,8 @@ class SpectralSolver2D:
                 # Fixed time-stepping (original behavior)
                 dt = self._fixed_run_step(dt, step_count, on_step)
             
+            if tracers is not None:
+                tracers.step(self.grid, self.equations, self.U, dt_used)
             step_count += 1
 
             if self.t + 1e-12 >= next_output:
@@ -672,7 +797,12 @@ class SpectralSolver2D:
 
             if outdir and self.t + 1e-12 >= next_checkpoint:
                 save_solution_snapshot(
-                    outdir, self.t, U=self.U, grid=self.grid, equations=self.equations
+                    outdir,
+                    self.t,
+                    U=self.U,
+                    grid=self.grid,
+                    equations=self.equations,
+                    tracers=tracers,
                 )
                 next_checkpoint += checkpoint_interval
 
@@ -682,8 +812,371 @@ class SpectralSolver2D:
         return history
 
 
+# ===================== Ideal/Resistive MHD solvers =====================
+#
+# 8-component conservative state U = [rho, rho*ux, rho*uy, rho*uz, E, Bx, By, Bz].
+# The RHS is the same conservative flux-divergence structure as Euler; the
+# magnetic solenoidal constraint div(B)=0 is enforced by Helmholtz (Leray)
+# projection of B after every RK substage and (last) after the spectral filter
+# (see mhd_plan.md). Optional explicit resistivity/viscosity are applied as
+# spectral Laplacians on the B and momentum rows; the energy row is left to the
+# ideal flux so that dissipated magnetic/kinetic energy is converted to thermal
+# energy through the pressure recovery (total energy conserving, div(B)-safe
+# since div(laplacian B) = laplacian(div B) = 0).
+
+
+def _mhd_clone(U: Array) -> Array:
+    if _TORCH_AVAILABLE and isinstance(U, torch.Tensor):
+        return U.clone()
+    return U.copy()
+
+
+def _max_abs_float(a: Array) -> float:
+    if _TORCH_AVAILABLE and isinstance(a, torch.Tensor):
+        return float(torch.max(torch.abs(a)).item())
+    return float(np.max(np.abs(a)))
+
+
+class SpectralSolverMHD:
+    """Pseudo-spectral ideal/resistive MHD solver (1D/2D/3D autodetected).
+
+    Mirrors the Euler solver interface (constructor signature, ``run`` signature)
+    so it is a drop-in for ``BaseProblem.run``. The dimensionality is inferred
+    from the grid. Runtime MHD options (resistivity, viscosity,
+    project_each_substage, divergence_clean) are read from ``grid.mhd_config`` if
+    present, and can also be set as attributes after construction.
+    """
+
+    def __init__(self, grid, equations, U0: Optional[Array] = None,
+                 scheme: str = "rk4", cfl: float = 0.3,
+                 adaptive_config: Optional[Dict] = None,
+                 artificial_viscosity_config: Optional[Dict] = None,
+                 gravity_config: Optional[Dict] = None):
+        self.grid = grid
+        self.equations = equations
+        self.scheme = scheme
+        self.cfl = cfl
+        self.t = 0.0
+        self.U = U0
+        self.gravity_config = gravity_config
+
+        # Infer dimensionality from the grid
+        if hasattr(grid, "Nz") and getattr(grid, "Nz", None) is not None:
+            self.dim = 3
+        elif hasattr(grid, "Ny") and getattr(grid, "Ny", None) is not None:
+            self.dim = 2
+        else:
+            self.dim = 1
+
+        # MHD runtime options (from grid.mhd_config, with safe defaults)
+        cfg = getattr(grid, "mhd_config", None) or {}
+        self.resistivity = float(cfg.get("resistivity", 0.0))   # eta
+        self.viscosity = float(cfg.get("viscosity", 0.0))       # nu
+        self.project_each_substage = bool(cfg.get("project_each_substage", True))
+        self.divergence_clean = str(cfg.get("divergence_clean", "projection"))
+        self.rho_min = float(cfg.get("rho_min", 1e-10))
+        self.p_min = float(cfg.get("p_min", 1e-12))
+        # Parabolic-CFL safety factor for explicit diffusion (RK4 stable region on
+        # the negative real axis extends to ~2.78; 1.0 leaves a comfortable margin).
+        self.cfl_diff = float(cfg.get("cfl_diff", 1.0))
+        self._k2_max = self._grid_k2_max()
+
+        # Adaptive time-stepping
+        self.adaptive_enabled = False
+        self.adaptive_stepper = None
+        if adaptive_config and adaptive_config.get("enabled", False):
+            adaptive_method = adaptive_config.get("scheme", "rk45")
+            rtol = adaptive_config.get("rtol", 1e-6)
+            atol = adaptive_config.get("atol", 1e-8)
+            controller_kwargs = {
+                "safety_factor": adaptive_config.get("safety_factor", 0.9),
+                "min_dt_factor": adaptive_config.get("min_dt_factor", 0.1),
+                "max_dt_factor": adaptive_config.get("max_dt_factor", 5.0),
+                "max_rejections": adaptive_config.get("max_rejections", 10),
+            }
+            if adaptive_method in ["rk23", "rk45", "rk78"]:
+                self.adaptive_stepper = create_adaptive_stepper(
+                    adaptive_method, rtol=rtol, atol=atol, **controller_kwargs
+                )
+                self.adaptive_enabled = True
+                self.scheme = adaptive_method
+            else:
+                self.scheme = adaptive_config.get("fallback_scheme", "rk4")
+
+        # Filter cadence (default 1)
+        self.filter_interval = 1
+        fcfg = getattr(self.grid, "filter_params", None)
+        if isinstance(fcfg, dict):
+            try:
+                self.filter_interval = max(1, int(fcfg.get("interval", 1)))
+            except Exception:
+                self.filter_interval = 1
+        self._step_counter = 0
+
+    def _grid_k2_max(self) -> float:
+        """Max squared wavenumber on the grid (for the parabolic diffusion CFL)."""
+        g = self.grid
+        try:
+            if self.dim == 1:
+                k = g.k
+                k2 = k * k
+            else:
+                k2 = g.k2
+            if _TORCH_AVAILABLE and isinstance(k2, torch.Tensor):
+                return float(torch.max(k2).item())
+            return float(np.max(np.asarray(k2)))
+        except Exception:
+            return 0.0
+
+    # --- physics helpers ---
+    def _flux_divergence(self, U: Array) -> Array:
+        F = self.equations.flux(U)
+        if self.dim == 1:
+            return -self.grid.dx1(F)
+        if self.dim == 2:
+            Fx, Fy = F
+            return -(self.grid.dx1(Fx) + self.grid.dy1(Fy))
+        Fx, Fy, Fz = F
+        return -(self.grid.dx1(Fx) + self.grid.dy1(Fy) + self.grid.dz1(Fz))
+
+    def _compute_rhs(self, U: Array) -> Array:
+        rhs = self._flux_divergence(U)
+        eta = self.resistivity
+        nu = self.viscosity
+        if eta != 0.0:
+            rhs[5] = rhs[5] + eta * self.grid.laplacian(U[5])
+            rhs[6] = rhs[6] + eta * self.grid.laplacian(U[6])
+            rhs[7] = rhs[7] + eta * self.grid.laplacian(U[7])
+        if nu != 0.0:
+            rhs[1] = rhs[1] + nu * self.grid.laplacian(U[1])
+            rhs[2] = rhs[2] + nu * self.grid.laplacian(U[2])
+            rhs[3] = rhs[3] + nu * self.grid.laplacian(U[3])
+        return rhs
+
+    def _clamp(self, U: Array) -> Array:
+        rho, ux, uy, uz, p, Bx, By, Bz = self.equations.primitive(U)
+        if _TORCH_AVAILABLE and isinstance(U, torch.Tensor):
+            rho_c = torch.clamp(rho, min=self.rho_min)
+            p_c = torch.clamp(p, min=self.p_min)
+        else:
+            rho_c = np.maximum(rho, self.rho_min)
+            p_c = np.maximum(p, self.p_min)
+        return self.equations.conservative(rho_c, ux, uy, uz, p_c, Bx, By, Bz)
+
+    def _project_B(self, U: Array) -> Array:
+        """Helmholtz-project B and recompute E holding thermal pressure fixed."""
+        if self.divergence_clean == "none":
+            return U
+        rho, ux, uy, uz, p, Bx, By, Bz = self.equations.primitive(U)
+        if self.dim == 1:
+            Bx = self.grid.project_solenoidal_x(U[5])
+        elif self.dim == 2:
+            Bx, By = self.grid.project_solenoidal(U[5], U[6])
+        else:
+            Bx, By, Bz = self.grid.project_solenoidal(U[5], U[6], U[7])
+        U = _mhd_clone(U)
+        U[5] = Bx
+        U[6] = By
+        U[7] = Bz
+        U[4] = (
+            p / (self.equations.gamma - 1.0)
+            + 0.5 * rho * (ux * ux + uy * uy + uz * uz)
+            + 0.5 * (Bx * Bx + By * By + Bz * Bz)
+        )
+        return U
+
+    def _rk_substages(self, U: Array, dt: float) -> Array:
+        proj = self._project_B if self.project_each_substage else (lambda x: x)
+        rhs = self._compute_rhs
+        clamp = self._clamp
+        if self.scheme.lower() == "rk2":
+            k1 = rhs(U)
+            U1 = proj(clamp(U + 0.5 * dt * k1))
+            k2 = rhs(U1)
+            Un = proj(clamp(U + dt * k2))
+        else:  # rk4
+            k1 = rhs(U)
+            U2 = proj(clamp(U + 0.5 * dt * k1))
+            k2 = rhs(U2)
+            U3 = proj(clamp(U + 0.5 * dt * k2))
+            k3 = rhs(U3)
+            U4 = proj(clamp(U + dt * k3))
+            k4 = rhs(U4)
+            Un = proj(clamp(U + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)))
+        return Un
+
+    def max_div_b(self, U: Array) -> float:
+        if self.dim == 1:
+            d = self.grid.divergence_x(U[5])
+        elif self.dim == 2:
+            d = self.grid.divergence(U[5], U[6])
+        else:
+            d = self.grid.divergence(U[5], U[6], U[7])
+        return _max_abs_float(d)
+
+    # --- time stepping ---
+    def compute_dt(self, U: Array) -> float:
+        max_speed = self.equations.max_wave_speed(U)
+        if max_speed <= 0.0:
+            return 1e-6
+        if self.dim == 1:
+            dx = self.grid.dx
+        elif self.dim == 2:
+            dx = min(self.grid.dx, self.grid.dy)
+        else:
+            dx = min(self.grid.dx, self.grid.dy, self.grid.dz)
+        dt_hyp = self.cfl * dx / max_speed
+        # Parabolic CFL for explicit resistivity/viscosity: dt <= cfl_diff/(D k^2_max)
+        diff = max(self.resistivity, self.viscosity)
+        if diff > 0.0 and self._k2_max > 0.0:
+            dt_diff = self.cfl_diff / (diff * self._k2_max)
+            return min(dt_hyp, dt_diff)
+        return dt_hyp
+
+    def step(self, U: Array, dt: float) -> Array:
+        if self.adaptive_enabled and self.adaptive_stepper is not None:
+            return self._adaptive_step(U, dt)
+        return self._fixed_step(U, dt)
+
+    def _fixed_step(self, U: Array, dt: float) -> Array:
+        Un = self._rk_substages(U, dt)
+        # Spectral filter (cadence), then project B LAST (filtering B reintroduces
+        # a small longitudinal component) so the stored state is exactly div-free.
+        if (self._step_counter % self.filter_interval) == 0:
+            Un = self.grid.apply_spectral_filter(Un)
+            Un = self._project_B(Un)
+        self._step_counter += 1
+        return Un
+
+    def _adaptive_step(self, U: Array, dt: float) -> Array:
+        def rhs_func(Uc: Array) -> Array:
+            return self._compute_rhs(Uc)
+
+        if _TORCH_AVAILABLE and isinstance(U, torch.Tensor):
+            solution_scale = float(torch.max(torch.abs(U)).item())
+        else:
+            solution_scale = float(np.max(np.abs(U)))
+        result = self.adaptive_stepper.step(rhs_func, U, dt, solution_scale)
+        if result.accepted:
+            Un = self.grid.apply_spectral_filter(result.U_new)
+            Un = self._project_B(self._clamp(Un))
+        else:
+            Un = U
+        return Un
+
+    def _adaptive_run_step(self, dt: float, step_count: int,
+                           on_step: Optional[Callable[[int, float, Array], None]]) -> float:
+        def rhs_func(Uc: Array) -> Array:
+            return self._compute_rhs(Uc)
+
+        if _TORCH_AVAILABLE and isinstance(self.U, torch.Tensor):
+            solution_scale = float(torch.max(torch.abs(self.U)).item())
+        else:
+            solution_scale = float(np.max(np.abs(self.U)))
+        result = self.adaptive_stepper.step(rhs_func, self.U, dt, solution_scale)
+        if result.accepted:
+            Un = self.grid.apply_spectral_filter(result.U_new)
+            self.U = self._project_B(self._clamp(Un))
+            self.t += dt
+            if on_step is not None:
+                on_step(step_count, dt, self.U)
+            return result.dt_next
+        return result.dt_next
+
+    def _fixed_run_step(self, dt: float, step_count: int,
+                        on_step: Optional[Callable[[int, float, Array], None]]) -> float:
+        self.U = self.step(self.U, dt)
+        self.t += dt
+        if on_step is not None:
+            on_step(step_count, dt, self.U)
+        return min(self.compute_dt(self.U),
+                   1e-6 if self.equations.max_wave_speed(self.U) <= 0.0 else float("inf"))
+
+    def run(self, U0: Array, t0: float, t_end: float,
+            output_interval: float = 0.1, checkpoint_interval: float = 0.0,
+            outdir: Optional[str] = None,
+            on_output: Optional[Callable[[float, Array], None]] = None,
+            on_step: Optional[Callable[[int, float, Array], None]] = None,
+            tracers: Optional[Any] = None) -> Dict[str, List[float]]:
+        from .io import save_solution_snapshot
+
+        if _TORCH_AVAILABLE and isinstance(U0, (torch.Tensor,)):
+            self.U = U0.clone()
+        else:
+            self.U = U0.copy()
+        # Project the initial state so div(B)=0 from the first stored step.
+        self.U = self._project_B(self.U)
+        self.t = float(t0)
+        next_output = self.t + output_interval
+        next_checkpoint = (
+            self.t + checkpoint_interval
+            if checkpoint_interval and checkpoint_interval > 0
+            else np.inf
+        )
+
+        history: Dict[str, List[float]] = {
+            "time": [], "mass": [], "momentum_x": [], "momentum_y": [],
+            "momentum_z": [], "energy": [], "magnetic_energy": [],
+            "cross_helicity": [], "div_b_max": [],
+        }
+        step_count = 0
+
+        def record() -> None:
+            cons = self.equations.conserved_quantities(self.U)
+            history["time"].append(self.t)
+            for key in ("mass", "momentum_x", "momentum_y", "momentum_z",
+                        "energy", "magnetic_energy", "cross_helicity"):
+                history[key].append(cons[key])
+            history["div_b_max"].append(self.max_div_b(self.U))
+
+        record()
+        if on_output is not None:
+            on_output(self.t, self.U)
+
+        dt = self.compute_dt(self.U) if self.U is not None else 1e-6
+        while self.t < t_end - 1e-12:
+            dt = min(dt, t_end - self.t)
+            dt_used = dt
+            if self.adaptive_enabled and self.adaptive_stepper is not None:
+                dt = self._adaptive_run_step(dt, step_count, on_step)
+            else:
+                dt = self._fixed_run_step(dt, step_count, on_step)
+            if tracers is not None:
+                tracers.step(self.grid, self.equations, self.U, dt_used)
+            step_count += 1
+
+            if self.t + 1e-12 >= next_output:
+                record()
+                if on_output is not None:
+                    on_output(self.t, self.U)
+                next_output += output_interval
+
+            if outdir and self.t + 1e-12 >= next_checkpoint:
+                save_solution_snapshot(outdir, self.t, U=self.U, grid=self.grid,
+                                       equations=self.equations, tracers=tracers)
+                next_checkpoint += checkpoint_interval
+
+        record()
+        if on_output is not None:
+            on_output(self.t, self.U)
+        return history
+
+
+class SpectralSolverMHD1D(SpectralSolverMHD):
+    """1D ideal/resistive MHD spectral solver."""
+
+
+class SpectralSolverMHD2D(SpectralSolverMHD):
+    """2D (2.5D) ideal/resistive MHD spectral solver."""
+
+
+class SpectralSolverMHD3D(SpectralSolverMHD):
+    """3D ideal/resistive MHD spectral solver."""
+
+
 def _compute_rhs_3d(grid: Grid3D, eqs: EulerEquations3D, U: Array,
-                   artificial_viscosity: Optional[SpectralArtificialViscosity] = None) -> Array:
+                   artificial_viscosity: Optional[SpectralArtificialViscosity] = None,
+                   gravity_config: Optional[Dict] = None) -> Array:
     Fx, Fy, Fz = eqs.flux(U)
     dFdx = grid.dx1(Fx)
     dFdy = grid.dy1(Fy)
@@ -697,26 +1190,43 @@ def _compute_rhs_3d(grid: Grid3D, eqs: EulerEquations3D, U: Array,
             if i < len(rhs):
                 rhs[i] += term
     
+    # Add gravity source terms if enabled
+    if gravity_config and gravity_config.get("enabled", False):
+        rho, ux, uy, uz, p = eqs.primitive(U)
+        gx = gravity_config.get("gx", 0.0)
+        gy = gravity_config.get("gy", 0.0)
+        gz = gravity_config.get("gz", 0.0)
+        
+        # Momentum equations: d(ρux)/dt += ρgx, d(ρuy)/dt += ρgy, d(ρuz)/dt += ρgz
+        rhs[1] += rho * gx
+        rhs[2] += rho * gy
+        rhs[3] += rho * gz
+        
+        # Energy equation: dE/dt += ρ(gx*ux + gy*uy + gz*uz) (work done by gravity)
+        rhs[4] += rho * (gx * ux + gy * uy + gz * uz)
+    
     return rhs
 
 
 def _rk2_step_3d(grid: Grid3D, eqs: EulerEquations3D, U: Array, dt: float,
-                 artificial_viscosity: Optional[SpectralArtificialViscosity] = None) -> Array:
-    k1 = _compute_rhs_3d(grid, eqs, U, artificial_viscosity)
+                 artificial_viscosity: Optional[SpectralArtificialViscosity] = None,
+                 gravity_config: Optional[Dict] = None) -> Array:
+    k1 = _compute_rhs_3d(grid, eqs, U, artificial_viscosity, gravity_config)
     U1 = U + dt * 0.5 * k1
-    k2 = _compute_rhs_3d(grid, eqs, U1, artificial_viscosity)
+    k2 = _compute_rhs_3d(grid, eqs, U1, artificial_viscosity, gravity_config)
     return U + dt * k2
 
 
 def _rk4_step_3d(grid: Grid3D, eqs: EulerEquations3D, U: Array, dt: float,
-                 artificial_viscosity: Optional[SpectralArtificialViscosity] = None) -> Array:
-    k1 = _compute_rhs_3d(grid, eqs, U, artificial_viscosity)
+                 artificial_viscosity: Optional[SpectralArtificialViscosity] = None,
+                 gravity_config: Optional[Dict] = None) -> Array:
+    k1 = _compute_rhs_3d(grid, eqs, U, artificial_viscosity, gravity_config)
     U2 = U + 0.5 * dt * k1
-    k2 = _compute_rhs_3d(grid, eqs, U2, artificial_viscosity)
+    k2 = _compute_rhs_3d(grid, eqs, U2, artificial_viscosity, gravity_config)
     U3 = U + 0.5 * dt * k2
-    k3 = _compute_rhs_3d(grid, eqs, U3, artificial_viscosity)
+    k3 = _compute_rhs_3d(grid, eqs, U3, artificial_viscosity, gravity_config)
     U4 = U + dt * k3
-    k4 = _compute_rhs_3d(grid, eqs, U4, artificial_viscosity)
+    k4 = _compute_rhs_3d(grid, eqs, U4, artificial_viscosity, gravity_config)
     return U + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
 
 
@@ -737,11 +1247,15 @@ class SpectralSolver3D:
     # Adaptive time-stepping
     adaptive_stepper: Optional[AdaptiveTimeStepper] = None
     adaptive_enabled: bool = False
+    
+    # Gravity configuration
+    gravity_config: Optional[Dict] = None
 
-    def __init__(self, grid: Grid3D, equations: EulerEquations3D, U0: Optional[Array] = None, 
-                 scheme: str = "rk4", cfl: float = 0.25, adaptive_config: Optional[Dict] = None):
+    def __init__(self, grid: Grid3D, equations: EulerEquations3D, U0: Optional[Array] = None,
+                 scheme: str = "rk4", cfl: float = 0.25, adaptive_config: Optional[Dict] = None,
+                 artificial_viscosity_config: Optional[Dict] = None, gravity_config: Optional[Dict] = None):
         """Initialize the 3D spectral solver.
-        
+
         Args:
             grid: 3D grid
             equations: 3D Euler equations
@@ -749,6 +1263,8 @@ class SpectralSolver3D:
             scheme: Time integration scheme ("rk2", "rk4", "rk23", "rk45", "rk78")
             cfl: CFL number
             adaptive_config: Configuration for adaptive time-stepping
+            artificial_viscosity_config: Ignored (kept for API compatibility with BaseProblem).
+            gravity_config: Configuration for gravity
         """
         self.grid = grid
         self.equations = equations
@@ -785,6 +1301,9 @@ class SpectralSolver3D:
                 # Fall back to non-adaptive scheme
                 self.scheme = adaptive_config.get("fallback_scheme", "rk4")
 
+        # Setup gravity if configured
+        self.gravity_config = gravity_config
+
     def compute_dt(self, U: Array) -> float:
         max_speed = self.equations.max_wave_speed(U)
         if max_speed <= 0.0:
@@ -811,9 +1330,9 @@ class SpectralSolver3D:
     def _fixed_step(self, U: Array, dt: float) -> Array:
         """Perform one fixed time step."""
         if self.scheme.lower() == "rk2":
-            Un = _rk2_step_3d(self.grid, self.equations, U, dt)
+            Un = _rk2_step_3d(self.grid, self.equations, U, dt, None, self.gravity_config)
         else:
-            Un = _rk4_step_3d(self.grid, self.equations, U, dt)
+            Un = _rk4_step_3d(self.grid, self.equations, U, dt, None, self.gravity_config)
         Un = _apply_physical_filters_3d(self.grid, Un)
         return Un
     
@@ -821,7 +1340,7 @@ class SpectralSolver3D:
         """Perform one adaptive time step."""
         def rhs_func(U_current: Array) -> Array:
             """RHS function for adaptive stepper."""
-            return _compute_rhs_3d(self.grid, self.equations, U_current)
+            return _compute_rhs_3d(self.grid, self.equations, U_current, None, self.gravity_config)
         
         # Compute solution scale for relative error
         if _TORCH_AVAILABLE and isinstance(U, torch.Tensor):
@@ -842,7 +1361,7 @@ class SpectralSolver3D:
                           on_step: Optional[Callable[[int, float, Array], None]]) -> float:
         """Perform one step in adaptive run loop."""
         def rhs_func(U_current: Array) -> Array:
-            return _compute_rhs_3d(self.grid, self.equations, U_current)
+            return _compute_rhs_3d(self.grid, self.equations, U_current, None, self.gravity_config)
         
         if _TORCH_AVAILABLE and isinstance(self.U, torch.Tensor):
             solution_scale = float(torch.max(torch.abs(self.U)).item())
@@ -883,6 +1402,7 @@ class SpectralSolver3D:
         outdir: Optional[str] = None,
         on_output: Optional[Callable[[float, Array], None]] = None,
         on_step: Optional[Callable[[int, float, Array], None]] = None,
+        tracers: Optional[Any] = None,
     ) -> Dict[str, List[float]]:
         from .io import save_solution_snapshot
 
@@ -957,6 +1477,7 @@ class SpectralSolver3D:
         while self.t < t_end - 1e-12:
             # Ensure we don't overshoot the end time
             dt = min(dt, t_end - self.t)
+            dt_used = dt
             
             if self.adaptive_enabled and self.adaptive_stepper is not None:
                 # Adaptive time-stepping
@@ -965,6 +1486,8 @@ class SpectralSolver3D:
                 # Fixed time-stepping (original behavior)
                 dt = self._fixed_run_step(dt, step_count, on_step)
             
+            if tracers is not None:
+                tracers.step(self.grid, self.equations, self.U, dt_used)
             step_count += 1
 
             if self.t + 1e-12 >= next_output:
@@ -975,7 +1498,12 @@ class SpectralSolver3D:
 
             if outdir and self.t + 1e-12 >= next_checkpoint:
                 save_solution_snapshot(
-                    outdir, self.t, U=self.U, grid=self.grid, equations=self.equations
+                    outdir,
+                    self.t,
+                    U=self.U,
+                    grid=self.grid,
+                    equations=self.equations,
+                    tracers=tracers,
                 )
                 next_checkpoint += checkpoint_interval
 

@@ -1,0 +1,49 @@
+# 2D Orszag-Tang vortex (MHD) at 1024^2 on Metal (MPS):
+#   python -m phrike orszag_tang2d --config configs/orszag_tang2d.yaml \
+#       --backend torch --device mps --video
+problem: orszag_tang2d
+
+grid:
+  Nx: 1024
+  Ny: 1024
+  Lx: 1.0
+  Ly: 1.0
+  dealias: true
+  precision: single        # MPS uses float32
+
+physics:
+  gamma: 1.6666666666666667   # 5/3
+  mhd:
+    enabled: true
+    resistivity: 0.0          # eta — raise to a small value (e.g. 1e-4) if unstable
+    viscosity: 0.0            # nu  — raise to a small value (e.g. 1e-4) if unstable
+    divergence_clean: projection
+    project_each_substage: true
+
+integration:
+  t0: 0.0
+  t_end: 0.5
+  cfl: 0.25
+  scheme: rk4
+  output_interval: 0.05
+  checkpoint_interval: 0.0
+  spectral_filter:
+    enabled: true
+    p: 8
+    alpha: 36.0
+
+initial_conditions: {}        # standard Stone/Athena OT normalization
+
+io:
+  outdir: outputs/orszag_tang2d
+
+video:
+  fps: 20
+  frame_dpi: 130
+
+monitoring:
+  enabled: true
+  step_interval: 50
+  include_conservation: true
+  include_timestep: true
+  include_time: true

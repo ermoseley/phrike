@@ -1,0 +1,87 @@
+# Configuration for 1D Hydrostatic Equilibrium test
+# Similar to SOD but with gravity in x-direction and Dirichlet BCs
+problem: hse_1d
+
+grid:
+  N: 256                    # Moderate resolution
+  Lx: 2.0                   # Domain length
+  basis: legendre           # Use Legendre basis for non-periodic BCs
+  bc: dirichlet             # Reflecting walls like SOD
+  dealias: false            # Not applicable for Legendre
+  precision: single         # Use single precision for MPS compatibility
+
+physics:
+  gamma: 1.4
+
+integration:
+  t0: 0.0
+  t_end: 0.1                # Short test run
+  cfl: 0.3                  # Conservative CFL like SOD
+  scheme: rk4               # Stable scheme like SOD
+  output_interval: 0.01     # Frequent outputs for monitoring
+  checkpoint_interval: 0.05
+  spectral_filter:
+    enabled: true
+    p: 8
+    alpha: 36.0
+
+# Gravity configuration - gravity in x-direction
+gravity:
+  enabled: true
+  type: "linear"
+  gx: -1.0                  # Gravity pointing in negative x (toward x=0)
+  gy: 0.0
+  gz: 0.0
+
+# Simple uniform initial conditions for HSE test
+initial_conditions:
+  left:
+    rho: 1.0                # Uniform density
+    u: 0.0                  # No initial velocity
+    p: 1.0                  # Base pressure
+  right:
+    rho: 1.0                # Same density everywhere
+    u: 0.0                  # No initial velocity
+    p: 1.0                  # Base pressure
+  smoothing:
+    enabled: false
+    sigma: 0.01             # Smooth transition
+
+# Adaptive time-stepping configuration
+adaptive:
+  enabled: true
+  scheme: rk45
+  rtol: 1e-5               # Relaxed for single precision
+  atol: 1e-7               # Relaxed for single precision
+  safety_factor: 0.9
+  min_dt_factor: 0.1
+  max_dt_factor: 5.0
+  max_rejections: 10
+  fallback_scheme: rk4
+
+# Constant artificial viscosity (like SOD)
+artificial_viscosity:
+  enabled: true
+  mode: constant
+  nu_constant: 0.0003       # Match SOD value
+  variable_weights:
+    density: 1.0
+    momentum_x: 1.0
+    energy: 1.0
+  diagnostic_output: true
+
+io:
+  outdir: outputs/hse_1d_test
+  save_spectra: true
+
+monitoring:
+  enabled: true
+  step_interval: 20
+  include_conservation: true
+  include_timestep: true
+  include_time: true
+  include_velocity_stats: true
+  include_density_stats: true
+
+runtime:
+  num_threads: 4            # Use parallel Legendre operations

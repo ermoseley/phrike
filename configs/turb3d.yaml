@@ -16,11 +16,11 @@ physics:
 
 integration:
   t0: 0.0
-  t_end: 2.0
+  t_end: 0.5
   cfl: 0.8         # Upper bound for dt
   scheme: rk4       # Fallback for non-adaptive
-  output_interval: 0.01
-  checkpoint_interval: 0.2
+  output_interval: 0.05
+  checkpoint_interval: 0.5
   spectral_filter:
     enabled: true
     p: 8
@@ -59,6 +59,17 @@ initial_conditions:
 
 io:
   outdir: outputs/turb3d
+
+# Tracer particles (Fourier interpolation + leap-frog advection)
+# uniform n^3 layout + density_grid: null => tetrahedral (LagrangianPhaseSpaceSheetEasy)
+tracers:
+  enabled: true
+  num: 262144   # 64^3
+  layout: uniform
+  mass: 1.0
+  seed: 42
+  plot_density: true
+  density_grid: null
 
 video:
   # Video generation parameters
@@ -99,7 +110,7 @@ video:
 
 monitoring:
   enabled: true
-  step_interval: 25
+  step_interval: 5   # print stats every 5 steps (more frequent output)
   include_conservation: true
   include_timestep: true
   include_time: true

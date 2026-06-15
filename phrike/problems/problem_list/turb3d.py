@@ -196,10 +196,13 @@ class Turb3DProblem(BaseProblem):
     """3D turbulent velocity field problem."""
 
     def __init__(
-        self, config_path: Optional[str] = None, config: Optional[Dict[str, Any]] = None
+        self,
+        config_path: Optional[str] = None,
+        config: Optional[Dict[str, Any]] = None,
+        restart_from: Optional[str] = None,
     ):
         """Initialize with custom colormap registration."""
-        super().__init__(config_path, config)
+        super().__init__(config_path=config_path, config=config, restart_from=restart_from)
 
         # Import and register the custom colormap
         sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))

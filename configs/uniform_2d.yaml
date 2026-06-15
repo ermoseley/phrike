@@ -1,0 +1,68 @@
+problem: uniform_2d
+
+grid:
+  Nx: 128
+  Ny: 128
+  Lx: 1.0
+  Ly: 1.0
+  basis_x: legendre
+  basis_y: legendre
+  bc: dirichlet
+  dealias: false
+  precision: single
+
+physics:
+  gamma: 1.4
+
+integration:
+  t0: 0.0
+  t_end: 0.5
+  cfl: 0.3
+  scheme: rk4
+  output_interval: 0.05
+  checkpoint_interval: 0.25
+  spectral_filter:
+    enabled: false
+
+adaptive:
+  enabled: false
+
+artificial_viscosity:
+  enabled: false
+
+gravity:
+  enabled: false
+  gx: 0.0
+  gy: 0.0
+
+initial_conditions:
+  rho: 1.0
+  p: 1.0
+
+runtime:
+  num_threads: 4
+
+io:
+  outdir: outputs/uniform_2d
+  save_spectra: false
+
+monitoring:
+  enabled: true
+  step_interval: 20
+  include_conservation: true
+  include_timestep: true
+  include_time: true
+  include_velocity_stats: true
+  include_density_stats: true
+
+video:
+  fps: 30
+  width: 1280
+  height: 720
+  scale: 1.0
+  frame_dpi: 120
+  codec: h264_videotoolbox
+  crf: 20
+  preset: medium
+  pix_fmt: yuv420p
+

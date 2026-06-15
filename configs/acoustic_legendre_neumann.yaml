@@ -1,0 +1,58 @@
+# Configuration for 1D acoustic wave with Legendre basis and Neumann BCs
+# Tests Legendre methods with Neumann boundary conditions
+problem: gaussian_wave1d
+
+grid:
+  N: 256            # number of Legendre points
+  Lx: 4.0           # domain length [0, Lx]
+  basis: legendre   # Use Legendre-Gauss-Lobatto basis
+  bc: neumann       # Neumann boundary conditions
+  dealias: false    # Not applicable for Legendre basis
+  precision: double
+
+physics:
+  gamma: 1.4        # adiabatic index
+
+integration:
+  t0: 0.0
+  t_end: 2.0        # Run for 2 time units
+  cfl: 0.3          # Conservative CFL for Legendre
+  scheme: rk4       # Stable scheme for Legendre
+  output_interval: 0.05     # Frequent outputs for video (20 frames)
+  checkpoint_interval: 0.2  # Checkpoints every 0.2 time units
+  spectral_filter:
+    enabled: true
+    p: 8            # even integer >= 2
+    alpha: 36.0     # filter strength
+
+# Initial conditions - Gaussian pulse
+initial_conditions:
+  wave_type: traveling  # traveling wave packet
+  rho0: 1.0         # background density
+  u0: 0.0           # background velocity (at rest)
+  p0: 1.0           # background pressure
+  amplitude: 1e-3   # Gaussian amplitude (linear regime)
+  sigma: 0.2        # Gaussian width
+  x0: 2.0           # center at middle of domain
+
+io:
+  outdir: outputs/acoustic_legendre_neumann
+  save_spectra: true
+
+video:
+  fps: 20
+  width: 1920
+  height: 1080
+  scale: 2.0
+  frame_dpi: 150
+  codec: libopenh264
+  crf: 18
+  preset: medium
+  pix_fmt: yuv420p
+
+monitoring:
+  enabled: true
+  step_interval: 50
+  include_conservation: true
+  include_timestep: true
+  include_time: true

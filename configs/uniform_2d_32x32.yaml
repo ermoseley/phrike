@@ -1,0 +1,70 @@
+adaptive:
+  enabled: false
+artificial_viscosity:
+  diagnostic_output: false
+  enabled: true
+  epsilon: 1.0e-12
+  nu_max: 0.0001
+  p: 2.0
+  s_min: 0.1
+  s_ref: 1.0
+  sensor_variable: density
+  variable_weights:
+    density: 1.0
+    energy: 1.0
+    momentum_x: 1.0
+    momentum_y: 1.0
+gravity:
+  enabled: false
+  gx: 0.0
+  gy: 0.0
+grid:
+  Lx: 1.0
+  Ly: 1.0
+  Nx: 32
+  Ny: 32
+  basis_x: legendre
+  basis_y: legendre
+  bc: dirichlet
+  dealias: false
+  precision: double
+initial_conditions:
+  p: 1.0
+  rho: 1.0
+integration:
+  cfl: 0.3
+  checkpoint_interval: 0.25
+  output_interval: 0.05
+  scheme: rk4
+  spectral_filter:
+    alpha: 36.0
+    enabled: true
+    p: 8
+  t0: 0.0
+  t_end: 0.1
+io:
+  outdir: outputs/uniform_2d_32x32
+  save_spectra: false
+monitoring:
+  enabled: true
+  include_conservation: true
+  include_density_stats: true
+  include_time: true
+  include_timestep: true
+  include_velocity_stats: true
+  step_interval: 10
+physics:
+  gamma: 1.4
+problem: uniform_2d
+runtime:
+  num_threads: 4
+video:
+  codec: h264_videotoolbox
+  crf: 20
+  fps: 30
+  frame_dpi: 120
+  height: 720
+  pix_fmt: yuv420p
+  preset: medium
+  scale: 1.0
+  width: 1280

@@ -1,0 +1,61 @@
+# Configuration for 1D Gaussian traveling wave with mixed boundary conditions
+# Dirichlet on left, Neumann on right, running until t=6
+problem: gaussian_wave1d
+
+grid:
+  N: 256            # number of Legendre points
+  Lx: 4.0           # domain length [0, Lx]
+  basis: legendre   # Use Legendre-Gauss-Lobatto basis
+  bc: 
+    left: dirichlet
+    right: neumann
+  dealias: false    # Not applicable for Legendre basis
+  precision: double
+
+physics:
+  gamma: 1.4        # adiabatic index
+
+# Enable parallel threading for OpenMP-enabled Numba kernels
+runtime:
+  num_threads: 4    # Use 4 threads for parallel Legendre operations
+
+integration:
+  t0: 0.0
+  t_end: 6.0        # Run for 6 time units (longer simulation)
+  cfl: 0.3          # Conservative CFL for Legendre
+  scheme: rk4       # Stable scheme for Legendre
+  output_interval: 0.1     # Output every 0.1 time units (60 frames total)
+  checkpoint_interval: 1.0  # Checkpoints every 1 time unit
+  spectral_filter:
+    enabled: true
+    p: 8            # even integer >= 2
+    alpha: 36.0     # filter strength
+
+# Initial conditions - Gaussian traveling wave
+initial_conditions:
+  wave_type: traveling  # traveling wave packet
+  rho0: 1.0         # background density
+  u0: 0.0           # background velocity (at rest)
+  p0: 1.0           # background pressure
+  amplitude: 1e-3   # Gaussian amplitude (linear regime)
+  sigma: 0.2        # Gaussian width
+  x0: 2.0           # center at middle of domain
+
+# Boundary condition values
+boundary_conditions:
+  density:
+    left: 1.0       # Dirichlet: fixed density at left boundary
+    right: neumann  # Neumann: zero gradient at right boundary
+  momentum:
+    left: 0.0       # Dirichlet: no flow at left boundary (wall)
+    right: neumann  # Neumann: zero gradient at right boundary
+  pressure:
+    left: 1.0       # Dirichlet: fixed pressure at left boundary
+    right: neumann  # Neumann: zero gradient at right boundary
+
+# Output configuration
+output:
+  outdir: outputs/gaussian_mixed_bc
+  save_fields: true
+  save_diagnostics: true
+  save_checkpoints: true

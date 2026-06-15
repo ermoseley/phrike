@@ -2,7 +2,7 @@
 problem: sod
 
 grid:
-  N: 256                    # Match Dedalus resolution
+  N: 512                    # High resolution test
   Lx: 1.0
   x0: 0.5                   # discontinuity location
   basis: legendre           # Use Legendre basis for non-periodic BCs
@@ -69,7 +69,7 @@ artificial_viscosity:
   diagnostic_output: true
 
 io:
-  outdir: outputs/sod_legendre
+  outdir: outputs/sod_legendre_512
   save_spectra: true
 
 monitoring:

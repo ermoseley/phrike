@@ -48,18 +48,20 @@ class ArtificialViscosityConfig:
     
     Attributes:
         enabled: Whether artificial viscosity is enabled
-        nu_max: Maximum viscosity coefficient
-        s_ref: Reference smoothness threshold
-        s_min: Minimum smoothness for applying viscosity
-        p: Exponent for smoothness scaling
-        epsilon: Small number to avoid division by zero
+        mode: Viscosity mode - "sensor" for gradient-based or "constant" for uniform
+        nu_constant: Constant viscosity coefficient (used when mode="constant")
+        nu_max: Maximum viscosity coefficient (used when mode="sensor")
+        s_ref: Reference smoothness threshold (used when mode="sensor")
+        s_min: Minimum smoothness for applying viscosity (used when mode="sensor")
+        p: Exponent for smoothness scaling (used when mode="sensor")
+        epsilon: Small number to avoid division by zero (used when mode="sensor")
         variable_weights: Weights for different conserved variables
-        sensor_variable: Which variable to use for smoothness sensing
+        sensor_variable: Which variable to use for smoothness sensing (used when mode="sensor")
         diagnostic_output: Whether to output diagnostic information
-    mode: str = "sensor"  # "sensor" or "constant"
-    nu_constant: float = 0.0  # used when mode == "constant"
     """
     enabled: bool = True
+    mode: str = "sensor"  # "sensor" or "constant"
+    nu_constant: float = 0.0  # used when mode == "constant"
     nu_max: float = 1e-3
     s_ref: float = 1.0
     s_min: float = 0.1
@@ -79,10 +81,18 @@ class ArtificialViscosityConfig:
                 "energy": 1.0
             }
         # Normalize mode value
-        if hasattr(self, "mode") and isinstance(self.mode, str):
+        if isinstance(self.mode, str):
             self.mode = self.mode.lower().strip()
         else:
             self.mode = "sensor"
+        
+        # Validate mode
+        if self.mode not in ["sensor", "constant"]:
+            raise ValueError(f"Invalid mode '{self.mode}'. Must be 'sensor' or 'constant'")
+        
+        # Validate nu_constant for constant mode
+        if self.mode == "constant" and self.nu_constant < 0:
+            raise ValueError("nu_constant must be non-negative")
 
 
 class SmoothnessSensor(ABC):
@@ -134,28 +144,57 @@ class GradientBasedSensor(SmoothnessSensor):
         # Compute gradient magnitude
         grad_magnitude = self._compute_gradient_magnitude(q, grid)
         
-        # Compute smoothness sensor
-        sensor = grad_magnitude / (np.abs(q) + self.config.epsilon)
-        
-        # Normalize to [0, 1] if desired
-        if self.config.s_ref > 0:
-            sensor = np.clip(sensor / self.config.s_ref, 0.0, 1.0)
-        
-        return sensor
+        # Torch-aware math to avoid implicit numpy conversions on device tensors
+        is_torch = False
+        try:
+            import torch  # type: ignore
+            is_torch = isinstance(q, torch.Tensor)
+        except Exception:
+            torch = None  # type: ignore
+            is_torch = False
+
+        if is_torch:
+            eps = torch.tensor(float(self.config.epsilon), dtype=q.dtype, device=q.device)
+            sensor = grad_magnitude / (torch.abs(q) + eps)
+            if self.config.s_ref > 0:
+                sref = torch.tensor(float(self.config.s_ref), dtype=q.dtype, device=q.device)
+                sensor = torch.clamp(sensor / sref, 0.0, 1.0)
+            return sensor
+        else:
+            sensor = grad_magnitude / (np.abs(q) + self.config.epsilon)
+            if self.config.s_ref > 0:
+                sensor = np.clip(sensor / self.config.s_ref, 0.0, 1.0)
+            return sensor
     
     def _compute_gradient_magnitude(self, q: np.ndarray, grid) -> np.ndarray:
         """Compute |∇q| using spectral differentiation."""
-        if hasattr(grid, 'dx1'):  # 1D
+        # Determine if we are working with torch tensors
+        is_torch = False
+        try:
+            import torch  # type: ignore
+            is_torch = isinstance(q, torch.Tensor)
+        except Exception:
+            torch = None  # type: ignore
+            is_torch = False
+
+        if hasattr(grid, 'dx1') and not hasattr(grid, 'dy1') and not hasattr(grid, 'dz1'):
+            # 1D
             dqdx = grid.dx1(q)
-            return np.abs(dqdx)
-        elif hasattr(grid, 'dx1') and hasattr(grid, 'dy1'):  # 2D
+            return (torch.abs(dqdx) if is_torch else np.abs(dqdx))
+        elif hasattr(grid, 'dx1') and hasattr(grid, 'dy1') and not hasattr(grid, 'dz1'):
+            # 2D
             dqdx = grid.dx1(q)
             dqdy = grid.dy1(q)
+            if is_torch:
+                return torch.sqrt(dqdx * dqdx + dqdy * dqdy)
             return np.sqrt(dqdx**2 + dqdy**2)
-        elif hasattr(grid, 'dx1') and hasattr(grid, 'dy1') and hasattr(grid, 'dz1'):  # 3D
+        elif hasattr(grid, 'dx1') and hasattr(grid, 'dy1') and hasattr(grid, 'dz1'):
+            # 3D
             dqdx = grid.dx1(q)
             dqdy = grid.dy1(q)
             dqdz = grid.dz1(q)
+            if is_torch:
+                return torch.sqrt(dqdx * dqdx + dqdy * dqdy + dqdz * dqdz)
             return np.sqrt(dqdx**2 + dqdy**2 + dqdz**2)
         else:
             raise ValueError("Grid does not support required differentiation methods")
@@ -176,18 +215,34 @@ class ArtificialViscosityCoefficient:
         Returns:
             Viscosity coefficient array
         """
-        # Apply minimum threshold
-        active_sensor = np.where(sensor > self.config.s_min, sensor, 0.0)
-        
-        # Compute viscosity: nu = nu_max * (s / s_ref)^p
-        if self.config.s_ref > 0:
-            scaled_sensor = active_sensor / self.config.s_ref
+        # Torch-aware path
+        is_torch = False
+        try:
+            import torch  # type: ignore
+            is_torch = isinstance(sensor, torch.Tensor)
+        except Exception:
+            torch = None  # type: ignore
+            is_torch = False
+
+        if is_torch:
+            s_min = torch.tensor(float(self.config.s_min), dtype=sensor.dtype, device=sensor.device)
+            active_sensor = torch.where(sensor > s_min, sensor, torch.zeros((), dtype=sensor.dtype, device=sensor.device))
+            if self.config.s_ref > 0:
+                s_ref = torch.tensor(float(self.config.s_ref), dtype=sensor.dtype, device=sensor.device)
+                scaled_sensor = active_sensor / s_ref
+            else:
+                scaled_sensor = active_sensor
+            nu_max = torch.tensor(float(self.config.nu_max), dtype=sensor.dtype, device=sensor.device)
+            viscosity = nu_max * (scaled_sensor ** float(self.config.p))
+            return viscosity
         else:
-            scaled_sensor = active_sensor
-        
-        viscosity = self.config.nu_max * (scaled_sensor ** self.config.p)
-        
-        return viscosity
+            active_sensor = np.where(sensor > self.config.s_min, sensor, 0.0)
+            if self.config.s_ref > 0:
+                scaled_sensor = active_sensor / self.config.s_ref
+            else:
+                scaled_sensor = active_sensor
+            viscosity = self.config.nu_max * (scaled_sensor ** self.config.p)
+            return viscosity
 
 
 class SpectralArtificialViscosity:
@@ -227,13 +282,24 @@ class SpectralArtificialViscosity:
             return [np.zeros_like(U[i]) for i in range(len(U))]
         
         # Compute viscosity field
-        if getattr(self.config, "mode", "sensor") == "constant":
+        if self.config.mode == "constant":
             # Use a uniform constant viscosity everywhere
-            nu_val = float(getattr(self.config, "nu_constant", 0.0))
-            # Backward compatibility: if nu_constant is 0, fall back to nu_max
+            nu_val = float(self.config.nu_constant)
+            # If nu_constant is 0, fall back to nu_max for backward compatibility
             if nu_val == 0.0:
                 nu_val = float(self.config.nu_max)
-            viscosity = np.full_like(U[0], nu_val)
+            # Preserve tensor type/device if U is a torch tensor
+            try:
+                import torch  # type: ignore
+                if isinstance(U, torch.Tensor):
+                    # Create a per-cell scalar viscosity field matching a single component's shape
+                    viscosity = torch.full_like(U[0], nu_val)
+                elif isinstance(U, (list, tuple)) and len(U) > 0 and hasattr(U[0], 'device'):
+                    viscosity = torch.full_like(U[0], nu_val)
+                else:
+                    viscosity = np.full_like(U[0], nu_val)
+            except Exception:
+                viscosity = np.full_like(U[0], nu_val)
             sensor = None
         else:
             # Sensor-based viscosity
@@ -257,9 +323,22 @@ class SpectralArtificialViscosity:
         
         # Store diagnostics
         if self.config.diagnostic_output:
-            self.last_sensor = None if sensor is None else sensor.copy()
-            self.last_viscosity = viscosity.copy()
-            self.last_viscosity_terms = [term.copy() for term in viscosity_terms]
+            # Store CPU copies for diagnostics to avoid device constraints
+            try:
+                import torch  # type: ignore
+                if sensor is None:
+                    self.last_sensor = None
+                else:
+                    self.last_sensor = sensor.detach().cpu().clone().numpy() if isinstance(sensor, torch.Tensor) else sensor.copy()
+                self.last_viscosity = viscosity.detach().cpu().clone().numpy() if isinstance(viscosity, torch.Tensor) else viscosity.copy()
+                self.last_viscosity_terms = [
+                    term.detach().cpu().clone().numpy() if isinstance(term, torch.Tensor) else term.copy()
+                    for term in viscosity_terms
+                ]
+            except Exception:
+                self.last_sensor = None if sensor is None else sensor.copy()
+                self.last_viscosity = viscosity.copy()
+                self.last_viscosity_terms = [term.copy() for term in viscosity_terms]
         
         return viscosity_terms
     
@@ -274,12 +353,13 @@ class SpectralArtificialViscosity:
         Returns:
             Viscosity term ∇·(ν ∇U)
         """
-        if hasattr(grid, 'dx1'):  # 1D
-            return self._compute_viscosity_term_1d(U_component, viscosity, grid)
+        # Prefer most-specific dimensionality detection first
+        if hasattr(grid, 'dx1') and hasattr(grid, 'dy1') and hasattr(grid, 'dz1'):  # 3D
+            return self._compute_viscosity_term_3d(U_component, viscosity, grid)
         elif hasattr(grid, 'dx1') and hasattr(grid, 'dy1'):  # 2D
             return self._compute_viscosity_term_2d(U_component, viscosity, grid)
-        elif hasattr(grid, 'dx1') and hasattr(grid, 'dy1') and hasattr(grid, 'dz1'):  # 3D
-            return self._compute_viscosity_term_3d(U_component, viscosity, grid)
+        elif hasattr(grid, 'dx1'):  # 1D
+            return self._compute_viscosity_term_1d(U_component, viscosity, grid)
         else:
             raise ValueError("Grid does not support required differentiation methods")
     
