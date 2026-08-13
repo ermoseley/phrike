@@ -77,15 +77,15 @@ After installation, verify PHRIKE is working correctly:
 GPU Support
 -----------
 
-For GPU acceleration, install PyTorch:
+For Metal/MPS, CUDA, or Torch CPU execution, install PHRIKE's Torch extra:
 
 .. code-block:: bash
 
-   # For CUDA (Linux/Windows)
-   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-   
-   # For MPS (Apple Silicon Macs)
-   pip install torch torchvision torchaudio
+   pip install -e ".[torch]"
+
+With automatic backend selection, PHRIKE prefers Metal/MPS, then CUDA, and
+falls back to NumPy CPU. Use ``--backend metal``, ``--backend cuda``, or
+``--backend cpu`` to make the choice explicit.
 
 Troubleshooting
 ---------------
@@ -100,7 +100,7 @@ Common Issues
    - Install pyfftw: ``pip install pyfftw``
 
 3. **GPU not detected**
-   - Verify PyTorch installation: ``python -c "import torch; print(torch.cuda.is_available())"``
+   - Verify PyTorch devices: ``python -c "import torch; print(torch.backends.mps.is_available(), torch.cuda.is_available())"``
 
 4. **Memory issues on large problems**
    - Use smaller resolutions or enable spectral filtering

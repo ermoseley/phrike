@@ -4,13 +4,14 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
-PHRIKE is a high-performance pseudo-spectral solver for compressible Euler equations, designed for computational fluid dynamics research and education. The solver provides exponential convergence, dual backend support (CPU/GPU), and comprehensive monitoring capabilities.
+PHRIKE is a high-performance pseudo-spectral solver for compressible Euler equations, designed for computational fluid dynamics research and education. The solver provides exponential convergence, portable CPU/GPU execution, and comprehensive monitoring capabilities.
 
 ## Features
 
 - **Multi-dimensional**: 1D, 2D, and 3D Euler equation solvers
 - **Spectral Accuracy**: Pseudo-spectral methods with exponential convergence for smooth solutions
-- **Dual Backend**: NumPy (CPU) and PyTorch (GPU) support with automatic device detection
+- **Portable Backends**: Metal/MPS preferred automatically, with CUDA and NumPy/Torch CPU support
+- **Adaptive Integration**: Embedded RK23, Dormand-Prince RK45, and 13-stage Fehlberg RKF78
 - **High Performance**: Numba JIT compilation and optional FFTW integration
 - **Comprehensive Testing**: Extensive test suite with validation problems
 - **Easy to Use**: YAML configuration and simple Python API
@@ -31,6 +32,9 @@ pip install -e .
 
 # Install with optional dependencies
 pip install -e .[fastfft,dev,docs]
+
+# Add PyTorch for Metal/MPS, CUDA, or Torch CPU execution
+pip install -e .[torch]
 ```
 
 ### Basic Usage
@@ -42,8 +46,13 @@ phrike sod --config configs/sod.yaml
 # Run 2D Kelvin-Helmholtz instability
 phrike khi2d --config configs/khi2d.yaml
 
-# Run with GPU acceleration
-phrike tgv3d --backend torch --device cuda
+# Automatic selection: Metal/MPS, then CUDA, then NumPy CPU
+phrike tgv3d --config configs/tgv3d.yaml
+
+# Explicit backends
+phrike tgv3d --config configs/tgv3d.yaml --backend metal
+phrike tgv3d --config configs/tgv3d.yaml --backend cuda
+phrike tgv3d --config configs/tgv3d.yaml --backend cpu
 ```
 
 ### Python API
@@ -126,20 +135,23 @@ initial_conditions:
 
 ## Backend Support
 
-### NumPy Backend (Default)
-- CPU-only computation
-- Uses SciPy FFT or PyFFTW (if available)
-- Stable and well-tested
+### Automatic Backend (Default)
+- Prefers PyTorch Metal/MPS on Apple Silicon
+- Uses PyTorch CUDA when Metal is unavailable and CUDA is present
+- Falls back to the NumPy CPU backend when no accelerator is available
+- Metal/MPS uses single precision because PyTorch MPS does not support float64
 
 ### PyTorch Backend
-- GPU acceleration via CUDA or MPS (Apple Silicon)
-- Automatic device detection
+- GPU acceleration via Metal/MPS (Apple Silicon) or CUDA
+- Torch CPU remains available explicitly
 - Better memory management for large problems
 
 ```bash
-# Use GPU acceleration
-phrike sod --backend torch --device cuda
-phrike sod --backend torch --device mps  # Apple Silicon
+# Preferred Metal path and explicit alternatives
+phrike sod --config configs/sod.yaml --backend metal
+phrike sod --config configs/sod.yaml --backend cuda
+phrike sod --config configs/sod.yaml --backend cpu
+phrike sod --config configs/sod.yaml --backend torch --device cpu
 ```
 
 ## Performance

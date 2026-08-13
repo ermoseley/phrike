@@ -36,7 +36,8 @@ This report documents the successful implementation of adaptive time-stepping ca
 
 - **RK23 (Bogacki-Shampine)**: 2nd/3rd order embedded method
 - **RK45 (Dormand-Prince)**: 4th/5th order embedded method (default)
-- **RK78 (Dormand-Prince)**: 7th/8th order embedded method
+- **RKF78 (Fehlberg)**: complete 13-stage eighth-order method with an
+  embedded seventh-order error estimate
 
 ### Error Control
 

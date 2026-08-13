@@ -1,7 +1,9 @@
 PHRIKE Documentation
 ===================
 
-PHRIKE is a high-performance pseudo-spectral hydrodynamics solver for compressible Euler equations. It supports 1D, 2D, and 3D simulations with both CPU (NumPy) and GPU (PyTorch) backends.
+PHRIKE is a high-performance pseudo-spectral hydrodynamics solver for
+compressible Euler equations. It supports 1D, 2D, and 3D simulations with
+automatic Metal/MPS, CUDA, and NumPy CPU backend selection.
 
 .. toctree::
    :maxdepth: 2
@@ -20,7 +22,8 @@ Features
 
 * **Multi-dimensional**: 1D, 2D, and 3D Euler equation solvers
 * **Spectral Accuracy**: Pseudo-spectral methods with exponential convergence
-* **Dual Backend**: NumPy (CPU) and PyTorch (GPU) support
+* **Portable Backends**: Metal/MPS preferred, with CUDA and CPU support
+* **Adaptive Integration**: RK23, RK45, and full 13-stage Fehlberg RKF78
 * **High Performance**: Numba JIT compilation and FFTW integration
 * **Comprehensive Testing**: Extensive test suite with validation problems
 * **Easy to Use**: YAML configuration and simple Python API
@@ -36,15 +39,14 @@ Quick Example
    solver, history = phrike.run_simulation(
        problem_name="sod",
        config_path="configs/sod.yaml",
-       backend="numpy"
+       backend="cpu"
    )
    
    # Run with GPU acceleration
    solver, history = phrike.run_simulation(
        problem_name="khi2d",
        config_path="configs/khi2d.yaml",
-       backend="torch",
-       device="cuda"
+       backend="metal"  # use "cuda" on NVIDIA systems
    )
 
 Indices and tables

@@ -16,8 +16,12 @@ The simplest way to run a simulation is using the command-line interface:
    # Run 2D Kelvin-Helmholtz instability
    phrike khi2d --config configs/khi2d.yaml
    
-   # Run with GPU acceleration
-   phrike tgv3d --backend torch --device cuda
+   # Automatic acceleration prefers Metal, then CUDA, then NumPy CPU
+   phrike tgv3d --config configs/tgv3d.yaml
+
+   # Or select a backend explicitly
+   phrike tgv3d --config configs/tgv3d.yaml --backend metal
+   phrike tgv3d --config configs/tgv3d.yaml --backend cuda
 
 Python API
 ----------
@@ -132,15 +136,15 @@ You can override configuration parameters:
 GPU Acceleration
 ~~~~~~~~~~~~~~~~
 
-For large problems, use GPU acceleration:
+Automatic selection prefers Metal/MPS, followed by CUDA. You can also select
+either accelerator explicitly:
 
 .. code-block:: python
 
    solver, history = phrike.run_simulation(
        problem_name="khi2d",
        config_path="configs/khi2d.yaml",
-       backend="torch",
-       device="cuda"  # or "mps" for Apple Silicon
+       backend="metal"  # use "cuda" for NVIDIA or "cpu" for NumPy
    )
 
 Monitoring

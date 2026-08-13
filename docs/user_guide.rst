@@ -82,8 +82,9 @@ PHRIKE provides a unified command-line interface:
 ### Basic Options
 
 - ``--config PATH``: Path to configuration file
-- ``--backend {numpy,torch}``: Array backend (default: numpy)
-- ``--device DEVICE``: Torch device (cpu, cuda, mps)
+- ``--backend {auto,metal,cuda,cpu,numpy,torch}``: Compute backend
+  (default: auto; prefers Metal, then CUDA, then NumPy CPU)
+- ``--device DEVICE``: Explicit Torch device (cpu, cuda, mps/metal)
 - ``--no-video``: Skip video generation
 - ``--restart-from PATH``: Restart from checkpoint
 
@@ -94,8 +95,10 @@ PHRIKE provides a unified command-line interface:
    # Basic simulation
    phrike sod --config configs/sod.yaml
    
-   # GPU acceleration
-   phrike khi2d --backend torch --device cuda
+   # Preferred Metal acceleration, or explicit CUDA/CPU
+   phrike khi2d --config configs/khi2d.yaml --backend metal
+   phrike khi2d --config configs/khi2d.yaml --backend cuda
+   phrike khi2d --config configs/khi2d.yaml --backend cpu
    
    # Restart from checkpoint
    phrike sod --restart-from outputs/sod/snapshot_t0.100000.npz
@@ -161,13 +164,14 @@ PHRIKE can be used programmatically through the Python API:
 Backend Selection
 -----------------
 
-PHRIKE supports two array backends:
+PHRIKE automatically selects the best available backend in this order:
+Metal/MPS, CUDA, and NumPy CPU.
 
-### NumPy Backend (Default)
+### NumPy Backend
 
 - **Pros**: Stable, well-tested, no additional dependencies
 - **Cons**: CPU-only, limited memory management
-- **Best for**: Small to medium problems, development
+- **Best for**: CPU runs, small to medium problems, development
 
 ### PyTorch Backend
 
@@ -181,21 +185,19 @@ For PyTorch backend, you can specify the device:
 
 - ``cpu``: CPU computation
 - ``cuda``: NVIDIA GPU (if available)
-- ``mps``: Apple Silicon GPU (if available)
+- ``mps`` or ``metal``: Apple Silicon GPU (preferred when available)
 
 .. code-block:: python
 
-   # Automatic device detection
+   # Automatic backend detection (Metal, CUDA, then NumPy CPU)
    solver, history = phrike.run_simulation(
-       problem_name="khi2d",
-       backend="torch"
+       problem_name="khi2d"
    )
    
-   # Explicit device selection
+   # Explicit backend selection
    solver, history = phrike.run_simulation(
        problem_name="khi2d",
-       backend="torch",
-       device="cuda"
+       backend="cuda"
    )
 
 Performance Optimization
