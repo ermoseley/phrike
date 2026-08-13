@@ -38,4 +38,6 @@ phrike = ["py.typed"]
 where = ["."]
 exclude = ["tests", "examples", "configs"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 

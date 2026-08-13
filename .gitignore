@@ -1,6 +1,8 @@
-0;276;0c11;rgb:1818/1818/181811;rgb:1818/1818/1818__pycache__/
+__pycache__/
 *.pyc
 *.pyo
+*.nbc
+*.nbi
 .pytest_cache/
 dist/
 build/

@@ -659,7 +659,7 @@ class SpectralSolver2D:
         else:
             solution_scale = float(np.max(np.abs(U)))
         
-        result = self.adaptive_stepper.step(rhs_func, U, dt, solution_scale, self.adaptive_stepper.controller)
+        result = self.adaptive_stepper.step(rhs_func, U, dt, solution_scale)
         
         if result.accepted:
             Un = _apply_physical_filters_2d(self.grid, result.U_new)
@@ -672,7 +672,13 @@ class SpectralSolver2D:
                           on_step: Optional[Callable[[int, float, Array], None]]) -> float:
         """Perform one step in adaptive run loop."""
         def rhs_func(U_current: Array) -> Array:
-            return _compute_rhs_2d(self.grid, self.equations, U_current, None, self.gravity_config)
+            return _compute_rhs_2d(
+                self.grid,
+                self.equations,
+                U_current,
+                self.artificial_viscosity,
+                self.gravity_config,
+            )
         
         if _TORCH_AVAILABLE and isinstance(self.U, torch.Tensor):
             solution_scale = float(torch.max(torch.abs(self.U)).item())
@@ -1348,7 +1354,7 @@ class SpectralSolver3D:
         else:
             solution_scale = float(np.max(np.abs(U)))
         
-        result = self.adaptive_stepper.step(rhs_func, U, dt, solution_scale, self.adaptive_stepper.controller)
+        result = self.adaptive_stepper.step(rhs_func, U, dt, solution_scale)
         
         if result.accepted:
             Un = _apply_physical_filters_3d(self.grid, result.U_new)
