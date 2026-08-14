@@ -15,8 +15,9 @@ def main() -> None:
         epilog="""
 Examples:
   phrike sod --config configs/sod.yaml
-  phrike khi2d --backend torch --device mps
-  phrike tgv3d --config configs/tgv3d.yaml --backend torch --device cuda
+  phrike khi2d --backend metal
+  phrike tgv3d --config configs/tgv3d.yaml --backend cuda
+  phrike sod --backend cpu
   phrike turb3d --video
   phrike sod --video --video-quality high --video-fps 60
   phrike khi2d --video --video-codec libx264 --video-quality medium
@@ -38,9 +39,12 @@ Examples:
     parser.add_argument(
         "--backend",
         type=str,
-        default="numpy",
-        choices=["numpy", "torch"],
-        help="Array backend (default: numpy)",
+        default="auto",
+        choices=["auto", "metal", "cuda", "cpu", "numpy", "torch"],
+        help=(
+            "Compute backend (default: auto; prefers Metal/MPS, then CUDA, "
+            "then NumPy CPU)"
+        ),
     )
     # Basis options (1D only currently)
     parser.add_argument(
@@ -60,14 +64,18 @@ Examples:
         "--device",
         type=str,
         default=None,
-        help="Torch device: cpu|mps|cuda (if backend=torch)",
+        choices=["auto", "cpu", "mps", "metal", "cuda"],
+        help="Explicit Torch device when --backend=torch",
     )
     parser.add_argument(
         "--precision",
         type=str,
         choices=["single", "double"],
-        default="double",
-        help="Floating point precision: single|double (default: double)",
+        default=None,
+        help=(
+            "Override YAML precision: single|double "
+            "(Metal/MPS executes in single precision)"
+        ),
     )
 
     # Output options
@@ -177,7 +185,7 @@ Examples:
             print(f"Backend: {args.backend}")
             if args.device:
                 print(f"Device: {args.device}")
-            print(f"Precision: {args.precision}")
+            print(f"Precision: {args.precision or problem.precision}")
             print(f"Output directory: {problem.outdir}")
 
         # Inject CLI overrides into problem config if provided

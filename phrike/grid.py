@@ -63,25 +63,132 @@ def _build_exponential_filter(N: int, p: int, alpha: float) -> np.ndarray:
     return sigma
 
 
-def _validate_torch_device(device: str, debug: bool) -> None:
-    """Validate that the requested torch device is available.
-    
-    Args:
-        device: The requested device ('cpu', 'cuda', 'mps')
-        debug: If True, raise error if device is not available
-        
-    Raises:
-        RuntimeError: If debug=True and device is not available
+def _mps_available() -> bool:
+    return bool(
+        _TORCH_AVAILABLE
+        and torch is not None
+        and hasattr(torch.backends, "mps")
+        and torch.backends.mps.is_available()
+    )
+
+
+def _cuda_available() -> bool:
+    return bool(
+        _TORCH_AVAILABLE and torch is not None and torch.cuda.is_available()
+    )
+
+
+def preferred_torch_device() -> str:
+    """Return the preferred Torch device: Metal, then CUDA, then CPU."""
+    if _mps_available():
+        return "mps"
+    if _cuda_available():
+        return "cuda"
+    return "cpu"
+
+
+def _validate_torch_device(device: str, debug: bool = False) -> None:
+    """Validate an explicit Torch device regardless of debug mode."""
+    del debug  # Kept for compatibility with existing call sites.
+    if not _TORCH_AVAILABLE or torch is None:
+        raise ImportError(
+            "The Torch backend requires PyTorch; install PHRIKE with "
+            "`pip install -e '.[torch]'`."
+        )
+    if device == "cuda" and not _cuda_available():
+        raise RuntimeError(
+            "CUDA was requested but is not available in this PyTorch installation."
+        )
+    if device == "mps" and not _mps_available():
+        raise RuntimeError(
+            "Metal/MPS was requested but is unavailable. MPS requires PyTorch "
+            "on an Apple Silicon Mac."
+        )
+    if device not in {"cpu", "cuda", "mps"}:
+        raise ValueError(
+            f"Unknown Torch device {device!r}; expected cpu, cuda, mps, or metal."
+        )
+
+
+def resolve_backend(
+    backend: str = "auto", device: Optional[str] = None
+) -> tuple[str, Optional[str]]:
+    """Resolve user-facing backend aliases to an array backend and device.
+
+    Automatic selection prefers Apple's Metal/MPS backend, then CUDA, and
+    finally the NumPy CPU backend. Explicit ``backend='torch'`` falls back to
+    Torch CPU when no accelerator is present.
     """
-    if not debug:
-        return
-        
-    if device == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError(f"Debug mode: CUDA requested but not available. PyTorch was not compiled with CUDA support.")
-    elif device == "mps" and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
-        raise RuntimeError(f"Debug mode: MPS requested but not available. MPS is only available on Apple Silicon Macs.")
-    elif device not in ["cpu", "cuda", "mps"]:
-        raise RuntimeError(f"Debug mode: Unknown device '{device}' requested. Valid devices are: cpu, cuda, mps")
+    requested_backend = str(backend).strip().lower()
+    requested_device = None if device is None else str(device).strip().lower()
+    if requested_device in {"", "auto"}:
+        requested_device = None
+    if requested_device == "metal":
+        requested_device = "mps"
+
+    backend_aliases = {
+        "metal": ("torch", "mps"),
+        "mps": ("torch", "mps"),
+        "cuda": ("torch", "cuda"),
+        "cpu": ("numpy", None),
+    }
+    if requested_backend in backend_aliases:
+        resolved_backend, alias_device = backend_aliases[requested_backend]
+        if requested_backend == "cpu" and requested_device == "cpu":
+            requested_device = None
+        if requested_device is not None and requested_device != alias_device:
+            raise ValueError(
+                f"Backend {requested_backend!r} conflicts with device "
+                f"{requested_device!r}."
+            )
+        requested_backend = resolved_backend
+        requested_device = alias_device
+
+    if requested_backend == "auto":
+        if requested_device in {"mps", "cuda"}:
+            requested_backend = "torch"
+        elif requested_device == "cpu":
+            return "numpy", None
+        elif _mps_available():
+            return "torch", "mps"
+        elif _cuda_available():
+            return "torch", "cuda"
+        else:
+            return "numpy", None
+
+    if requested_backend == "numpy":
+        if requested_device not in {None, "cpu"}:
+            raise ValueError(
+                "The NumPy backend only supports CPU. Use backend='torch' "
+                "for Metal/MPS or CUDA."
+            )
+        return "numpy", None
+
+    if requested_backend != "torch":
+        raise ValueError(
+            f"Unknown backend {backend!r}; expected auto, metal, cuda, cpu, "
+            "numpy, or torch."
+        )
+
+    resolved_device = requested_device or preferred_torch_device()
+    _validate_torch_device(resolved_device)
+    return "torch", resolved_device
+
+
+def _torch_dtypes(precision: str, device: str) -> tuple[Any, Any, str]:
+    """Return real/complex Torch dtypes and the effective precision."""
+    normalized = str(precision).strip().lower()
+    if normalized not in {"single", "double"}:
+        raise ValueError(
+            f"Unknown precision {precision!r}; expected 'single' or 'double'."
+        )
+    # PyTorch MPS does not support float64. Metal is preferred for automatic
+    # acceleration, so normalize its effective precision instead of failing.
+    if device == "mps":
+        normalized = "single"
+    if normalized == "single":
+        return torch.float32, torch.complex64, normalized
+    return torch.float64, torch.complex128, normalized
 
 
 def _build_filter_mask_2d(Nx: int, Ny: int, dealias: bool) -> np.ndarray:
@@ -174,13 +281,17 @@ class Grid1D:
     dealias: bool = True
     filter_params: Optional[Dict[str, float]] = None
     fft_workers: int = 1
-    backend: str = "numpy"  # "numpy" or "torch"
+    backend: str = "auto"  # Metal, CUDA, then NumPy CPU
     torch_device: Optional[str] = None
     precision: str = "double"  # "single" or "double"
     debug: bool = False
     problem_config: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
+        self.backend, self.torch_device = resolve_backend(
+            self.backend, self.torch_device
+        )
+
         # Normalize/parse boundary condition configuration (string, dict, or per-boundary dict)
         def _normalize_bc_value(name: str) -> str:
             n = str(name).strip().lower()
@@ -336,31 +447,10 @@ class Grid1D:
         )
         if self._use_torch:
             assert torch is not None
-            if self.torch_device is None:
-                dev = "cpu"
-                try:
-                    if (
-                        hasattr(torch.backends, "mps")
-                        and torch.backends.mps.is_available()
-                    ):
-                        dev = "mps"
-                    elif torch.cuda.is_available():
-                        dev = "cuda"
-                except Exception:
-                    dev = "cpu"
-                self.torch_device = dev
-
             _validate_torch_device(self.torch_device, self.debug)
-
-            if self.precision == "single":
-                torch_dtype = torch.float32
-                torch_cdtype = torch.complex64
-            else:
-                torch_dtype = torch.float64
-                torch_cdtype = torch.complex128
-            if self.torch_device == "mps":
-                torch_dtype = torch.float32
-                torch_cdtype = torch.complex64
+            torch_dtype, torch_cdtype, self.precision = _torch_dtypes(
+                self.precision, self.torch_device
+            )
 
             self.x = torch.from_numpy(np.asarray(self.x)).to(
                 dtype=torch_dtype, device=self.torch_device
@@ -417,42 +507,12 @@ class Grid1D:
             and (self._basis_name in ("fourier", "legendre"))
         )
         if self._use_torch:
-            # Choose device if not provided
-            if self.torch_device is None:
-                dev = "cpu"
-                try:
-                    if (
-                        torch is not None
-                        and hasattr(torch.backends, "mps")
-                        and torch.backends.mps.is_available()
-                    ):
-                        dev = "mps"
-                    elif torch is not None and torch.cuda.is_available():
-                        dev = "cuda"
-                except Exception:
-                    dev = "cpu"
-                self.torch_device = dev
-            
-            # Debug mode: validate that the requested device is available
-            if self.torch_device is not None:
-                _validate_torch_device(self.torch_device, self.debug)
-
-            # Choose dtype based on precision and device
-            if self.precision == "single":
-                torch_dtype = torch.float32
-                torch_cdtype = torch.complex64
-            elif self.precision == "double":
-                torch_dtype = torch.float64
-                torch_cdtype = torch.complex128
-            else:
-                torch_dtype = torch.float64
-                torch_cdtype = torch.complex128
-            if self.torch_device == "mps":
-                torch_dtype = torch.float32
-                torch_cdtype = torch.complex64
-
             # Move arrays to torch (including CPU device)
             assert torch is not None
+            _validate_torch_device(self.torch_device, self.debug)
+            torch_dtype, torch_cdtype, self.precision = _torch_dtypes(
+                self.precision, self.torch_device
+            )
             self.x = torch.from_numpy(np.asarray(self.x)).to(
                 dtype=torch_dtype, device=self.torch_device
             )
@@ -786,7 +846,7 @@ class Grid2D:
     dealias: bool = True
     filter_params: Optional[Dict[str, float]] = None
     fft_workers: int = 1
-    backend: str = "numpy"  # "numpy" or "torch"
+    backend: str = "auto"  # Metal, CUDA, then NumPy CPU
     torch_device: Optional[str] = None
     precision: str = "double"  # "single" or "double"
     debug: bool = False
@@ -797,6 +857,9 @@ class Grid2D:
     bc_config: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
+        self.backend, self.torch_device = resolve_backend(
+            self.backend, self.torch_device
+        )
         self.dx = self.Lx / self.Nx
         self.dy = self.Ly / self.Ny
         # Precompute minimum node spacings for CFL with nonuniform grids (Legendre)
@@ -924,33 +987,10 @@ class Grid2D:
         self._use_torch = (self.backend.lower() == "torch") and _TORCH_AVAILABLE
         if self._use_torch:
             assert torch is not None
-            if self.torch_device is None:
-                dev = "cpu"
-                try:
-                    if (
-                        hasattr(torch.backends, "mps")
-                        and torch.backends.mps.is_available()
-                    ):
-                        dev = "mps"
-                    elif torch.cuda.is_available():
-                        dev = "cuda"
-                except Exception:
-                    dev = "cpu"
-                self.torch_device = dev
-
-            # Choose dtype based on precision and device
-            if self.precision == "single":
-                torch_dtype = torch.float32
-                torch_cdtype = torch.complex64
-            elif self.precision == "double":
-                torch_dtype = torch.float64
-                torch_cdtype = torch.complex128
-            else:
-                torch_dtype = torch.float64
-                torch_cdtype = torch.complex128
-            if self.torch_device == "mps":
-                torch_dtype = torch.float32
-                torch_cdtype = torch.complex64
+            _validate_torch_device(self.torch_device, self.debug)
+            torch_dtype, torch_cdtype, self.precision = _torch_dtypes(
+                self.precision, self.torch_device
+            )
 
             self.x = torch.from_numpy(np.asarray(self.x)).to(
                 dtype=torch_dtype, device=self.torch_device
@@ -1345,9 +1385,12 @@ class Grid2D:
             y_np = self.y.detach().cpu().numpy()
             X_np, Y_np = np.meshgrid(x_np, y_np, indexing="xy")
             # Convert back to torch with same dtype and device
-            torch_dtype = torch.float32 if self.torch_device == "mps" else torch.float64
-            X = torch.from_numpy(X_np).to(dtype=torch_dtype, device=self.torch_device)
-            Y = torch.from_numpy(Y_np).to(dtype=torch_dtype, device=self.torch_device)
+            X = torch.from_numpy(X_np).to(
+                dtype=self.x.dtype, device=self.torch_device
+            )
+            Y = torch.from_numpy(Y_np).to(
+                dtype=self.y.dtype, device=self.torch_device
+            )
             return X, Y
         else:
             X, Y = np.meshgrid(self.x, self.y, indexing="xy")
@@ -1370,12 +1413,15 @@ class Grid3D:
     dealias: bool = True
     filter_params: Optional[Dict[str, float]] = None
     fft_workers: int = 1
-    backend: str = "numpy"  # "numpy" or "torch"
+    backend: str = "auto"  # Metal, CUDA, then NumPy CPU
     torch_device: Optional[str] = None
     precision: str = "double"  # "single" or "double"
     debug: bool = False
 
     def __post_init__(self) -> None:
+        self.backend, self.torch_device = resolve_backend(
+            self.backend, self.torch_device
+        )
         self.dx = self.Lx / self.Nx
         self.dy = self.Ly / self.Ny
         self.dz = self.Lz / self.Nz
@@ -1425,33 +1471,10 @@ class Grid3D:
         self._use_torch = (self.backend.lower() == "torch") and _TORCH_AVAILABLE
         if self._use_torch:
             assert torch is not None
-            if self.torch_device is None:
-                dev = "cpu"
-                try:
-                    if (
-                        hasattr(torch.backends, "mps")
-                        and torch.backends.mps.is_available()
-                    ):
-                        dev = "mps"
-                    elif torch.cuda.is_available():
-                        dev = "cuda"
-                except Exception:
-                    dev = "cpu"
-                self.torch_device = dev
-
-            # Choose dtype based on precision and device
-            if self.precision == "single":
-                torch_dtype = torch.float32
-                torch_cdtype = torch.complex64
-            elif self.precision == "double":
-                torch_dtype = torch.float64
-                torch_cdtype = torch.complex128
-            else:
-                torch_dtype = torch.float64
-                torch_cdtype = torch.complex128
-            if self.torch_device == "mps":
-                torch_dtype = torch.float32
-                torch_cdtype = torch.complex64
+            _validate_torch_device(self.torch_device, self.debug)
+            torch_dtype, torch_cdtype, self.precision = _torch_dtypes(
+                self.precision, self.torch_device
+            )
 
             self.x = torch.from_numpy(np.asarray(self.x)).to(
                 dtype=torch_dtype, device=self.torch_device

@@ -12,6 +12,11 @@ import numpy as np
 from phrike.io import load_config, ensure_outdir, save_solution_snapshot
 from phrike.tracers import FourierTracers1D, FourierTracers2D, FourierTracers3D
 
+try:
+    import torch  # type: ignore
+except ImportError:  # pragma: no cover - Torch is optional
+    torch = None  # type: ignore
+
 
 class BaseProblem(ABC):
     """Base class for all PHRIKE problems."""
@@ -108,7 +113,11 @@ class BaseProblem(ABC):
         self.precision = str(self.config["grid"].get("precision", "double"))
         
         # Adaptive time-stepping parameters
-        adaptive_raw = self.config["integration"].get("adaptive", None)
+        # Prefer the nested form, while continuing to load the public
+        # top-level `adaptive:` blocks used by existing configurations.
+        adaptive_raw = self.config["integration"].get(
+            "adaptive"
+        ) or self.config.get("adaptive")
         if adaptive_raw:
             self.adaptive_config = {
                 "enabled": bool(adaptive_raw.get("enabled", False)),
@@ -843,7 +852,7 @@ class BaseProblem(ABC):
                 try:
                     rho, ux, uy, p = solver.equations.primitive(U)
                     import numpy as _np
-                    if 'torch' in globals() and isinstance(rho, (torch.Tensor,)):
+                    if torch is not None and isinstance(rho, torch.Tensor):
                         wyt = torch.from_numpy(_np.asarray(wy)).to(rho.device, rho.dtype)
                         wxt = torch.from_numpy(_np.asarray(wx)).to(rho.device, rho.dtype)
                         w2d = wyt[:, None] * wxt[None, :]
@@ -1023,7 +1032,7 @@ class BaseProblem(ABC):
 
     def run(
         self,
-        backend: str = "numpy",
+        backend: str = "auto",
         device: Optional[str] = None,
         generate_video: bool = True,
         debug: bool = False,
@@ -1039,21 +1048,18 @@ class BaseProblem(ABC):
             print(f"Using restart data for initial conditions (shape: {U0.shape})")
             
             # Convert restart data to appropriate backend format
-            if backend == "torch" and isinstance(U0, np.ndarray):
+            if getattr(grid, "_use_torch", False) and isinstance(U0, np.ndarray):
                 try:
                     import torch
-                    # Determine dtype based on precision
-                    if self.precision == "single":
-                        torch_dtype = torch.float32
-                    elif self.precision == "double":
-                        torch_dtype = torch.float64
-                    else:
-                        # Fallback to device-based logic (MPS only supports float32)
-                        torch_dtype = torch.float32 if device == "mps" else torch.float64
-                    
-                    # Convert to torch tensor
-                    U0 = torch.from_numpy(U0).to(dtype=torch_dtype, device=device)
-                    print(f"Converted restart data to torch tensor: dtype={torch_dtype}, device={device}")
+
+                    # Match the grid's resolved backend, device, and precision.
+                    U0 = torch.from_numpy(U0).to(
+                        dtype=grid.x.dtype, device=grid.x.device
+                    )
+                    print(
+                        "Converted restart data to torch tensor: "
+                        f"dtype={grid.x.dtype}, device={grid.x.device}"
+                    )
                 except ImportError:
                     raise ImportError("PyTorch is required for torch backend but not available")
         else:

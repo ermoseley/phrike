@@ -15,9 +15,9 @@ def run_simulation(
     problem_name: str,
     config_path: str = None,
     config: dict = None,
-    backend: str = "numpy",
+    backend: str = "auto",
     device: str = None,
-    precision: str = "double",
+    precision: str = None,
     generate_video: bool = True,
     debug: bool = False,
 ):
@@ -27,9 +27,12 @@ def run_simulation(
         problem_name: Name of the problem to run
         config_path: Path to YAML configuration file
         config: Configuration dictionary
-        backend: Array backend ('numpy' or 'torch')
-        device: Torch device ('cpu', 'mps', 'cuda')
-        precision: Floating point precision ('single' or 'double')
+        backend: Compute backend. ``auto`` prefers Metal/MPS, then CUDA,
+            then NumPy CPU. Explicit aliases are ``metal``, ``cuda``, ``cpu``,
+            ``numpy``, and ``torch``.
+        device: Optional Torch device ('cpu', 'mps'/'metal', 'cuda')
+        precision: Optional floating point precision override
+            ('single' or 'double'). Metal/MPS executes in single precision.
         generate_video: Whether to generate video from frames
         debug: Debug mode - error if specified backend/device is not available
 

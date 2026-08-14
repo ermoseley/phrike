@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use PHRIKE, please cite this software."
+title: "PHRIKE"
+type: software
+authors:
+  - family-names: Moseley
+    given-names: Eric R.
+repository-code: "https://github.com/ermoseley/phrike"
+license: MIT
+version: 0.1.0
