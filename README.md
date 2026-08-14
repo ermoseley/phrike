@@ -1,266 +1,82 @@
-# PHRIKE: Pseudo-spectral Hydrodynamical solver for Realistic Integration of physiKal Environments
+# PHRIKE
 
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+[![CI](https://github.com/ermoseley/phrike/actions/workflows/ci.yml/badge.svg)](https://github.com/ermoseley/phrike/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-PHRIKE is a high-performance pseudo-spectral solver for compressible Euler equations, designed for computational fluid dynamics research and education. The solver provides exponential convergence, portable CPU/GPU execution, and comprehensive monitoring capabilities.
+PHRIKE is an experimental pseudo-spectral research code for compressible
+hydrodynamics and ideal magnetohydrodynamics (MHD). It is a compact platform
+for investigating spectral discretizations, explicit adaptive integration, and
+portable NumPy/PyTorch backends—not a production CFD package.
 
-## Features
+## What is implemented
 
-- **Multi-dimensional**: 1D, 2D, and 3D Euler equation solvers
-- **Spectral Accuracy**: Pseudo-spectral methods with exponential convergence for smooth solutions
-- **Portable Backends**: Metal/MPS preferred automatically, with CUDA and NumPy/Torch CPU support
-- **Adaptive Integration**: Embedded RK23, Dormand-Prince RK45, and 13-stage Fehlberg RKF78
-- **High Performance**: Numba JIT compilation and optional FFTW integration
-- **Comprehensive Testing**: Extensive test suite with validation problems
-- **Easy to Use**: YAML configuration and simple Python API
-- **Monitoring**: Built-in conservation tracking and real-time statistics
-- **Visualization**: Automatic frame generation and video creation
+- 1D, 2D, and 3D hydrodynamic and ideal-MHD problem setups.
+- Fourier and Legendre bases, with spectral filtering and optional artificial
+  viscosity for exploratory shock problems.
+- Fixed-step RK2/RK4 and embedded RK23, RK45, and Fehlberg RKF78 integration.
+- NumPy CPU execution plus optional PyTorch CPU, CUDA, and Apple Metal/MPS
+  backends.
+- YAML-configured example problems, including acoustic waves, Kelvin-Helmholtz,
+  Alfvén waves, and Orszag-Tang.
 
-## Quick Start
-
-### Installation
+## Quick start
 
 ```bash
-# Clone the repository
-git clone https://github.com/your-username/phrike.git
+git clone https://github.com/ermoseley/phrike.git
 cd phrike
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e ".[dev]"
 
-# Install in development mode
-pip install -e .
+# A CPU smoke run; outputs are kept outside the repository.
+python -m phrike acoustic1d --config configs/acoustic1d.yaml \
+  --backend cpu --outdir /tmp/phrike-acoustic
 
-# Install with optional dependencies
-pip install -e .[fastfft,dev,docs]
-
-# Add PyTorch for Metal/MPS, CUDA, or Torch CPU execution
-pip install -e .[torch]
+# Run the checked test suite.
+python -m pytest -q
 ```
 
-### Basic Usage
+For an optional accelerator backend, install the Torch extra and select a
+backend explicitly:
 
 ```bash
-# Run a 1D Sod shock tube
-phrike sod --config configs/sod.yaml
-
-# Run 2D Kelvin-Helmholtz instability
-phrike khi2d --config configs/khi2d.yaml
-
-# Automatic selection: Metal/MPS, then CUDA, then NumPy CPU
-phrike tgv3d --config configs/tgv3d.yaml
-
-# Explicit backends
-phrike tgv3d --config configs/tgv3d.yaml --backend metal
-phrike tgv3d --config configs/tgv3d.yaml --backend cuda
-phrike tgv3d --config configs/tgv3d.yaml --backend cpu
+python -m pip install -e ".[torch]"
+python -m phrike alfven1d --config configs/alfven1d.yaml --backend metal
+# Use --backend cuda on an NVIDIA system.
 ```
 
-### Python API
+## Validation and scope
 
-```python
-import phrike
+The automated suite checks adaptive Runge-Kutta tableaus and controller order,
+backend selection/error handling, and Torch CPU tensor behavior. It is a smoke
+and unit-test suite, not a full numerical-validation campaign.
 
-# Run simulation and get results
-solver, history = phrike.run_simulation(
-    problem_name="sod",
-    config_path="configs/sod.yaml"
-)
+Use the code as experimental research software. In particular:
 
-# Access final state
-print(f"Final time: {solver.t}")
-print(f"Final density range: {solver.U[0].min():.3f} to {solver.U[0].max():.3f}")
-```
+- Claims of performance, convergence, and accelerator parity require a
+  hardware- and configuration-specific measurement.
+- Pseudo-spectral shock problems require filtering/viscosity choices to be
+  validated for the case at hand.
+- Non-periodic Legendre workflows are still exploratory; the 3D Legendre path
+  is not implemented.
+- CUDA and Metal/MPS hardware are not exercised in continuous integration.
 
-## Documentation
+See [the documentation source](docs/) for installation, a walkthrough, and
+development checks.
 
-- [Installation Guide](docs/installation.rst)
-- [Quick Start Guide](docs/quickstart.rst)
-- [User Guide](docs/user_guide.rst)
-- [API Reference](docs/api_reference.rst)
-- [Examples](docs/examples.rst)
+## Repository layout
 
-To build documentation locally:
+- `phrike/` — solver, equations, grids, and problem definitions.
+- `configs/` — version-controlled YAML configurations.
+- `tests/` — focused automated checks.
+- `docs/` — Sphinx documentation source.
 
-```bash
-pip install -e .[docs]
-cd docs
-make html
-```
+## Contributing
 
-## Available Problems
-
-### 1D Problems
-- **Sod Shock Tube** (`sod`): Classic Riemann problem for shock wave validation
-- **Acoustic Waves** (`acoustic1d`): Linear wave propagation for accuracy testing
-- **Gaussian Wave Packets** (`gaussian_wave1d`): Stationary and traveling wave tests
-
-### 2D Problems
-- **Kelvin-Helmholtz Instability** (`khi2d`): Shear layer instability for mixing studies
-
-### 3D Problems
-- **Taylor-Green Vortex** (`tgv3d`): Decaying vortex for turbulence validation
-- **3D Turbulence** (`turb3d`): Forced turbulence for statistical analysis
-
-## Configuration
-
-PHRIKE uses YAML configuration files. Here's a basic example:
-
-```yaml
-problem: sod
-
-grid:
-  N: 1024
-  Lx: 1.0
-  dealias: true
-
-physics:
-  gamma: 1.4
-
-integration:
-  t0: 0.0
-  t_end: 0.2
-  cfl: 0.4
-  scheme: rk4
-
-initial_conditions:
-  left:
-    rho: 1.0
-    u: 0.0
-    p: 1.0
-  right:
-    rho: 0.125
-    u: 0.0
-    p: 0.1
-```
-
-## Backend Support
-
-### Automatic Backend (Default)
-- Prefers PyTorch Metal/MPS on Apple Silicon
-- Uses PyTorch CUDA when Metal is unavailable and CUDA is present
-- Falls back to the NumPy CPU backend when no accelerator is available
-- Metal/MPS uses single precision because PyTorch MPS does not support float64
-
-### PyTorch Backend
-- GPU acceleration via Metal/MPS (Apple Silicon) or CUDA
-- Torch CPU remains available explicitly
-- Better memory management for large problems
-
-```bash
-# Preferred Metal path and explicit alternatives
-phrike sod --config configs/sod.yaml --backend metal
-phrike sod --config configs/sod.yaml --backend cuda
-phrike sod --config configs/sod.yaml --backend cpu
-phrike sod --config configs/sod.yaml --backend torch --device cpu
-```
-
-## Performance
-
-PHRIKE is optimized for high-performance computing:
-
-- **Numba JIT**: Critical kernels compiled for speed
-- **FFTW Integration**: Optional high-performance FFT
-- **GPU Acceleration**: PyTorch backend with MPS/CUDA support
-- **Memory Efficient**: Optimized array operations
-
-### Benchmark Results
-
-| Problem | Resolution | CPU Time | GPU Time | Speedup |
-|---------|------------|----------|----------|---------|
-| 1D Gaussian | 1024 | 2.3s | 0.8s | 2.9x |
-| 2D KHI | 128² | 45s | 12s | 3.8x |
-| 3D TGV | 64³ | 180s | 35s | 5.1x |
-
-## Testing
-
-Run the test suite:
-
-```bash
-# Run all tests
-pytest
-
-# Run specific test categories
-pytest tests/test_1d_solver.py
-pytest tests/test_sod_validation.py
-```
-
-## Monitoring
-
-PHRIKE includes comprehensive monitoring capabilities:
-
-```yaml
-monitoring:
-  enabled: true
-  step_interval: 10
-  include_conservation: true
-  include_timestep: true
-  include_velocity_stats: true
-```
-
-## Visualization
-
-Automatic visualization and video generation:
-
-```bash
-# Generate video (default)
-phrike sod --config configs/sod.yaml
-
-# Skip video generation
-phrike sod --config configs/sod.yaml --no-video
-```
-
-## Scientific Validation
-
-PHRIKE has been validated against:
-
-- **Analytical Solutions**: Sod shock tube, acoustic waves
-- **Literature Benchmarks**: Taylor-Green vortex, KHI growth rates
-- **Conservation Properties**: Mass, momentum, energy conservation
-- **Convergence Studies**: Spectral accuracy verification
-
-## Development
-
-### Code Quality
-
-```bash
-# Format code
-black phrike/
-
-# Lint code
-ruff check phrike/
-
-# Type checking
-mypy phrike/ --ignore-missing-imports
-```
-
-### Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests
-5. Submit a pull request
+Contributions are welcome; please read [CONTRIBUTING.md](CONTRIBUTING.md) and
+include the command(s) used to validate a change.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-- **NumPy/SciPy**: Core numerical computing
-- **PyTorch**: GPU acceleration
-- **Numba**: JIT compilation
-- **Matplotlib**: Visualization
-- **FFTW**: High-performance FFT (optional)
-
-## Support
-
-- **Issues**: [GitHub Issues](https://github.com/your-username/phrike/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/your-username/phrike/discussions)
-- **Documentation**: [Read the Docs](https://phrike.readthedocs.io/)
-
-## Related Projects
-
-- [Dedalus](https://dedalus-project.org/): General-purpose spectral PDE solver
-- [SpectralDNS](https://github.com/spectralDNS/spectralDNS): Spectral DNS solver
-- [PySpectral](https://github.com/pyspectral/pyspectral): Spectral analysis tools
+PHRIKE is released under the [MIT License](LICENSE).

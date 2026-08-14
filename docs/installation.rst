@@ -1,115 +1,23 @@
 Installation
 ============
 
-PHRIKE requires Python 3.9 or higher and can be installed from source.
-
-Dependencies
-------------
-
-PHRIKE depends on the following packages:
-
-* **Core Dependencies**:
-  - `numpy >= 1.22` - Array operations
-  - `scipy >= 1.10` - Scientific computing
-  - `matplotlib >= 3.5` - Visualization
-  - `PyYAML >= 6.0` - Configuration files
-  - `numba >= 0.58` - JIT compilation
-
-* **Optional Dependencies**:
-  - `pyfftw >= 0.13` - High-performance FFT (install with ``pip install phrike[fastfft]``)
-  - `torch` - GPU acceleration (install separately)
-  - `pytest >= 7.0` - Testing (install with ``pip install phrike[dev]``)
-
-Installation Methods
---------------------
-
-From Source
-~~~~~~~~~~~
-
-1. Clone the repository:
-
-   .. code-block:: bash
-
-      git clone https://github.com/your-username/phrike.git
-      cd phrike
-
-2. Install in development mode:
-
-   .. code-block:: bash
-
-      pip install -e .
-
-3. Install with optional dependencies:
-
-   .. code-block:: bash
-
-      pip install -e .[fastfft,dev]
-
-Using pip
-~~~~~~~~~
+PHRIKE requires Python 3.9 or newer. Clone the source repository and install
+it into an isolated environment:
 
 .. code-block:: bash
 
-   pip install phrike
+   git clone https://github.com/ermoseley/phrike.git
+   cd phrike
+   python -m venv .venv
+   source .venv/bin/activate
+   python -m pip install --upgrade pip
+   python -m pip install -e ".[dev]"
 
-Using conda
-~~~~~~~~~~~
-
-.. code-block:: bash
-
-   conda install -c conda-forge numpy scipy matplotlib pyyaml numba
-   pip install phrike
-
-Verification
-------------
-
-After installation, verify PHRIKE is working correctly:
-
-.. code-block:: python
-
-   import phrike
-   print(f"PHRIKE version: {phrike.__version__}")
-   
-   # List available problems
-   from phrike.problems import ProblemRegistry
-   print("Available problems:", ProblemRegistry.list_problems())
-
-GPU Support
------------
-
-For Metal/MPS, CUDA, or Torch CPU execution, install PHRIKE's Torch extra:
+Accelerator backends use the optional Torch dependency:
 
 .. code-block:: bash
 
-   pip install -e ".[torch]"
+   python -m pip install -e ".[torch]"
 
-With automatic backend selection, PHRIKE prefers Metal/MPS, then CUDA, and
-falls back to NumPy CPU. Use ``--backend metal``, ``--backend cuda``, or
-``--backend cpu`` to make the choice explicit.
-
-Troubleshooting
----------------
-
-Common Issues
-~~~~~~~~~~~~~
-
-1. **ImportError: No module named 'numba'**
-   - Install numba: ``pip install numba``
-
-2. **FFT performance issues**
-   - Install pyfftw: ``pip install pyfftw``
-
-3. **GPU not detected**
-   - Verify PyTorch devices: ``python -c "import torch; print(torch.backends.mps.is_available(), torch.cuda.is_available())"``
-
-4. **Memory issues on large problems**
-   - Use smaller resolutions or enable spectral filtering
-   - Consider using the Torch backend for better memory management
-
-Performance Tips
-~~~~~~~~~~~~~~~~
-
-* Use ``pyfftw`` for better FFT performance
-* Enable multi-threading with ``fft_workers`` in configuration
-* Use GPU backend for large 3D problems
-* Enable spectral filtering for stability at high resolutions
+The package is installed from source; this repository does not claim a PyPI
+release.

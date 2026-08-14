@@ -26,3 +26,13 @@ dgpy/
 FastGaussQuadrature.jl/
 quail/
 LagrangianPhaseSpaceSheetEasy/
+
+# Generated documentation and local agent/run artifacts
+docs/_build/
+.coverage
+.claude/
+.codex-pets/
+pet-runs/
+runs/
+clawd.zip
+coral.zip
