@@ -16,6 +16,10 @@ documentation with warnings treated as errors, and build a wheel:
    python -m sphinx -W -b html docs docs/_build/html
    python -m build --wheel --outdir dist
 
+The source-tree post-processing, benchmark, and numerical-diagnostic tools are
+documented in ``scripts/README.md``. They are intentionally separate from the
+stable ``phrike`` command-line interface.
+
 Keep generated documentation, local run directories, output files, and Numba
 caches out of version control. See the repository's CONTRIBUTING.md for the
 expected numerical-validation context.

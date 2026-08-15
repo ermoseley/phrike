@@ -39,9 +39,9 @@ def load_checkpoint(checkpoint_path: str) -> Dict[str, Any]:
         Dictionary containing:
         - t: simulation time
         - U: conservative variables
-        - grid_params: grid parameters (N, Lx, etc.)
-        - physics_params: physics parameters (gamma, etc.)
+        - meta: snapshot metadata (grid and physics parameters)
         - primitive_vars: primitive variables (rho, u, p, etc.)
+        - optional tracer arrays (tracer_x, tracer_y, tracer_z, tracer_mass)
     """
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")

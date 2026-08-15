@@ -70,6 +70,7 @@ development checks.
 - `phrike/` — solver, equations, grids, and problem definitions.
 - `configs/` — version-controlled YAML configurations.
 - `tests/` — focused automated checks.
+- `scripts/` — source-tree post-processing and development diagnostics.
 - `docs/` — Sphinx documentation source.
 
 ## Contributing

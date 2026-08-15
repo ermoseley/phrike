@@ -61,7 +61,8 @@ io:
   outdir: outputs/turb3d
 
 # Tracer particles (Fourier interpolation + leap-frog advection)
-# uniform n^3 layout + density_grid: null => tetrahedral (LagrangianPhaseSpaceSheetEasy)
+# A uniform n^3 layout can use the optional tetrahedral estimator; otherwise
+# tracer density falls back to histogram deposition.
 tracers:
   enabled: true
   num: 262144   # 64^3
@@ -83,7 +84,7 @@ video:
   projection_type: "column_density"  # "slice" or "column_density"
   slice_axis: "z"            # Axis for slice (x, y, or z)
   slice_position: 0.5        # Position along slice axis (0-1)
-  column_thickness: 1.0      # Thickness for column density integration (0-1)
+  column_thickness: 1.0      # Fraction used for the central density projection
   column_axis: "z"           # Axis for column density projection (x, y, or z)
   
   # Colorbar settings
