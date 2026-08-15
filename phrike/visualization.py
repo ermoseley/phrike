@@ -1,14 +1,79 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import matplotlib.pyplot as plt
+
+
+def _axis_index(axis: str) -> int:
+    """Return the array axis for a 3-D field stored as ``(z, y, x)``."""
+    try:
+        return {"z": 0, "y": 1, "x": 2}[axis]
+    except KeyError as exc:
+        raise ValueError(f"axis must be x, y, or z, got {axis!r}") from exc
+
+
+def central_column_mean(
+    field: np.ndarray, axis: str = "z", thickness: float = 1.0
+) -> np.ndarray:
+    """Average a central fraction of a 3-D ``(z, y, x)`` field along ``axis``."""
+    if field.ndim != 3:
+        raise ValueError(f"expected a 3-D field, got shape {field.shape}")
+    if not 0.0 < thickness <= 1.0:
+        raise ValueError(f"thickness must be in (0, 1], got {thickness}")
+
+    index = _axis_index(axis)
+    size = field.shape[index]
+    start = max(0, int(size * (0.5 - thickness / 2.0)))
+    stop = min(size, int(size * (0.5 + thickness / 2.0)))
+    if start >= stop:
+        start = min(size - 1, max(0, size // 2))
+        stop = start + 1
+    return np.mean(np.take(field, range(start, stop), axis=index), axis=index)
+
+
+def central_slice(
+    field: np.ndarray, axis: str = "z", position: float = 0.5
+) -> np.ndarray:
+    """Return a slice through a 3-D ``(z, y, x)`` field at fractional ``position``."""
+    if field.ndim != 3:
+        raise ValueError(f"expected a 3-D field, got shape {field.shape}")
+    if not 0.0 <= position <= 1.0:
+        raise ValueError(f"position must be in [0, 1], got {position}")
+
+    index = _axis_index(axis)
+    slice_index = min(field.shape[index] - 1, int(field.shape[index] * position))
+    return np.take(field, slice_index, axis=index)
+
+
+def projection_extent(
+    domain: Tuple[float, float, float], axis: str = "z"
+) -> Tuple[float, float, float, float]:
+    """Return the Matplotlib extent for a projection or slice normal to ``axis``."""
+    lx, ly, lz = domain
+    _axis_index(axis)
+    if axis == "z":
+        return (0.0, lx, 0.0, ly)
+    if axis == "y":
+        return (0.0, lx, 0.0, lz)
+    return (0.0, ly, 0.0, lz)
+
+
+def projection_axis_labels(axis: str = "z") -> Tuple[str, str]:
+    """Return coordinate labels for a projection or slice normal to ``axis``."""
+    _axis_index(axis)
+    if axis == "z":
+        return ("x", "y")
+    if axis == "y":
+        return ("x", "z")
+    return ("y", "z")
 
 
 def plot_fields(
     grid, U, equations, title: str = "", outpath: Optional[str] = None
 ) -> None:
+    import matplotlib.pyplot as plt
+
     rho, u, p, _ = equations.primitive(U)
     E = U[2]
     
@@ -45,6 +110,8 @@ def plot_fields(
 def plot_conserved_time_series(
     history: Dict[str, List[float]], outpath: Optional[str] = None
 ) -> None:
+    import matplotlib.pyplot as plt
+
     t = np.array(history["time"])  # type: ignore[index]
     mass = np.array(history["mass"])  # type: ignore[index]
     mom = np.array(history["momentum"])  # type: ignore[index]

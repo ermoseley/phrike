@@ -1,6 +1,6 @@
-"""Validation of the 1D circularly polarized Alfven wave (ideal MHD).
+"""Diagnostic validation of the 1-D circularly polarized Alfvén wave.
 
-Checks, per mhd_plan.md section 7:
+Checks:
   - max|div B| at round-off (1D: dBx/dx, Bx = const),
   - phase speed = c_A = B0/sqrt(rho0) (from the fundamental-mode phase slope),
   - exactness after one full period (L2 error vs analytic),

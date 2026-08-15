@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Benchmark tracer particle cost vs PDE step. Identifies bottlenecks."""
+"""Measure tracer-advection cost relative to a 3-D PDE step."""
 
-import time
 import argparse
+import time
 
 import numpy as np
 
@@ -57,7 +57,6 @@ def run_benchmark(
         def copy_U():
             return np.asarray(U).copy()
 
-    dt = 0.005
     results = []
     for P in particle_counts:
         tracers = None
@@ -129,18 +128,6 @@ def main():
             if P > 0 and base > 0:
                 overhead = (ms - base) / base * 100
                 print(f"  {label}: +{overhead:.0f}% ({ms - base:.2f} ms/step tracer cost)")
-
-
-"""
-Bottleneck summary (64^3 grid, numpy):
-- PDE-only: ~375 ms/step.
-- Tracer cost scales with P: ~50--350% overhead for P=512--4096.
-- Dominant cost: 3x evaluate_fourier_at_points per step (3 FFTs + 3 x O(P*N^3)
-  matmul for Fourier interpolation at P points). For large P, consider chunking
-  the numpy path or using the batched torch path (one chunk loop, shared E).
-- Batched evaluate_fourier_at_points_batched_3d is used for torch only (saves
-  chunk loop and kernel launches); for numpy, three separate calls are used.
-"""
 
 if __name__ == "__main__":
     main()

@@ -10,6 +10,8 @@ release requires a corresponding reproducible validation record.
 - Added an RKF78 adaptive integrator and focused tests for its tableau and
   controller behavior.
 - Tightened public packaging, documentation, and continuous-integration checks.
+- Consolidated developer-only visualization, benchmark, and validation helpers
+  under `scripts/`.
 
 ## 0.1.0
 

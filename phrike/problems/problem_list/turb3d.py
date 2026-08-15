@@ -1,8 +1,7 @@
 """3D turbulent velocity field problem."""
 
 import os
-import sys
-from typing import Optional, Dict, Any
+from typing import Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -12,6 +11,12 @@ from phrike.equations import EulerEquations3D
 # Initial condition function moved from phrike.initial_conditions
 from phrike.solver import SpectralSolver3D
 from phrike.io import save_solution_snapshot
+from phrike.visualization import (
+    central_column_mean,
+    central_slice,
+    projection_axis_labels,
+    projection_extent,
+)
 from ..base import BaseProblem
 
 
@@ -173,7 +178,7 @@ def turbulent_velocity_3d(
 
     # Generate velocity field
     u, v, w = build_turbulent_velocity(
-        nx, ny, nz, kmin, kmax, alpha, vrms, rng, spectrum_type, power_law_slope
+        nz, ny, nx, kmin, kmax, alpha, vrms, rng, spectrum_type, power_law_slope
     )
 
     # Convert to torch if needed
@@ -194,24 +199,6 @@ def turbulent_velocity_3d(
 
 class Turb3DProblem(BaseProblem):
     """3D turbulent velocity field problem."""
-
-    def __init__(
-        self,
-        config_path: Optional[str] = None,
-        config: Optional[Dict[str, Any]] = None,
-        restart_from: Optional[str] = None,
-    ):
-        """Initialize with custom colormap registration."""
-        super().__init__(config_path=config_path, config=config, restart_from=restart_from)
-
-        # Import and register the custom colormap
-        sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-        try:
-            from colormaps import register
-
-            register("cmapkk9")
-        except ImportError:
-            pass  # colormap registration is optional
 
     def create_grid(
         self, backend: str = "numpy", device: Optional[str] = None, debug: bool = False
@@ -292,21 +279,24 @@ class Turb3DProblem(BaseProblem):
 
         # Create frame
         fig, ax = plt.subplots(1, 1, figsize=figsize, constrained_layout=True)
+        domain = (solver.grid.Lx, solver.grid.Ly, solver.grid.Lz)
 
         if projection_type == "column_density":
-            # Create column density projection
-            projection_data = self._create_column_density_projection(
-                rho, solver.grid, video_config
+            axis = str(video_config.get("column_axis", "z"))
+            projection_data = central_column_mean(
+                rho,
+                axis=axis,
+                thickness=float(video_config.get("column_thickness", 0.2)),
             )
-            extent = self._get_projection_extent(solver.grid, video_config)
-            axis_labels = self._get_projection_axis_labels(video_config)
         else:
-            # Create slice projection (original behavior)
-            projection_data = self._create_slice_projection(
-                rho, solver.grid, video_config
+            axis = str(video_config.get("slice_axis", "z"))
+            projection_data = central_slice(
+                rho,
+                axis=axis,
+                position=float(video_config.get("slice_position", 0.5)),
             )
-            extent = self._get_slice_extent(solver.grid, video_config)
-            axis_labels = self._get_slice_axis_labels(video_config)
+        extent = projection_extent(domain, axis=axis)
+        axis_labels = projection_axis_labels(axis=axis)
 
         # Get colorbar settings
         colorbar_scale = video_config.get("colorbar_scale", "linear")
@@ -328,24 +318,14 @@ class Turb3DProblem(BaseProblem):
         else:
             norm = None
 
-        try:
-            im = ax.imshow(
-                projection_data,
-                origin="lower",
-                extent=extent,
-                aspect="equal",
-                cmap="cmapkk9",
-                norm=norm,
-            )
-        except ValueError:
-            # Fallback to default colormap if custom one not available
-            im = ax.imshow(
-                projection_data,
-                origin="lower",
-                extent=extent,
-                aspect="equal",
-                norm=norm,
-            )
+        im = ax.imshow(
+            projection_data,
+            origin="lower",
+            extent=extent,
+            aspect="equal",
+            cmap="viridis",
+            norm=norm,
+        )
 
         icfg = self.config["initial_conditions"]
         vrms = float(icfg.get("vrms", 0.1))
@@ -353,14 +333,12 @@ class Turb3DProblem(BaseProblem):
 
         if projection_type == "column_density":
             thickness = video_config.get("column_thickness", 0.2)
-            axis = video_config.get("column_axis", "z")
             ax.set_title(
-                f"Turbulent Column Density (∫{axis}) t={t:.3f}\nvrms={vrms:.3f}, α={alpha:.3f}, thickness={thickness:.1f}"
+                f"Turbulent Density Projection ({axis}) t={t:.3f}\nvrms={vrms:.3f}, α={alpha:.3f}, thickness={thickness:.1f}"
             )
         else:
-            slice_axis = video_config.get("slice_axis", "z")
             ax.set_title(
-                f"Turbulent Density ({slice_axis}=mid) t={t:.3f}\nvrms={vrms:.3f}, α={alpha:.3f}"
+                f"Turbulent Density ({axis}=mid) t={t:.3f}\nvrms={vrms:.3f}, α={alpha:.3f}"
             )
 
         ax.set_xlabel(axis_labels[0])
@@ -384,124 +362,6 @@ class Turb3DProblem(BaseProblem):
         )
         print(f"Saved snapshot at t={t:.3f}: {snapshot_path}")
 
-    def _create_column_density_projection(self, rho, grid, video_config):
-        """Create column density projection along specified axis."""
-        axis = video_config.get("column_axis", "z")
-        thickness = video_config.get("column_thickness", 0.2)
-
-        # Calculate integration range
-        if axis == "z":
-            # Project along z-axis (integrate over z)
-            nz = rho.shape[0]
-            z_start = int(nz * (0.5 - thickness / 2))
-            z_end = int(nz * (0.5 + thickness / 2))
-            z_start = max(0, z_start)
-            z_end = min(nz, z_end)
-            n_elements = z_end - z_start
-            projection = np.sum(rho[z_start:z_end, :, :], axis=0) / n_elements
-        elif axis == "y":
-            # Project along y-axis (integrate over y)
-            ny = rho.shape[1]
-            y_start = int(ny * (0.5 - thickness / 2))
-            y_end = int(ny * (0.5 + thickness / 2))
-            y_start = max(0, y_start)
-            y_end = min(ny, y_end)
-            n_elements = y_end - y_start
-            projection = np.sum(rho[:, y_start:y_end, :], axis=1) / n_elements
-        elif axis == "x":
-            # Project along x-axis (integrate over x)
-            nx = rho.shape[2]
-            x_start = int(nx * (0.5 - thickness / 2))
-            x_end = int(nx * (0.5 + thickness / 2))
-            x_start = max(0, x_start)
-            x_end = min(nx, x_end)
-            n_elements = x_end - x_start
-            projection = np.sum(rho[:, :, x_start:x_end], axis=2) / n_elements
-        else:
-            raise ValueError(f"Invalid column axis: {axis}")
-
-        return projection
-
-    def _create_slice_projection(self, rho, grid, video_config):
-        """Create slice projection along specified axis."""
-        axis = video_config.get("slice_axis", "z")
-        position = video_config.get("slice_position", 0.5)
-
-        if axis == "z":
-            # Slice along z-axis
-            nz = rho.shape[0]
-            slice_idx = int(nz * position)
-            slice_idx = max(0, min(nz - 1, slice_idx))
-            projection = rho[slice_idx, :, :]
-        elif axis == "y":
-            # Slice along y-axis
-            ny = rho.shape[1]
-            slice_idx = int(ny * position)
-            slice_idx = max(0, min(ny - 1, slice_idx))
-            projection = rho[:, slice_idx, :]
-        elif axis == "x":
-            # Slice along x-axis
-            nx = rho.shape[2]
-            slice_idx = int(nx * position)
-            slice_idx = max(0, min(nx - 1, slice_idx))
-            projection = rho[:, :, slice_idx]
-        else:
-            raise ValueError(f"Invalid slice axis: {axis}")
-
-        return projection
-
-    def _get_projection_extent(self, grid, video_config):
-        """Get extent for column density projection."""
-        axis = video_config.get("column_axis", "z")
-
-        if axis == "z":
-            return [0, grid.Lx, 0, grid.Ly]
-        elif axis == "y":
-            return [0, grid.Lx, 0, grid.Lz]
-        elif axis == "x":
-            return [0, grid.Ly, 0, grid.Lz]
-        else:
-            raise ValueError(f"Invalid column axis: {axis}")
-
-    def _get_slice_extent(self, grid, video_config):
-        """Get extent for slice projection."""
-        axis = video_config.get("slice_axis", "z")
-
-        if axis == "z":
-            return [0, grid.Lx, 0, grid.Ly]
-        elif axis == "y":
-            return [0, grid.Lx, 0, grid.Lz]
-        elif axis == "x":
-            return [0, grid.Ly, 0, grid.Lz]
-        else:
-            raise ValueError(f"Invalid slice axis: {axis}")
-
-    def _get_projection_axis_labels(self, video_config):
-        """Get axis labels for column density projection."""
-        axis = video_config.get("column_axis", "z")
-
-        if axis == "z":
-            return ["x", "y"]
-        elif axis == "y":
-            return ["x", "z"]
-        elif axis == "x":
-            return ["y", "z"]
-        else:
-            raise ValueError(f"Invalid column axis: {axis}")
-
-    def _get_slice_axis_labels(self, video_config):
-        """Get axis labels for slice projection."""
-        axis = video_config.get("slice_axis", "z")
-
-        if axis == "z":
-            return ["x", "y"]
-        elif axis == "y":
-            return ["x", "z"]
-        elif axis == "x":
-            return ["y", "z"]
-        else:
-            raise ValueError(f"Invalid slice axis: {axis}")
-
     def create_final_visualization(self, solver) -> None:
         """Create final visualization plots."""
         rho, ux, uy, uz, p = solver.equations.primitive(solver.U)
@@ -518,21 +378,13 @@ class Turb3DProblem(BaseProblem):
         kmax = float(icfg.get("kmax", 16.0))
 
         # Density
-        try:
-            im1 = axes[0, 0].imshow(
-                rho[mid],
-                origin="lower",
-                extent=[0, solver.grid.Lx, 0, solver.grid.Ly],
-                aspect="equal",
-                cmap="cmapkk9",
-            )
-        except ValueError:
-            im1 = axes[0, 0].imshow(
-                rho[mid],
-                origin="lower",
-                extent=[0, solver.grid.Lx, 0, solver.grid.Ly],
-                aspect="equal",
-            )
+        im1 = axes[0, 0].imshow(
+            rho[mid],
+            origin="lower",
+            extent=[0, solver.grid.Lx, 0, solver.grid.Ly],
+            aspect="equal",
+            cmap="viridis",
+        )
         axes[0, 0].set_title(f"Density (z=mid)\nt={solver.t:.3f}")
         axes[0, 0].set_xlabel("x")
         axes[0, 0].set_ylabel("y")
@@ -540,42 +392,26 @@ class Turb3DProblem(BaseProblem):
 
         # Velocity magnitude
         v_mag = np.sqrt(ux**2 + uy**2 + uz**2)
-        try:
-            im2 = axes[0, 1].imshow(
-                v_mag[mid],
-                origin="lower",
-                extent=[0, solver.grid.Lx, 0, solver.grid.Ly],
-                aspect="equal",
-                cmap="cmapkk9",
-            )
-        except ValueError:
-            im2 = axes[0, 1].imshow(
-                v_mag[mid],
-                origin="lower",
-                extent=[0, solver.grid.Lx, 0, solver.grid.Ly],
-                aspect="equal",
-            )
+        im2 = axes[0, 1].imshow(
+            v_mag[mid],
+            origin="lower",
+            extent=[0, solver.grid.Lx, 0, solver.grid.Ly],
+            aspect="equal",
+            cmap="viridis",
+        )
         axes[0, 1].set_title(f"Velocity Magnitude (z=mid)\nt={solver.t:.3f}")
         axes[0, 1].set_xlabel("x")
         axes[0, 1].set_ylabel("y")
         plt.colorbar(im2, ax=axes[0, 1], shrink=0.8)
 
         # Pressure
-        try:
-            im3 = axes[0, 2].imshow(
-                p[mid],
-                origin="lower",
-                extent=[0, solver.grid.Lx, 0, solver.grid.Ly],
-                aspect="equal",
-                cmap="cmapkk9",
-            )
-        except ValueError:
-            im3 = axes[0, 2].imshow(
-                p[mid],
-                origin="lower",
-                extent=[0, solver.grid.Lx, 0, solver.grid.Ly],
-                aspect="equal",
-            )
+        im3 = axes[0, 2].imshow(
+            p[mid],
+            origin="lower",
+            extent=[0, solver.grid.Lx, 0, solver.grid.Ly],
+            aspect="equal",
+            cmap="viridis",
+        )
         axes[0, 2].set_title(f"Pressure (z=mid)\nt={solver.t:.3f}")
         axes[0, 2].set_xlabel("x")
         axes[0, 2].set_ylabel("y")
