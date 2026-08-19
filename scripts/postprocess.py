@@ -288,12 +288,23 @@ def _plot_tracer_density(args: argparse.Namespace) -> int:
         z=np.asarray(data["tracer_z"]).flatten(),
         mass=_tracer_mass(data),
     )
+    for axis in ("x", "y", "z"):
+        key = f"tracer_{axis}_unwrapped"
+        if key in data:
+            setattr(tracers, f"{axis}_unwrapped", np.asarray(data[key]).flatten())
+    if "tracer_lattice_shape" in data:
+        tracers.lattice_shape = tuple(
+            int(value) for value in np.asarray(data["tracer_lattice_shape"])
+        )
     config = _config(args.config)
+    layout = args.layout
+    if layout == "auto":
+        layout = str(config.get("tracers", {}).get("layout", "auto")).lower()
     density, _ = tracer_density_3d(
         tracers,
         _domain(meta),
         grid_shape=_tracer_grid_shape(config, args.grid),
-        layout=args.layout,
+        layout=layout,
     )
     output = Path(args.output) if args.output else snapshot.with_name(
         f"{snapshot.stem}_tracer_density.png"

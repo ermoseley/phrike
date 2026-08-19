@@ -79,6 +79,12 @@ def load_checkpoint(checkpoint_path: str) -> Dict[str, Any]:
         result["tracer_z"] = data["tracer_z"]
     if "tracer_mass" in data:
         result["tracer_mass"] = data["tracer_mass"]
+    for axis in ("x", "y", "z"):
+        key = f"tracer_{axis}_unwrapped"
+        if key in data:
+            result[key] = data[key]
+    if "tracer_lattice_shape" in data:
+        result["tracer_lattice_shape"] = data["tracer_lattice_shape"]
 
     return result
 
@@ -97,6 +103,13 @@ def _tracer_save_dict(tracers: Any) -> Dict[str, Any]:
         out["tracer_z"] = _to_numpy(tracers.z)
     if hasattr(tracers, "mass"):
         out["tracer_mass"] = _to_numpy(tracers.mass)
+    for axis in ("x", "y", "z"):
+        name = f"{axis}_unwrapped"
+        if hasattr(tracers, name):
+            out[f"tracer_{name}"] = _to_numpy(getattr(tracers, name))
+    lattice_shape = getattr(tracers, "lattice_shape", None)
+    if lattice_shape is not None:
+        out["tracer_lattice_shape"] = np.asarray(lattice_shape, dtype=np.int64)
     return out
 
 

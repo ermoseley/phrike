@@ -44,6 +44,145 @@ def _to_np(x: Any) -> np.ndarray:
     return np.asarray(x)
 
 
+def _periodic_linear_1d(f: Any, xp: Any, length: float) -> Any:
+    """Linearly interpolate a periodic 1-D grid without changing backends."""
+    n = int(f.shape[-1])
+    if _TORCH_AVAILABLE and torch is not None and isinstance(f, torch.Tensor):
+        if not isinstance(xp, torch.Tensor):
+            xp = torch.as_tensor(xp, dtype=f.dtype, device=f.device)
+        else:
+            xp = xp.to(dtype=f.dtype, device=f.device)
+        coord = torch.remainder(xp, length) * (n / length)
+        cell = torch.floor(coord)
+        i0 = torch.remainder(cell.to(dtype=torch.long), n)
+        frac = coord - cell
+        i1 = torch.remainder(i0 + 1, n)
+        return (1.0 - frac) * f[..., i0] + frac * f[..., i1]
+
+    f_np = np.asarray(f)
+    xp_np = np.asarray(xp, dtype=f_np.dtype)
+    coord = np.mod(xp_np, length) * (n / length)
+    cell = np.floor(coord)
+    i0 = cell.astype(np.intp) % n
+    frac = coord - cell
+    i1 = (i0 + 1) % n
+    return (1.0 - frac) * f_np[..., i0] + frac * f_np[..., i1]
+
+
+def _periodic_linear_2d(
+    f: Any, xp: Any, yp: Any, length_x: float, length_y: float
+) -> Any:
+    """Bilinearly interpolate a periodic ``(..., Ny, Nx)`` grid."""
+    ny, nx = (int(size) for size in f.shape[-2:])
+    if _TORCH_AVAILABLE and torch is not None and isinstance(f, torch.Tensor):
+        if not isinstance(xp, torch.Tensor):
+            xp = torch.as_tensor(xp, dtype=f.dtype, device=f.device)
+        else:
+            xp = xp.to(dtype=f.dtype, device=f.device)
+        if not isinstance(yp, torch.Tensor):
+            yp = torch.as_tensor(yp, dtype=f.dtype, device=f.device)
+        else:
+            yp = yp.to(dtype=f.dtype, device=f.device)
+        sx = torch.remainder(xp, length_x) * (nx / length_x)
+        sy = torch.remainder(yp, length_y) * (ny / length_y)
+        cell_x = torch.floor(sx)
+        cell_y = torch.floor(sy)
+        ix0 = torch.remainder(cell_x.to(dtype=torch.long), nx)
+        iy0 = torch.remainder(cell_y.to(dtype=torch.long), ny)
+        wx = sx - cell_x
+        wy = sy - cell_y
+        ix1 = torch.remainder(ix0 + 1, nx)
+        iy1 = torch.remainder(iy0 + 1, ny)
+    else:
+        f = np.asarray(f)
+        xp = np.asarray(xp, dtype=f.dtype)
+        yp = np.asarray(yp, dtype=f.dtype)
+        sx = np.mod(xp, length_x) * (nx / length_x)
+        sy = np.mod(yp, length_y) * (ny / length_y)
+        cell_x = np.floor(sx)
+        cell_y = np.floor(sy)
+        ix0 = cell_x.astype(np.intp) % nx
+        iy0 = cell_y.astype(np.intp) % ny
+        wx = sx - cell_x
+        wy = sy - cell_y
+        ix1 = (ix0 + 1) % nx
+        iy1 = (iy0 + 1) % ny
+
+    return (
+        (1.0 - wx) * (1.0 - wy) * f[..., iy0, ix0]
+        + wx * (1.0 - wy) * f[..., iy0, ix1]
+        + (1.0 - wx) * wy * f[..., iy1, ix0]
+        + wx * wy * f[..., iy1, ix1]
+    )
+
+
+def _periodic_linear_3d(
+    f: Any,
+    xp: Any,
+    yp: Any,
+    zp: Any,
+    length_x: float,
+    length_y: float,
+    length_z: float,
+) -> Any:
+    """Trilinearly interpolate a periodic ``(..., Nz, Ny, Nx)`` grid."""
+    nz, ny, nx = (int(size) for size in f.shape[-3:])
+    if _TORCH_AVAILABLE and torch is not None and isinstance(f, torch.Tensor):
+        positions = []
+        for position in (xp, yp, zp):
+            if not isinstance(position, torch.Tensor):
+                position = torch.as_tensor(
+                    position, dtype=f.dtype, device=f.device
+                )
+            else:
+                position = position.to(dtype=f.dtype, device=f.device)
+            positions.append(position)
+        xp, yp, zp = positions
+        sx = torch.remainder(xp, length_x) * (nx / length_x)
+        sy = torch.remainder(yp, length_y) * (ny / length_y)
+        sz = torch.remainder(zp, length_z) * (nz / length_z)
+        cell_x = torch.floor(sx)
+        cell_y = torch.floor(sy)
+        cell_z = torch.floor(sz)
+        ix0 = torch.remainder(cell_x.to(dtype=torch.long), nx)
+        iy0 = torch.remainder(cell_y.to(dtype=torch.long), ny)
+        iz0 = torch.remainder(cell_z.to(dtype=torch.long), nz)
+        wx = sx - cell_x
+        wy = sy - cell_y
+        wz = sz - cell_z
+        ix1 = torch.remainder(ix0 + 1, nx)
+        iy1 = torch.remainder(iy0 + 1, ny)
+        iz1 = torch.remainder(iz0 + 1, nz)
+    else:
+        f = np.asarray(f)
+        xp = np.asarray(xp, dtype=f.dtype)
+        yp = np.asarray(yp, dtype=f.dtype)
+        zp = np.asarray(zp, dtype=f.dtype)
+        sx = np.mod(xp, length_x) * (nx / length_x)
+        sy = np.mod(yp, length_y) * (ny / length_y)
+        sz = np.mod(zp, length_z) * (nz / length_z)
+        cell_x = np.floor(sx)
+        cell_y = np.floor(sy)
+        cell_z = np.floor(sz)
+        ix0 = cell_x.astype(np.intp) % nx
+        iy0 = cell_y.astype(np.intp) % ny
+        iz0 = cell_z.astype(np.intp) % nz
+        wx = sx - cell_x
+        wy = sy - cell_y
+        wz = sz - cell_z
+        ix1 = (ix0 + 1) % nx
+        iy1 = (iy0 + 1) % ny
+        iz1 = (iz0 + 1) % nz
+
+    c00 = (1.0 - wx) * f[..., iz0, iy0, ix0] + wx * f[..., iz0, iy0, ix1]
+    c01 = (1.0 - wx) * f[..., iz0, iy1, ix0] + wx * f[..., iz0, iy1, ix1]
+    c10 = (1.0 - wx) * f[..., iz1, iy0, ix0] + wx * f[..., iz1, iy0, ix1]
+    c11 = (1.0 - wx) * f[..., iz1, iy1, ix0] + wx * f[..., iz1, iy1, ix1]
+    c0 = (1.0 - wy) * c00 + wy * c01
+    c1 = (1.0 - wy) * c10 + wy * c11
+    return (1.0 - wz) * c0 + wz * c1
+
+
 def _build_filter_mask(N: int, dealias: bool) -> np.ndarray:
     if not dealias:
         return np.ones(N, dtype=float)
@@ -54,13 +193,47 @@ def _build_filter_mask(N: int, dealias: bool) -> np.ndarray:
     return mask
 
 
-def _build_exponential_filter(N: int, p: int, alpha: float) -> np.ndarray:
-    # High-order exponential filter: sigma(k) = exp(-alpha * (|k|/kmax)^p)
+def _spectral_dissipation_settings(
+    params: Optional[Dict[str, float]],
+) -> tuple[bool, int, float, bool]:
+    """Return enabled, order, rate, and normalization for Fourier grids.
+
+    ``rate`` and ``e_folding_time_at_cutoff`` define damping at each retained
+    2/3 per-axis cutoff. The legacy ``alpha`` key keeps its Nyquist-normalized
+    spatial profile, but is interpreted per unit simulation time rather than
+    per call.
+    """
+    if not params or not bool(params.get("enabled", False)):
+        return False, 8, 0.0, True
+    p = int(params.get("p", params.get("order", 8)))
+    if p < 2 or p % 2:
+        raise ValueError("Fourier spectral dissipation order must be even and >= 2")
+    if "e_folding_time_at_cutoff" in params:
+        tau = float(params["e_folding_time_at_cutoff"])
+        if not np.isfinite(tau) or tau <= 0.0:
+            raise ValueError("e_folding_time_at_cutoff must be finite and positive")
+        rate = 1.0 / tau
+        normalize_at_cutoff = True
+    elif "rate" in params:
+        rate = float(params["rate"])
+        normalize_at_cutoff = True
+    else:
+        rate = float(params.get("alpha", 36.0))
+        normalize_at_cutoff = False
+    if not np.isfinite(rate) or rate < 0.0:
+        raise ValueError("Fourier spectral dissipation rate must be finite and non-negative")
+    return True, p, rate, normalize_at_cutoff
+
+
+def _build_exponential_filter_rate(
+    N: int, p: int, rate: float, dealias: bool, normalize_at_cutoff: bool
+) -> np.ndarray:
+    """Build the non-negative generator lambda(k) for exp(-dt*lambda)."""
     k = np.fft.fftfreq(N) * N
-    kmax = np.max(np.abs(k)) if N > 0 else 1.0
-    eta = np.abs(k) / max(kmax, 1.0)
-    sigma = np.exp(-alpha * eta**p)
-    return sigma
+    kmax = int(np.max(np.abs(k)))
+    scale = N // 3 if dealias and normalize_at_cutoff else kmax
+    eta = np.abs(k) / max(scale, 1)
+    return rate * eta**p
 
 
 def _mps_available() -> bool:
@@ -203,16 +376,21 @@ def _build_filter_mask_2d(Nx: int, Ny: int, dealias: bool) -> np.ndarray:
     return mask_y[:, None] * mask_x[None, :]
 
 
-def _build_exponential_filter_2d(Nx: int, Ny: int, p: int, alpha: float) -> np.ndarray:
+def _build_exponential_filter_rate_2d(
+    Nx: int,
+    Ny: int,
+    p: int,
+    rate: float,
+    dealias: bool,
+    normalize_at_cutoff: bool,
+) -> np.ndarray:
     kx = (np.fft.fftfreq(Nx) * Nx).astype(float)
     ky = (np.fft.fftfreq(Ny) * Ny).astype(float)
-    kxmax = np.max(np.abs(kx)) if Nx > 0 else 1.0
-    kymax = np.max(np.abs(ky)) if Ny > 0 else 1.0
-    eta_x = np.abs(kx) / max(kxmax, 1.0)
-    eta_y = np.abs(ky) / max(kymax, 1.0)
-    sigma_x = np.exp(-alpha * eta_x**p)
-    sigma_y = np.exp(-alpha * eta_y**p)
-    return sigma_y[:, None] * sigma_x[None, :]
+    scale_x = Nx // 3 if dealias and normalize_at_cutoff else int(np.max(np.abs(kx)))
+    scale_y = Ny // 3 if dealias and normalize_at_cutoff else int(np.max(np.abs(ky)))
+    eta_x = np.abs(kx) / max(scale_x, 1)
+    eta_y = np.abs(ky) / max(scale_y, 1)
+    return rate * (eta_y[:, None] ** p + eta_x[None, :] ** p)
 
 
 def _build_filter_mask_3d(Nx: int, Ny: int, Nz: int, dealias: bool) -> np.ndarray:
@@ -230,22 +408,29 @@ def _build_filter_mask_3d(Nx: int, Ny: int, Nz: int, dealias: bool) -> np.ndarra
     return mask_z[:, None, None] * mask_y[None, :, None] * mask_x[None, None, :]
 
 
-def _build_exponential_filter_3d(
-    Nx: int, Ny: int, Nz: int, p: int, alpha: float
+def _build_exponential_filter_rate_3d(
+    Nx: int,
+    Ny: int,
+    Nz: int,
+    p: int,
+    rate: float,
+    dealias: bool,
+    normalize_at_cutoff: bool,
 ) -> np.ndarray:
     kx = (np.fft.fftfreq(Nx) * Nx).astype(float)
     ky = (np.fft.fftfreq(Ny) * Ny).astype(float)
     kz = (np.fft.fftfreq(Nz) * Nz).astype(float)
-    kxmax = np.max(np.abs(kx)) if Nx > 0 else 1.0
-    kymax = np.max(np.abs(ky)) if Ny > 0 else 1.0
-    kzmax = np.max(np.abs(kz)) if Nz > 0 else 1.0
-    eta_x = np.abs(kx) / max(kxmax, 1.0)
-    eta_y = np.abs(ky) / max(kymax, 1.0)
-    eta_z = np.abs(kz) / max(kzmax, 1.0)
-    sigma_x = np.exp(-alpha * eta_x**p)
-    sigma_y = np.exp(-alpha * eta_y**p)
-    sigma_z = np.exp(-alpha * eta_z**p)
-    return sigma_z[:, None, None] * sigma_y[None, :, None] * sigma_x[None, None, :]
+    scale_x = Nx // 3 if dealias and normalize_at_cutoff else int(np.max(np.abs(kx)))
+    scale_y = Ny // 3 if dealias and normalize_at_cutoff else int(np.max(np.abs(ky)))
+    scale_z = Nz // 3 if dealias and normalize_at_cutoff else int(np.max(np.abs(kz)))
+    eta_x = np.abs(kx) / max(scale_x, 1)
+    eta_y = np.abs(ky) / max(scale_y, 1)
+    eta_z = np.abs(kz) / max(scale_z, 1)
+    return rate * (
+        eta_z[:, None, None] ** p
+        + eta_y[None, :, None] ** p
+        + eta_x[None, None, :] ** p
+    )
 
 
 @dataclass
@@ -268,10 +453,11 @@ class Grid1D:
     dealias : bool
         If True, apply 2/3-rule dealiasing mask in spectral space (Fourier only).
     filter_params : Optional[Dict[str, float]]
-        Optional exponential filter configuration with keys:
+        Optional timestep-aware Fourier spectral dissipation configuration:
         - enabled: bool
         - p: even integer (>= 2)
-        - alpha: filter strength
+        - e_folding_time_at_cutoff: positive simulation time
+        ``rate`` (or legacy alias ``alpha``) may be supplied instead.
     """
 
     N: int
@@ -368,14 +554,20 @@ class Grid1D:
             self.k = 2.0 * np.pi * k_index
             self.ik = 1j * self.k
 
-            # Dealias mask and optional spectral filter
+            # Hard dealias mask and optional timestep-aware spectral dissipation.
             self.dealias_mask = _build_filter_mask(self.N, self.dealias)
 
-            self.filter_sigma = np.ones(self.N, dtype=float)
-            if self.filter_params and bool(self.filter_params.get("enabled", False)):
-                p = int(self.filter_params.get("p", 8))
-                alpha = float(self.filter_params.get("alpha", 36.0))
-                self.filter_sigma = _build_exponential_filter(self.N, p=p, alpha=alpha)
+            enabled, p, rate, normalize_at_cutoff = _spectral_dissipation_settings(
+                self.filter_params
+            )
+            self.spectral_dissipation_enabled = enabled
+            self.filter_rate = _build_exponential_filter_rate(
+                self.N,
+                p=p,
+                rate=rate,
+                dealias=self.dealias,
+                normalize_at_cutoff=normalize_at_cutoff,
+            )
 
             # Initialize Fourier basis instance (NumPy path used inside helpers)
             try:
@@ -407,7 +599,8 @@ class Grid1D:
                     self.dx = self.Lx
                 # No Fourier masks in non-periodic modal bases
                 self.dealias_mask = np.ones(self.N, dtype=float)
-                self.filter_sigma = np.ones(self.N, dtype=float)
+                self.spectral_dissipation_enabled = False
+                self.filter_rate = np.zeros(self.N, dtype=float)
                 # Expose quadrature weights for monitoring integrations
                 try:
                     self.wx = self._basis.quadrature_weights()
@@ -463,14 +656,14 @@ class Grid1D:
             self.dealias_mask = torch.from_numpy(np.asarray(self.dealias_mask)).to(
                 dtype=torch_dtype, device=self.torch_device
             )
-            self.filter_sigma = torch.from_numpy(np.asarray(self.filter_sigma)).to(
+            self.filter_rate = torch.from_numpy(np.asarray(self.filter_rate)).to(
                 dtype=torch_dtype, device=self.torch_device
             )
         else:
             self.k = np.asarray(self.k)
             self.ik = self.k * (1j)
             self.dealias_mask = np.asarray(self.dealias_mask)
-            self.filter_sigma = np.asarray(self.filter_sigma)
+            self.filter_rate = np.asarray(self.filter_rate)
 
     def set_dirichlet_bc_values(self, values: dict[str, tuple[float, float]]) -> None:
         """Set per-variable Dirichlet boundary values.
@@ -525,7 +718,7 @@ class Grid1D:
                 self.dealias_mask = torch.from_numpy(np.asarray(self.dealias_mask)).to(
                     dtype=torch_dtype, device=self.torch_device
                 )
-                self.filter_sigma = torch.from_numpy(np.asarray(self.filter_sigma)).to(
+                self.filter_rate = torch.from_numpy(np.asarray(self.filter_rate)).to(
                     dtype=torch_dtype, device=self.torch_device
                 )
         else:
@@ -534,7 +727,7 @@ class Grid1D:
                 self.k = np.asarray(self.k)
                 self.ik = self.k * (1j)
                 self.dealias_mask = np.asarray(self.dealias_mask)
-                self.filter_sigma = np.asarray(self.filter_sigma)
+                self.filter_rate = np.asarray(self.filter_rate)
 
     # FFT wrappers (Fourier basis only)
     def rfft(self, f: np.ndarray) -> np.ndarray:
@@ -574,37 +767,59 @@ class Grid1D:
         if self._basis_name == "fourier":
             F = self.rfft(f)
             F *= self.dealias_mask
-            F *= self.filter_sigma
             dF = self.ik * F
             return self.irfft(dF)
         else:
             # Generic basis path (e.g., Legendre): delegate to basis implementation
             return self._basis.dx(f)  # type: ignore[union-attr]
 
-    def apply_spectral_filter(self, f: np.ndarray) -> np.ndarray:
-        # Supports f with shape (..., N)
+    def project_dealiased(self, f: np.ndarray) -> np.ndarray:
+        """Project a Fourier field onto the retained 2/3 modal subspace."""
         if self._basis_name == "fourier":
             F = self.rfft(f)
             F *= self.dealias_mask
-            F *= self.filter_sigma
             return self.irfft(F)
-        else:
-            # Non-Fourier path
-            if self.filter_params and bool(self.filter_params.get("enabled", False)):
+        return f
+
+    def apply_spectral_dissipation(
+        self, f: np.ndarray, dt: float, *, project: bool = False
+    ) -> np.ndarray:
+        """Apply exp(-dt*lambda(k)); optionally combine the dealias projection."""
+        if dt < 0.0:
+            raise ValueError("spectral dissipation dt must be non-negative")
+        if self._basis_name != "fourier":
+            # Preserve legacy Legendre modal filtering as a separate accepted-step
+            # stabilization.  It is deliberately not part of the Fourier
+            # timestep-aware operator.
+            if project and self.filter_params and bool(self.filter_params.get("enabled", False)):
                 p = int(self.filter_params.get("p", 8))
                 alpha = float(self.filter_params.get("alpha", 36.0))
-                # Delegate to basis filter (e.g., Legendre implements modal filters)
                 return self._basis.apply_spectral_filter(f, p=p, alpha=alpha)  # type: ignore[union-attr]
             return f
+        if not self.spectral_dissipation_enabled:
+            return self.project_dealiased(f) if project else f
+        F = self.rfft(f)
+        if project:
+            F *= self.dealias_mask
+        if getattr(self, "_use_torch", False):
+            assert torch is not None
+            F *= torch.exp(-float(dt) * self.filter_rate)
+        else:
+            F *= np.exp(-float(dt) * self.filter_rate)
+        return self.irfft(F)
+
+    def apply_spectral_filter(self, f: np.ndarray) -> np.ndarray:
+        """Backward-compatible accepted-state projection/modal-filter entrypoint."""
+        return self.apply_spectral_dissipation(f, 0.0, project=True)
 
     def convolve(self, f: np.ndarray, g: np.ndarray) -> np.ndarray:
         """Compute product in physical space, with dealiased spectral filtering.
 
         For pseudo-spectral nonlinearity, compute pointwise product then
-        apply dealiasing/filter on the spectral representation.
+        apply the hard dealias projection to the spectral representation.
         """
         h = f * g
-        return self.apply_spectral_filter(h)
+        return self.project_dealiased(h)
 
     # --- MHD solenoidal helpers (1D) ---
     def divergence_x(self, Bx: np.ndarray) -> np.ndarray:
@@ -631,17 +846,27 @@ class Grid1D:
         if self._basis_name != "fourier":
             raise ValueError("laplacian requires Fourier basis")
         F = self.rfft(f)
-        F = F * self.dealias_mask * self.filter_sigma
+        F = F * self.dealias_mask
         if getattr(self, "_use_torch", False) and torch is not None and isinstance(F, torch.Tensor):
             k2 = (self.k ** 2).to(F.dtype)
         else:
             k2 = np.asarray(self.k) ** 2
         return self.irfft(-k2 * F)
 
+    def interpolate_periodic_linear_at_points_1d(
+        self, f: np.ndarray, xp: np.ndarray
+    ) -> np.ndarray:
+        """Interpolate a periodic field at points on its current array backend."""
+        if self._basis_name != "fourier":
+            raise ValueError(
+                "interpolate_periodic_linear_at_points_1d requires Fourier basis"
+            )
+        return _periodic_linear_1d(f, xp, self.Lx)
+
     def evaluate_fourier_at_points_1d(self, f: np.ndarray, xp: np.ndarray) -> np.ndarray:
         """Evaluate a Fourier-represented field at arbitrary points (Fourier basis only).
 
-        f(x) = (1/N) * Re( sum_k F_k exp(i*k*x) ) with dealias and filter applied.
+        f(x) = (1/N) * Re( sum_k F_k exp(i*k*x) ) on retained modes.
         Supports NumPy and PyTorch (including MPS/CUDA); keeps tensors on same device.
 
         Args:
@@ -662,10 +887,9 @@ class Grid1D:
             f_np = np.asarray(f)
             xp_np = np.asarray(xp, dtype=np.float64)
         dealias = _to_np(self.dealias_mask)
-        sigma = _to_np(self.filter_sigma)
         f_flat = np.reshape(f_np, (-1, self.N))
         F = np.fft.fft(f_flat, axis=-1)
-        F = np.ascontiguousarray((F * dealias * sigma)[0], dtype=np.complex128)
+        F = np.ascontiguousarray((F * dealias)[0], dtype=np.complex128)
         if _FINUFFT_AVAILABLE:
             x_fin = np.ascontiguousarray((2.0 * np.pi / self.Lx) * xp_np)
             vals = np.real(_finufft.nufft1d2(x_fin, F, **_FINUFFT_OPTS)) / self.N
@@ -963,15 +1187,21 @@ class Grid2D:
             self.k2 = None
             self.k2_safe = None
 
-        # Dealias and filter
+        # Hard dealias projection and optional timestep-aware Fourier dissipation.
         self.dealias_mask = _build_filter_mask_2d(self.Nx, self.Ny, self.dealias)
-        self.filter_sigma = np.ones((self.Ny, self.Nx), dtype=float)
-        if self.filter_params and bool(self.filter_params.get("enabled", False)):
-            p = int(self.filter_params.get("p", 8))
-            alpha = float(self.filter_params.get("alpha", 36.0))
-            self.filter_sigma = _build_exponential_filter_2d(
-                self.Nx, self.Ny, p=p, alpha=alpha
-            )
+        pure_fourier = self.basis_x == "fourier" and self.basis_y == "fourier"
+        enabled, p, rate, normalize_at_cutoff = _spectral_dissipation_settings(
+            self.filter_params if pure_fourier else None
+        )
+        self.spectral_dissipation_enabled = enabled
+        self.filter_rate = _build_exponential_filter_rate_2d(
+            self.Nx,
+            self.Ny,
+            p=p,
+            rate=rate,
+            dealias=self.dealias,
+            normalize_at_cutoff=normalize_at_cutoff,
+        )
 
         if scipy_fft_cache_enabled and fftw_cache is not None:
             try:
@@ -1020,7 +1250,7 @@ class Grid2D:
             self.dealias_mask = torch.from_numpy(np.asarray(self.dealias_mask)).to(
                 dtype=torch_dtype, device=self.torch_device
             )
-            self.filter_sigma = torch.from_numpy(np.asarray(self.filter_sigma)).to(
+            self.filter_rate = torch.from_numpy(np.asarray(self.filter_rate)).to(
                 dtype=torch_dtype, device=self.torch_device
             )
             if self.k2_safe is not None:
@@ -1212,15 +1442,25 @@ class Grid2D:
         except TypeError:
             return scipy_fft.ifft2(F, axes=(-2, -1)).real
 
-    def _apply_masks(self, F: np.ndarray) -> np.ndarray:
+    def _apply_dealias_mask(self, F: np.ndarray) -> np.ndarray:
         F *= self.dealias_mask
-        F *= self.filter_sigma
         return F
+
+    def interpolate_periodic_linear_at_points(
+        self, f: np.ndarray, xp: np.ndarray, yp: np.ndarray
+    ) -> np.ndarray:
+        """Interpolate a periodic 2-D field without host/device transfers."""
+        if self.basis_x != "fourier" or self.basis_y != "fourier":
+            raise ValueError(
+                "interpolate_periodic_linear_at_points requires Fourier basis"
+            )
+        return _periodic_linear_2d(f, xp, yp, self.Lx, self.Ly)
 
     def evaluate_fourier_at_points(self, f: np.ndarray, xp: np.ndarray, yp: np.ndarray) -> np.ndarray:
         """Evaluate a Fourier-represented 2D field at arbitrary points (Fourier x and y only).
 
-        f(x,y) = (1/(Nx*Ny)) * Re( sum_{kx,ky} F exp(i*kx*x + i*ky*y) ) with dealias and filter.
+        f(x,y) = (1/(Nx*Ny)) * Re( sum_{kx,ky} F exp(i*kx*x + i*ky*y) )
+        on the retained 2/3-dealiased modes.
         Supports NumPy and PyTorch (including MPS/CUDA); keeps tensors on same device.
 
         Args:
@@ -1244,8 +1484,10 @@ class Grid2D:
             xp_np = np.asarray(xp, dtype=np.float64)
             yp_np = np.asarray(yp, dtype=np.float64)
         dealias = _to_np(self.dealias_mask)
-        sigma = _to_np(self.filter_sigma)
-        F = np.ascontiguousarray(np.fft.fft2(f_np, axes=(-2, -1)) * dealias * sigma, dtype=np.complex128)
+        F = np.ascontiguousarray(
+            np.fft.fft2(f_np, axes=(-2, -1)) * dealias,
+            dtype=np.complex128,
+        )
         N_total = self.Nx * self.Ny
         if _FINUFFT_AVAILABLE:
             # F is (Ny, Nx): first axis=y, second=x -> nufft2d2(y, x, F)
@@ -1263,6 +1505,87 @@ class Grid2D:
             return torch.from_numpy(vals.astype(np.float32 if dtype == torch.float32 else np.float64)).to(device=device)
         return vals.astype(f_np.dtype)
 
+    def evaluate_fourier_at_points_batched_2d(
+        self,
+        fx: np.ndarray,
+        fy: np.ndarray,
+        xp: np.ndarray,
+        yp: np.ndarray,
+    ) -> tuple:
+        """Evaluate two Fourier fields at one shared set of 2-D points."""
+        if self.basis_x != "fourier" or self.basis_y != "fourier":
+            raise ValueError(
+                "evaluate_fourier_at_points_batched_2d requires Fourier basis"
+            )
+        is_torch_input = (
+            _TORCH_AVAILABLE
+            and torch is not None
+            and getattr(self, "_use_torch", False)
+            and isinstance(fx, torch.Tensor)
+        )
+        if is_torch_input:
+            fx_np = fx.detach().cpu().numpy().astype(np.float64)
+            fy_np = fy.detach().cpu().numpy().astype(np.float64)
+            xp_np = np.asarray(
+                xp.detach().cpu().numpy() if isinstance(xp, torch.Tensor) else xp,
+                dtype=np.float64,
+            )
+            yp_np = np.asarray(
+                yp.detach().cpu().numpy() if isinstance(yp, torch.Tensor) else yp,
+                dtype=np.float64,
+            )
+            device, dtype = fx.device, fx.dtype
+        else:
+            fx_np = np.asarray(fx)
+            fy_np = np.asarray(fy)
+            xp_np = np.asarray(xp, dtype=np.float64)
+            yp_np = np.asarray(yp, dtype=np.float64)
+        dealias = _to_np(self.dealias_mask)
+        scale = 1.0 / (self.Nx * self.Ny)
+        Fx = np.ascontiguousarray(
+            np.fft.fft2(fx_np, axes=(-2, -1)) * dealias,
+            dtype=np.complex128,
+        )
+        Fy = np.ascontiguousarray(
+            np.fft.fft2(fy_np, axes=(-2, -1)) * dealias,
+            dtype=np.complex128,
+        )
+        if _FINUFFT_AVAILABLE:
+            y_fin = np.ascontiguousarray((2.0 * np.pi / self.Ly) * yp_np)
+            x_fin = np.ascontiguousarray((2.0 * np.pi / self.Lx) * xp_np)
+            plan_key = (self.Ny, self.Nx, x_fin.size)
+            cached_plan = getattr(self, "_finufft_batched_2d_plan", None)
+            if cached_plan is None or cached_plan[0] != plan_key:
+                plan = _finufft.Plan(
+                    2,
+                    (self.Ny, self.Nx),
+                    n_trans=2,
+                    dtype="complex128",
+                    **_FINUFFT_OPTS,
+                )
+                self._finufft_batched_2d_plan = (plan_key, plan)
+            else:
+                plan = cached_plan[1]
+            plan.setpts(y_fin, x_fin)
+            values = np.real(
+                plan.execute(np.ascontiguousarray(np.stack((Fx, Fy))))
+            ) * scale
+            vx, vy = values
+        else:
+            kx = _to_np(self.kx).reshape(-1)
+            ky = _to_np(self.ky).reshape(-1)
+            E_ky = np.exp(1j * yp_np[:, None] * ky[None, :])
+            E_kx = np.exp(1j * xp_np[:, None] * kx[None, :])
+            vx = np.real(((E_ky @ Fx) * E_kx).sum(axis=1)) * scale
+            vy = np.real(((E_ky @ Fy) * E_kx).sum(axis=1)) * scale
+        if is_torch_input:
+            np_dtype = np.float32 if dtype == torch.float32 else np.float64
+            return (
+                torch.from_numpy(vx.astype(np_dtype)).to(device=device),
+                torch.from_numpy(vy.astype(np_dtype)).to(device=device),
+            )
+        return vx.astype(fx_np.dtype), vy.astype(fy_np.dtype)
+
     def dx1(self, f: np.ndarray) -> np.ndarray:
         # derivative along x on last spatial axis
         if self._legendre_basis is not None:
@@ -1270,7 +1593,7 @@ class Grid2D:
             return self._legendre_basis.dx(f)
         elif self.basis_x == "fourier":
             F = self.fft2(f)
-            F = self._apply_masks(F)
+            F = self._apply_dealias_mask(F)
             dF = F * self.ikx  # broadcast over (Ny, Nx)
             return self.ifft2(dF)
         elif self.basis_x == "legendre":
@@ -1287,7 +1610,7 @@ class Grid2D:
             return self._legendre_basis.dy(f)
         elif self.basis_y == "fourier":
             F = self.fft2(f)
-            F = self._apply_masks(F)
+            F = self._apply_dealias_mask(F)
             dF = F * self.iky
             return self.ifft2(dF)
         elif self.basis_y == "legendre":
@@ -1297,40 +1620,52 @@ class Grid2D:
         else:
             raise ValueError(f"Unknown basis_y: {self.basis_y}")
 
-    def apply_spectral_filter(self, f: np.ndarray) -> np.ndarray:
+    def project_dealiased(self, f: np.ndarray) -> np.ndarray:
+        """Project Fourier directions onto the retained 2/3 modal subspace."""
         if self._legendre_basis is not None:
-            # Use 2D Legendre basis filtering (supports NumPy and Torch)
-            if self.filter_params and bool(self.filter_params.get("enabled", False)):
+            return f
+        if self.basis_x == "fourier" and self.basis_y == "fourier":
+            F = self.fft2(f)
+            F = self._apply_dealias_mask(F)
+            return self.ifft2(F)
+        return f
+
+    def apply_spectral_dissipation(
+        self, f: np.ndarray, dt: float, *, project: bool = False
+    ) -> np.ndarray:
+        """Apply exp(-dt*lambda(k)); optionally combine dealias projection."""
+        if dt < 0.0:
+            raise ValueError("spectral dissipation dt must be non-negative")
+        if self._legendre_basis is not None:
+            if project and self.filter_params and bool(self.filter_params.get("enabled", False)):
                 p = int(self.filter_params.get("p", 8))
                 alpha = float(self.filter_params.get("alpha", 36.0))
-                return self._legendre_basis.apply_spectral_filter(f, p=p, alpha=alpha)
-            else:
-                return f
-        elif self.basis_x == "fourier" and self.basis_y == "fourier":
-            F = self.fft2(f)
-            F = self._apply_masks(F)
-            return self.ifft2(F)
+                return self._legendre_basis.apply_spectral_filter(
+                    f, p=p, alpha=alpha
+                )
+            return f
+        pure_fourier = self.basis_x == "fourier" and self.basis_y == "fourier"
+        if not pure_fourier or not self.spectral_dissipation_enabled:
+            return self.project_dealiased(f) if project else f
+        F = self.fft2(f)
+        if project:
+            F = self._apply_dealias_mask(F)
+        if getattr(self, "_use_torch", False):
+            assert torch is not None
+            F *= torch.exp(-float(dt) * self.filter_rate)
         else:
-            # For hybrid basis, only apply filter to Fourier directions
-            if self.basis_x == "fourier" and self.basis_y == "legendre":
-                # Apply FFT in x, then apply filter
-                F = self.fft2(f)
-                F = self._apply_masks(F)
-                return self.ifft2(F)
-            elif self.basis_x == "legendre" and self.basis_y == "fourier":
-                # Apply FFT in y, then apply filter
-                F = self.fft2(f)
-                F = self._apply_masks(F)
-                return self.ifft2(F)
-            else:
-                # Both Legendre - no spectral filtering
-                return f
+            F *= np.exp(-float(dt) * self.filter_rate)
+        return self.ifft2(F)
+
+    def apply_spectral_filter(self, f: np.ndarray) -> np.ndarray:
+        """Backward-compatible accepted-state projection/modal-filter entrypoint."""
+        return self.apply_spectral_dissipation(f, 0.0, project=True)
 
     # --- MHD solenoidal helpers (2D) ---
     def divergence(self, Bx: np.ndarray, By: np.ndarray) -> np.ndarray:
         """2D spectral divergence dxBx + dyBy using the masked derivative operator."""
-        Fx = self._apply_masks(self.fft2(Bx))
-        Fy = self._apply_masks(self.fft2(By))
+        Fx = self._apply_dealias_mask(self.fft2(Bx))
+        Fy = self._apply_dealias_mask(self.fft2(By))
         div_hat = self.ikx * Fx + self.iky * Fy
         return self.ifft2(div_hat)
 
@@ -1370,7 +1705,7 @@ class Grid2D:
         """2D spectral Laplacian (for explicit resistivity/viscosity)."""
         if self.kx is None or self.ky is None:
             raise ValueError("laplacian requires Fourier basis in x and y")
-        F = self._apply_masks(self.fft2(f))
+        F = self._apply_dealias_mask(self.fft2(f))
         if getattr(self, "_use_torch", False) and torch is not None and isinstance(F, torch.Tensor):
             k2 = self.k2.to(F.dtype)
         else:
@@ -1448,17 +1783,23 @@ class Grid3D:
         )
         self.k2_safe = np.where(self.k2 == 0.0, 1.0, self.k2)
 
-        # Dealias and filter
+        # Hard dealias projection and optional timestep-aware Fourier dissipation.
         self.dealias_mask = _build_filter_mask_3d(
             self.Nx, self.Ny, self.Nz, self.dealias
         )
-        self.filter_sigma = np.ones((self.Nz, self.Ny, self.Nx), dtype=float)
-        if self.filter_params and bool(self.filter_params.get("enabled", False)):
-            p = int(self.filter_params.get("p", 8))
-            alpha = float(self.filter_params.get("alpha", 36.0))
-            self.filter_sigma = _build_exponential_filter_3d(
-                self.Nx, self.Ny, self.Nz, p=p, alpha=alpha
-            )
+        enabled, p, rate, normalize_at_cutoff = _spectral_dissipation_settings(
+            self.filter_params
+        )
+        self.spectral_dissipation_enabled = enabled
+        self.filter_rate = _build_exponential_filter_rate_3d(
+            self.Nx,
+            self.Ny,
+            self.Nz,
+            p=p,
+            rate=rate,
+            dealias=self.dealias,
+            normalize_at_cutoff=normalize_at_cutoff,
+        )
 
         if scipy_fft_cache_enabled and fftw_cache is not None:
             try:
@@ -1512,7 +1853,7 @@ class Grid3D:
             self.dealias_mask = torch.from_numpy(np.asarray(self.dealias_mask)).to(
                 dtype=torch_dtype, device=self.torch_device
             )
-            self.filter_sigma = torch.from_numpy(np.asarray(self.filter_sigma)).to(
+            self.filter_rate = torch.from_numpy(np.asarray(self.filter_rate)).to(
                 dtype=torch_dtype, device=self.torch_device
             )
 
@@ -1535,17 +1876,48 @@ class Grid3D:
         except TypeError:
             return scipy_fft.ifftn(F, axes=(-3, -2, -1)).real
 
-    def _apply_masks(self, F: np.ndarray) -> np.ndarray:
+    def _apply_dealias_mask(self, F: np.ndarray) -> np.ndarray:
         F *= self.dealias_mask
-        F *= self.filter_sigma
         return F
+
+    def interpolate_periodic_linear_at_points(
+        self,
+        f: np.ndarray,
+        xp: np.ndarray,
+        yp: np.ndarray,
+        zp: np.ndarray,
+    ) -> np.ndarray:
+        """Interpolate a periodic 3-D field without host/device transfers."""
+        return _periodic_linear_3d(
+            f, xp, yp, zp, self.Lx, self.Ly, self.Lz
+        )
+
+    def interpolate_periodic_linear_at_points_batched_3d(
+        self,
+        fx: np.ndarray,
+        fy: np.ndarray,
+        fz: np.ndarray,
+        xp: np.ndarray,
+        yp: np.ndarray,
+        zp: np.ndarray,
+    ) -> tuple:
+        """Interpolate three periodic fields at one shared particle set."""
+        if _TORCH_AVAILABLE and torch is not None and isinstance(fx, torch.Tensor):
+            fields = torch.stack((fx, fy, fz), dim=0)
+        else:
+            fields = np.stack((fx, fy, fz), axis=0)
+        values = _periodic_linear_3d(
+            fields, xp, yp, zp, self.Lx, self.Ly, self.Lz
+        )
+        return values[0], values[1], values[2]
 
     def evaluate_fourier_at_points(
         self, f: np.ndarray, xp: np.ndarray, yp: np.ndarray, zp: np.ndarray
     ) -> np.ndarray:
         """Evaluate a Fourier-represented 3D field at arbitrary points.
 
-        f(x,y,z) = (1/(Nx*Ny*Nz)) * Re( sum F exp(i*kx*x + i*ky*y + i*kz*z) ) with dealias and filter.
+        f(x,y,z) = (1/(Nx*Ny*Nz)) * Re( sum F exp(i*kx*x + i*ky*y + i*kz*z) )
+        on the retained 2/3-dealiased modes.
         Supports NumPy and PyTorch (including MPS/CUDA); keeps tensors on same device.
 
         Args:
@@ -1568,8 +1940,10 @@ class Grid3D:
             yp_np = np.asarray(yp, dtype=np.float64)
             zp_np = np.asarray(zp, dtype=np.float64)
         dealias = _to_np(self.dealias_mask)
-        sigma = _to_np(self.filter_sigma)
-        F = np.ascontiguousarray(np.fft.fftn(f_np, axes=(-3, -2, -1)) * dealias * sigma, dtype=np.complex128)
+        F = np.ascontiguousarray(
+            np.fft.fftn(f_np, axes=(-3, -2, -1)) * dealias,
+            dtype=np.complex128,
+        )
         N_total = self.Nx * self.Ny * self.Nz
         if _FINUFFT_AVAILABLE:
             z_fin = np.ascontiguousarray((2.0 * np.pi / self.Lz) * zp_np)
@@ -1619,11 +1993,19 @@ class Grid3D:
             yp_np = np.asarray(yp, dtype=np.float64)
             zp_np = np.asarray(zp, dtype=np.float64)
         dealias = _to_np(self.dealias_mask)
-        sigma = _to_np(self.filter_sigma)
         scale = 1.0 / (self.Nx * self.Ny * self.Nz)
-        Fx = np.ascontiguousarray(np.fft.fftn(fx_np, axes=(-3, -2, -1)) * dealias * sigma, dtype=np.complex128)
-        Fy = np.ascontiguousarray(np.fft.fftn(fy_np, axes=(-3, -2, -1)) * dealias * sigma, dtype=np.complex128)
-        Fz = np.ascontiguousarray(np.fft.fftn(fz_np, axes=(-3, -2, -1)) * dealias * sigma, dtype=np.complex128)
+        Fx = np.ascontiguousarray(
+            np.fft.fftn(fx_np, axes=(-3, -2, -1)) * dealias,
+            dtype=np.complex128,
+        )
+        Fy = np.ascontiguousarray(
+            np.fft.fftn(fy_np, axes=(-3, -2, -1)) * dealias,
+            dtype=np.complex128,
+        )
+        Fz = np.ascontiguousarray(
+            np.fft.fftn(fz_np, axes=(-3, -2, -1)) * dealias,
+            dtype=np.complex128,
+        )
         if _FINUFFT_AVAILABLE:
             z_fin = np.ascontiguousarray((2.0 * np.pi / self.Lz) * zp_np)
             y_fin = np.ascontiguousarray((2.0 * np.pi / self.Ly) * yp_np)
@@ -1662,9 +2044,9 @@ class Grid3D:
         machine precision because k.V_hat = 0 on every retained mode and the
         mask only zeroes high modes.
         """
-        Fx = self._apply_masks(self.fftn(Vx))
-        Fy = self._apply_masks(self.fftn(Vy))
-        Fz = self._apply_masks(self.fftn(Vz))
+        Fx = self._apply_dealias_mask(self.fftn(Vx))
+        Fy = self._apply_dealias_mask(self.fftn(Vy))
+        Fz = self._apply_dealias_mask(self.fftn(Vz))
         div_hat = self.ikx * Fx + self.iky * Fy + self.ikz * Fz
         return self.ifftn(div_hat)
 
@@ -1708,9 +2090,9 @@ class Grid3D:
 
     def curl(self, Vx: np.ndarray, Vy: np.ndarray, Vz: np.ndarray):
         """3D spectral curl (masked derivative operator). Returns (Cx, Cy, Cz)."""
-        Fx = self._apply_masks(self.fftn(Vx))
-        Fy = self._apply_masks(self.fftn(Vy))
-        Fz = self._apply_masks(self.fftn(Vz))
+        Fx = self._apply_dealias_mask(self.fftn(Vx))
+        Fy = self._apply_dealias_mask(self.fftn(Vy))
+        Fz = self._apply_dealias_mask(self.fftn(Vz))
         Cx = self.ifftn(self.iky * Fz - self.ikz * Fy)
         Cy = self.ifftn(self.ikz * Fx - self.ikx * Fz)
         Cz = self.ifftn(self.ikx * Fy - self.iky * Fx)
@@ -1718,7 +2100,7 @@ class Grid3D:
 
     def laplacian(self, f: np.ndarray) -> np.ndarray:
         """3D spectral Laplacian (used for explicit resistivity/viscosity)."""
-        F = self._apply_masks(self.fftn(f))
+        F = self._apply_dealias_mask(self.fftn(f))
         if getattr(self, "_use_torch", False) and torch is not None and isinstance(F, torch.Tensor):
             k2 = self.k2.to(F.dtype)
         else:
@@ -1727,26 +2109,49 @@ class Grid3D:
 
     def dx1(self, f: np.ndarray) -> np.ndarray:
         F = self.fftn(f)
-        F = self._apply_masks(F)
+        F = self._apply_dealias_mask(F)
         dF = F * self.ikx
         return self.ifftn(dF)
 
     def dy1(self, f: np.ndarray) -> np.ndarray:
         F = self.fftn(f)
-        F = self._apply_masks(F)
+        F = self._apply_dealias_mask(F)
         dF = F * self.iky
         return self.ifftn(dF)
 
     def dz1(self, f: np.ndarray) -> np.ndarray:
         F = self.fftn(f)
-        F = self._apply_masks(F)
+        F = self._apply_dealias_mask(F)
         dF = F * self.ikz
         return self.ifftn(dF)
 
-    def apply_spectral_filter(self, f: np.ndarray) -> np.ndarray:
+    def project_dealiased(self, f: np.ndarray) -> np.ndarray:
+        """Project a Fourier field onto the retained 2/3 modal subspace."""
         F = self.fftn(f)
-        F = self._apply_masks(F)
+        F = self._apply_dealias_mask(F)
         return self.ifftn(F)
+
+    def apply_spectral_dissipation(
+        self, f: np.ndarray, dt: float, *, project: bool = False
+    ) -> np.ndarray:
+        """Apply exp(-dt*lambda(k)); optionally combine dealias projection."""
+        if dt < 0.0:
+            raise ValueError("spectral dissipation dt must be non-negative")
+        if not self.spectral_dissipation_enabled:
+            return self.project_dealiased(f) if project else f
+        F = self.fftn(f)
+        if project:
+            F = self._apply_dealias_mask(F)
+        if getattr(self, "_use_torch", False):
+            assert torch is not None
+            F *= torch.exp(-float(dt) * self.filter_rate)
+        else:
+            F *= np.exp(-float(dt) * self.filter_rate)
+        return self.ifftn(F)
+
+    def apply_spectral_filter(self, f: np.ndarray) -> np.ndarray:
+        """Backward-compatible accepted-state projection entrypoint."""
+        return self.apply_spectral_dissipation(f, 0.0, project=True)
 
     def xyz_mesh(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if getattr(self, "_use_torch", False):

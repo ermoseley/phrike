@@ -1,15 +1,13 @@
 """Tracer particle density estimation and plotting.
 
-Estimates density from tracer positions: for uniform 3D grids uses the
-LagrangianPhaseSpaceSheetEasy tetrahedra-based voxel volumes when that repo is
-available (at phrike/LagrangianPhaseSpaceSheetEasy or on PYTHONPATH); otherwise
-uses histogram deposit. Plots 3D density via slices and projections.
+Uniform tracer lattices use a periodic six-tetrahedron decomposition of each
+Lagrangian cell. Random particles use a histogram estimate. The simplex path
+uses unwrapped particle coordinates when snapshots provide them, avoiding
+spurious box-spanning cells at periodic boundaries.
 """
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 from typing import Any, Optional, Tuple
 
 import numpy as np
@@ -24,26 +22,6 @@ except Exception:
     def _arr_from_tracers(a: Any) -> np.ndarray:
         return np.asarray(a, dtype=np.float64).flatten()
 
-# Optional: LagrangianPhaseSpaceSheetEasy (phase-space sheet voxel volumes)
-_SHEET_UTILS = None
-_MAKE_FIGS = None
-_pkg_dir = Path(__file__).resolve().parent
-_proj_root = _pkg_dir.parent
-_sheet_path = _proj_root / "LagrangianPhaseSpaceSheetEasy"
-if _sheet_path.is_dir():
-    try:
-        sys.path.insert(0, str(_proj_root))
-        from LagrangianPhaseSpaceSheetEasy.SheetUtils import get_voxel_volumes
-        _SHEET_UTILS = get_voxel_volumes
-    except Exception:
-        pass
-    try:
-        from LagrangianPhaseSpaceSheetEasy.helpers import makeFigs as _makeFigs_impl
-        _MAKE_FIGS = _makeFigs_impl
-    except Exception:
-        pass
-
-
 def _is_perfect_cube(P: int) -> Optional[int]:
     """Return n if P == n**3, else None."""
     if P <= 0:
@@ -55,14 +33,113 @@ def _is_perfect_cube(P: int) -> Optional[int]:
 
 
 def _build_p3d_uniform(
-    x: np.ndarray, y: np.ndarray, z: np.ndarray, n: int
+    x: np.ndarray, y: np.ndarray, z: np.ndarray, shape: Tuple[int, int, int]
 ) -> np.ndarray:
-    """Build (n, n, n, 3) vertex grid from raveled x, y, z (C-order, indexing='ij')."""
-    p3d = np.empty((n, n, n, 3), dtype=np.float64)
-    p3d[:, :, :, 0] = x.reshape(n, n, n)
-    p3d[:, :, :, 1] = y.reshape(n, n, n)
-    p3d[:, :, :, 2] = z.reshape(n, n, n)
+    """Build an ``(nx, ny, nz, 3)`` vertex grid from C-order arrays."""
+    p3d = np.empty((*shape, 3), dtype=np.float64)
+    p3d[..., 0] = x.reshape(shape)
+    p3d[..., 1] = y.reshape(shape)
+    p3d[..., 2] = z.reshape(shape)
     return p3d
+
+
+_TET_CONNECTIVITY = np.asarray(
+    (
+        (4, 0, 7, 1),
+        (1, 0, 7, 3),
+        (5, 1, 4, 7),
+        (2, 3, 1, 7),
+        (1, 5, 6, 7),
+        (2, 6, 7, 1),
+    ),
+    dtype=np.intp,
+)
+_CUBE_VERTICES = np.asarray(
+    (
+        (0, 0, 0),
+        (1, 0, 0),
+        (1, 1, 0),
+        (0, 1, 0),
+        (0, 0, 1),
+        (1, 0, 1),
+        (1, 1, 1),
+        (0, 1, 1),
+    ),
+    dtype=np.intp,
+)
+
+
+def _uniform_lattice_shape(tracers: Any, count: int) -> Optional[Tuple[int, int, int]]:
+    configured = getattr(tracers, "lattice_shape", None)
+    if configured is not None:
+        shape = tuple(int(value) for value in configured)
+        if len(shape) != 3 or np.prod(shape) != count:
+            raise ValueError("tracer lattice shape does not match particle count")
+        return shape
+    n = _is_perfect_cube(count)
+    return None if n is None else (n, n, n)
+
+
+def periodic_simplex_density_3d(
+    tracers: Any,
+    domain: Tuple[float, float, float],
+    mass: Optional[float] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return periodic simplex-cell density and deformed cell centroids.
+
+    Density is returned in ``(nz, ny, nx)`` order. Centroids have shape
+    ``(nz, ny, nx, 3)`` and are wrapped into the periodic domain.
+    """
+    wrapped = [_arr_from_tracers(getattr(tracers, axis)) for axis in "xyz"]
+    unwrapped = [
+        _arr_from_tracers(getattr(tracers, f"{axis}_unwrapped", values))
+        for axis, values in zip("xyz", wrapped)
+    ]
+    count = len(unwrapped[0])
+    if any(len(values) != count for values in unwrapped[1:]):
+        raise ValueError("tracer coordinate arrays must have the same length")
+    shape = _uniform_lattice_shape(tracers, count)
+    if shape is None or any(size < 2 for size in shape):
+        raise ValueError("simplex density requires a uniform 3-D tracer lattice")
+
+    base = _build_p3d_uniform(*unwrapped, shape)
+    nx, ny, nz = shape
+    extended = base[
+        np.ix_(
+            np.arange(nx + 1) % nx,
+            np.arange(ny + 1) % ny,
+            np.arange(nz + 1) % nz,
+        )
+    ].copy()
+    extended[-1, :, :, 0] += domain[0]
+    extended[:, -1, :, 1] += domain[1]
+    extended[:, :, -1, 2] += domain[2]
+
+    cube = np.empty((nx, ny, nz, 8, 3), dtype=np.float64)
+    for vertex, offset in enumerate(_CUBE_VERTICES):
+        i, j, k = offset
+        cube[..., vertex, :] = extended[
+            i : i + nx, j : j + ny, k : k + nz, :
+        ]
+
+    volume = np.zeros((nx, ny, nz), dtype=np.float64)
+    for connection in _TET_CONNECTIVITY:
+        a, b, c, origin = (cube[..., index, :] for index in connection)
+        determinant = np.einsum(
+            "...i,...i->...", a - origin, np.cross(b - origin, c - origin)
+        )
+        volume += np.abs(determinant) / 6.0
+    if not np.all(np.isfinite(volume)) or np.any(volume <= 0.0):
+        raise ValueError("tracer simplex lattice contains invalid cell volumes")
+
+    mass_value = (
+        float(mass) if mass is not None else float(getattr(tracers, "mass", 1.0))
+    )
+    density = mass_value / volume
+    centroid = np.mean(cube, axis=-2)
+    for axis, length in enumerate(domain):
+        centroid[..., axis] = np.mod(centroid[..., axis], length)
+    return density.transpose(2, 1, 0), centroid.transpose(2, 1, 0, 3)
 
 
 def tracer_density_3d(
@@ -74,17 +151,16 @@ def tracer_density_3d(
 ) -> Tuple[np.ndarray, Tuple[float, float, float, float, float, float]]:
     """Estimate 3D density field from tracer positions.
 
-    For uniform layout and n^3 particles, uses tetrahedra-based voxel volumes
-    when LagrangianPhaseSpaceSheetEasy is available; otherwise histogram deposit.
-    For random layout (or non-cube count), uses histogram deposit.
+    For a uniform lattice, use the periodic six-tetrahedron volume of each
+    deformed Lagrangian cell. For random particles, use histogram deposition.
 
     Args:
         tracers: Object with .x, .y, .z (each 1D length P) and optionally .mass.
         domain: (Lx, Ly, Lz).
-        grid_shape: (nx, ny, nz) for histogram output; if None, uniform uses
-            (n-1)^3 voxels, random uses (32, 32, 32).
-        layout: 'auto' | 'uniform' | 'random'. If 'auto', use uniform when
-            P is a perfect cube.
+        grid_shape: (nx, ny, nz) for histogram output; if None, random layouts
+            use (32, 32, 32). This is ignored for uniform lattices.
+        layout: 'auto' | 'uniform' | 'random'. If 'auto', use the simplex
+            estimator only when lattice topology is explicitly available.
         mass: Override mass per particle (default: tracers.mass or 1.0).
 
     Returns:
@@ -105,22 +181,14 @@ def tracer_density_3d(
 
     use_uniform = False
     if layout == "uniform":
-        n_cube = _is_perfect_cube(P)
-        use_uniform = n_cube is not None
+        use_uniform = _uniform_lattice_shape(tracers, P) is not None
     elif layout == "auto":
-        n_cube = _is_perfect_cube(P)
-        use_uniform = n_cube is not None and _SHEET_UTILS is not None
+        use_uniform = getattr(tracers, "lattice_shape", None) is not None
 
-    if use_uniform and n_cube is not None and n_cube >= 2 and _SHEET_UTILS is not None:
-        n = n_cube
-        p3d = _build_p3d_uniform(x, y, z, n)
-        M = n - 1
-        voxvol = _SHEET_UTILS(M, p3d)
-        voxvol = np.abs(voxvol)
-        num_voxels = (n - 1) ** 3
-        mass_per_voxel = (P * mass_val) / num_voxels if num_voxels > 0 else mass_val
-        rho_3d = np.where(voxvol > 1e-30, mass_per_voxel / voxvol, 0.0)
-        rho_3d = rho_3d.astype(np.float64)
+    if use_uniform:
+        rho_3d, _ = periodic_simplex_density_3d(
+            tracers, domain, mass=mass_val
+        )
         extent = (0.0, Lx, 0.0, Ly, 0.0, Lz)
         return rho_3d, extent
 
@@ -135,7 +203,7 @@ def tracer_density_3d(
         bins=(nx, ny, nz),
         range=[[0.0, Lx], [0.0, Ly], [0.0, Lz]],
     )
-    rho_3d = (counts * mass_val) / cell_vol
+    rho_3d = ((counts * mass_val) / cell_vol).transpose(2, 1, 0)
     rho_3d = rho_3d.astype(np.float64)
     extent = (0.0, Lx, 0.0, Ly, 0.0, Lz)
     return rho_3d, extent
@@ -229,10 +297,9 @@ def plot_tracer_density_3d(
 ) -> None:
     """Plot 3D tracer density: slices and projections.
 
-    If LagrangianPhaseSpaceSheetEasy.helpers.makeFigs is available, uses it;
-    otherwise uses a simple 6-panel figure. When outpath is set, saves the
-    figure and does not block. Color range defaults to 2–98% percentile so
-    extreme voxels do not dominate; pass vmin/vmax to override.
+    When outpath is set, save the figure and do not block. Color range defaults
+    to the 2–98% percentile so extreme cells do not dominate; pass vmin/vmax
+    to override.
 
     Args:
         rho_3d: 3D array (nz, ny, nx).
@@ -246,9 +313,6 @@ def plot_tracer_density_3d(
     """
     Lx, Ly, Lz = domain
     extent = (0.0, Lx, 0.0, Ly, 0.0, Lz)
-    if _MAKE_FIGS is not None and outpath is None:
-        _MAKE_FIGS(rho_3d, log=log, title=title)
-        return
     _plot_tracer_density_3d_simple(
         rho_3d, extent, outpath=outpath, log=log, title=title,
         vmin=vmin, vmax=vmax, percentile=percentile,

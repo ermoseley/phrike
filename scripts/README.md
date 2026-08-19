@@ -27,16 +27,18 @@ python -m scripts.postprocess plot outputs/turb3d/snapshot_t0.100000.npz \
 python -m scripts.postprocess tracer-density --config configs/turb3d.yaml
 ```
 
-The snapshot metadata supplies the domain dimensions. The tracer tool uses the
-configured density grid when present and otherwise selects the estimator
-automatically; it does not claim a tetrahedral reconstruction when the optional
-dependency is unavailable.
+The snapshot metadata supplies the domain dimensions. Uniform tracer lattices
+retain unwrapped coordinates and topology for the periodic simplex-cell density
+estimator; random tracers use the configured histogram grid.
 
 ## Development diagnostics
 
 ```bash
 # Benchmark the cost of tracer advection on a chosen backend.
 python -m scripts.benchmark_tracers --backend numpy --grid 64 --steps 20
+
+# Validate tracer density against a smooth compressive flow on Apple Metal.
+python -m scripts.validate_tracers --backend torch --device mps --grid 32
 
 # Run the full 1-D circularly polarized Alfvén-wave diagnostic.
 python -m scripts.validate_alfven1d
