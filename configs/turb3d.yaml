@@ -60,14 +60,14 @@ initial_conditions:
 io:
   outdir: outputs/turb3d
 
-# Tracer particles (Fourier interpolation + leap-frog advection)
-# A uniform n^3 layout can use the optional tetrahedral estimator; otherwise
-# tracer density falls back to histogram deposition.
+# Tracer particles (dealiased Fourier interpolation + explicit midpoint)
+# A uniform n^3 layout retains its lattice topology for the periodic simplex
+# density estimator; random tracers use histogram deposition.
 tracers:
   enabled: true
   num: 262144   # 64^3
   layout: uniform
-  mass: 1.0
+  mass: auto     # initialize each tracer with total gas mass / particle count
   seed: 42
   plot_density: true
   density_grid: null

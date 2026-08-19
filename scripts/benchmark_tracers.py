@@ -47,12 +47,12 @@ def run_benchmark(
 
     if backend == "torch" and hasattr(grid, "torch_device"):
         import torch
-        U = [torch.from_numpy(U[i]).to(device=grid.torch_device, dtype=grid.x.dtype) for i in range(5)]
+        U = torch.from_numpy(U).to(device=grid.torch_device, dtype=grid.x.dtype)
 
-    # U: 3D state is (5, Nz, Ny, Nx) or list of 5 arrays
+    # U: 3D state has shape (5, Nz, Ny, Nx).
     if backend == "torch":
         def copy_U():
-            return [u.clone() for u in U]
+            return U.clone()
     else:
         def copy_U():
             return np.asarray(U).copy()
@@ -73,21 +73,31 @@ def run_benchmark(
 
         # Warmup
         for s in range(2):
-            step_dt = solver._fixed_run_step(step_dt, s, None)
+            dt_used = step_dt
+            state_before = solver.U
+            step_dt = solver._fixed_run_step(dt_used, s, None)
             if tracers is not None:
-                tracers.step(grid, equations, solver.U, step_dt)
+                tracers.step(
+                    grid, equations, state_before, dt_used, U_new=solver.U
+                )
 
         solver.U = copy_U()
         solver.t = 0.0
         step_dt = 0.005
+        if tracers is not None:
+            tracers = FourierTracers3D(x0, y0, z0, mass=1.0)
 
         # Time: PDE step + optional tracer step
         steps = num_steps
         t0 = time.perf_counter()
         for s in range(steps):
-            step_dt = solver._fixed_run_step(step_dt, s, None)
+            dt_used = step_dt
+            state_before = solver.U
+            step_dt = solver._fixed_run_step(dt_used, s, None)
             if tracers is not None:
-                tracers.step(grid, equations, solver.U, step_dt)
+                tracers.step(
+                    grid, equations, state_before, dt_used, U_new=solver.U
+                )
         elapsed = time.perf_counter() - t0
 
         label = f"P={P}" if P > 0 else "PDE-only (no tracers)"

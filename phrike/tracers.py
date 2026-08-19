@@ -1,13 +1,14 @@
-"""Fourier-basis tracer particles with leap-frog advection.
+"""Passive tracer particles for periodic Fourier grids.
 
-Tracers interpolate velocity from the spectral (Fourier) representation at their
-positions and advance using leap-frog (Euler on first step). Supported only when
-the grid is Fourier in all periodic directions (1D/2D) or for Grid3D (always Fourier).
+Particles sample the retained, dealiased Fourier velocity representation and
+use an explicit-midpoint update between the gas states bracketing each accepted step.
+This needs two position evaluations per step, remains second-order accurate
+when the gas timestep changes, and requires no restart history.
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 import numpy as np
 
@@ -15,222 +16,241 @@ try:
     import torch  # type: ignore
 
     _TORCH_AVAILABLE = True
-except Exception:
+except Exception:  # pragma: no cover - Torch is optional
     _TORCH_AVAILABLE = False
     torch = None  # type: ignore
 
 
-def _to_numpy(a: Any) -> np.ndarray:
-    """Convert array to NumPy (e.g. for saving or NumPy-only grid eval)."""
-    if _TORCH_AVAILABLE and isinstance(a, torch.Tensor):
-        return a.detach().cpu().numpy()
-    return np.asarray(a)
+def _is_torch(value: Any) -> bool:
+    return bool(
+        _TORCH_AVAILABLE and torch is not None and isinstance(value, torch.Tensor)
+    )
 
 
-def _is_torch(u: Any) -> bool:
-    """True if u is a torch tensor (for choosing tracer step path)."""
-    return _TORCH_AVAILABLE and isinstance(u, torch.Tensor)
+def _as_backend(value: Any, template: Any) -> Any:
+    """Move a position array to the field backend, device, and dtype."""
+    if _is_torch(template):
+        assert torch is not None
+        if isinstance(value, torch.Tensor):
+            return value.to(dtype=template.dtype, device=template.device)
+        return torch.as_tensor(value, dtype=template.dtype, device=template.device)
+    if _is_torch(value):
+        value = value.detach().cpu().numpy()
+    return np.asarray(value, dtype=np.asarray(template).dtype)
+
+
+def _wrap(value: Any, length: float) -> Any:
+    if _is_torch(value):
+        assert torch is not None
+        wrapped = torch.remainder(value, length)
+        return torch.where(wrapped >= length, torch.zeros_like(wrapped), wrapped)
+    wrapped = np.mod(value, length)
+    return np.where(wrapped >= length, np.zeros_like(wrapped), wrapped)
+
+
+def _velocities(equations: Any, state: Any, ndim: int) -> Tuple[Any, ...]:
+    primitive = equations.primitive(state)
+    if len(primitive) < ndim + 1:
+        raise ValueError(
+            f"Expected at least {ndim + 1} primitive fields, got {len(primitive)}"
+        )
+    return tuple(primitive[1 : ndim + 1])
 
 
 class FourierTracers1D:
-    """Tracer particles for 1D Fourier (periodic) grids. Leap-frog advection."""
+    """Passive tracers for a periodic one-dimensional Fourier grid."""
 
     def __init__(self, x0: np.ndarray, mass: float = 1.0) -> None:
-        self.x = np.asarray(x0, dtype=np.float64).flatten().copy()
-        self._x_prev = np.empty_like(self.x)
+        self.x = np.asarray(x0, dtype=np.float64).reshape(-1).copy()
+        self.x_unwrapped = self.x.copy()
         self.mass = float(mass)
-        self._first_step = True
+        self.lattice_shape: Optional[Tuple[int, ...]] = None
 
-    def _ensure_torch(self, device: Any, dtype: Any) -> None:
-        if not _TORCH_AVAILABLE or isinstance(self.x, torch.Tensor):
-            return
-        self.x = torch.from_numpy(np.asarray(self.x)).to(device=device, dtype=dtype)
-        self._x_prev = torch.empty_like(self.x, device=device, dtype=dtype)
-        self._x_prev.copy_(self.x)
+    def _ensure_backend(self, template: Any) -> None:
+        self.x = _as_backend(self.x, template)
+        self.x_unwrapped = _as_backend(self.x_unwrapped, template)
 
-    def step(self, grid: Any, equations: Any, U: Any, dt: float) -> None:
+    @staticmethod
+    def _sample(grid: Any, velocity: Any, x: Any) -> Any:
+        return grid.evaluate_fourier_at_points_1d(velocity.reshape(-1), x)
+
+    def step(
+        self,
+        grid: Any,
+        equations: Any,
+        U: Any,
+        dt: float,
+        U_new: Optional[Any] = None,
+    ) -> None:
+        """Advance one accepted gas step with two-evaluation explicit midpoint."""
         if getattr(grid, "_basis_name", None) != "fourier":
-            raise ValueError("FourierTracers1D requires grid with Fourier basis")
-        u = equations.primitive(U)[1]
-        if _is_torch(u):
-            device, dtype = u.device, u.dtype
-            self._ensure_torch(device, dtype)
-            v = grid.evaluate_fourier_at_points_1d(u.flatten(), self.x)
-            if self._first_step:
-                self._x_prev.copy_(self.x)
-                self.x = self.x + dt * v
-                self._first_step = False
-            else:
-                x_new = self._x_prev + 2.0 * dt * v
-                self._x_prev.copy_(self.x)
-                self.x = x_new
-            self.x = torch.remainder(self.x, grid.Lx)
-        else:
-            u_np = _to_numpy(u).flatten()
-            v = grid.evaluate_fourier_at_points_1d(u_np, _to_numpy(self.x))
-            if self._first_step:
-                self._x_prev[:] = self.x
-                self.x = self.x + dt * v
-                self._first_step = False
-            else:
-                x_new = self._x_prev + 2.0 * dt * v
-                self._x_prev[:] = self.x
-                self.x = x_new
-            self.x = np.mod(self.x, grid.Lx)
+            raise ValueError("FourierTracers1D requires a Fourier grid")
+        if dt < 0.0 or not np.isfinite(dt):
+            raise ValueError("Tracer timestep must be finite and non-negative")
+        u0 = _velocities(equations, U, 1)[0]
+        self._ensure_backend(u0)
+        v0 = self._sample(grid, u0, self.x_unwrapped)
+        midpoint = self.x_unwrapped + 0.5 * dt * v0
+        end_state = U if U_new is None else U_new
+        midpoint_state = 0.5 * (U + end_state)
+        u_midpoint = _velocities(equations, midpoint_state, 1)[0]
+        v_midpoint = self._sample(grid, u_midpoint, midpoint)
+        self.x_unwrapped = self.x_unwrapped + dt * v_midpoint
+        self.x = _wrap(self.x_unwrapped, grid.Lx)
 
 
 class FourierTracers2D:
-    """Tracer particles for 2D Fourier (periodic) grids. Leap-frog advection."""
+    """Passive tracers for a periodic two-dimensional Fourier grid."""
 
-    def __init__(self, x0: np.ndarray, y0: np.ndarray, mass: float = 1.0) -> None:
-        self.x = np.asarray(x0, dtype=np.float64).flatten().copy()
-        self.y = np.asarray(y0, dtype=np.float64).flatten().copy()
+    def __init__(
+        self,
+        x0: np.ndarray,
+        y0: np.ndarray,
+        mass: float = 1.0,
+        lattice_shape: Optional[Tuple[int, int]] = None,
+    ) -> None:
+        self.x = np.asarray(x0, dtype=np.float64).reshape(-1).copy()
+        self.y = np.asarray(y0, dtype=np.float64).reshape(-1).copy()
         if self.x.shape != self.y.shape:
             raise ValueError("x0 and y0 must have the same size")
-        self._x_prev = np.empty_like(self.x)
-        self._y_prev = np.empty_like(self.y)
+        self.x_unwrapped = self.x.copy()
+        self.y_unwrapped = self.y.copy()
         self.mass = float(mass)
-        self._first_step = True
+        self.lattice_shape = lattice_shape
 
-    def _ensure_torch(self, device: Any, dtype: Any) -> None:
-        if not _TORCH_AVAILABLE or isinstance(self.x, torch.Tensor):
-            return
-        self.x = torch.from_numpy(np.asarray(self.x)).to(device=device, dtype=dtype)
-        self.y = torch.from_numpy(np.asarray(self.y)).to(device=device, dtype=dtype)
-        self._x_prev = torch.empty_like(self.x, device=device, dtype=dtype)
-        self._y_prev = torch.empty_like(self.y, device=device, dtype=dtype)
-        self._x_prev.copy_(self.x)
-        self._y_prev.copy_(self.y)
+    def _ensure_backend(self, template: Any) -> None:
+        for name in ("x", "y", "x_unwrapped", "y_unwrapped"):
+            setattr(self, name, _as_backend(getattr(self, name), template))
 
-    def step(self, grid: Any, equations: Any, U: Any, dt: float) -> None:
-        if getattr(grid, "basis_x", None) != "fourier" or getattr(grid, "basis_y", None) != "fourier":
-            raise ValueError("FourierTracers2D requires Fourier basis in both x and y")
-        _, ux, uy, _ = equations.primitive(U)
-        if _is_torch(ux):
-            device, dtype = ux.device, ux.dtype
-            self._ensure_torch(device, dtype)
-            vx = grid.evaluate_fourier_at_points(ux, self.x, self.y)
-            vy = grid.evaluate_fourier_at_points(uy, self.x, self.y)
-            if self._first_step:
-                self._x_prev.copy_(self.x)
-                self._y_prev.copy_(self.y)
-                self.x = self.x + dt * vx
-                self.y = self.y + dt * vy
-                self._first_step = False
-            else:
-                x_new = self._x_prev + 2.0 * dt * vx
-                y_new = self._y_prev + 2.0 * dt * vy
-                self._x_prev.copy_(self.x)
-                self._y_prev.copy_(self.y)
-                self.x = x_new
-                self.y = y_new
-            self.x = torch.remainder(self.x, grid.Lx)
-            self.y = torch.remainder(self.y, grid.Ly)
-        else:
-            ux_np = _to_numpy(ux)
-            uy_np = _to_numpy(uy)
-            vx = grid.evaluate_fourier_at_points(ux_np, self.x, self.y)
-            vy = grid.evaluate_fourier_at_points(uy_np, self.x, self.y)
-            if self._first_step:
-                self._x_prev[:] = self.x
-                self._y_prev[:] = self.y
-                self.x = self.x + dt * vx
-                self.y = self.y + dt * vy
-                self._first_step = False
-            else:
-                x_new = self._x_prev + 2.0 * dt * vx
-                y_new = self._y_prev + 2.0 * dt * vy
-                self._x_prev[:] = self.x
-                self._y_prev[:] = self.y
-                self.x = x_new
-                self.y = y_new
-            self.x = np.mod(self.x, grid.Lx)
-            self.y = np.mod(self.y, grid.Ly)
+    @staticmethod
+    def _sample(
+        grid: Any, velocities: Tuple[Any, Any], x: Any, y: Any
+    ) -> Tuple[Any, Any]:
+        batched = getattr(grid, "evaluate_fourier_at_points_batched_2d", None)
+        if batched is not None:
+            return batched(*velocities, x, y)
+        return tuple(
+            grid.evaluate_fourier_at_points(field, x, y)
+            for field in velocities
+        )  # type: ignore[return-value]
+
+    def step(
+        self,
+        grid: Any,
+        equations: Any,
+        U: Any,
+        dt: float,
+        U_new: Optional[Any] = None,
+    ) -> None:
+        """Advance one accepted gas step with two-evaluation explicit midpoint."""
+        if (
+            getattr(grid, "basis_x", None) != "fourier"
+            or getattr(grid, "basis_y", None) != "fourier"
+        ):
+            raise ValueError("FourierTracers2D requires Fourier basis in x and y")
+        if dt < 0.0 or not np.isfinite(dt):
+            raise ValueError("Tracer timestep must be finite and non-negative")
+        velocity0 = _velocities(equations, U, 2)
+        ux0 = velocity0[0]
+        self._ensure_backend(ux0)
+        vx0, vy0 = self._sample(
+            grid, velocity0, self.x_unwrapped, self.y_unwrapped
+        )
+        x_midpoint = self.x_unwrapped + 0.5 * dt * vx0
+        y_midpoint = self.y_unwrapped + 0.5 * dt * vy0
+        end_state = U if U_new is None else U_new
+        midpoint_state = 0.5 * (U + end_state)
+        velocity_midpoint = _velocities(equations, midpoint_state, 2)
+        vx_midpoint, vy_midpoint = self._sample(
+            grid, velocity_midpoint, x_midpoint, y_midpoint
+        )
+        self.x_unwrapped = self.x_unwrapped + dt * vx_midpoint
+        self.y_unwrapped = self.y_unwrapped + dt * vy_midpoint
+        self.x = _wrap(self.x_unwrapped, grid.Lx)
+        self.y = _wrap(self.y_unwrapped, grid.Ly)
 
 
 class FourierTracers3D:
-    """Tracer particles for 3D Fourier (periodic) grids. Leap-frog advection."""
+    """Passive tracers for a periodic three-dimensional Fourier grid."""
 
     def __init__(
-        self, x0: np.ndarray, y0: np.ndarray, z0: np.ndarray, mass: float = 1.0
+        self,
+        x0: np.ndarray,
+        y0: np.ndarray,
+        z0: np.ndarray,
+        mass: float = 1.0,
+        lattice_shape: Optional[Tuple[int, int, int]] = None,
     ) -> None:
-        self.x = np.asarray(x0, dtype=np.float64).flatten().copy()
-        self.y = np.asarray(y0, dtype=np.float64).flatten().copy()
-        self.z = np.asarray(z0, dtype=np.float64).flatten().copy()
+        self.x = np.asarray(x0, dtype=np.float64).reshape(-1).copy()
+        self.y = np.asarray(y0, dtype=np.float64).reshape(-1).copy()
+        self.z = np.asarray(z0, dtype=np.float64).reshape(-1).copy()
         if self.x.shape != self.y.shape or self.y.shape != self.z.shape:
             raise ValueError("x0, y0, z0 must have the same size")
-        self._x_prev = np.empty_like(self.x)
-        self._y_prev = np.empty_like(self.y)
-        self._z_prev = np.empty_like(self.z)
+        self.x_unwrapped = self.x.copy()
+        self.y_unwrapped = self.y.copy()
+        self.z_unwrapped = self.z.copy()
         self.mass = float(mass)
-        self._first_step = True
+        self.lattice_shape = lattice_shape
 
-    def _ensure_torch(self, device: Any, dtype: Any) -> None:
-        if not _TORCH_AVAILABLE or isinstance(self.x, torch.Tensor):
-            return
-        self.x = torch.from_numpy(np.asarray(self.x)).to(device=device, dtype=dtype)
-        self.y = torch.from_numpy(np.asarray(self.y)).to(device=device, dtype=dtype)
-        self.z = torch.from_numpy(np.asarray(self.z)).to(device=device, dtype=dtype)
-        self._x_prev = torch.empty_like(self.x, device=device, dtype=dtype)
-        self._y_prev = torch.empty_like(self.y, device=device, dtype=dtype)
-        self._z_prev = torch.empty_like(self.z, device=device, dtype=dtype)
-        self._x_prev.copy_(self.x)
-        self._y_prev.copy_(self.y)
-        self._z_prev.copy_(self.z)
+    def _ensure_backend(self, template: Any) -> None:
+        for name in (
+            "x",
+            "y",
+            "z",
+            "x_unwrapped",
+            "y_unwrapped",
+            "z_unwrapped",
+        ):
+            setattr(self, name, _as_backend(getattr(self, name), template))
 
-    def step(self, grid: Any, equations: Any, U: Any, dt: float) -> None:
-        _, ux, uy, uz, _ = equations.primitive(U)
-        if _is_torch(ux):
-            device, dtype = ux.device, ux.dtype
-            self._ensure_torch(device, dtype)
+    @staticmethod
+    def _sample(
+        grid: Any,
+        velocities: Tuple[Any, Any, Any],
+        x: Any,
+        y: Any,
+        z: Any,
+    ) -> Tuple[Any, Any, Any]:
         batched = getattr(grid, "evaluate_fourier_at_points_batched_3d", None)
         if batched is not None:
-            vx, vy, vz = batched(ux, uy, uz, self.x, self.y, self.z)
-        else:
-            vx = grid.evaluate_fourier_at_points(ux, self.x, self.y, self.z)
-            vy = grid.evaluate_fourier_at_points(uy, self.x, self.y, self.z)
-            vz = grid.evaluate_fourier_at_points(uz, self.x, self.y, self.z)
-        if _is_torch(ux):
-            if self._first_step:
-                self._x_prev.copy_(self.x)
-                self._y_prev.copy_(self.y)
-                self._z_prev.copy_(self.z)
-                self.x = self.x + dt * vx
-                self.y = self.y + dt * vy
-                self.z = self.z + dt * vz
-                self._first_step = False
-            else:
-                x_new = self._x_prev + 2.0 * dt * vx
-                y_new = self._y_prev + 2.0 * dt * vy
-                z_new = self._z_prev + 2.0 * dt * vz
-                self._x_prev.copy_(self.x)
-                self._y_prev.copy_(self.y)
-                self._z_prev.copy_(self.z)
-                self.x = x_new
-                self.y = y_new
-                self.z = z_new
-            self.x = torch.remainder(self.x, grid.Lx)
-            self.y = torch.remainder(self.y, grid.Ly)
-            self.z = torch.remainder(self.z, grid.Lz)
-        else:
-            if self._first_step:
-                self._x_prev[:] = self.x
-                self._y_prev[:] = self.y
-                self._z_prev[:] = self.z
-                self.x = self.x + dt * vx
-                self.y = self.y + dt * vy
-                self.z = self.z + dt * vz
-                self._first_step = False
-            else:
-                x_new = self._x_prev + 2.0 * dt * vx
-                y_new = self._y_prev + 2.0 * dt * vy
-                z_new = self._z_prev + 2.0 * dt * vz
-                self._x_prev[:] = self.x
-                self._y_prev[:] = self.y
-                self._z_prev[:] = self.z
-                self.x = x_new
-                self.y = y_new
-                self.z = z_new
-            self.x = np.mod(self.x, grid.Lx)
-            self.y = np.mod(self.y, grid.Ly)
-            self.z = np.mod(self.z, grid.Lz)
+            return batched(*velocities, x, y, z)
+        return tuple(
+            grid.evaluate_fourier_at_points(field, x, y, z)
+            for field in velocities
+        )  # type: ignore[return-value]
+
+    def step(
+        self,
+        grid: Any,
+        equations: Any,
+        U: Any,
+        dt: float,
+        U_new: Optional[Any] = None,
+    ) -> None:
+        """Advance one accepted gas step with two-evaluation explicit midpoint."""
+        if dt < 0.0 or not np.isfinite(dt):
+            raise ValueError("Tracer timestep must be finite and non-negative")
+        velocity0 = _velocities(equations, U, 3)
+        self._ensure_backend(velocity0[0])
+        vx0, vy0, vz0 = self._sample(
+            grid,
+            velocity0,
+            self.x_unwrapped,
+            self.y_unwrapped,
+            self.z_unwrapped,
+        )
+        x_midpoint = self.x_unwrapped + 0.5 * dt * vx0
+        y_midpoint = self.y_unwrapped + 0.5 * dt * vy0
+        z_midpoint = self.z_unwrapped + 0.5 * dt * vz0
+        end_state = U if U_new is None else U_new
+        midpoint_state = 0.5 * (U + end_state)
+        velocity_midpoint = _velocities(equations, midpoint_state, 3)
+        vx_midpoint, vy_midpoint, vz_midpoint = self._sample(
+            grid, velocity_midpoint, x_midpoint, y_midpoint, z_midpoint
+        )
+        self.x_unwrapped = self.x_unwrapped + dt * vx_midpoint
+        self.y_unwrapped = self.y_unwrapped + dt * vy_midpoint
+        self.z_unwrapped = self.z_unwrapped + dt * vz_midpoint
+        self.x = _wrap(self.x_unwrapped, grid.Lx)
+        self.y = _wrap(self.y_unwrapped, grid.Ly)
+        self.z = _wrap(self.z_unwrapped, grid.Lz)

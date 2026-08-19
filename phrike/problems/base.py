@@ -967,7 +967,9 @@ class BaseProblem(ABC):
         # Reset step counter
         self.monitoring_step_count = 0
 
-    def _create_tracers_from_config(self, grid: Any) -> Optional[Any]:
+    def _create_tracers_from_config(
+        self, grid: Any, U0: Any, equations: Any
+    ) -> Optional[Any]:
         """Create tracer particles from config when tracers.enabled and grid is Fourier.
 
         Returns FourierTracers1D, FourierTracers2D, or FourierTracers3D, or None.
@@ -975,17 +977,150 @@ class BaseProblem(ABC):
         tcfg = self.config.get("tracers", {})
         if not tcfg.get("enabled", False):
             return None
+        is_3d = hasattr(grid, "Nz") and getattr(grid, "Nz", None) is not None
+        is_2d = (
+            not is_3d
+            and hasattr(grid, "Ny")
+            and getattr(grid, "Ny", None) is not None
+        )
+        if is_2d and (
+            getattr(grid, "basis_x", None) != "fourier"
+            or getattr(grid, "basis_y", None) != "fourier"
+        ):
+            return None
+        if (
+            not is_3d
+            and not is_2d
+            and getattr(grid, "_basis_name", None) != "fourier"
+        ):
+            return None
         num = int(tcfg.get("num", 100))
+        if num <= 0:
+            raise ValueError("tracers.num must be positive")
         layout = str(tcfg.get("layout", "random")).lower()
-        mass = float(tcfg.get("mass", 1.0))
+        if layout not in {"random", "uniform"}:
+            raise ValueError("tracers.layout must be 'random' or 'uniform'")
         seed = tcfg.get("seed", None)
         rng = np.random.default_rng(seed)
 
+        def tracer_mass(count: int) -> float:
+            configured = tcfg.get("mass", 1.0)
+            if configured is not None and str(configured).lower() != "auto":
+                return float(configured)
+            rho = equations.primitive(U0)[0]
+            if torch is not None and isinstance(rho, torch.Tensor):
+                mean_density = float(torch.mean(rho).item())
+            else:
+                mean_density = float(np.mean(rho))
+            volume = float(grid.Lx)
+            if hasattr(grid, "Ly"):
+                volume *= float(grid.Ly)
+            if hasattr(grid, "Lz"):
+                volume *= float(grid.Lz)
+            return mean_density * volume / count
+
+        def restart_mass() -> float:
+            assert self.restart_data is not None
+            values = np.asarray(self.restart_data.get("tracer_mass", 1.0)).reshape(-1)
+            if values.size != 1:
+                raise ValueError("Restart tracer_mass must be a scalar")
+            value = float(values[0])
+            if not np.isfinite(value):
+                raise ValueError("Restart tracer_mass must be finite")
+            return value
+
+        restart_tracer_keys = set()
+        if self.restart_data is not None:
+            restart_tracer_keys = {
+                key for key in self.restart_data if key.startswith("tracer_")
+            }
+        if restart_tracer_keys and "tracer_x" not in restart_tracer_keys:
+            raise ValueError("Tracer restart metadata is missing tracer_x")
+
+        if self.restart_data is not None and "tracer_x" in self.restart_data:
+            axes = "xyz" if is_3d else "xy" if is_2d else "x"
+            missing = [
+                axis for axis in axes if f"tracer_{axis}" not in self.restart_data
+            ]
+            if missing:
+                raise ValueError(
+                    "Tracer restart is missing position arrays: " + ", ".join(missing)
+                )
+            coordinates = {
+                axis: np.asarray(
+                    self.restart_data[f"tracer_{axis}"], dtype=np.float64
+                ).reshape(-1)
+                for axis in axes
+            }
+            count = coordinates["x"].size
+            if count == 0:
+                raise ValueError("Tracer restart contains no particles")
+            if any(values.size != count for values in coordinates.values()):
+                raise ValueError("Restart tracer coordinate lengths do not match")
+            if any(
+                not np.all(np.isfinite(values)) for values in coordinates.values()
+            ):
+                raise ValueError("Restart tracer coordinates must be finite")
+
+            shape_raw = self.restart_data.get("tracer_lattice_shape")
+            lattice_shape = None
+            if shape_raw is not None:
+                lattice_shape = tuple(
+                    int(value) for value in np.asarray(shape_raw).reshape(-1)
+                )
+                if (
+                    len(lattice_shape) != len(axes)
+                    or any(value <= 0 for value in lattice_shape)
+                    or int(np.prod(lattice_shape)) != count
+                ):
+                    raise ValueError(
+                        "Restart tracer_lattice_shape does not match particle data"
+                    )
+            if is_3d:
+                tracers = FourierTracers3D(
+                    coordinates["x"],
+                    coordinates["y"],
+                    coordinates["z"],
+                    mass=restart_mass(),
+                    lattice_shape=lattice_shape,
+                )
+            elif is_2d:
+                tracers = FourierTracers2D(
+                    coordinates["x"],
+                    coordinates["y"],
+                    mass=restart_mass(),
+                    lattice_shape=lattice_shape,
+                )
+            else:
+                tracers = FourierTracers1D(coordinates["x"], mass=restart_mass())
+            unwrapped_axes = [
+                axis
+                for axis in axes
+                if f"tracer_{axis}_unwrapped" in self.restart_data
+            ]
+            if unwrapped_axes and len(unwrapped_axes) != len(axes):
+                raise ValueError(
+                    "Tracer restart must provide either all or no unwrapped axes"
+                )
+            for axis in axes:
+                key = f"tracer_{axis}_unwrapped"
+                if key not in self.restart_data:
+                    continue
+                values = np.asarray(self.restart_data[key], dtype=np.float64).reshape(-1)
+                if values.size != count or not np.all(np.isfinite(values)):
+                    raise ValueError(
+                        f"Restart {key} must be finite and match particle count"
+                    )
+                setattr(tracers, f"{axis}_unwrapped", values.copy())
+            return tracers
+
         # 3D
-        if hasattr(grid, "Nz") and getattr(grid, "Nz", None) is not None:
+        if is_3d:
             Lx, Ly, Lz = grid.Lx, grid.Ly, grid.Lz
             if layout == "uniform":
                 n = max(1, int(round(num ** (1.0 / 3.0))))
+                if n**3 != num:
+                    raise ValueError("Uniform 3-D tracers require tracers.num = n^3")
                 x = np.linspace(0.0, Lx, n, endpoint=False)
                 y = np.linspace(0.0, Ly, n, endpoint=False)
                 z = np.linspace(0.0, Lz, n, endpoint=False)
@@ -993,42 +1128,51 @@ class BaseProblem(ABC):
                 x0 = xx.ravel()
                 y0 = yy.ravel()
                 z0 = zz.ravel()
-                if len(x0) > num:
-                    x0, y0, z0 = x0[:num], y0[:num], z0[:num]
+                lattice_shape = (n, n, n)
             else:
                 x0 = rng.uniform(0.0, Lx, size=num).astype(np.float64)
                 y0 = rng.uniform(0.0, Ly, size=num).astype(np.float64)
                 z0 = rng.uniform(0.0, Lz, size=num).astype(np.float64)
-            return FourierTracers3D(x0, y0, z0, mass=mass)
+                lattice_shape = None
+            return FourierTracers3D(
+                x0,
+                y0,
+                z0,
+                mass=tracer_mass(len(x0)),
+                lattice_shape=lattice_shape,
+            )
 
         # 2D
-        if hasattr(grid, "Ny") and getattr(grid, "Ny", None) is not None:
-            if getattr(grid, "basis_x", None) != "fourier" or getattr(grid, "basis_y", None) != "fourier":
-                return None
+        if is_2d:
             Lx, Ly = grid.Lx, grid.Ly
             if layout == "uniform":
                 n = max(1, int(round(num ** 0.5)))
+                if n**2 != num:
+                    raise ValueError("Uniform 2-D tracers require tracers.num = n^2")
                 x = np.linspace(0.0, Lx, n, endpoint=False)
                 y = np.linspace(0.0, Ly, n, endpoint=False)
                 xx, yy = np.meshgrid(x, y, indexing="ij")
                 x0 = xx.ravel()
                 y0 = yy.ravel()
-                if len(x0) > num:
-                    x0, y0 = x0[:num], y0[:num]
+                lattice_shape = (n, n)
             else:
                 x0 = rng.uniform(0.0, Lx, size=num).astype(np.float64)
                 y0 = rng.uniform(0.0, Ly, size=num).astype(np.float64)
-            return FourierTracers2D(x0, y0, mass=mass)
+                lattice_shape = None
+            return FourierTracers2D(
+                x0,
+                y0,
+                mass=tracer_mass(len(x0)),
+                lattice_shape=lattice_shape,
+            )
 
         # 1D
-        if getattr(grid, "_basis_name", None) != "fourier":
-            return None
         Lx = grid.Lx
         if layout == "uniform":
             x0 = np.linspace(0.0, Lx, num, endpoint=False).astype(np.float64)
         else:
             x0 = rng.uniform(0.0, Lx, size=num).astype(np.float64)
-        return FourierTracers1D(x0, mass=mass)
+        return FourierTracers1D(x0, mass=tracer_mass(len(x0)))
 
     def run(
         self,
@@ -1086,8 +1230,9 @@ class BaseProblem(ABC):
         self.initialize_monitoring(solver, U0)
 
         # Create tracers from config if enabled (Fourier grids only)
-        tracers = self._create_tracers_from_config(grid)
+        tracers = self._create_tracers_from_config(grid, U0, equations)
         if tracers is not None:
+            tracers._ensure_backend(equations.primitive(U0)[1])
             n_tracers = len(tracers.x)
             print(f"Tracers enabled: {n_tracers} particles")
 
@@ -1149,6 +1294,18 @@ class BaseProblem(ABC):
 
         # Final visualization
         self.create_final_visualization(solver)
+
+        # Some problem-specific final visualizers also write the final snapshot.
+        # Write it once more with tracer state so those helpers cannot discard it.
+        if tracers is not None:
+            save_solution_snapshot(
+                self.outdir,
+                solver.t,
+                U=solver.U,
+                grid=solver.grid,
+                equations=solver.equations,
+                tracers=tracers,
+            )
 
         # Tracer density plot if enabled (3D only)
         tcfg = self.config.get("tracers", {})

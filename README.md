@@ -11,8 +11,9 @@ portable NumPy/PyTorch backends—not a production CFD package.
 ## What is implemented
 
 - 1D, 2D, and 3D hydrodynamic and ideal-MHD problem setups.
-- Fourier and Legendre bases, with spectral filtering and optional artificial
-  viscosity for exploratory shock problems.
+- Fourier and Legendre bases, with hard 2/3 Fourier dealiasing, optional
+  timestep-aware spectral dissipation, and artificial viscosity for
+  exploratory shock problems.
 - Fixed-step RK2/RK4 and embedded RK23, RK45, and Fehlberg RKF78 integration.
 - NumPy CPU execution plus optional PyTorch CPU, CUDA, and Apple Metal/MPS
   backends.
@@ -64,6 +65,12 @@ Use the code as experimental research software. In particular:
 
 See [the documentation source](docs/) for installation, a walkthrough, and
 development checks.
+
+For Fourier grids, `integration.spectral_filter.rate` is the damping rate at
+each retained per-axis cutoff; `e_folding_time_at_cutoff` is its inverse. The
+legacy `alpha` key remains supported with its Nyquist-normalized spatial
+profile, but is now a rate per unit simulation time rather than attenuation
+per RK stage.
 
 ## Repository layout
 

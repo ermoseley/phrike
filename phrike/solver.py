@@ -101,8 +101,7 @@ def _rk2_step(grid: Grid1D, eqs: EulerEquations1D, U: Array, dt: float,
     U1 = _positivity_clamp(U1, eqs)
     k2 = _compute_rhs(grid, eqs, U1, artificial_viscosity, gravity_config)
     Unew = U + dt * k2
-    Unew = _positivity_clamp(Unew, eqs)
-    return _apply_physical_filters(grid, Unew, eqs)
+    return _positivity_clamp(Unew, eqs)
 
 
 def _rk4_step(grid: Grid1D, eqs: EulerEquations1D, U: Array, dt: float,
@@ -116,13 +115,17 @@ def _rk4_step(grid: Grid1D, eqs: EulerEquations1D, U: Array, dt: float,
     U4 = _positivity_clamp(U + dt * k3, eqs)
     k4 = _compute_rhs(grid, eqs, U4, artificial_viscosity, gravity_config)
     Unew = U + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
-    Unew = _positivity_clamp(Unew, eqs)
-    return _apply_physical_filters(grid, Unew, eqs)
+    return _positivity_clamp(Unew, eqs)
 
 
-def _apply_physical_filters(grid: Grid1D, U: Array, equations: Optional[EulerEquations1D] = None) -> Array:
-    # Apply optional spectral filter to each component to suppress Gibbs/aliasing
-    U_filtered = grid.apply_spectral_filter(U)
+def _apply_physical_filters(
+    grid: Grid1D,
+    U: Array,
+    equations: Optional[EulerEquations1D] = None,
+    dt: float = 0.0,
+) -> Array:
+    # Complete the split dissipation step and project onto retained modes.
+    U_filtered = grid.apply_spectral_dissipation(U, dt, project=True)
     # Re-apply boundary conditions after filtering to prevent endpoint drift
     if equations is not None and hasattr(grid, "apply_boundary_conditions"):
         try:
@@ -150,7 +153,7 @@ class SpectralSolver1D:
     artificial_viscosity: Optional[SpectralArtificialViscosity] = None
     # Gravity configuration
     gravity_config: Optional[Dict] = None
-    # Filter cadence
+    # Retained for API compatibility; timestep-aware dissipation runs every step.
     filter_interval: int = 1
 
     def __init__(self, grid: Grid1D, equations: EulerEquations1D, U0: Optional[Array] = None, 
@@ -212,24 +215,7 @@ class SpectralSolver1D:
         # Setup gravity if configured
         self.gravity_config = gravity_config
 
-        # Filter interval: use integration.spectral_filter.interval if present
-        # If AV is enabled, default to 5; else 1
-        try:
-            from .problems.base import BaseProblem  # type: ignore
-        except Exception:
-            BaseProblem = None  # type: ignore
-        # Pull interval from grid.filter_params if provided via Problem
-        cfg = getattr(self.grid, "filter_params", None)
-        interval_cfg = None
-        if isinstance(cfg, dict):
-            interval_cfg = cfg.get("interval", None)
-        if interval_cfg is not None:
-            try:
-                self.filter_interval = max(1, int(interval_cfg))
-            except Exception:
-                self.filter_interval = 1
-        else:
-            self.filter_interval = 5 if self.artificial_viscosity is not None else 1
+        self.filter_interval = 1
 
 
     def compute_dt(self, U: Array) -> float:
@@ -258,15 +244,14 @@ class SpectralSolver1D:
     
     def _fixed_step(self, U: Array, dt: float) -> Array:
         """Perform one fixed time step."""
+        U_split = self.grid.apply_spectral_dissipation(U, 0.5 * dt)
         if self.scheme.lower() == "rk2":
-            Un = _rk2_step(self.grid, self.equations, U, dt, self.artificial_viscosity, self.gravity_config)
+            Un = _rk2_step(self.grid, self.equations, U_split, dt, self.artificial_viscosity, self.gravity_config)
         else:
-            Un = _rk4_step(self.grid, self.equations, U, dt, self.artificial_viscosity, self.gravity_config)
-        # Apply spectral filter with cadence
-        if (getattr(self, "_step_counter", 0) % self.filter_interval) == 0:
-            Un = _apply_physical_filters(self.grid, Un, self.equations)
-        self._step_counter = getattr(self, "_step_counter", 0) + 1
-        return Un
+            Un = _rk4_step(self.grid, self.equations, U_split, dt, self.artificial_viscosity, self.gravity_config)
+        return _apply_physical_filters(
+            self.grid, Un, self.equations, dt=0.5 * dt
+        )
     
     def _adaptive_step(self, U: Array, dt: float) -> Array:
         """Perform one adaptive time step."""
@@ -274,18 +259,22 @@ class SpectralSolver1D:
             """RHS function for adaptive stepper."""
             return _compute_rhs(self.grid, self.equations, U_current, self.artificial_viscosity, self.gravity_config)
         
+        U_split = self.grid.apply_spectral_dissipation(U, 0.5 * dt)
+
         # Compute solution scale for relative error
-        if _TORCH_AVAILABLE and isinstance(U, torch.Tensor):
-            solution_scale = float(torch.max(torch.abs(U)).item())
+        if _TORCH_AVAILABLE and isinstance(U_split, torch.Tensor):
+            solution_scale = float(torch.max(torch.abs(U_split)).item())
         else:
-            solution_scale = float(np.max(np.abs(U)))
+            solution_scale = float(np.max(np.abs(U_split)))
         
         # Perform adaptive step
-        result = self.adaptive_stepper.step(rhs_func, U, dt, solution_scale)
+        result = self.adaptive_stepper.step(rhs_func, U_split, dt, solution_scale)
         
-        # Apply spectral filtering to accepted solution
+        # Complete the split dissipation and projection for an accepted solution.
         if result.accepted:
-            Un = _apply_physical_filters(self.grid, result.U_new, self.equations)
+            Un = _apply_physical_filters(
+                self.grid, result.U_new, self.equations, dt=0.5 * dt
+            )
         else:
             # Return original solution if step was rejected
             Un = U
@@ -298,18 +287,22 @@ class SpectralSolver1D:
         def rhs_func(U_current: Array) -> Array:
             return _compute_rhs(self.grid, self.equations, U_current, self.artificial_viscosity, self.gravity_config)
         
+        U_split = self.grid.apply_spectral_dissipation(self.U, 0.5 * dt)
+
         # Compute solution scale for relative error
-        if _TORCH_AVAILABLE and isinstance(self.U, torch.Tensor):
-            solution_scale = float(torch.max(torch.abs(self.U)).item())
+        if _TORCH_AVAILABLE and isinstance(U_split, torch.Tensor):
+            solution_scale = float(torch.max(torch.abs(U_split)).item())
         else:
-            solution_scale = float(np.max(np.abs(self.U)))
+            solution_scale = float(np.max(np.abs(U_split)))
         
         # Perform adaptive step
-        result = self.adaptive_stepper.step(rhs_func, self.U, dt, solution_scale)
+        result = self.adaptive_stepper.step(rhs_func, U_split, dt, solution_scale)
         
         if result.accepted:
             # Step accepted - update solution and time
-            self.U = _apply_physical_filters(self.grid, result.U_new)
+            self.U = _apply_physical_filters(
+                self.grid, result.U_new, self.equations, dt=0.5 * dt
+            )
             self.t += dt
             
             # Call monitoring callback
@@ -387,6 +380,8 @@ class SpectralSolver1D:
             # Ensure we don't overshoot the end time
             dt = min(dt, t_end - self.t)
             dt_used = dt
+            state_before = self.U
+            time_before = self.t
             
             if self.adaptive_enabled and self.adaptive_stepper is not None:
                 # Adaptive time-stepping
@@ -395,8 +390,14 @@ class SpectralSolver1D:
                 # Fixed time-stepping (original behavior)
                 dt = self._fixed_run_step(dt, step_count, on_step)
             
-            if tracers is not None:
-                tracers.step(self.grid, self.equations, self.U, dt_used)
+            if tracers is not None and self.t > time_before:
+                tracers.step(
+                    self.grid,
+                    self.equations,
+                    state_before,
+                    dt_used,
+                    U_new=self.U,
+                )
             step_count += 1
 
             if self.t + 1e-12 >= next_output:
@@ -513,8 +514,10 @@ def _rk4_step_2d(grid: Grid2D, eqs: EulerEquations2D, U: Array, dt: float,
     return _positivity_clamp_2d(Unew, eqs)
 
 
-def _apply_physical_filters_2d(grid: Grid2D, U: Array) -> Array:
-    U_filtered = grid.apply_spectral_filter(U)
+def _apply_physical_filters_2d(
+    grid: Grid2D, U: Array, dt: float = 0.0
+) -> Array:
+    U_filtered = grid.apply_spectral_dissipation(U, dt, project=True)
     # Re-apply BCs after filtering if available
     try:
         if hasattr(grid, "apply_boundary_conditions"):
@@ -601,14 +604,8 @@ class SpectralSolver2D:
         # Setup gravity if configured
         self.gravity_config = gravity_config
 
-        # Filter interval cadence (default 1; if AV enabled, can be more frequent)
+        # Retained for API compatibility; timestep-aware dissipation runs every step.
         self.filter_interval: int = 1
-        cfg = getattr(self.grid, "filter_params", None)
-        if isinstance(cfg, dict):
-            try:
-                self.filter_interval = max(1, int(cfg.get("interval", 1)))
-            except Exception:
-                self.filter_interval = 1
 
     def compute_dt(self, U: Array) -> float:
         max_speed = self.equations.max_wave_speed(U)
@@ -638,14 +635,12 @@ class SpectralSolver2D:
     
     def _fixed_step(self, U: Array, dt: float) -> Array:
         """Perform one fixed time step."""
+        U_split = self.grid.apply_spectral_dissipation(U, 0.5 * dt)
         if self.scheme.lower() == "rk2":
-            Un = _rk2_step_2d(self.grid, self.equations, U, dt, self.artificial_viscosity, self.gravity_config)
+            Un = _rk2_step_2d(self.grid, self.equations, U_split, dt, self.artificial_viscosity, self.gravity_config)
         else:
-            Un = _rk4_step_2d(self.grid, self.equations, U, dt, self.artificial_viscosity, self.gravity_config)
-        if (getattr(self, "_step_counter", 0) % self.filter_interval) == 0:
-            Un = _apply_physical_filters_2d(self.grid, Un)
-        self._step_counter = getattr(self, "_step_counter", 0) + 1
-        return Un
+            Un = _rk4_step_2d(self.grid, self.equations, U_split, dt, self.artificial_viscosity, self.gravity_config)
+        return _apply_physical_filters_2d(self.grid, Un, dt=0.5 * dt)
     
     def _adaptive_step(self, U: Array, dt: float) -> Array:
         """Perform one adaptive time step."""
@@ -653,16 +648,20 @@ class SpectralSolver2D:
             """RHS function for adaptive stepper."""
             return _compute_rhs_2d(self.grid, self.equations, U_current, self.artificial_viscosity, self.gravity_config)
         
+        U_split = self.grid.apply_spectral_dissipation(U, 0.5 * dt)
+
         # Compute solution scale for relative error
-        if _TORCH_AVAILABLE and isinstance(U, torch.Tensor):
-            solution_scale = float(torch.max(torch.abs(U)).item())
+        if _TORCH_AVAILABLE and isinstance(U_split, torch.Tensor):
+            solution_scale = float(torch.max(torch.abs(U_split)).item())
         else:
-            solution_scale = float(np.max(np.abs(U)))
+            solution_scale = float(np.max(np.abs(U_split)))
         
-        result = self.adaptive_stepper.step(rhs_func, U, dt, solution_scale)
+        result = self.adaptive_stepper.step(rhs_func, U_split, dt, solution_scale)
         
         if result.accepted:
-            Un = _apply_physical_filters_2d(self.grid, result.U_new)
+            Un = _apply_physical_filters_2d(
+                self.grid, result.U_new, dt=0.5 * dt
+            )
         else:
             Un = U
             
@@ -680,15 +679,19 @@ class SpectralSolver2D:
                 self.gravity_config,
             )
         
-        if _TORCH_AVAILABLE and isinstance(self.U, torch.Tensor):
-            solution_scale = float(torch.max(torch.abs(self.U)).item())
+        U_split = self.grid.apply_spectral_dissipation(self.U, 0.5 * dt)
+
+        if _TORCH_AVAILABLE and isinstance(U_split, torch.Tensor):
+            solution_scale = float(torch.max(torch.abs(U_split)).item())
         else:
-            solution_scale = float(np.max(np.abs(self.U)))
+            solution_scale = float(np.max(np.abs(U_split)))
         
-        result = self.adaptive_stepper.step(rhs_func, self.U, dt, solution_scale)
+        result = self.adaptive_stepper.step(rhs_func, U_split, dt, solution_scale)
         
         if result.accepted:
-            self.U = _apply_physical_filters_2d(self.grid, result.U_new)
+            self.U = _apply_physical_filters_2d(
+                self.grid, result.U_new, dt=0.5 * dt
+            )
             self.t += dt
             if on_step is not None:
                 on_step(step_count, dt, self.U)
@@ -783,6 +786,8 @@ class SpectralSolver2D:
             # Ensure we don't overshoot the end time
             dt = min(dt, t_end - self.t)
             dt_used = dt
+            state_before = self.U
+            time_before = self.t
             
             if self.adaptive_enabled and self.adaptive_stepper is not None:
                 # Adaptive time-stepping
@@ -791,8 +796,14 @@ class SpectralSolver2D:
                 # Fixed time-stepping (original behavior)
                 dt = self._fixed_run_step(dt, step_count, on_step)
             
-            if tracers is not None:
-                tracers.step(self.grid, self.equations, self.U, dt_used)
+            if tracers is not None and self.t > time_before:
+                tracers.step(
+                    self.grid,
+                    self.equations,
+                    state_before,
+                    dt_used,
+                    U_new=self.U,
+                )
             step_count += 1
 
             if self.t + 1e-12 >= next_output:
@@ -823,7 +834,7 @@ class SpectralSolver2D:
 # 8-component conservative state U = [rho, rho*ux, rho*uy, rho*uz, E, Bx, By, Bz].
 # The RHS is the same conservative flux-divergence structure as Euler; the
 # magnetic solenoidal constraint div(B)=0 is enforced by Helmholtz (Leray)
-# projection of B after every RK substage and (last) after the spectral filter
+# projection of B after every RK substage and (last) after spectral dissipation
 # (see mhd_plan.md). Optional explicit resistivity/viscosity are applied as
 # spectral Laplacians on the B and momentum rows; the energy row is left to the
 # ideal flux so that dissipated magnetic/kinetic energy is converted to thermal
@@ -909,15 +920,8 @@ class SpectralSolverMHD:
             else:
                 self.scheme = adaptive_config.get("fallback_scheme", "rk4")
 
-        # Filter cadence (default 1)
+        # Retained for API compatibility; timestep-aware dissipation runs every step.
         self.filter_interval = 1
-        fcfg = getattr(self.grid, "filter_params", None)
-        if isinstance(fcfg, dict):
-            try:
-                self.filter_interval = max(1, int(fcfg.get("interval", 1)))
-            except Exception:
-                self.filter_interval = 1
-        self._step_counter = 0
 
     def _grid_k2_max(self) -> float:
         """Max squared wavenumber on the grid (for the parabolic diffusion CFL)."""
@@ -1045,27 +1049,31 @@ class SpectralSolverMHD:
         return self._fixed_step(U, dt)
 
     def _fixed_step(self, U: Array, dt: float) -> Array:
-        Un = self._rk_substages(U, dt)
-        # Spectral filter (cadence), then project B LAST (filtering B reintroduces
-        # a small longitudinal component) so the stored state is exactly div-free.
-        if (self._step_counter % self.filter_interval) == 0:
-            Un = self.grid.apply_spectral_filter(Un)
-            Un = self._project_B(Un)
-        self._step_counter += 1
+        U_split = self.grid.apply_spectral_dissipation(U, 0.5 * dt)
+        Un = self._rk_substages(U_split, dt)
+        # Project B before the scalar modal operator; the latter commutes with
+        # divergence, so the stored state remains both band-limited and div-free.
+        Un = self._project_B(Un)
+        Un = self.grid.apply_spectral_dissipation(
+            Un, 0.5 * dt, project=True
+        )
         return Un
 
     def _adaptive_step(self, U: Array, dt: float) -> Array:
         def rhs_func(Uc: Array) -> Array:
             return self._compute_rhs(Uc)
 
-        if _TORCH_AVAILABLE and isinstance(U, torch.Tensor):
-            solution_scale = float(torch.max(torch.abs(U)).item())
+        U_split = self.grid.apply_spectral_dissipation(U, 0.5 * dt)
+        if _TORCH_AVAILABLE and isinstance(U_split, torch.Tensor):
+            solution_scale = float(torch.max(torch.abs(U_split)).item())
         else:
-            solution_scale = float(np.max(np.abs(U)))
-        result = self.adaptive_stepper.step(rhs_func, U, dt, solution_scale)
+            solution_scale = float(np.max(np.abs(U_split)))
+        result = self.adaptive_stepper.step(rhs_func, U_split, dt, solution_scale)
         if result.accepted:
-            Un = self.grid.apply_spectral_filter(result.U_new)
-            Un = self._project_B(self._clamp(Un))
+            Un = self._project_B(self._clamp(result.U_new))
+            Un = self.grid.apply_spectral_dissipation(
+                Un, 0.5 * dt, project=True
+            )
         else:
             Un = U
         return Un
@@ -1075,14 +1083,18 @@ class SpectralSolverMHD:
         def rhs_func(Uc: Array) -> Array:
             return self._compute_rhs(Uc)
 
-        if _TORCH_AVAILABLE and isinstance(self.U, torch.Tensor):
-            solution_scale = float(torch.max(torch.abs(self.U)).item())
+        U_split = self.grid.apply_spectral_dissipation(self.U, 0.5 * dt)
+        if _TORCH_AVAILABLE and isinstance(U_split, torch.Tensor):
+            solution_scale = float(torch.max(torch.abs(U_split)).item())
         else:
-            solution_scale = float(np.max(np.abs(self.U)))
-        result = self.adaptive_stepper.step(rhs_func, self.U, dt, solution_scale)
+            solution_scale = float(np.max(np.abs(U_split)))
+        result = self.adaptive_stepper.step(rhs_func, U_split, dt, solution_scale)
         if result.accepted:
-            Un = self.grid.apply_spectral_filter(result.U_new)
-            self.U = self._project_B(self._clamp(Un))
+            Un = self._project_B(self._clamp(result.U_new))
+            Un = self.grid.apply_spectral_dissipation(
+                Un, 0.5 * dt, project=True
+            )
+            self.U = Un
             self.t += dt
             if on_step is not None:
                 on_step(step_count, dt, self.U)
@@ -1143,12 +1155,20 @@ class SpectralSolverMHD:
         while self.t < t_end - 1e-12:
             dt = min(dt, t_end - self.t)
             dt_used = dt
+            state_before = self.U
+            time_before = self.t
             if self.adaptive_enabled and self.adaptive_stepper is not None:
                 dt = self._adaptive_run_step(dt, step_count, on_step)
             else:
                 dt = self._fixed_run_step(dt, step_count, on_step)
-            if tracers is not None:
-                tracers.step(self.grid, self.equations, self.U, dt_used)
+            if tracers is not None and self.t > time_before:
+                tracers.step(
+                    self.grid,
+                    self.equations,
+                    state_before,
+                    dt_used,
+                    U_new=self.U,
+                )
             step_count += 1
 
             if self.t + 1e-12 >= next_output:
@@ -1236,8 +1256,10 @@ def _rk4_step_3d(grid: Grid3D, eqs: EulerEquations3D, U: Array, dt: float,
     return U + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
 
 
-def _apply_physical_filters_3d(grid: Grid3D, U: Array) -> Array:
-    return grid.apply_spectral_filter(U)
+def _apply_physical_filters_3d(
+    grid: Grid3D, U: Array, dt: float = 0.0
+) -> Array:
+    return grid.apply_spectral_dissipation(U, dt, project=True)
 
 
 @dataclass
@@ -1335,12 +1357,12 @@ class SpectralSolver3D:
     
     def _fixed_step(self, U: Array, dt: float) -> Array:
         """Perform one fixed time step."""
+        U_split = self.grid.apply_spectral_dissipation(U, 0.5 * dt)
         if self.scheme.lower() == "rk2":
-            Un = _rk2_step_3d(self.grid, self.equations, U, dt, None, self.gravity_config)
+            Un = _rk2_step_3d(self.grid, self.equations, U_split, dt, None, self.gravity_config)
         else:
-            Un = _rk4_step_3d(self.grid, self.equations, U, dt, None, self.gravity_config)
-        Un = _apply_physical_filters_3d(self.grid, Un)
-        return Un
+            Un = _rk4_step_3d(self.grid, self.equations, U_split, dt, None, self.gravity_config)
+        return _apply_physical_filters_3d(self.grid, Un, dt=0.5 * dt)
     
     def _adaptive_step(self, U: Array, dt: float) -> Array:
         """Perform one adaptive time step."""
@@ -1348,16 +1370,20 @@ class SpectralSolver3D:
             """RHS function for adaptive stepper."""
             return _compute_rhs_3d(self.grid, self.equations, U_current, None, self.gravity_config)
         
+        U_split = self.grid.apply_spectral_dissipation(U, 0.5 * dt)
+
         # Compute solution scale for relative error
-        if _TORCH_AVAILABLE and isinstance(U, torch.Tensor):
-            solution_scale = float(torch.max(torch.abs(U)).item())
+        if _TORCH_AVAILABLE and isinstance(U_split, torch.Tensor):
+            solution_scale = float(torch.max(torch.abs(U_split)).item())
         else:
-            solution_scale = float(np.max(np.abs(U)))
+            solution_scale = float(np.max(np.abs(U_split)))
         
-        result = self.adaptive_stepper.step(rhs_func, U, dt, solution_scale)
+        result = self.adaptive_stepper.step(rhs_func, U_split, dt, solution_scale)
         
         if result.accepted:
-            Un = _apply_physical_filters_3d(self.grid, result.U_new)
+            Un = _apply_physical_filters_3d(
+                self.grid, result.U_new, dt=0.5 * dt
+            )
         else:
             Un = U
             
@@ -1369,15 +1395,19 @@ class SpectralSolver3D:
         def rhs_func(U_current: Array) -> Array:
             return _compute_rhs_3d(self.grid, self.equations, U_current, None, self.gravity_config)
         
-        if _TORCH_AVAILABLE and isinstance(self.U, torch.Tensor):
-            solution_scale = float(torch.max(torch.abs(self.U)).item())
+        U_split = self.grid.apply_spectral_dissipation(self.U, 0.5 * dt)
+
+        if _TORCH_AVAILABLE and isinstance(U_split, torch.Tensor):
+            solution_scale = float(torch.max(torch.abs(U_split)).item())
         else:
-            solution_scale = float(np.max(np.abs(self.U)))
+            solution_scale = float(np.max(np.abs(U_split)))
         
-        result = self.adaptive_stepper.step(rhs_func, self.U, dt, solution_scale)
+        result = self.adaptive_stepper.step(rhs_func, U_split, dt, solution_scale)
         
         if result.accepted:
-            self.U = _apply_physical_filters_3d(self.grid, result.U_new)
+            self.U = _apply_physical_filters_3d(
+                self.grid, result.U_new, dt=0.5 * dt
+            )
             self.t += dt
             if on_step is not None:
                 on_step(step_count, dt, self.U)
@@ -1484,6 +1514,8 @@ class SpectralSolver3D:
             # Ensure we don't overshoot the end time
             dt = min(dt, t_end - self.t)
             dt_used = dt
+            state_before = self.U
+            time_before = self.t
             
             if self.adaptive_enabled and self.adaptive_stepper is not None:
                 # Adaptive time-stepping
@@ -1492,8 +1524,14 @@ class SpectralSolver3D:
                 # Fixed time-stepping (original behavior)
                 dt = self._fixed_run_step(dt, step_count, on_step)
             
-            if tracers is not None:
-                tracers.step(self.grid, self.equations, self.U, dt_used)
+            if tracers is not None and self.t > time_before:
+                tracers.step(
+                    self.grid,
+                    self.equations,
+                    state_before,
+                    dt_used,
+                    U_new=self.U,
+                )
             step_count += 1
 
             if self.t + 1e-12 >= next_output:
