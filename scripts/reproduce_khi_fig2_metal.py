@@ -19,7 +19,11 @@ from typing import Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
+
+try:
+    import torch
+except ModuleNotFoundError:
+    torch = None
 
 
 GAMMA = 5.0 / 3.0
@@ -598,6 +602,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if torch is None:
+        raise RuntimeError("This validation requires the optional torch dependency")
     if not torch.backends.mps.is_available():
         raise RuntimeError("This validation requires an available Metal/MPS device")
     resolutions = sorted(set(args.resolutions))
