@@ -19,10 +19,8 @@ integration:
   scheme: rk4       # Fallback for non-adaptive
   output_interval: 0.1      # Reasonable frame rate for video
   checkpoint_interval: 1.2566370614359172  # 0.2 * crossing time
-  spectral_filter:
-    enabled: true
-    p: 8            # even integer >= 2
-    alpha: 36.0     # filter strength
+  spectral_dissipation:
+    enabled: false
 
 # Initial conditions smoothing (optional)
 initial_conditions_smoothing:

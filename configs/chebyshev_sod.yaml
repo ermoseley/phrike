@@ -18,7 +18,7 @@ integration:
   scheme: rk4
   output_interval: 0.002  # frequent output for verification
   checkpoint_interval: 0.005
-  spectral_filter:
+  modal_filter:
     enabled: true
     p: 8
     alpha: 36.0
@@ -54,4 +54,3 @@ video:
   crf: 20
   preset: medium
   pix_fmt: yuv420p
-

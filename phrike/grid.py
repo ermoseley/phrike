@@ -186,54 +186,113 @@ def _periodic_linear_3d(
 def _build_filter_mask(N: int, dealias: bool) -> np.ndarray:
     if not dealias:
         return np.ones(N, dtype=float)
-    # 2/3 rule: zero modes with |k| > N/3
+    # Exact quadratic 2/3 rule: retain |k| < N/3.
     k = np.fft.fftfreq(N) * N
-    cutoff = N // 3
+    cutoff = (N - 1) // 3
     mask = (np.abs(k) <= cutoff).astype(float)
     return mask
 
 
-def _spectral_dissipation_settings(
-    params: Optional[Dict[str, float]],
-) -> tuple[bool, int, float, bool]:
-    """Return enabled, order, rate, and normalization for Fourier grids.
+def _stabilization_params(
+    params: Optional[Dict[str, Any]], key: str
+) -> Optional[Dict[str, Any]]:
+    """Select one stabilization block while preserving the direct grid API."""
+    if not params:
+        return None
+    nested_keys = {"spectral_dissipation", "modal_filter"}
+    if nested_keys.intersection(params):
+        selected = params.get(key)
+        if selected is None:
+            return None
+        if not isinstance(selected, dict):
+            raise TypeError(f"{key} must be a mapping")
+        return selected
+    return params
 
-    ``rate`` and ``e_folding_time_at_cutoff`` define damping at each retained
-    2/3 per-axis cutoff. The legacy ``alpha`` key keeps its Nyquist-normalized
-    spatial profile, but is interpreted per unit simulation time rather than
-    per call.
-    """
-    if not params or not bool(params.get("enabled", False)):
-        return False, 8, 0.0, True
+
+def _spectral_dissipation_settings(
+    params: Optional[Dict[str, Any]],
+) -> tuple[bool, int, float, float]:
+    """Return enabled, order, cutoff rate, and top-band onset."""
+    params = _stabilization_params(params, "spectral_dissipation")
+    if not params:
+        return False, 8, 0.0, 0.0
+    obsolete = {"alpha", "interval"}.intersection(params)
+    if obsolete:
+        names = ", ".join(sorted(obsolete))
+        raise ValueError(
+            f"Fourier spectral dissipation no longer accepts {names}; "
+            "use rate or e_folding_time_at_cutoff"
+        )
+    if not bool(params.get("enabled", False)):
+        return False, 8, 0.0, 0.0
     p = int(params.get("p", params.get("order", 8)))
     if p < 2 or p % 2:
         raise ValueError("Fourier spectral dissipation order must be even and >= 2")
-    if "e_folding_time_at_cutoff" in params:
+    has_tau = "e_folding_time_at_cutoff" in params
+    has_rate = "rate" in params
+    if has_tau == has_rate:
+        raise ValueError(
+            "Enabled Fourier spectral dissipation requires exactly one of "
+            "rate or e_folding_time_at_cutoff"
+        )
+    if has_tau:
         tau = float(params["e_folding_time_at_cutoff"])
         if not np.isfinite(tau) or tau <= 0.0:
             raise ValueError("e_folding_time_at_cutoff must be finite and positive")
         rate = 1.0 / tau
-        normalize_at_cutoff = True
-    elif "rate" in params:
-        rate = float(params["rate"])
-        normalize_at_cutoff = True
     else:
-        rate = float(params.get("alpha", 36.0))
-        normalize_at_cutoff = False
+        rate = float(params["rate"])
     if not np.isfinite(rate) or rate < 0.0:
         raise ValueError("Fourier spectral dissipation rate must be finite and non-negative")
-    return True, p, rate, normalize_at_cutoff
+    onset = float(params.get("onset_fraction", 0.0))
+    if not np.isfinite(onset) or not 0.0 <= onset < 1.0:
+        raise ValueError(
+            "Fourier spectral dissipation onset_fraction must be finite and "
+            "lie in [0, 1)"
+        )
+    return True, p, rate, onset
+
+
+def _modal_filter_settings(
+    params: Optional[Dict[str, Any]],
+) -> tuple[bool, int, float]:
+    """Return the independent accepted-step modal-filter settings."""
+    params = _stabilization_params(params, "modal_filter")
+    if not params or not bool(params.get("enabled", False)):
+        return False, 8, 36.0
+    p = int(params.get("p", params.get("order", 8)))
+    alpha = float(params.get("alpha", 36.0))
+    if p < 2 or p % 2:
+        raise ValueError("Modal filter order must be even and >= 2")
+    if not np.isfinite(alpha) or alpha < 0.0:
+        raise ValueError("Modal filter alpha must be finite and non-negative")
+    return True, p, alpha
+
+
+def _spectral_viscosity_profile(
+    eta: np.ndarray, p: int, onset_fraction: float
+) -> np.ndarray:
+    """Return a power ramp confined to the selected top spectral band."""
+    ramp = np.maximum(
+        (eta - onset_fraction) / (1.0 - onset_fraction), 0.0
+    )
+    return ramp**p
 
 
 def _build_exponential_filter_rate(
-    N: int, p: int, rate: float, dealias: bool, normalize_at_cutoff: bool
+    N: int,
+    p: int,
+    rate: float,
+    dealias: bool,
+    onset_fraction: float = 0.0,
 ) -> np.ndarray:
     """Build the non-negative generator lambda(k) for exp(-dt*lambda)."""
     k = np.fft.fftfreq(N) * N
     kmax = int(np.max(np.abs(k)))
-    scale = N // 3 if dealias and normalize_at_cutoff else kmax
+    scale = (N - 1) // 3 if dealias else kmax
     eta = np.abs(k) / max(scale, 1)
-    return rate * eta**p
+    return rate * _spectral_viscosity_profile(eta, p, onset_fraction)
 
 
 def _mps_available() -> bool:
@@ -369,8 +428,8 @@ def _build_filter_mask_2d(Nx: int, Ny: int, dealias: bool) -> np.ndarray:
         return np.ones((Ny, Nx), dtype=float)
     kx = (np.fft.fftfreq(Nx) * Nx).astype(float)
     ky = (np.fft.fftfreq(Ny) * Ny).astype(float)
-    cutoff_x = Nx // 3
-    cutoff_y = Ny // 3
+    cutoff_x = (Nx - 1) // 3
+    cutoff_y = (Ny - 1) // 3
     mask_x = (np.abs(kx) <= cutoff_x).astype(float)
     mask_y = (np.abs(ky) <= cutoff_y).astype(float)
     return mask_y[:, None] * mask_x[None, :]
@@ -382,15 +441,18 @@ def _build_exponential_filter_rate_2d(
     p: int,
     rate: float,
     dealias: bool,
-    normalize_at_cutoff: bool,
+    onset_fraction: float = 0.0,
 ) -> np.ndarray:
     kx = (np.fft.fftfreq(Nx) * Nx).astype(float)
     ky = (np.fft.fftfreq(Ny) * Ny).astype(float)
-    scale_x = Nx // 3 if dealias and normalize_at_cutoff else int(np.max(np.abs(kx)))
-    scale_y = Ny // 3 if dealias and normalize_at_cutoff else int(np.max(np.abs(ky)))
+    scale_x = (Nx - 1) // 3 if dealias else int(np.max(np.abs(kx)))
+    scale_y = (Ny - 1) // 3 if dealias else int(np.max(np.abs(ky)))
     eta_x = np.abs(kx) / max(scale_x, 1)
     eta_y = np.abs(ky) / max(scale_y, 1)
-    return rate * (eta_y[:, None] ** p + eta_x[None, :] ** p)
+    return rate * (
+        _spectral_viscosity_profile(eta_y, p, onset_fraction)[:, None]
+        + _spectral_viscosity_profile(eta_x, p, onset_fraction)[None, :]
+    )
 
 
 def _build_filter_mask_3d(Nx: int, Ny: int, Nz: int, dealias: bool) -> np.ndarray:
@@ -399,9 +461,9 @@ def _build_filter_mask_3d(Nx: int, Ny: int, Nz: int, dealias: bool) -> np.ndarra
     kx = (np.fft.fftfreq(Nx) * Nx).astype(float)
     ky = (np.fft.fftfreq(Ny) * Ny).astype(float)
     kz = (np.fft.fftfreq(Nz) * Nz).astype(float)
-    cutoff_x = Nx // 3
-    cutoff_y = Ny // 3
-    cutoff_z = Nz // 3
+    cutoff_x = (Nx - 1) // 3
+    cutoff_y = (Ny - 1) // 3
+    cutoff_z = (Nz - 1) // 3
     mask_x = (np.abs(kx) <= cutoff_x).astype(float)
     mask_y = (np.abs(ky) <= cutoff_y).astype(float)
     mask_z = (np.abs(kz) <= cutoff_z).astype(float)
@@ -415,21 +477,21 @@ def _build_exponential_filter_rate_3d(
     p: int,
     rate: float,
     dealias: bool,
-    normalize_at_cutoff: bool,
+    onset_fraction: float = 0.0,
 ) -> np.ndarray:
     kx = (np.fft.fftfreq(Nx) * Nx).astype(float)
     ky = (np.fft.fftfreq(Ny) * Ny).astype(float)
     kz = (np.fft.fftfreq(Nz) * Nz).astype(float)
-    scale_x = Nx // 3 if dealias and normalize_at_cutoff else int(np.max(np.abs(kx)))
-    scale_y = Ny // 3 if dealias and normalize_at_cutoff else int(np.max(np.abs(ky)))
-    scale_z = Nz // 3 if dealias and normalize_at_cutoff else int(np.max(np.abs(kz)))
+    scale_x = (Nx - 1) // 3 if dealias else int(np.max(np.abs(kx)))
+    scale_y = (Ny - 1) // 3 if dealias else int(np.max(np.abs(ky)))
+    scale_z = (Nz - 1) // 3 if dealias else int(np.max(np.abs(kz)))
     eta_x = np.abs(kx) / max(scale_x, 1)
     eta_y = np.abs(ky) / max(scale_y, 1)
     eta_z = np.abs(kz) / max(scale_z, 1)
     return rate * (
-        eta_z[:, None, None] ** p
-        + eta_y[None, :, None] ** p
-        + eta_x[None, None, :] ** p
+        _spectral_viscosity_profile(eta_z, p, onset_fraction)[:, None, None]
+        + _spectral_viscosity_profile(eta_y, p, onset_fraction)[None, :, None]
+        + _spectral_viscosity_profile(eta_x, p, onset_fraction)[None, None, :]
     )
 
 
@@ -452,12 +514,10 @@ class Grid1D:
         Boundary condition for non-periodic bases (e.g., "dirichlet").
     dealias : bool
         If True, apply 2/3-rule dealiasing mask in spectral space (Fourier only).
-    filter_params : Optional[Dict[str, float]]
-        Optional timestep-aware Fourier spectral dissipation configuration:
-        - enabled: bool
-        - p: even integer (>= 2)
-        - e_folding_time_at_cutoff: positive simulation time
-        ``rate`` (or legacy alias ``alpha``) may be supplied instead.
+    filter_params : Optional[Dict[str, Any]]
+        Basis-specific stabilization configuration. Fourier grids accept only
+        timestep-aware ``spectral_dissipation`` settings; Legendre grids use an
+        independent accepted-step ``modal_filter``.
     """
 
     N: int
@@ -465,7 +525,7 @@ class Grid1D:
     basis: str = "fourier"
     bc: Optional[str] = None
     dealias: bool = True
-    filter_params: Optional[Dict[str, float]] = None
+    filter_params: Optional[Dict[str, Any]] = None
     fft_workers: int = 1
     backend: str = "auto"  # Metal, CUDA, then NumPy CPU
     torch_device: Optional[str] = None
@@ -557,16 +617,19 @@ class Grid1D:
             # Hard dealias mask and optional timestep-aware spectral dissipation.
             self.dealias_mask = _build_filter_mask(self.N, self.dealias)
 
-            enabled, p, rate, normalize_at_cutoff = _spectral_dissipation_settings(
+            enabled, p, rate, onset = _spectral_dissipation_settings(
                 self.filter_params
             )
             self.spectral_dissipation_enabled = enabled
+            self.modal_filter_enabled = False
+            self.modal_filter_order = 8
+            self.modal_filter_alpha = 36.0
             self.filter_rate = _build_exponential_filter_rate(
                 self.N,
                 p=p,
                 rate=rate,
                 dealias=self.dealias,
-                normalize_at_cutoff=normalize_at_cutoff,
+                onset_fraction=onset,
             )
 
             # Initialize Fourier basis instance (NumPy path used inside helpers)
@@ -601,6 +664,11 @@ class Grid1D:
                 self.dealias_mask = np.ones(self.N, dtype=float)
                 self.spectral_dissipation_enabled = False
                 self.filter_rate = np.zeros(self.N, dtype=float)
+                (
+                    self.modal_filter_enabled,
+                    self.modal_filter_order,
+                    self.modal_filter_alpha,
+                ) = _modal_filter_settings(self.filter_params)
                 # Expose quadrature weights for monitoring integrations
                 try:
                     self.wx = self._basis.quadrature_weights()
@@ -788,13 +856,6 @@ class Grid1D:
         if dt < 0.0:
             raise ValueError("spectral dissipation dt must be non-negative")
         if self._basis_name != "fourier":
-            # Preserve legacy Legendre modal filtering as a separate accepted-step
-            # stabilization.  It is deliberately not part of the Fourier
-            # timestep-aware operator.
-            if project and self.filter_params and bool(self.filter_params.get("enabled", False)):
-                p = int(self.filter_params.get("p", 8))
-                alpha = float(self.filter_params.get("alpha", 36.0))
-                return self._basis.apply_spectral_filter(f, p=p, alpha=alpha)  # type: ignore[union-attr]
             return f
         if not self.spectral_dissipation_enabled:
             return self.project_dealiased(f) if project else f
@@ -808,9 +869,25 @@ class Grid1D:
             F *= np.exp(-float(dt) * self.filter_rate)
         return self.irfft(F)
 
+    def apply_modal_filter(self, f: np.ndarray) -> np.ndarray:
+        """Apply the independent Legendre accepted-step modal filter."""
+        if self._basis_name != "legendre" or not self.modal_filter_enabled:
+            return f
+        return self._basis.apply_spectral_filter(  # type: ignore[union-attr]
+            f, p=self.modal_filter_order, alpha=self.modal_filter_alpha
+        )
+
+    def apply_accepted_state_stabilization(
+        self, f: np.ndarray, dt: float
+    ) -> np.ndarray:
+        """Project Fourier states or apply the separate Legendre modal filter."""
+        if self._basis_name == "fourier":
+            return self.apply_spectral_dissipation(f, dt, project=True)
+        return self.apply_modal_filter(f)
+
     def apply_spectral_filter(self, f: np.ndarray) -> np.ndarray:
-        """Backward-compatible accepted-state projection/modal-filter entrypoint."""
-        return self.apply_spectral_dissipation(f, 0.0, project=True)
+        """Backward-compatible accepted-state stabilization entrypoint."""
+        return self.apply_accepted_state_stabilization(f, 0.0)
 
     def convolve(self, f: np.ndarray, g: np.ndarray) -> np.ndarray:
         """Compute product in physical space, with dealiased spectral filtering.
@@ -1068,7 +1145,7 @@ class Grid2D:
     Lx: float
     Ly: float
     dealias: bool = True
-    filter_params: Optional[Dict[str, float]] = None
+    filter_params: Optional[Dict[str, Any]] = None
     fft_workers: int = 1
     backend: str = "auto"  # Metal, CUDA, then NumPy CPU
     torch_device: Optional[str] = None
@@ -1190,7 +1267,7 @@ class Grid2D:
         # Hard dealias projection and optional timestep-aware Fourier dissipation.
         self.dealias_mask = _build_filter_mask_2d(self.Nx, self.Ny, self.dealias)
         pure_fourier = self.basis_x == "fourier" and self.basis_y == "fourier"
-        enabled, p, rate, normalize_at_cutoff = _spectral_dissipation_settings(
+        enabled, p, rate, onset = _spectral_dissipation_settings(
             self.filter_params if pure_fourier else None
         )
         self.spectral_dissipation_enabled = enabled
@@ -1200,8 +1277,18 @@ class Grid2D:
             p=p,
             rate=rate,
             dealias=self.dealias,
-            normalize_at_cutoff=normalize_at_cutoff,
+            onset_fraction=onset,
         )
+        if self._legendre_basis is not None:
+            (
+                self.modal_filter_enabled,
+                self.modal_filter_order,
+                self.modal_filter_alpha,
+            ) = _modal_filter_settings(self.filter_params)
+        else:
+            self.modal_filter_enabled = False
+            self.modal_filter_order = 8
+            self.modal_filter_alpha = 36.0
 
         if scipy_fft_cache_enabled and fftw_cache is not None:
             try:
@@ -1637,12 +1724,6 @@ class Grid2D:
         if dt < 0.0:
             raise ValueError("spectral dissipation dt must be non-negative")
         if self._legendre_basis is not None:
-            if project and self.filter_params and bool(self.filter_params.get("enabled", False)):
-                p = int(self.filter_params.get("p", 8))
-                alpha = float(self.filter_params.get("alpha", 36.0))
-                return self._legendre_basis.apply_spectral_filter(
-                    f, p=p, alpha=alpha
-                )
             return f
         pure_fourier = self.basis_x == "fourier" and self.basis_y == "fourier"
         if not pure_fourier or not self.spectral_dissipation_enabled:
@@ -1657,9 +1738,26 @@ class Grid2D:
             F *= np.exp(-float(dt) * self.filter_rate)
         return self.ifft2(F)
 
+    def apply_modal_filter(self, f: np.ndarray) -> np.ndarray:
+        """Apply the independent Legendre accepted-step modal filter."""
+        if self._legendre_basis is None or not self.modal_filter_enabled:
+            return f
+        return self._legendre_basis.apply_spectral_filter(
+            f, p=self.modal_filter_order, alpha=self.modal_filter_alpha
+        )
+
+    def apply_accepted_state_stabilization(
+        self, f: np.ndarray, dt: float
+    ) -> np.ndarray:
+        """Project Fourier states or apply the separate Legendre modal filter."""
+        pure_fourier = self.basis_x == "fourier" and self.basis_y == "fourier"
+        if pure_fourier:
+            return self.apply_spectral_dissipation(f, dt, project=True)
+        return self.apply_modal_filter(f)
+
     def apply_spectral_filter(self, f: np.ndarray) -> np.ndarray:
-        """Backward-compatible accepted-state projection/modal-filter entrypoint."""
-        return self.apply_spectral_dissipation(f, 0.0, project=True)
+        """Backward-compatible accepted-state stabilization entrypoint."""
+        return self.apply_accepted_state_stabilization(f, 0.0)
 
     # --- MHD solenoidal helpers (2D) ---
     def divergence(self, Bx: np.ndarray, By: np.ndarray) -> np.ndarray:
@@ -1746,7 +1844,7 @@ class Grid3D:
     Ly: float
     Lz: float
     dealias: bool = True
-    filter_params: Optional[Dict[str, float]] = None
+    filter_params: Optional[Dict[str, Any]] = None
     fft_workers: int = 1
     backend: str = "auto"  # Metal, CUDA, then NumPy CPU
     torch_device: Optional[str] = None
@@ -1787,7 +1885,7 @@ class Grid3D:
         self.dealias_mask = _build_filter_mask_3d(
             self.Nx, self.Ny, self.Nz, self.dealias
         )
-        enabled, p, rate, normalize_at_cutoff = _spectral_dissipation_settings(
+        enabled, p, rate, onset = _spectral_dissipation_settings(
             self.filter_params
         )
         self.spectral_dissipation_enabled = enabled
@@ -1798,7 +1896,7 @@ class Grid3D:
             p=p,
             rate=rate,
             dealias=self.dealias,
-            normalize_at_cutoff=normalize_at_cutoff,
+            onset_fraction=onset,
         )
 
         if scipy_fft_cache_enabled and fftw_cache is not None:
@@ -2149,9 +2247,15 @@ class Grid3D:
             F *= np.exp(-float(dt) * self.filter_rate)
         return self.ifftn(F)
 
+    def apply_accepted_state_stabilization(
+        self, f: np.ndarray, dt: float
+    ) -> np.ndarray:
+        """Complete the Fourier split step and enforce hard dealiasing."""
+        return self.apply_spectral_dissipation(f, dt, project=True)
+
     def apply_spectral_filter(self, f: np.ndarray) -> np.ndarray:
         """Backward-compatible accepted-state projection entrypoint."""
-        return self.apply_spectral_dissipation(f, 0.0, project=True)
+        return self.apply_accepted_state_stabilization(f, 0.0)
 
     def xyz_mesh(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if getattr(self, "_use_torch", False):

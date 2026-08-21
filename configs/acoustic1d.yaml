@@ -17,10 +17,8 @@ integration:
   scheme: rk4        # Fallback for non-adaptive
   output_interval: 0.01
   checkpoint_interval: 0.5
-  spectral_filter:
-    enabled: true
-    p: 8            # even integer >= 2
-    alpha: 36.0     # filter strength
+  spectral_dissipation:
+    enabled: false
 
 # Initial conditions smoothing (optional)
 initial_conditions_smoothing:

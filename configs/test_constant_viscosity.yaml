@@ -35,10 +35,8 @@ integration:
   scheme: rk4
   output_interval: 0.02
   checkpoint_interval: 0.0
-  spectral_filter:
-    enabled: true
-    p: 8
-    alpha: 36.0
+  spectral_dissipation:
+    enabled: false
 
 # Initial conditions
 initial_conditions:

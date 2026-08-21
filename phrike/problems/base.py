@@ -105,9 +105,21 @@ class BaseProblem(ABC):
         self.checkpoint_interval = float(
             self.config["integration"].get("checkpoint_interval", 0.0)
         )
-        self.filter_config = self.config["integration"].get(
-            "spectral_filter", {"enabled": False}
-        )
+        integration = self.config["integration"]
+        if "spectral_filter" in integration:
+            raise ValueError(
+                "integration.spectral_filter has been removed; use "
+                "integration.spectral_dissipation for Fourier grids or "
+                "integration.modal_filter for Legendre grids"
+            )
+        self.filter_config = {
+            "spectral_dissipation": integration.get(
+                "spectral_dissipation", {"enabled": False}
+            ),
+            "modal_filter": integration.get(
+                "modal_filter", {"enabled": False}
+            ),
+        }
         
         # Grid parameters
         self.precision = str(self.config["grid"].get("precision", "double"))

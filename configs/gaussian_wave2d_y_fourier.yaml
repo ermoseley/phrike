@@ -42,10 +42,8 @@ integration:
   scheme: "rk4"             # 4th order Runge-Kutta
   cfl: 0.5                  # CFL number
   adaptive_dt: true         # Use adaptive time stepping
-  spectral_filter:
-    enabled: true           # Enable spectral filtering
-    p: 8                    # Filter order
-    alpha: 36.0             # Filter strength
+  spectral_dissipation:
+    enabled: false
 
 # Artificial viscosity (small amount for stability)
 artificial_viscosity:

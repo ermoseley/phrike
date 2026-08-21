@@ -36,7 +36,7 @@ integration:
   checkpoint_interval: 0.25
   output_interval: 0.02
   scheme: rk4
-  spectral_filter:
+  modal_filter:
     alpha: 36.0
     enabled: true
     p: 8

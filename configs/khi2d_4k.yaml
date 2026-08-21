@@ -22,10 +22,11 @@ integration:
   atol: 1e-8
   output_interval: 0.02
   checkpoint_interval: 0.5
-  spectral_filter:
+  spectral_dissipation:
     enabled: true
-    p: 8
-    alpha: 36.0
+    order: 2
+    onset_fraction: 0.8
+    e_folding_time_at_cutoff: 1.06e-4
 
 # Initial conditions smoothing (optional)
 initial_conditions_smoothing:
