@@ -36,10 +36,8 @@ integration:
   scheme: "rk4"
   cfl: 0.5
   adaptive_dt: true
-  spectral_filter:
-    enabled: true
-    p: 8
-    alpha: 36.0
+  spectral_dissipation:
+    enabled: false
 
 artificial_viscosity:
   enabled: true

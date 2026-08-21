@@ -14,11 +14,10 @@ integration:
   cfl: 0.15
   scheme: rk4
   output_interval: 0.01
-  spectral_filter:
+  modal_filter:
     enabled: true
     p: 16
     alpha: 150.0
-    interval: 1
   adaptive:
     enabled: true
     scheme: rk45

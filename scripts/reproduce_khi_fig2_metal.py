@@ -15,6 +15,7 @@ import json
 import math
 import time
 from pathlib import Path
+from typing import Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -27,7 +28,68 @@ CHI = 2.0e-5
 D_DYE = 2.0e-5
 LX = 1.0
 LY = 2.0
-NUMERICS_VERSION = "hard-two-thirds-v1"
+RHO_FLOOR = 1.0e-6
+PRESSURE_FLOOR = 1.0e-6
+SPECTRAL_DISSIPATION_ORDER = 2
+SPECTRAL_DISSIPATION_ONSET_FRACTION = 0.8
+SPECTRAL_DISSIPATION_CUTOFF_CROSSING_FRACTION = 0.5
+INITIAL_MAX_SIGNAL_SPEED = 1.0 + math.sqrt(GAMMA * 10.0)
+NUMERICS_VERSION = "hard-two-thirds-top-band-spectral-viscosity-v4"
+FIELDS = ("rho", "ux", "uy", "pressure", "dye")
+DYE_COLORMAP = "RdBu"
+DYE_COLOR_LIMITS = (0.0, 1.0)
+
+
+def cutoff_e_folding_time(nx: int) -> float:
+    """Return the cutoff damping time in physical simulation units."""
+    return (
+        SPECTRAL_DISSIPATION_CUTOFF_CROSSING_FRACTION
+        * (LX / nx)
+        / INITIAL_MAX_SIGNAL_SPEED
+    )
+
+
+def numerical_signature(nx: int, cfl: float) -> dict:
+    """Return the numerical policy that must match when resuming a run."""
+    return {
+        "version": NUMERICS_VERSION,
+        "Nx": nx,
+        "Ny": 2 * nx,
+        "Lx": LX,
+        "Ly": LY,
+        "cfl": float(cfl),
+        "gamma": GAMMA,
+        "nu": NU,
+        "chi": CHI,
+        "dye_diffusivity": D_DYE,
+        "time_integrator": "SSPRK3",
+        "dealias": "hard-two-thirds",
+        "spectral_dissipation": {
+            "enabled": True,
+            "order": SPECTRAL_DISSIPATION_ORDER,
+            "onset_fraction": SPECTRAL_DISSIPATION_ONSET_FRACTION,
+            "e_folding_time_at_cutoff": cutoff_e_folding_time(nx),
+            "cutoff_crossing_fraction": (
+                SPECTRAL_DISSIPATION_CUTOFF_CROSSING_FRACTION
+            ),
+            "reference_signal_speed": INITIAL_MAX_SIGNAL_SPEED,
+        },
+        "rho_floor": RHO_FLOOR,
+        "pressure_floor": PRESSURE_FLOOR,
+        "backend": "torch-mps",
+        "precision": "float32",
+    }
+
+
+def validate_checkpoint_signature(
+    checkpoint: dict, expected: dict, checkpoint_path: Path
+) -> None:
+    """Reject checkpoints made with another numerical policy."""
+    if checkpoint.get("numerical_signature") != expected:
+        raise RuntimeError(
+            f"{checkpoint_path} has a different or obsolete numerical "
+            "signature; restart this resolution without --resume"
+        )
 
 
 def initial_condition(nx: int, device: torch.device) -> torch.Tensor:
@@ -76,23 +138,49 @@ class SpectralNavierStokesDye:
         self.ikx = (1j * kx).reshape(1, 1, self.nx)
         self.iky = (1j * ky).reshape(1, self.ny, 1)
 
-        mx = torch.fft.fftfreq(self.nx, device=device) * self.nx
-        my = torch.fft.fftfreq(self.ny, device=device) * self.ny
-        dealias_x = torch.abs(mx) <= self.nx // 3
-        dealias_y = torch.abs(my) <= self.ny // 3
+        ix = torch.arange(self.nx, device=device)
+        iy = torch.arange(self.ny, device=device)
+        mx = torch.where(ix < (self.nx + 1) // 2, ix, ix - self.nx)
+        my = torch.where(iy < (self.ny + 1) // 2, iy, iy - self.ny)
+        dealias_x = torch.abs(mx) <= (self.nx - 1) // 3
+        dealias_y = torch.abs(my) <= (self.ny - 1) // 3
         dealias = dealias_y[:, None] & dealias_x[None, :]
         self.dealias_mask = dealias.to(dtype).reshape(1, self.ny, self.nx)
+        cutoff_x = (self.nx - 1) // 3
+        cutoff_y = (self.ny - 1) // 3
+        eta_x = torch.abs(mx).to(dtype) / max(cutoff_x, 1)
+        eta_y = torch.abs(my).to(dtype) / max(cutoff_y, 1)
+        ramp_x = torch.clamp(
+            (eta_x - SPECTRAL_DISSIPATION_ONSET_FRACTION)
+            / (1.0 - SPECTRAL_DISSIPATION_ONSET_FRACTION),
+            min=0.0,
+        )
+        ramp_y = torch.clamp(
+            (eta_y - SPECTRAL_DISSIPATION_ONSET_FRACTION)
+            / (1.0 - SPECTRAL_DISSIPATION_ONSET_FRACTION),
+            min=0.0,
+        )
+        cutoff_rate = 1.0 / cutoff_e_folding_time(nx)
+        self.dissipation_rate = cutoff_rate * (
+            ramp_y[:, None] ** SPECTRAL_DISSIPATION_ORDER
+            + ramp_x[None, :] ** SPECTRAL_DISSIPATION_ORDER
+        )
+        self.dissipation_rate = self.dissipation_rate.reshape(
+            1, self.ny, self.nx
+        )
 
     def _fft(self, fields: torch.Tensor) -> torch.Tensor:
         return torch.fft.fft2(fields, dim=(-2, -1)) * self.dealias_mask
 
     @staticmethod
     def primitives(U: torch.Tensor):
-        rho = torch.clamp(U[0], min=1.0e-6)
+        rho = torch.clamp(U[0], min=RHO_FLOOR)
         ux = U[1] / rho
         uy = U[2] / rho
         kinetic = 0.5 * rho * (ux**2 + uy**2)
-        pressure = torch.clamp((GAMMA - 1.0) * (U[3] - kinetic), min=1.0e-6)
+        pressure = torch.clamp(
+            (GAMMA - 1.0) * (U[3] - kinetic), min=PRESSURE_FLOOR
+        )
         dye = U[4] / rho
         return rho, ux, uy, pressure, dye
 
@@ -164,12 +252,20 @@ class SpectralNavierStokesDye:
     def project(self, U: torch.Tensor) -> torch.Tensor:
         return torch.fft.ifft2(self._fft(U), dim=(-2, -1)).real
 
+    def dissipate(self, U: torch.Tensor, dt: float) -> torch.Tensor:
+        """Apply exact exponential spectral viscosity for elapsed time ``dt``."""
+        U_hat = self._fft(U)
+        U_hat *= torch.exp(-float(dt) * self.dissipation_rate)
+        return torch.fft.ifft2(U_hat, dim=(-2, -1)).real
+
     def step_ssprk3(self, U: torch.Tensor, dt: float) -> torch.Tensor:
-        U1 = U + dt * self.rhs(U)
-        U2 = 0.75 * U + 0.25 * (U1 + dt * self.rhs(U1))
-        return self.project(
-            (1.0 / 3.0) * U + (2.0 / 3.0) * (U2 + dt * self.rhs(U2))
+        U_split = self.dissipate(U, 0.5 * dt)
+        U1 = U_split + dt * self.rhs(U_split)
+        U2 = 0.75 * U_split + 0.25 * (U1 + dt * self.rhs(U1))
+        U_next = (1.0 / 3.0) * U_split + (2.0 / 3.0) * (
+            U2 + dt * self.rhs(U2)
         )
+        return self.dissipate(U_next, 0.5 * dt)
 
     def timestep(self, U: torch.Tensor, cfl: float) -> float:
         rho, ux, uy, pressure, _ = self.primitives(U)
@@ -206,7 +302,10 @@ def save_result(
         "elapsed_seconds": elapsed,
         "backend": "torch-mps",
         "precision": "float32",
-        "method": "Phrike periodic Fourier pseudo-spectral, SSPRK3, hard 2/3 dealiasing",
+        "method": (
+            "Phrike periodic Fourier pseudo-spectral, SSPRK3, hard 2/3 "
+            "dealiasing, timestep-aware top-band spectral viscosity"
+        ),
         "numerics_version": NUMERICS_VERSION,
         "gamma": GAMMA,
         "Re": 1.0e5,
@@ -222,11 +321,106 @@ def save_result(
         "pressure_max": float(arrays["pressure"].max()),
         "dye_min": float(arrays["dye"].min()),
         "dye_max": float(arrays["dye"].max()),
+        "numerical_signature": numerical_signature(nx, cfl),
     }
     (outdir / f"khi_fig2_metal_N{nx:04d}_t{t:.3f}.json").write_text(
         json.dumps(metrics, indent=2, sort_keys=True) + "\n"
     )
     return metrics
+
+
+def restrict_to_common_modes(field: np.ndarray, target_nx: int) -> np.ndarray:
+    """Evaluate a field on the target grid after a common 2/3 truncation."""
+    source_ny, source_nx = field.shape
+    target_ny = 2 * target_nx
+    if source_nx % target_nx or source_ny % target_ny:
+        raise ValueError(
+            "Common-mode comparison requires integer resolution ratios; "
+            f"got {source_nx}x{source_ny} and {target_nx}x{target_ny}"
+        )
+    mx = np.fft.fftfreq(source_nx) * source_nx
+    my = np.fft.fftfreq(source_ny) * source_ny
+    mask = (
+        (np.abs(my) <= (target_ny - 1) // 3)[:, None]
+        & (np.abs(mx) <= (target_nx - 1) // 3)[None, :]
+    )
+    restricted = np.fft.ifft2(np.fft.fft2(field) * mask).real
+    return restricted[:: source_ny // target_ny, :: source_nx // target_nx].copy()
+
+
+def common_mode_error(reference: np.ndarray, candidate: np.ndarray) -> dict:
+    difference = candidate - reference
+    rms = float(np.sqrt(np.mean(difference**2)))
+    reference_rms = float(np.sqrt(np.mean(reference**2)))
+    return {
+        "rms": rms,
+        "relative_rms": rms / max(reference_rms, np.finfo(float).tiny),
+        "max": float(np.max(np.abs(difference))),
+    }
+
+
+def common_mode_report(
+    outdir: Path, resolutions: list[int], t: float, target_nx: Optional[int] = None
+) -> dict:
+    """Compare saved solutions after restriction to one common Fourier space."""
+    ordered = sorted(set(resolutions))
+    if not ordered:
+        raise ValueError("At least one resolution is required")
+    target_nx = ordered[0] if target_nx is None else target_nx
+    restricted: dict[int, dict[str, np.ndarray]] = {}
+    for nx in ordered:
+        path = outdir / f"khi_fig2_metal_N{nx:04d}_t{t:.3f}.npz"
+        with np.load(path) as data:
+            restricted[nx] = {
+                field: restrict_to_common_modes(data[field], target_nx)
+                for field in FIELDS
+            }
+
+    comparisons = []
+    for coarse, fine in zip(ordered[:-1], ordered[1:]):
+        comparisons.append(
+            {
+                "coarse_Nx": coarse,
+                "fine_Nx": fine,
+                "errors": {
+                    field: common_mode_error(
+                        restricted[coarse][field], restricted[fine][field]
+                    )
+                    for field in FIELDS
+                },
+            }
+        )
+    convergence = []
+    for previous, current in zip(comparisons[:-1], comparisons[1:]):
+        resolution_ratio = current["fine_Nx"] / previous["fine_Nx"]
+        convergence.append(
+            {
+                "from": [previous["coarse_Nx"], previous["fine_Nx"]],
+                "to": [current["coarse_Nx"], current["fine_Nx"]],
+                "observed_orders": {
+                    field: math.log(
+                        max(
+                            previous["errors"][field]["rms"],
+                            np.finfo(float).tiny,
+                        )
+                        / max(
+                            current["errors"][field]["rms"],
+                            np.finfo(float).tiny,
+                        )
+                    )
+                    / math.log(resolution_ratio)
+                    for field in FIELDS
+                },
+            }
+        )
+    return {
+        "target_Nx": target_nx,
+        "target_Ny": 2 * target_nx,
+        "mode_cutoff_x": (target_nx - 1) // 3,
+        "mode_cutoff_y": (2 * target_nx - 1) // 3,
+        "comparisons": comparisons,
+        "successive_error_reduction": convergence,
+    }
 
 
 def plot_comparison(outdir: Path, resolutions: list[int], t: float) -> Path:
@@ -258,12 +452,15 @@ def plot_comparison(outdir: Path, resolutions: list[int], t: float) -> Path:
             data["dye"],
             origin="lower",
             extent=(0.0, LX, 0.0, LY),
-            cmap="viridis",
-            vmin=0.0,
-            vmax=1.0,
+            cmap=DYE_COLORMAP,
+            vmin=DYE_COLOR_LIMITS[0],
+            vmax=DYE_COLOR_LIMITS[1],
             interpolation="nearest",
             aspect="equal",
         )
+        ax.set_xlim(0.0, LX)
+        ax.set_ylim(0.0, LY)
+        ax.margins(0.0)
         ax.set_title(rf"$N_{{\rm DOF,x}}={nx}$")
         ax.set_xlabel("x")
         if ax is axes[0]:
@@ -276,7 +473,7 @@ def plot_comparison(outdir: Path, resolutions: list[int], t: float) -> Path:
     colorbar_ax = fig.add_axes(
         [panels_left, axes_bottom - 0.105, panels_width, 0.025]
     )
-    fig.colorbar(image, cax=colorbar_ax, orientation="horizontal", label="dye c")
+    fig.colorbar(image, cax=colorbar_ax, orientation="horizontal", label="dye C")
     fig.suptitle(rf"Metal/Phrike KHI analogue, $t={t:g}$, $Re=10^5$", y=0.97)
     path = outdir / f"khi_fig2_metal_t{t:.3f}.png"
     fig.savefig(path, dpi=300, bbox_inches="tight")
@@ -284,14 +481,117 @@ def plot_comparison(outdir: Path, resolutions: list[int], t: float) -> Path:
     return path
 
 
+def run_resolution(
+    outdir: Path,
+    nx: int,
+    t_end: float,
+    cfl: float,
+    progress_every: int,
+    checkpoint_interval: float,
+    resume: bool,
+    device: torch.device,
+) -> dict:
+    model = SpectralNavierStokesDye(nx, device)
+    signature = numerical_signature(nx, cfl)
+    checkpoint_path = outdir / f"khi_fig2_metal_N{nx:04d}.checkpoint.pt"
+    if resume and checkpoint_path.exists():
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        validate_checkpoint_signature(checkpoint, signature, checkpoint_path)
+        U = checkpoint["U"].to(device)
+        t_now = float(checkpoint["t"])
+        step = int(checkpoint["step"])
+        if t_now > t_end + 1.0e-12:
+            raise RuntimeError(
+                f"{checkpoint_path} is at t={t_now:g}, beyond requested t={t_end:g}"
+            )
+        print(f"N={nx} resumed at step={step} t={t_now:.6f}", flush=True)
+    else:
+        U = model.project(initial_condition(nx, device))
+        t_now = 0.0
+        step = 0
+
+    next_checkpoint = (
+        (math.floor(t_now / checkpoint_interval) + 1) * checkpoint_interval
+        if checkpoint_interval > 0.0
+        else math.inf
+    )
+    started = time.perf_counter()
+    while t_now < t_end - 1.0e-12:
+        dt = min(model.timestep(U, cfl), t_end - t_now)
+        U = model.step_ssprk3(U, dt)
+        t_now += dt
+        step += 1
+        if step % progress_every == 0 or t_now >= t_end - 1.0e-12:
+            elapsed = time.perf_counter() - started
+            print(
+                f"N={nx} step={step} t={t_now:.6f}/{t_end:g} "
+                f"elapsed={elapsed:.1f}s",
+                flush=True,
+            )
+            rho, _, _, pressure, _ = model.primitives(U)
+            if not bool(torch.all(torch.isfinite(U)).item()):
+                raise FloatingPointError(f"non-finite state at N={nx}, t={t_now}")
+            if (
+                float(torch.min(rho).item()) <= 0.0
+                or float(torch.min(pressure).item()) <= 0.0
+            ):
+                raise FloatingPointError(f"non-positive state at N={nx}, t={t_now}")
+        if t_now + 1.0e-12 >= next_checkpoint:
+            outdir.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "U": U.detach().cpu(),
+                    "t": t_now,
+                    "step": step,
+                    "numerical_signature": signature,
+                },
+                checkpoint_path,
+            )
+            next_checkpoint += checkpoint_interval
+    elapsed = time.perf_counter() - started
+    return save_result(outdir, nx, t_now, U, elapsed, step, cfl)
+
+
+def temporal_refinement_report(
+    baseline_dir: Path,
+    refined_dir: Path,
+    nx: int,
+    target_nx: int,
+    t: float,
+    baseline_cfl: float,
+    refined_cfl: float,
+) -> dict:
+    baseline_path = baseline_dir / f"khi_fig2_metal_N{nx:04d}_t{t:.3f}.npz"
+    refined_path = refined_dir / f"khi_fig2_metal_N{nx:04d}_t{t:.3f}.npz"
+    with np.load(baseline_path) as baseline, np.load(refined_path) as refined:
+        errors = {
+            field: common_mode_error(
+                restrict_to_common_modes(baseline[field], target_nx),
+                restrict_to_common_modes(refined[field], target_nx),
+            )
+            for field in FIELDS
+        }
+    return {
+        "Nx": nx,
+        "target_Nx": target_nx,
+        "baseline_cfl": baseline_cfl,
+        "refined_cfl": refined_cfl,
+        "errors": errors,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--resolutions", nargs="+", type=int, default=[256, 512, 1024])
     parser.add_argument("--t-end", type=float, default=6.0)
-    parser.add_argument("--cfl", type=float, default=0.35)
+    parser.add_argument("--cfl", type=float, default=0.7)
     parser.add_argument("--progress-every", type=int, default=100)
     parser.add_argument("--checkpoint-interval", type=float, default=0.5)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--temporal-refinement", action="store_true")
+    parser.add_argument("--temporal-resolution", type=int, default=512)
+    parser.add_argument("--temporal-cfl-factor", type=float, default=0.5)
+    parser.add_argument("--common-resolution", type=int)
     parser.add_argument("--outdir", type=Path, default=Path("outputs/khi_fig2_metal"))
     return parser.parse_args()
 
@@ -300,68 +600,93 @@ def main() -> None:
     args = parse_args()
     if not torch.backends.mps.is_available():
         raise RuntimeError("This validation requires an available Metal/MPS device")
+    resolutions = sorted(set(args.resolutions))
+    if not resolutions or any(nx <= 0 for nx in resolutions):
+        raise ValueError("resolutions must contain positive integers")
+    target_nx = args.common_resolution or resolutions[0]
+    if target_nx <= 0 or any(nx % target_nx for nx in resolutions):
+        raise ValueError("common resolution must divide every requested resolution")
+    if args.progress_every <= 0:
+        raise ValueError("progress-every must be positive")
+    if args.cfl <= 0.0:
+        raise ValueError("cfl must be positive")
+    if not 0.0 < args.temporal_cfl_factor < 1.0:
+        raise ValueError("temporal-cfl-factor must lie strictly between zero and one")
+
     device = torch.device("mps")
-    all_metrics = []
-    for nx in args.resolutions:
-        model = SpectralNavierStokesDye(nx, device)
-        checkpoint_path = args.outdir / f"khi_fig2_metal_N{nx:04d}.checkpoint.pt"
-        if args.resume and checkpoint_path.exists():
-            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-            if checkpoint.get("numerics_version") != NUMERICS_VERSION:
-                raise RuntimeError(
-                    f"{checkpoint_path} predates {NUMERICS_VERSION}; restart this "
-                    "resolution without --resume"
-                )
-            U = checkpoint["U"].to(device)
-            t_now = float(checkpoint["t"])
-            step = int(checkpoint["step"])
-            print(f"N={nx} resumed at step={step} t={t_now:.6f}", flush=True)
-        else:
-            U = model.project(initial_condition(nx, device))
-            t_now = 0.0
-            step = 0
-        next_checkpoint = (
-            (math.floor(t_now / args.checkpoint_interval) + 1) * args.checkpoint_interval
-            if args.checkpoint_interval > 0.0
-            else math.inf
+    all_metrics = [
+        run_resolution(
+            args.outdir,
+            nx,
+            args.t_end,
+            args.cfl,
+            args.progress_every,
+            args.checkpoint_interval,
+            args.resume,
+            device,
         )
-        started = time.perf_counter()
-        while t_now < args.t_end:
-            dt = min(model.timestep(U, args.cfl), args.t_end - t_now)
-            U = model.step_ssprk3(U, dt)
-            t_now += dt
-            step += 1
-            if step % args.progress_every == 0 or t_now >= args.t_end:
-                elapsed = time.perf_counter() - started
-                print(
-                    f"N={nx} step={step} t={t_now:.6f}/{args.t_end:g} "
-                    f"elapsed={elapsed:.1f}s",
-                    flush=True,
-                )
-                rho, _, _, pressure, _ = model.primitives(U)
-                if not bool(torch.all(torch.isfinite(U)).item()):
-                    raise FloatingPointError(f"non-finite state at N={nx}, t={t_now}")
-                if float(torch.min(rho).item()) <= 0.0 or float(torch.min(pressure).item()) <= 0.0:
-                    raise FloatingPointError(f"non-positive state at N={nx}, t={t_now}")
-            if t_now + 1.0e-12 >= next_checkpoint:
-                args.outdir.mkdir(parents=True, exist_ok=True)
-                torch.save(
-                    {
-                        "U": U.detach().cpu(),
-                        "t": t_now,
-                        "step": step,
-                        "numerics_version": NUMERICS_VERSION,
-                    },
-                    checkpoint_path,
-                )
-                next_checkpoint += args.checkpoint_interval
-        elapsed = time.perf_counter() - started
-        all_metrics.append(
-            save_result(args.outdir, nx, t_now, U, elapsed, step, args.cfl)
+        for nx in resolutions
+    ]
+    comparison = common_mode_report(
+        args.outdir, resolutions, args.t_end, target_nx=target_nx
+    )
+    report = {"runs": all_metrics, "common_mode": comparison}
+
+    if args.temporal_refinement:
+        if args.temporal_resolution not in resolutions:
+            raise ValueError("temporal-resolution must be one of --resolutions")
+        refined_cfl = args.cfl * args.temporal_cfl_factor
+        refined_dir = args.outdir / "temporal_refinement"
+        refined_metrics = run_resolution(
+            refined_dir,
+            args.temporal_resolution,
+            args.t_end,
+            refined_cfl,
+            args.progress_every,
+            args.checkpoint_interval,
+            args.resume,
+            device,
         )
-    plot_path = plot_comparison(args.outdir, args.resolutions, args.t_end)
+        temporal_comparison = temporal_refinement_report(
+            args.outdir,
+            refined_dir,
+            args.temporal_resolution,
+            target_nx,
+            args.t_end,
+            args.cfl,
+            refined_cfl,
+        )
+        incoming_spatial = next(
+            (
+                item
+                for item in comparison["comparisons"]
+                if item["fine_Nx"] == args.temporal_resolution
+            ),
+            None,
+        )
+        if incoming_spatial is not None:
+            temporal_comparison["relative_to_incoming_spatial_error"] = {
+                field: {
+                    "rms_ratio": temporal_comparison["errors"][field]["rms"]
+                    / max(
+                        incoming_spatial["errors"][field]["rms"],
+                        np.finfo(float).tiny,
+                    ),
+                    "temporal_error_is_smaller": temporal_comparison["errors"][field][
+                        "rms"
+                    ]
+                    < incoming_spatial["errors"][field]["rms"],
+                }
+                for field in FIELDS
+            }
+        report["temporal_refinement"] = {
+            "run": refined_metrics,
+            "comparison": temporal_comparison,
+        }
+
+    plot_path = plot_comparison(args.outdir, resolutions, args.t_end)
     (args.outdir / f"khi_fig2_metal_t{args.t_end:.3f}.json").write_text(
-        json.dumps(all_metrics, indent=2, sort_keys=True) + "\n"
+        json.dumps(report, indent=2, sort_keys=True) + "\n"
     )
     print(plot_path)
 

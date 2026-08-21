@@ -118,14 +118,14 @@ def _rk4_step(grid: Grid1D, eqs: EulerEquations1D, U: Array, dt: float,
     return _positivity_clamp(Unew, eqs)
 
 
-def _apply_physical_filters(
+def _apply_accepted_state_stabilization(
     grid: Grid1D,
     U: Array,
     equations: Optional[EulerEquations1D] = None,
     dt: float = 0.0,
 ) -> Array:
-    # Complete the split dissipation step and project onto retained modes.
-    U_filtered = grid.apply_spectral_dissipation(U, dt, project=True)
+    # Complete the split Fourier step, or apply the independent modal filter.
+    U_filtered = grid.apply_accepted_state_stabilization(U, dt)
     # Re-apply boundary conditions after filtering to prevent endpoint drift
     if equations is not None and hasattr(grid, "apply_boundary_conditions"):
         try:
@@ -153,9 +153,6 @@ class SpectralSolver1D:
     artificial_viscosity: Optional[SpectralArtificialViscosity] = None
     # Gravity configuration
     gravity_config: Optional[Dict] = None
-    # Retained for API compatibility; timestep-aware dissipation runs every step.
-    filter_interval: int = 1
-
     def __init__(self, grid: Grid1D, equations: EulerEquations1D, U0: Optional[Array] = None, 
                  scheme: str = "rk4", cfl: float = 0.4, adaptive_config: Optional[Dict] = None,
                  artificial_viscosity_config: Optional[Dict] = None, gravity_config: Optional[Dict] = None):
@@ -215,8 +212,6 @@ class SpectralSolver1D:
         # Setup gravity if configured
         self.gravity_config = gravity_config
 
-        self.filter_interval = 1
-
 
     def compute_dt(self, U: Array) -> float:
         max_speed = self.equations.max_wave_speed(U)
@@ -249,7 +244,7 @@ class SpectralSolver1D:
             Un = _rk2_step(self.grid, self.equations, U_split, dt, self.artificial_viscosity, self.gravity_config)
         else:
             Un = _rk4_step(self.grid, self.equations, U_split, dt, self.artificial_viscosity, self.gravity_config)
-        return _apply_physical_filters(
+        return _apply_accepted_state_stabilization(
             self.grid, Un, self.equations, dt=0.5 * dt
         )
     
@@ -272,7 +267,7 @@ class SpectralSolver1D:
         
         # Complete the split dissipation and projection for an accepted solution.
         if result.accepted:
-            Un = _apply_physical_filters(
+            Un = _apply_accepted_state_stabilization(
                 self.grid, result.U_new, self.equations, dt=0.5 * dt
             )
         else:
@@ -300,7 +295,7 @@ class SpectralSolver1D:
         
         if result.accepted:
             # Step accepted - update solution and time
-            self.U = _apply_physical_filters(
+            self.U = _apply_accepted_state_stabilization(
                 self.grid, result.U_new, self.equations, dt=0.5 * dt
             )
             self.t += dt
@@ -346,6 +341,8 @@ class SpectralSolver1D:
             self.U = U0.clone()
         else:
             self.U = U0.copy()
+        # Start Fourier runs in the same retained subspace enforced after steps.
+        self.U = self.grid.project_dealiased(self.U)
         self.t = float(t0)
         next_output = self.t + output_interval
         next_checkpoint = (
@@ -514,10 +511,10 @@ def _rk4_step_2d(grid: Grid2D, eqs: EulerEquations2D, U: Array, dt: float,
     return _positivity_clamp_2d(Unew, eqs)
 
 
-def _apply_physical_filters_2d(
+def _apply_accepted_state_stabilization_2d(
     grid: Grid2D, U: Array, dt: float = 0.0
 ) -> Array:
-    U_filtered = grid.apply_spectral_dissipation(U, dt, project=True)
+    U_filtered = grid.apply_accepted_state_stabilization(U, dt)
     # Re-apply BCs after filtering if available
     try:
         if hasattr(grid, "apply_boundary_conditions"):
@@ -604,9 +601,6 @@ class SpectralSolver2D:
         # Setup gravity if configured
         self.gravity_config = gravity_config
 
-        # Retained for API compatibility; timestep-aware dissipation runs every step.
-        self.filter_interval: int = 1
-
     def compute_dt(self, U: Array) -> float:
         max_speed = self.equations.max_wave_speed(U)
         if max_speed <= 0.0:
@@ -640,7 +634,9 @@ class SpectralSolver2D:
             Un = _rk2_step_2d(self.grid, self.equations, U_split, dt, self.artificial_viscosity, self.gravity_config)
         else:
             Un = _rk4_step_2d(self.grid, self.equations, U_split, dt, self.artificial_viscosity, self.gravity_config)
-        return _apply_physical_filters_2d(self.grid, Un, dt=0.5 * dt)
+        return _apply_accepted_state_stabilization_2d(
+            self.grid, Un, dt=0.5 * dt
+        )
     
     def _adaptive_step(self, U: Array, dt: float) -> Array:
         """Perform one adaptive time step."""
@@ -659,7 +655,7 @@ class SpectralSolver2D:
         result = self.adaptive_stepper.step(rhs_func, U_split, dt, solution_scale)
         
         if result.accepted:
-            Un = _apply_physical_filters_2d(
+            Un = _apply_accepted_state_stabilization_2d(
                 self.grid, result.U_new, dt=0.5 * dt
             )
         else:
@@ -689,7 +685,7 @@ class SpectralSolver2D:
         result = self.adaptive_stepper.step(rhs_func, U_split, dt, solution_scale)
         
         if result.accepted:
-            self.U = _apply_physical_filters_2d(
+            self.U = _apply_accepted_state_stabilization_2d(
                 self.grid, result.U_new, dt=0.5 * dt
             )
             self.t += dt
@@ -730,6 +726,8 @@ class SpectralSolver2D:
             self.U = U0.clone()
         else:
             self.U = U0.copy()
+        # Start Fourier runs in the same retained subspace enforced after steps.
+        self.U = self.grid.project_dealiased(self.U)
         self.t = float(t0)
         next_output = self.t + output_interval
         next_checkpoint = (
@@ -920,9 +918,6 @@ class SpectralSolverMHD:
             else:
                 self.scheme = adaptive_config.get("fallback_scheme", "rk4")
 
-        # Retained for API compatibility; timestep-aware dissipation runs every step.
-        self.filter_interval = 1
-
     def _grid_k2_max(self) -> float:
         """Max squared wavenumber on the grid (for the parabolic diffusion CFL)."""
         g = self.grid
@@ -1054,9 +1049,7 @@ class SpectralSolverMHD:
         # Project B before the scalar modal operator; the latter commutes with
         # divergence, so the stored state remains both band-limited and div-free.
         Un = self._project_B(Un)
-        Un = self.grid.apply_spectral_dissipation(
-            Un, 0.5 * dt, project=True
-        )
+        Un = self.grid.apply_accepted_state_stabilization(Un, 0.5 * dt)
         return Un
 
     def _adaptive_step(self, U: Array, dt: float) -> Array:
@@ -1071,9 +1064,7 @@ class SpectralSolverMHD:
         result = self.adaptive_stepper.step(rhs_func, U_split, dt, solution_scale)
         if result.accepted:
             Un = self._project_B(self._clamp(result.U_new))
-            Un = self.grid.apply_spectral_dissipation(
-                Un, 0.5 * dt, project=True
-            )
+            Un = self.grid.apply_accepted_state_stabilization(Un, 0.5 * dt)
         else:
             Un = U
         return Un
@@ -1091,9 +1082,7 @@ class SpectralSolverMHD:
         result = self.adaptive_stepper.step(rhs_func, U_split, dt, solution_scale)
         if result.accepted:
             Un = self._project_B(self._clamp(result.U_new))
-            Un = self.grid.apply_spectral_dissipation(
-                Un, 0.5 * dt, project=True
-            )
+            Un = self.grid.apply_accepted_state_stabilization(Un, 0.5 * dt)
             self.U = Un
             self.t += dt
             if on_step is not None:
@@ -1124,6 +1113,7 @@ class SpectralSolverMHD:
             self.U = U0.copy()
         # Project the initial state so div(B)=0 from the first stored step.
         self.U = self._project_B(self.U)
+        self.U = self.grid.project_dealiased(self.U)
         self.t = float(t0)
         next_output = self.t + output_interval
         next_checkpoint = (
@@ -1256,10 +1246,10 @@ def _rk4_step_3d(grid: Grid3D, eqs: EulerEquations3D, U: Array, dt: float,
     return U + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
 
 
-def _apply_physical_filters_3d(
+def _apply_accepted_state_stabilization_3d(
     grid: Grid3D, U: Array, dt: float = 0.0
 ) -> Array:
-    return grid.apply_spectral_dissipation(U, dt, project=True)
+    return grid.apply_accepted_state_stabilization(U, dt)
 
 
 @dataclass
@@ -1362,7 +1352,9 @@ class SpectralSolver3D:
             Un = _rk2_step_3d(self.grid, self.equations, U_split, dt, None, self.gravity_config)
         else:
             Un = _rk4_step_3d(self.grid, self.equations, U_split, dt, None, self.gravity_config)
-        return _apply_physical_filters_3d(self.grid, Un, dt=0.5 * dt)
+        return _apply_accepted_state_stabilization_3d(
+            self.grid, Un, dt=0.5 * dt
+        )
     
     def _adaptive_step(self, U: Array, dt: float) -> Array:
         """Perform one adaptive time step."""
@@ -1381,7 +1373,7 @@ class SpectralSolver3D:
         result = self.adaptive_stepper.step(rhs_func, U_split, dt, solution_scale)
         
         if result.accepted:
-            Un = _apply_physical_filters_3d(
+            Un = _apply_accepted_state_stabilization_3d(
                 self.grid, result.U_new, dt=0.5 * dt
             )
         else:
@@ -1405,7 +1397,7 @@ class SpectralSolver3D:
         result = self.adaptive_stepper.step(rhs_func, U_split, dt, solution_scale)
         
         if result.accepted:
-            self.U = _apply_physical_filters_3d(
+            self.U = _apply_accepted_state_stabilization_3d(
                 self.grid, result.U_new, dt=0.5 * dt
             )
             self.t += dt
@@ -1454,6 +1446,8 @@ class SpectralSolver3D:
             self.U = U0.clone()
         else:
             self.U = U0.copy()
+        # Start Fourier runs in the same retained subspace enforced after steps.
+        self.U = self.grid.project_dealiased(self.U)
         self.t = float(t0)
         next_output = self.t + output_interval
         next_checkpoint = (

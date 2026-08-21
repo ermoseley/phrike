@@ -25,7 +25,7 @@ integration:
   scheme: rk4               # Stable scheme like SOD
   output_interval: 0.02     # Very frequent outputs for smooth video (100 frames)
   checkpoint_interval: 0.2
-  spectral_filter:
+  modal_filter:
     enabled: true
     p: 8                     # Similar to SOD
     alpha: 36.0             # Similar to SOD

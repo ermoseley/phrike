@@ -20,7 +20,7 @@ integration:
   scheme: rk4               # Stable scheme like SOD
   output_interval: 0.01     # Frequent outputs for monitoring
   checkpoint_interval: 0.05
-  spectral_filter:
+  modal_filter:
     enabled: true
     p: 8
     alpha: 36.0

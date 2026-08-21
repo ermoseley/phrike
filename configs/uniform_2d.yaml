@@ -21,7 +21,7 @@ integration:
   scheme: rk4
   output_interval: 0.05
   checkpoint_interval: 0.25
-  spectral_filter:
+  modal_filter:
     enabled: false
 
 adaptive:
@@ -65,4 +65,3 @@ video:
   crf: 20
   preset: medium
   pix_fmt: yuv420p
-

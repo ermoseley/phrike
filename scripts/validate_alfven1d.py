@@ -23,8 +23,16 @@ C_A = B0 / np.sqrt(RHO0)
 PERIOD = LX / (M * C_A)
 
 
-def make_grid(N, backend, device, precision, filt=True):
-    fp = {"enabled": True, "p": 8, "alpha": 36.0} if filt else {"enabled": False}
+def make_grid(N, backend, device, precision, filt=False):
+    fp = (
+        {
+            "enabled": True,
+            "order": 8,
+            "e_folding_time_at_cutoff": 1.0 / 36.0,
+        }
+        if filt
+        else {"enabled": False}
+    )
     return Grid1D(N=N, Lx=LX, dealias=True, filter_params=fp,
                   backend=backend, torch_device=device, precision=precision)
 
@@ -45,7 +53,7 @@ def b_perp_error(grid, eqs, U, t):
     return float(np.sqrt(np.mean((By - Bya) ** 2 + (Bz - Bza) ** 2)))
 
 
-def run(N, t_end, backend, device, precision, cfl=0.4, scheme="rk4", filt=True):
+def run(N, t_end, backend, device, precision, cfl=0.4, scheme="rk4", filt=False):
     grid = make_grid(N, backend, device, precision, filt)
     eqs = MHDEquations1D(gamma=GAMMA)
     U0 = circularly_polarized_alfven_1d(grid.x, t=0.0, rho0=RHO0, p0=P0, B0=B0,

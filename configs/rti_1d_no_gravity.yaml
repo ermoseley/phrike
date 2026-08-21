@@ -19,7 +19,7 @@ integration:
   scheme: rk4                # Stable scheme for Legendre
   output_interval: 0.05      # Output every 0.05 time units
   checkpoint_interval: 0.2   # Checkpoints every 0.2 time units
-  spectral_filter:
+  modal_filter:
     enabled: true
     p: 8                     # Even integer >= 2
     alpha: 36.0              # Filter strength

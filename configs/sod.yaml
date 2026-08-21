@@ -22,10 +22,8 @@ integration:
   atol: 1e-8
   output_interval: 0.01
   checkpoint_interval: 0.05
-  spectral_filter:
-    enabled: true
-    p: 8
-    alpha: 36.0
+  spectral_dissipation:
+    enabled: false
 
 # Initial conditions smoothing (optional)
 initial_conditions_smoothing:

@@ -66,11 +66,16 @@ Use the code as experimental research software. In particular:
 See [the documentation source](docs/) for installation, a walkthrough, and
 development checks.
 
-For Fourier grids, `integration.spectral_filter.rate` is the damping rate at
-each retained per-axis cutoff; `e_folding_time_at_cutoff` is its inverse. The
-legacy `alpha` key remains supported with its Nyquist-normalized spatial
-profile, but is now a rate per unit simulation time rather than attenuation
-per RK stage.
+The shipped Fourier configurations use a hard 2/3 dealias projection. Optional
+smooth damping is configured separately with
+`integration.spectral_dissipation`: set `enabled`, an even `order`, and exactly
+one of `rate` or `e_folding_time_at_cutoff`. The exponential is integrated in
+simulation time with a Strang half-step on either side of the Runge--Kutta
+step. Optional `onset_fraction` confines damping to the corresponding upper
+fraction of the retained band (for example, `0.8` leaves the lower 80% exactly
+untouched). Legendre grids instead use the independently named
+`integration.modal_filter`; its `alpha` remains a dimensionless modal-filter
+strength.
 
 ## Repository layout
 

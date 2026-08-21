@@ -20,10 +20,8 @@ integration:
   atol: 1e-9
   output_interval: 0.01
   checkpoint_interval: 0.05
-  spectral_filter:
-    enabled: true
-    p: 12             # Higher order filter
-    alpha: 200.0       # Stronger filtering
+  spectral_dissipation:
+    enabled: false
 
 # Minimal initial conditions smoothing - preserve physics!
 initial_conditions_smoothing:
