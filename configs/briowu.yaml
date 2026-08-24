@@ -1,0 +1,76 @@
+# 1D Brio-Wu MHD shock tube (Brio & Wu 1988), periodic (Fourier) basis.
+#   python -m phrike briowu --config configs/briowu.yaml
+#   python -m phrike briowu --config configs/briowu.yaml --video --video-codec libx264
+problem: briowu
+
+grid:
+  N: 512
+  Lx: 1.0
+  x0: 0.5                 # discontinuity location
+  dealias: true
+  precision: double
+
+physics:
+  gamma: 2.0
+  mhd:
+    enabled: true
+    resistivity: 1.0e-3     # eta — small explicit dissipation to stabilise shocks
+    viscosity: 1.0e-3       # nu
+    divergence_clean: projection
+    project_each_substage: true
+
+integration:
+  t0: 0.0
+  t_end: 0.1                # standard Brio-Wu final time on [0,1]
+  cfl: 0.3
+  scheme: rk4
+  output_interval: 0.005    # -> 21 frames for the video
+  checkpoint_interval: 0.0
+  spectral_filter:
+    enabled: true
+    p: 8
+    alpha: 36.0
+
+# Brio-Wu Riemann initial condition (primitive variables)
+initial_conditions:
+  Bx: 0.75                  # uniform normal field (constant in 1D)
+  left:
+    rho: 1.0
+    ux: 0.0
+    uy: 0.0
+    uz: 0.0
+    p: 1.0
+    By: 1.0
+    Bz: 0.0
+  right:
+    rho: 0.125
+    ux: 0.0
+    uy: 0.0
+    uz: 0.0
+    p: 0.1
+    By: -1.0
+    Bz: 0.0
+
+io:
+  outdir: outputs/briowu
+
+monitoring:
+  enabled: true
+  step_interval: 100
+  include_conservation: true
+  include_timestep: true
+  include_time: true
+
+video:
+  fps: 30
+  width: 1920
+  height: 1080
+  scale: 1.0
+  frame_dpi: 150
+  quality: high
+  codec: libx264            # Linux-friendly (configs default elsewhere to macOS h264_videotoolbox)
+  crf: 23
+  preset: medium
+  pix_fmt: yuv420p
+  profile: high
+  level: "4.1"
