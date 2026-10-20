@@ -19,7 +19,7 @@ non-periodic polynomial paths remain exploratory, and 3D Legendre support is not
 implemented.
 
 1D bases and boundary conditions
--------------------------------
+--------------------------------
 
 ``grid.basis`` accepts ``fourier``, ``legendre``, and ``chebyshev`` in 1D.
 Fourier is periodic on a uniform grid. Both polynomial bases use Lobatto nodes
@@ -80,7 +80,7 @@ Only 1D has been extended here; multi-dimensional boundary behavior is unchanged
 NumPy and Torch CPU are checked. CUDA and Metal/MPS are untested on hardware.
 
 1D shock runs (2026-10-20)
--------------------------
+--------------------------
 
 The examples run sharp Sod to ``t=0.2`` and sharp Brio-Wu to ``t=0.1``:
 
