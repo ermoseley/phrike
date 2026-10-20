@@ -454,7 +454,9 @@ def _compute_rhs_2d(grid: Grid2D, eqs: EulerEquations2D, U: Array,
     # dU/dt = -(dFx/dx + dFy/dy)
     rhs = -(dFdx + dFdy)
 
-    # Remove SAT/Rusanov boundary fluxes to mirror 1D behavior
+    if getattr(grid, "_mixed_open_y", False):
+        rhs = grid.apply_boundary_flux(rhs, U, eqs, Fy)
+        rhs = grid.project_dealiased(rhs)
     
     # Add artificial viscosity if enabled
     if artificial_viscosity is not None:
@@ -743,6 +745,8 @@ class SpectralSolver2D:
             self.U = U0.copy()
         # Start Fourier runs in the same retained subspace enforced after steps.
         self.U = self.grid.project_dealiased(self.U)
+        if getattr(self.grid, "_mixed_open_y", False):
+            self.U = self.grid.initialize_boundary_conditions(self.U, self.equations)
         self.t = float(t0)
         next_output = self.t + output_interval
         next_checkpoint = (
@@ -761,6 +765,12 @@ class SpectralSolver2D:
         step_count = 0
 
         def record() -> None:
+            if getattr(self.grid, "_mixed_open_y", False):
+                cons = self.grid.conserved_quantities(self.U, self.equations)
+                history["time"].append(self.t)
+                for key in ("mass", "momentum_x", "momentum_y", "energy"):
+                    history[key].append(cons[key])
+                return
             rho, ux, uy, p = self.equations.primitive(self.U)  # type: ignore[arg-type]
             if _TORCH_AVAILABLE and isinstance(rho, (torch.Tensor,)):
                 mass = float(torch.sum(rho).item())
@@ -904,8 +914,18 @@ class SpectralSolverMHD:
         self.viscosity = float(cfg.get("viscosity", 0.0))       # nu
         self.project_each_substage = bool(cfg.get("project_each_substage", True))
         self.divergence_clean = str(cfg.get("divergence_clean", "projection"))
+        if getattr(grid, "_mixed_open_y", False) and self.divergence_clean != "projection":
+            raise ValueError("Mixed open MHD boundaries require magnetic projection")
         self.rho_min = float(cfg.get("rho_min", 1e-10))
         self.p_min = float(cfg.get("p_min", 1e-12))
+        self.ambipolar = None
+        ambipolar_config = cfg.get("ambipolar", {})
+        if ambipolar_config.get("enabled", False):
+            from .nonideal import MidpointAmbipolar
+
+            self.ambipolar = MidpointAmbipolar(grid, ambipolar_config)
+            if adaptive_config and adaptive_config.get("enabled", False):
+                raise ValueError("Ambipolar splitting currently requires fixed-step RK integration")
         # Parabolic-CFL safety factor for explicit diffusion (RK4 stable region on
         # the negative real axis extends to ~2.78; 1.0 leaves a comfortable margin).
         self.cfl_diff = float(cfg.get("cfl_diff", 1.0))
@@ -942,6 +962,13 @@ class SpectralSolverMHD:
         """Max squared wavenumber on the grid (for the parabolic diffusion CFL)."""
         g = self.grid
         try:
+            if getattr(g, "_mixed_open_y", False):
+                D = g._sbp_dy(np.eye(g.Ny))
+                root = np.sqrt(g.wy)
+                D = root[:, None]*D/root[None, :]
+                ky2_bound = np.linalg.norm(D, 1)*np.linalg.norm(D, np.inf)
+                kx = g.kx.detach().cpu().numpy() if g._use_torch else g.kx
+                return float(np.max(kx*kx)+ky2_bound)
             if self.dim == 1:
                 if g._basis_name != "fourier":
                     return 4.0 / g.dx ** 2
@@ -962,12 +989,16 @@ class SpectralSolverMHD:
         F = self.equations.flux(U)
         if self.dim == 2:
             Fx, Fy = F
-            return -(self.grid.dx1(Fx) + self.grid.dy1(Fy))
+            rhs = -(self.grid.dx1(Fx) + self.grid.dy1(Fy))
+            if getattr(self.grid, "_mixed_open_y", False):
+                rhs = self.grid.apply_boundary_flux(rhs, U, self.equations, Fy)
+                rhs = self.grid.project_dealiased(rhs)
+            return rhs
         Fx, Fy, Fz = F
         return -(self.grid.dx1(Fx) + self.grid.dy1(Fy) + self.grid.dz1(Fz))
 
     def _compute_rhs(self, U: Array) -> Array:
-        if self.dim == 1:
+        if self.dim == 1 or getattr(self.grid, "_mixed_open_y", False):
             U = self.grid.apply_boundary_conditions(U, self.equations)
         rhs = self._flux_divergence(U)
         if self.artificial_viscosity is not None:
@@ -1075,14 +1106,23 @@ class SpectralSolverMHD:
         return self._fixed_step(U, dt)
 
     def _fixed_step(self, U: Array, dt: float) -> Array:
+        if getattr(self.grid, "_mixed_open_y", False):
+            U = self.grid.apply_boundary_conditions(U, self.equations)
         U_split = self.grid.apply_spectral_dissipation(U, 0.5 * dt)
+        if self.ambipolar is not None:
+            U_split = self.ambipolar.step(U_split, self.equations, 0.5 * dt)
         Un = self._rk_substages(U_split, dt)
         # Project B before the scalar modal operator; the latter commutes with
         # divergence, so the stored state remains both band-limited and div-free.
         Un = self._project_B(Un)
+        if self.ambipolar is not None:
+            Un = self.ambipolar.step(Un, self.equations, 0.5 * dt)
         Un = self.grid.apply_accepted_state_stabilization(Un, 0.5 * dt)
         if self.dim == 1:
             Un = self.grid.apply_boundary_conditions(Un, self.equations)
+        elif getattr(self.grid, "_mixed_open_y", False):
+            # Finite-tolerance CG need not preserve the SBP divergence exactly.
+            Un = self._project_B(Un)
         return Un
 
     def _adaptive_step(self, U: Array, dt: float) -> Array:
@@ -1151,7 +1191,7 @@ class SpectralSolverMHD:
         # Project the initial state so div(B)=0 from the first stored step.
         self.U = self._project_B(self.U)
         self.U = self.grid.project_dealiased(self.U)
-        if self.dim == 1:
+        if self.dim == 1 or getattr(self.grid, "_mixed_open_y", False):
             self.U = self.grid.initialize_boundary_conditions(self.U, self.equations)
         self.t = float(t0)
         next_output = self.t + output_interval
@@ -1169,7 +1209,9 @@ class SpectralSolverMHD:
         step_count = 0
 
         def record() -> None:
-            cons = self.equations.conserved_quantities(self.U)
+            cons = (self.grid.conserved_quantities(self.U, self.equations)
+                    if getattr(self.grid, "_mixed_open_y", False)
+                    else self.equations.conserved_quantities(self.U))
             history["time"].append(self.t)
             for key in ("mass", "momentum_x", "momentum_y", "momentum_z",
                         "energy", "magnetic_energy", "cross_helicity"):

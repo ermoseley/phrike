@@ -17,6 +17,8 @@ portable NumPy/PyTorch backends—not a production CFD package.
   exploratory shock problems.
 - 1D fixed/Dirichlet, outflow, and wall boundaries for hydro and MHD,
   including independent endpoint and per-variable settings.
+- 2D Fourier-x/SBP-y grids with periodic x and approximately open y faces,
+  plus midpoint-resolvent ambipolar diffusion for 2D MHD.
 - Fixed-step RK2/RK4 and embedded RK23, RK45, and Fehlberg RKF78 integration.
 - NumPy CPU execution plus optional PyTorch CPU, CUDA, and Apple Metal/MPS
   backends.
@@ -107,3 +109,14 @@ python -m phrike brio_wu1d --config configs/brio_wu1d.yaml --backend cpu
 
 See [1D boundary configuration and validation](docs/validation.rst) for the
 endpoint semantics, fixed-value overrides, and measured shock-profile errors.
+
+The single-layer ambipolar-diffusion shear instability example retains all
+three velocity and magnetic components on a two-dimensional grid:
+
+```bash
+python -m phrike adsi2d --config configs/adsi2d.yaml --backend metal
+```
+
+Its open ideal-MHD boundary flux and zero tangential diffusive electric field
+are separate closures. See [validation and limitations](docs/validation.rst)
+before interpreting growth rates or boundary-sensitive results.

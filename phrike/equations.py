@@ -138,7 +138,7 @@ def _flux2d_kernel(U: np.ndarray, gamma: float) -> Tuple[np.ndarray, np.ndarray]
 def _max_wave_speed2d_kernel(U: np.ndarray, gamma: float) -> float:
     rho, ux, uy, p = _primitive2d_kernel(U, gamma)
     a = np.sqrt(gamma * p / rho)
-    c = np.abs(ux) + a
+    c = np.maximum(np.abs(ux), np.abs(uy)) + a
     max_c = 0.0
     for j in range(c.shape[0]):
         for i in range(c.shape[1]):
@@ -366,7 +366,7 @@ class EulerEquations2D:
         if _TORCH_AVAILABLE and isinstance(U, (torch.Tensor,)):
             rho, ux, uy, p = self.primitive(U)
             a = torch.sqrt(self.gamma * p / rho)
-            return float(torch.max(torch.abs(ux) + a).item())
+            return float(torch.max(torch.maximum(torch.abs(ux), torch.abs(uy)) + a).item())
         return float(_max_wave_speed2d_kernel(U, self.gamma))
 
     def conserved_quantities(self, U: Array) -> Dict[str, float]:

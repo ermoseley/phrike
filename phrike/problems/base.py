@@ -514,7 +514,9 @@ class BaseProblem(ABC):
             return {}
 
         # Get current conserved quantities
-        if hasattr(solver.equations, "conserved_quantities"):
+        if getattr(solver.grid, "_mixed_open_y", False):
+            current_cons = solver.grid.conserved_quantities(U, solver.equations)
+        elif hasattr(solver.equations, "conserved_quantities"):
             current_cons = solver.equations.conserved_quantities(U)
         else:
             # Fallback: compute manually - work directly with torch tensors
@@ -819,7 +821,17 @@ class BaseProblem(ABC):
         except Exception:
             max_div_b = float("nan")
 
-        if is_torch:
+        if getattr(solver.grid, "_mixed_open_y", False):
+            _, weights = solver.grid._sbp_arrays(U)
+            w = solver.grid.dx*weights[:, None]
+            volume = solver.grid.Lx*solver.grid.Ly
+            b2 = Bx*Bx+By*By+Bz*Bz
+            mag_e = float((0.5*b2*w).sum())
+            b_rms = (2*mag_e/volume)**0.5
+            p_mean = float((p*w).sum())/volume
+            bmag_mean = mag_e/volume
+            cross_h = float(((ux*Bx+uy*By+uz*Bz)*w).sum())
+        elif is_torch:
             b2 = Bx * Bx + By * By + Bz * Bz
             mag_e = float(torch.sum(0.5 * b2).item())
             b_rms = float(torch.sqrt(torch.mean(b2)).item())
@@ -924,7 +936,9 @@ class BaseProblem(ABC):
             return
 
         # Store initial conserved quantities for error computation
-        if hasattr(solver.equations, "conserved_quantities"):
+        if getattr(solver.grid, "_mixed_open_y", False):
+            self.monitoring_initial_values = solver.grid.conserved_quantities(U, solver.equations)
+        elif hasattr(solver.equations, "conserved_quantities"):
             self.monitoring_initial_values = solver.equations.conserved_quantities(U)
         else:
             # Fallback: compute manually
