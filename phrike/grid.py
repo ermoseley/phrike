@@ -1146,6 +1146,16 @@ class Grid2D:
             self.backend, self.torch_device
         )
         self._mixed_open_y = self.basis_x == "fourier" and self.basis_y == "sbp"
+        sbp_params = (self.filter_params or {}).get("sbp_dissipation", {})
+        if not isinstance(sbp_params, dict):
+            raise TypeError("sbp_dissipation must be a mapping")
+        strength = float(sbp_params.get("strength", 0.0))
+        if not np.isfinite(strength) or strength < 0.0:
+            raise ValueError("SBP dissipation strength must be finite and nonnegative")
+        enabled = bool(sbp_params.get("enabled", False))
+        if enabled and not self._mixed_open_y:
+            raise ValueError("SBP dissipation requires Fourier x and SBP y")
+        self.sbp_dissipation_strength = strength if enabled else 0.0
         self.dx = self.Lx / self.Nx
         self.dy = self.Ly / self.Ny
         # Precompute minimum node spacings for CFL with nonuniform grids (Legendre)
@@ -1401,6 +1411,36 @@ class Grid2D:
         result[..., 0, :] -= f[..., 0, :] / weights[0]
         result[..., -1, :] += f[..., -1, :] / weights[-1]
         return result
+
+    def sbp_dissipation_rate_bound(self, speed):
+        """Upper bound for the nonnegative KO6 decay rates in the SBP norm."""
+        speed = float(speed)
+        if not np.isfinite(speed) or speed < 0.0:
+            raise ValueError("SBP dissipation speed must be finite and nonnegative")
+        if self.sbp_dissipation_strength == 0.0:
+            return 0.0
+        return self.sbp_dissipation_strength * speed / float(np.min(self.wy))
+
+    def sbp_dissipation(self, f, speed):
+        """Conservative H-negative KO6 RHS, using unwrapped y differences.
+
+        Q = -strength*speed/64 H^-1 R3.T R3. Its truncation contribution
+        is O(dy^5) inside and O(dy^2) at the boundary closure.
+        """
+        rate_bound = self.sbp_dissipation_rate_bound(speed)
+        result = (torch.zeros_like(f) if _TORCH_AVAILABLE and isinstance(f, torch.Tensor)
+                  else np.zeros_like(f))
+        if rate_bound == 0.0:
+            return result
+        difference = f[..., 1:, :] - f[..., :-1, :]
+        difference = difference[..., 1:, :] - difference[..., :-1, :]
+        difference = difference[..., 1:, :] - difference[..., :-1, :]
+        result[..., :-3, :] -= difference
+        result[..., 1:-2, :] += 3.0 * difference
+        result[..., 2:-1, :] -= 3.0 * difference
+        result[..., 3:, :] += difference
+        _, weights = self._sbp_arrays(f)
+        return (-self.sbp_dissipation_strength * float(speed) / 64.0) * result / weights[:, None]
 
     def _mixed_fft_x(self, f):
         if getattr(self, "_use_torch", False):

@@ -35,6 +35,9 @@ integration:
   checkpoint_interval: 0.0
   spectral_dissipation:
     enabled: false
+  sbp_dissipation:
+    enabled: true
+    strength: 0.01
 
 initial_conditions:
   p0: 60.0
