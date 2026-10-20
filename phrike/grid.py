@@ -1136,7 +1136,7 @@ class Grid2D:
     precision: str = "double"  # "single" or "double"
     debug: bool = False
     basis_x: str = "fourier"  # "fourier" or "legendre"
-    basis_y: str = "fourier"  # "fourier" or "legendre"
+    basis_y: str = "fourier"  # "fourier", "legendre", or "sbp" (open y)
     bc: str = "dirichlet"     # Simple boundary condition like SOD
     # Boundary condition configuration
     bc_config: Optional[Dict[str, Any]] = None
@@ -1145,6 +1145,7 @@ class Grid2D:
         self.backend, self.torch_device = resolve_backend(
             self.backend, self.torch_device
         )
+        self._mixed_open_y = self.basis_x == "fourier" and self.basis_y == "sbp"
         self.dx = self.Lx / self.Nx
         self.dy = self.Ly / self.Ny
         # Precompute minimum node spacings for CFL with nonuniform grids (Legendre)
@@ -1235,6 +1236,14 @@ class Grid2D:
                     self.dy_min = float(_np.min(_np.diff(self.y))) if len(self.y) > 1 else self.dy
                 except Exception:
                     self.dy_min = self.dy
+            elif self._mixed_open_y:
+                if self.Ny < 9:
+                    raise ValueError("The open SBP direction requires Ny >= 9")
+                self.dy = self.Ly / (self.Ny - 1)
+                self.dy_min = self.dy
+                self.y = np.linspace(0.0, self.Ly, self.Ny)
+                self.ky = self.iky = None
+                self._setup_sbp_y()
             else:
                 raise ValueError(f"Unknown basis_y: {self.basis_y}")
 
@@ -1250,6 +1259,10 @@ class Grid2D:
 
         # Hard dealias projection and optional timestep-aware Fourier dissipation.
         self.dealias_mask = _build_filter_mask_2d(self.Nx, self.Ny, self.dealias)
+        if self._mixed_open_y:
+            self.dealias_mask = np.broadcast_to(
+                _build_filter_mask(self.Nx, self.dealias), (self.Ny, self.Nx)
+            ).copy()
         pure_fourier = self.basis_x == "fourier" and self.basis_y == "fourier"
         enabled, p, rate, onset = _spectral_dissipation_settings(
             self.filter_params if pure_fourier else None
@@ -1332,11 +1345,90 @@ class Grid2D:
                     dtype=torch_dtype, device=self.torch_device
                 )
 
+    def _setup_sbp_y(self) -> None:
+        """Fourth-order interior, second-order boundary diagonal-norm SBP."""
+        rows = np.zeros((4, 6))
+        rows[0, :4] = [-24/17, 59/34, -4/17, -3/34]
+        rows[1, :3] = [-1/2, 0, 1/2]
+        rows[2, :5] = [4/43, -59/86, 0, 59/86, -4/43]
+        rows[3, :6] = [3/98, 0, -59/98, 0, 32/49, -4/49]
+        self._sbp_rows = rows / self.dy
+        self.wy = np.ones(self.Ny) * self.dy
+        self.wy[:4] *= [17/48, 59/48, 43/48, 49/48]
+        self.wy[-4:] = self.wy[:4][::-1]
+        self._sbp_backend_cache = {}
+        self._boundary_reference = None
+
+    def _sbp_arrays(self, ref):
+        is_torch = _TORCH_AVAILABLE and isinstance(ref, torch.Tensor)
+        key = (str(ref.device) if is_torch else "numpy", str(ref.dtype))
+        if key not in self._sbp_backend_cache:
+            if is_torch:
+                rows = torch.as_tensor(self._sbp_rows, dtype=ref.dtype, device=ref.device)
+                weights = torch.as_tensor(self.wy, dtype=ref.real.dtype, device=ref.device)
+            else:
+                rows = self._sbp_rows.astype(ref.dtype)
+                weights = self.wy.astype(ref.real.dtype)
+            self._sbp_backend_cache[key] = rows, weights
+        return self._sbp_backend_cache[key]
+
+    def _sbp_dy(self, f):
+        rows, _ = self._sbp_arrays(f)
+        if _TORCH_AVAILABLE and isinstance(f, torch.Tensor):
+            result = torch.empty_like(f)
+            multiply = torch.einsum
+            top = f[..., -6:, :].flip(-2)
+        else:
+            result = np.empty_like(f)
+            multiply = np.einsum
+            top = f[..., -6:, :][..., ::-1, :]
+        result[..., 4:-4, :] = (
+            8.0 * (f[..., 5:-3, :] - f[..., 3:-5, :])
+            - (f[..., 6:-2, :] - f[..., 2:-6, :])
+        ) / (12.0 * self.dy)
+        result[..., :4, :] = multiply("ij,...jx->...ix", rows,
+                                     f[..., :6, :] - f[..., :1, :])
+        upper = -multiply("ij,...jx->...ix", rows, top - top[..., :1, :])
+        result[..., -4:, :] = upper.flip(-2) if _TORCH_AVAILABLE and isinstance(upper, torch.Tensor) else upper[..., ::-1, :]
+        return result
+
+    def dy_adjoint(self, f):
+        """Adjoint of the mixed-grid y derivative in its SBP quadrature."""
+        if not self._mixed_open_y:
+            return -self.dy1(f)
+        _, weights = self._sbp_arrays(f)
+        result = -self.dy1(f)
+        result[..., 0, :] -= f[..., 0, :] / weights[0]
+        result[..., -1, :] += f[..., -1, :] / weights[-1]
+        return result
+
+    def _mixed_fft_x(self, f):
+        if getattr(self, "_use_torch", False):
+            return torch.fft.fft(f, dim=-1)
+        return scipy_fft.fft(f, axis=-1, workers=self.fft_workers)
+
+    def _mixed_ifft_x(self, f):
+        if getattr(self, "_use_torch", False):
+            return torch.fft.ifft(f, dim=-1).real
+        return scipy_fft.ifft(f, axis=-1, workers=self.fft_workers).real
+
     def _parse_boundary_conditions(self) -> None:
         """Parse boundary condition configuration for 2D grid."""
         # Initialize boundary condition maps
         self._bc_boundary_map = {}
         self._dirichlet_values_map = {}
+        if self._mixed_open_y:
+            aliases = {"outflow": "open", "neumann": "open"}
+            for side in ("left", "right", "bottom", "top"):
+                default = "periodic" if side in ("left", "right") else "open"
+                kind = str((self.bc_config or {}).get(side, default)).lower()
+                kind = aliases.get(kind, kind)
+                if (side in ("left", "right") and kind != "periodic") or (
+                    side in ("bottom", "top") and kind != "open"
+                ):
+                    raise ValueError("Fourier/SBP grids require periodic x and open y")
+                self._bc_boundary_map[side] = kind
+            return
         
         if not self.bc_config:
             # Default all boundaries to global bc if provided
@@ -1410,6 +1502,49 @@ class Grid2D:
                         "pressure": "dirichlet"
                     }
 
+    def initialize_boundary_conditions(self, U, equations):
+        """Store the initial ambient exterior for the mixed-grid open faces."""
+        if self._mixed_open_y:
+            boundary = U[:, [0, -1], :]
+            self._boundary_reference = (boundary.clone() if _TORCH_AVAILABLE
+                                        and isinstance(U, torch.Tensor) else boundary.copy())
+        return self.apply_boundary_conditions(U, equations)
+
+    def apply_boundary_flux(self, rhs, U, equations, Fy):
+        """Strong SBP/Rusanov penalty against the initial ambient exterior.
+
+        Open endpoints evolve with the interior. Copying neighbouring values
+        instead traps the high-wavenumber branch of a centred derivative.
+        MHD callers project the accepted magnetic state to enforce div(B)=0.
+        """
+        if not self._mixed_open_y:
+            return rhs
+        if self._boundary_reference is None:
+            self.initialize_boundary_conditions(U, equations)
+        exterior = self._boundary_reference
+        exterior_flux = equations.flux(exterior)[1]
+        is_torch = _TORCH_AVAILABLE and isinstance(U, torch.Tensor)
+
+        def speed(state):
+            primitive = equations.primitive(state)
+            rho, uy = primitive[0], primitive[2]
+            p = primitive[4] if state.shape[0] == 8 else primitive[3]
+            c2 = equations.gamma*p/rho
+            if state.shape[0] == 8:
+                c2 = c2+(state[5:8]**2).sum(axis=0)/rho
+            return (torch.abs(uy)+torch.sqrt(torch.clamp(c2, min=0)) if is_torch
+                    else np.abs(uy)+np.sqrt(np.maximum(c2, 0)))
+
+        interior = U[:, [0, -1], :]
+        maximum = torch.maximum if is_torch else np.maximum
+        signal = maximum(speed(interior), speed(exterior))
+        for side, endpoint, normal in ((0, 0, -1), (1, -1, 1)):
+            outward = normal*Fy[:, endpoint]
+            numerical = (0.5*(outward+normal*exterior_flux[:, side])
+                         -0.5*signal[side]*(exterior[:, side]-U[:, endpoint]))
+            rhs[:, endpoint] -= (numerical-outward)/self.wy[endpoint]
+        return rhs
+
     def apply_boundary_conditions(self, U: np.ndarray, equations) -> np.ndarray:
         """Apply boundary conditions to conservative variables U in-place for 2D grid.
         
@@ -1420,6 +1555,12 @@ class Grid2D:
         Returns:
             U with boundary conditions applied
         """
+        if self._mixed_open_y:
+            if U.shape[0] not in (4, 8) or U.shape[-2:] != (self.Ny, self.Nx):
+                raise ValueError("Mixed 2D boundaries require a hydro or MHD state")
+            if self._boundary_reference is None and equations is not None:
+                self.initialize_boundary_conditions(U, equations)
+            return U
         if self._legendre_basis is None:
             # Only apply BCs for Legendre basis
             return U
@@ -1496,6 +1637,8 @@ class Grid2D:
 
     # 2D FFT wrappers
     def fft2(self, f: np.ndarray) -> np.ndarray:
+        if self._mixed_open_y:
+            raise ValueError("A Fourier/SBP grid has no periodic transform in y")
         if getattr(self, "_use_torch", False):
             assert torch is not None
             return torch.fft.fft2(f, dim=(-2, -1))
@@ -1505,6 +1648,8 @@ class Grid2D:
             return scipy_fft.fft2(f, axes=(-2, -1))
 
     def ifft2(self, F: np.ndarray) -> np.ndarray:
+        if self._mixed_open_y:
+            raise ValueError("A Fourier/SBP grid has no periodic transform in y")
         if getattr(self, "_use_torch", False):
             assert torch is not None
             return torch.fft.ifft2(F, dim=(-2, -1)).real
@@ -1659,6 +1804,9 @@ class Grid2D:
 
     def dx1(self, f: np.ndarray) -> np.ndarray:
         # derivative along x on last spatial axis
+        if self._mixed_open_y:
+            F = self._mixed_fft_x(f)
+            return self._mixed_ifft_x(F * self.dealias_mask * self.ikx)
         if self._legendre_basis is not None:
             # Use 2D Legendre basis directly (supports NumPy and Torch)
             return self._legendre_basis.dx(f)
@@ -1676,6 +1824,8 @@ class Grid2D:
 
     def dy1(self, f: np.ndarray) -> np.ndarray:
         # derivative along y on second-to-last spatial axis
+        if self._mixed_open_y:
+            return self._sbp_dy(f)
         if self._legendre_basis is not None:
             # Use 2D Legendre basis directly (supports NumPy and Torch)
             return self._legendre_basis.dy(f)
@@ -1693,6 +1843,10 @@ class Grid2D:
 
     def project_dealiased(self, f: np.ndarray) -> np.ndarray:
         """Project Fourier directions onto the retained 2/3 modal subspace."""
+        if self._mixed_open_y:
+            if not self.dealias:
+                return f
+            return self._mixed_ifft_x(self._mixed_fft_x(f) * self.dealias_mask)
         if self._legendre_basis is not None:
             return f
         if self.basis_x == "fourier" and self.basis_y == "fourier":
@@ -1707,6 +1861,8 @@ class Grid2D:
         """Apply exp(-dt*lambda(k)); optionally combine dealias projection."""
         if dt < 0.0:
             raise ValueError("spectral dissipation dt must be non-negative")
+        if self._mixed_open_y:
+            return self.project_dealiased(f) if project else f
         if self._legendre_basis is not None:
             return f
         pure_fourier = self.basis_x == "fourier" and self.basis_y == "fourier"
@@ -1734,6 +1890,8 @@ class Grid2D:
         self, f: np.ndarray, dt: float
     ) -> np.ndarray:
         """Project Fourier states or apply the separate Legendre modal filter."""
+        if self._mixed_open_y:
+            return self.project_dealiased(f)
         pure_fourier = self.basis_x == "fourier" and self.basis_y == "fourier"
         if pure_fourier:
             return self.apply_spectral_dissipation(f, dt, project=True)
@@ -1744,8 +1902,26 @@ class Grid2D:
         return self.apply_accepted_state_stabilization(f, 0.0)
 
     # --- MHD solenoidal helpers (2D) ---
+    def conserved_quantities(self, U, equations):
+        """Use physical SBP quadrature for mixed-grid conservation diagnostics."""
+        if not self._mixed_open_y:
+            return equations.conserved_quantities(U)
+        _, weights = self._sbp_arrays(U)
+        w = self.dx*weights[:, None]
+        mhd = U.shape[0] == 8
+        keys = (["mass", "momentum_x", "momentum_y", "momentum_z", "energy"]
+                if mhd else ["mass", "momentum_x", "momentum_y", "energy"])
+        totals = (U[:len(keys)]*w).sum(axis=(-2, -1))
+        result = {key: float(value) for key, value in zip(keys, totals)}
+        if mhd:
+            result["magnetic_energy"] = float((0.5*(U[5:8]**2).sum(axis=0)*w).sum())
+            result["cross_helicity"] = float(((U[1:4]*U[5:8]).sum(axis=0)/U[0]*w).sum())
+        return result
+
     def divergence(self, Bx: np.ndarray, By: np.ndarray) -> np.ndarray:
         """2D spectral divergence dxBx + dyBy using the masked derivative operator."""
+        if self._mixed_open_y:
+            return self.dx1(Bx) + self.dy1(By)
         Fx = self._apply_dealias_mask(self.fft2(Bx))
         Fy = self._apply_dealias_mask(self.fft2(By))
         div_hat = self.ikx * Fx + self.iky * Fy
@@ -1758,6 +1934,8 @@ class Grid2D:
         mode, i.e. div(B) = 0 to machine precision. Bz (out-of-plane) does not
         enter the 2D divergence and is left untouched by the caller.
         """
+        if self._mixed_open_y:
+            return self._project_mixed_solenoidal(Bx, By)
         if self.kx is None or self.ky is None:
             raise ValueError("project_solenoidal requires Fourier basis in x and y")
         Fx = self.fft2(Bx)
@@ -1783,8 +1961,50 @@ class Grid2D:
         Fy = Fy - ky * coef
         return self.ifft2(Fx), self.ifft2(Fy)
 
+    def _project_mixed_solenoidal(self, Bx, By):
+        """Weighted projection onto Dx Bx + Dy By = 0, with free normal B."""
+        if not hasattr(self, "_mixed_poisson"):
+            from scipy.linalg import eigh
+
+            D = self._sbp_dy(np.eye(self.Ny))
+            root = np.sqrt(self.wy)
+            weighted_D = root[:, None] * D / root[None, :]
+            values, vectors = eigh(weighted_D @ weighted_D.T)
+            values[values < 1e-10 * values[-1]] = 0.0
+            self._mixed_poisson = values, vectors, root
+            self._mixed_poisson_cache = {}
+        is_torch = _TORCH_AVAILABLE and isinstance(Bx, torch.Tensor)
+        key = (str(Bx.device) if is_torch else "numpy", str(Bx.dtype))
+        if key not in self._mixed_poisson_cache:
+            arrays = self._mixed_poisson
+            if is_torch:
+                arrays = tuple(torch.as_tensor(a, dtype=Bx.dtype, device=Bx.device) for a in arrays)
+            else:
+                arrays = tuple(a.astype(Bx.dtype) for a in arrays)
+            self._mixed_poisson_cache[key] = arrays
+        values, vectors, root = self._mixed_poisson_cache[key]
+        Fx, Fy = self._mixed_fft_x(Bx), self._mixed_fft_x(By)
+        ik = self.ikx * self.dealias_mask
+        if self.Nx % 2 == 0:
+            ik = ik.clone() if is_torch else ik.copy()
+            ik[..., self.Nx // 2] = 0.0
+        q = root[:, None] * (ik * Fx + self.dy1(Fy))
+        denominator = values[:, None] + abs(ik)**2
+        if is_torch:
+            inverse = torch.where(denominator > 0, 1.0 / denominator.clamp_min(1e-30), 0.0)
+            def solve(part):
+                return vectors @ ((vectors.T @ part) * inverse)
+            phi = torch.complex(solve(q.real), solve(q.imag)) / root[:, None]
+        else:
+            inverse = np.divide(1.0, denominator, out=np.zeros_like(denominator), where=denominator > 0)
+            phi = (vectors @ ((vectors.T @ q) * inverse)) / root[:, None]
+        return (self._mixed_ifft_x(Fx + ik * phi),
+                self._mixed_ifft_x(Fy - self.dy_adjoint(phi)))
+
     def laplacian(self, f: np.ndarray) -> np.ndarray:
         """2D spectral Laplacian (for explicit resistivity/viscosity)."""
+        if self._mixed_open_y:
+            return self.dx1(self.dx1(f)) - self.dy_adjoint(self.dy1(f))
         if self.kx is None or self.ky is None:
             raise ValueError("laplacian requires Fourier basis in x and y")
         F = self._apply_dealias_mask(self.fft2(f))

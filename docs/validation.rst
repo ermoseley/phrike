@@ -76,8 +76,8 @@ Fixed values are captured anew at each ``solver.run``; explicit overrides
 are preferable when restarting if the original boundary data must persist.
 Lobatto MHD projection retains the quadrature-weighted mean longitudinal field.
 
-Only 1D has been extended here; multi-dimensional boundary behavior is unchanged.
-NumPy and Torch CPU are checked. CUDA and Metal/MPS are untested on hardware.
+These polynomial-boundary checks cover NumPy and Torch CPU; they do not
+qualify polynomial runs on CUDA or Metal/MPS hardware.
 
 1D shock runs (2026-10-20)
 --------------------------
@@ -254,3 +254,82 @@ overintegrated mode products, positive extra-node shock states, original-state
 immutability, constant longitudinal field, fixed/wall/extrapolating BCs,
 accepted/rejected RK paths, and NumPy/Torch CPU precision behavior.
 Accelerator parity has not been established.
+
+2D mixed boundaries and ambipolar diffusion
+-------------------------------------------
+
+``Grid2D(basis_x="fourier", basis_y="sbp")`` uses a periodic x direction and
+uniform, endpoint-inclusive y nodes. The y derivative is diagonal-norm SBP4(2):
+fourth order in the interior and second order at the boundary. Its quadrature
+weights are used for mixed-grid conservation diagnostics and magnetic
+projection. The hard 2/3 projection acts only in x. There is no periodic y
+transform or smooth y filter on this path.
+
+Specify ``left``/``right`` as ``periodic`` and ``bottom``/``top`` as ``open``
+in ``bc_config``; ``outflow`` and ``neumann`` are aliases for this open flux
+closure, not derivative constraints. Endpoints evolve through an SBP/Rusanov
+boundary flux against the initial ambient exterior state. Unlike endpoint
+copying, this lets outgoing acoustic energy leave without a later recurrence.
+The exterior is recaptured by ``solver.run``; restart boundary values therefore
+come from the restart state. Walls and other orientations are not implemented
+on this new path.
+
+MHD requires ``divergence_clean: projection``. The weighted projection allows
+normal magnetic flux and holds thermal pressure fixed while changing magnetic
+and total energy. ``project_each_substage: false`` projects accepted states;
+intermediate RK stages need not be solenoidal. This is not constrained transport
+or an exactly non-reflecting MHD boundary. Outgoing oblique MHD packets retain
+some reflected energy, so boundary-distance checks remain necessary.
+
+``physics.mhd.ambipolar`` enables constant-coupling ambipolar diffusion with
+``eta`` multiplying ``(B**2 I - B B.T) curl(B)``. Only two-dimensional MHD is
+supported. Set ``method: midpoint_resolvent``; optional solver controls are
+``midpoint_tol``, ``midpoint_maxiter``, and ``preconditioner: fourier_tensor``
+(or ``none``). Adaptive RK integration is rejected when this split operator
+is enabled. Explicit resistivity and viscosity retain separate diffusion CFL
+limits, including the SBP derivative bound on mixed grids.
+
+The ambipolar step predicts the coefficient field at half time, then applies
+``(I - h L + h**2 L**2 / 2)**(-1)`` with that field frozen. An H-weighted
+increment CG solve uses a checked true relative residual and raises on failure.
+Fourier transforms in the preconditioner do not impose periodic physical y
+boundaries. Strang half-steps around the ideal RK update give second-order
+combined time integration. Total energy evolves through the corresponding
+conservative diffusive Poynting flux, allowing magnetic energy to heat the gas.
+
+At open y faces the diffusive closure sets tangential ambipolar electric field
+to zero. This differs from transparent diffusion and from the ideal-MHD open
+flux. The boundary tensor is projected on both sides to preserve weighted
+symmetry and dissipation; its constitutive accuracy can be lower at endpoints
+with nonzero normal magnetic field. Localized modes require a wider-domain
+control before interpreting their growth.
+
+The focused tests check the SBP identity, outgoing acoustic-pulse recurrence,
+projection, explicit diffusion stability, weighted ambipolar dissipation and
+energy balance, nonlinear second-order time accuracy, CG failure handling,
+and NumPy/Torch CPU agreement. These checks alone do not establish full MHD
+boundary transparency or general accelerator parity.
+
+ADSI example
+~~~~~~~~~~~~
+
+.. code-block:: bash
+
+   python -m phrike adsi2d --config configs/adsi2d.yaml --backend metal
+
+This is a 2.5D single layer: all three vector components are retained, while
+fields depend only on x and y. The flow is out of plane,
+``U_z = 0.5*tanh((y - Ly/2)/0.05)``, with ``B=(b,0,b)`` and
+``b=1/sqrt(4*pi)``. Density is one, thermal pressure is 60, gamma is 5/3, and
+the ambipolar coupling coefficient is one. Periodic x has length one; the
+shipped transverse domain has length two. This geometry suppresses the usual
+flow-parallel Kelvin--Helmholtz mode while retaining ambipolar shear coupling.
+
+The seed is a compressible linear eigenmode computed independently on a padded
+periodic perturbation domain, with the same localized single-layer shear.
+Initial in-plane magnetic perturbations use a discrete vector potential.
+The reference growth is 0.450648772464; doubling reference resolution changes
+it by approximately 5e-13, and doubling its transverse domain changes it by
+4.2e-9. This is a padded linear reference, not an exact solution of the
+production open boundary conditions. Set ``reference_alpha: 1`` when disabling
+ambipolar diffusion to retain identical initial data in an ideal-MHD control.
