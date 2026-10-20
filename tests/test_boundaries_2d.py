@@ -86,6 +86,25 @@ def test_mixed_explicit_diffusion_respects_sbp_stability_bound():
     assert np.linalg.norm(result[7]) < np.linalg.norm(U[7])
 
 
+@pytest.mark.parametrize("mhd", [False, True])
+def test_sbp_dissipation_controls_stationary_grid_scale_shear(mhd):
+    grid = Grid2D(4, 33, 1.0, 2.0, basis_y="sbp", backend="numpy",
+                  filter_params={"sbp_dissipation": {"enabled": True, "strength": 2.0}})
+    X, _ = grid.xy_mesh()
+    one, zero = X*0+1, X*0
+    ux = 1e-4*np.broadcast_to((-1.0)**np.arange(grid.Ny)[:, None], X.shape)
+    eq = MHDEquations2D() if mhd else EulerEquations2D()
+    U = (eq.conservative(one, ux, zero, zero, one, zero+.3, zero, zero+.3)
+         if mhd else eq.conservative(one, ux, zero, one))
+    solver = (SpectralSolverMHD2D(grid, eq, cfl=.65) if mhd
+              else SpectralSolver2D(grid, eq, cfl=.65))
+    dt = solver.compute_dt(U)
+    assert dt*grid.sbp_dissipation_rate_bound(eq.max_wave_speed(U)) <= 1.0+1e-14
+    result = solver.step(U, dt)
+    assert np.sum(grid.wy[:, None]*result[1]**2) < np.sum(grid.wy[:, None]*U[1]**2)
+    assert eq.primitive(result)[4 if mhd else 3].min() > 0.0
+
+
 @pytest.mark.parametrize("backend", ["numpy", "torch"])
 def test_transverse_flow_enters_hydro_cfl(backend):
     if backend == "torch":

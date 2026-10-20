@@ -265,6 +265,19 @@ weights are used for mixed-grid conservation diagnostics and magnetic
 projection. The hard 2/3 projection acts only in x. There is no periodic y
 transform or smooth y filter on this path.
 
+For nonlinear mixed-grid runs, ``integration.sbp_dissipation`` can enable
+conservative high-order numerical damping with ``strength: 0.01``. It applies
+the negative SBP-weighted transpose product of third forward differences to
+all conserved variables inside the RK right-hand side. The interior
+checkerboard damping rate is ``strength * max_wave_speed / dy``; the term
+vanishes as fifth order in the interior and second order at the endpoints
+under refinement. It preserves SBP-weighted totals and constants before
+boundary fluxes and magnetic projection. This is numerical regularization,
+separate from physical ambipolar diffusion; its strength and grid dependence
+must be checked for nonlinear results. The timestep includes its damping
+bound. The ADSI example enables it because centered y derivatives otherwise
+admit nearly alternating computational modes that nonlinear terms can feed.
+
 Specify ``left``/``right`` as ``periodic`` and ``bottom``/``top`` as ``open``
 in ``bc_config``; ``outflow`` and ``neumann`` are aliases for this open flux
 closure, not derivative constraints. Endpoints evolve through an SBP/Rusanov

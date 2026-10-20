@@ -119,6 +119,9 @@ class BaseProblem(ABC):
             "modal_filter": integration.get(
                 "modal_filter", {"enabled": False}
             ),
+            "sbp_dissipation": integration.get(
+                "sbp_dissipation", {"enabled": False}
+            ),
         }
         
         # Grid parameters

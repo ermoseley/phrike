@@ -457,6 +457,8 @@ def _compute_rhs_2d(grid: Grid2D, eqs: EulerEquations2D, U: Array,
     if getattr(grid, "_mixed_open_y", False):
         rhs = grid.apply_boundary_flux(rhs, U, eqs, Fy)
         rhs = grid.project_dealiased(rhs)
+        if grid.sbp_dissipation_strength > 0.0:
+            rhs += grid.sbp_dissipation(U, eqs.max_wave_speed(U))
     
     # Add artificial viscosity if enabled
     if artificial_viscosity is not None:
@@ -625,7 +627,12 @@ class SpectralSolver2D:
         # Use true minimum node spacing if available (Legendre/nonuniform)
         dx_eff = getattr(self.grid, "dx_min", None) or self.grid.dx
         dy_eff = getattr(self.grid, "dy_min", None) or self.grid.dy
-        return self.cfl * min(dx_eff, dy_eff) / max_speed
+        dt = self.cfl * min(dx_eff, dy_eff) / max_speed
+        if getattr(self.grid, "_mixed_open_y", False):
+            rate = self.grid.sbp_dissipation_rate_bound(max_speed)
+            if rate > 0.0:
+                dt = min(dt, 1.0 / rate)
+        return dt
 
     def step(self, U: Array, dt: float) -> Array:
         """Perform one time step using the configured scheme.
@@ -1001,6 +1008,9 @@ class SpectralSolverMHD:
         if self.dim == 1 or getattr(self.grid, "_mixed_open_y", False):
             U = self.grid.apply_boundary_conditions(U, self.equations)
         rhs = self._flux_divergence(U)
+        if (getattr(self.grid, "_mixed_open_y", False)
+                and self.grid.sbp_dissipation_strength > 0.0):
+            rhs += self.grid.sbp_dissipation(U, self.equations.max_wave_speed(U))
         if self.artificial_viscosity is not None:
             terms = self.artificial_viscosity.compute_viscosity_terms(U, self.grid, self.equations)
             for i, term in enumerate(terms):
@@ -1095,8 +1105,11 @@ class SpectralSolverMHD:
             dt_hyp = min(dt_hyp, _artificial_viscosity_dt(self.grid, self.artificial_viscosity))
         # Parabolic CFL for explicit resistivity/viscosity: dt <= cfl_diff/(D k^2_max)
         diff = max(self.resistivity, self.viscosity)
-        if diff > 0.0 and self._k2_max > 0.0:
-            dt_diff = self.cfl_diff / (diff * self._k2_max)
+        rate = diff * self._k2_max
+        if getattr(self.grid, "_mixed_open_y", False):
+            rate += self.grid.sbp_dissipation_rate_bound(max_speed)
+        if rate > 0.0:
+            dt_diff = self.cfl_diff / rate
             return min(dt_hyp, dt_diff)
         return dt_hyp
 
