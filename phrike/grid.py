@@ -500,7 +500,7 @@ class Grid1D:
     """1D grid and spectral operators with pluggable basis.
 
     Default is periodic Fourier basis on a uniform grid. Optionally, a
-    Legendre–Gauss–Lobatto collocation basis with non-periodic BCs can be used.
+    Legendre or Chebyshev–Gauss–Lobatto basis supports non-periodic BCs.
 
     Attributes
     ----------
@@ -509,21 +509,21 @@ class Grid1D:
     Lx : float
         Domain length.
     basis : str
-        Spectral basis: "fourier" (default) or "legendre".
+        Spectral basis: "fourier" (default), "legendre", or "chebyshev".
     bc : Optional[str]
         Boundary condition for non-periodic bases (e.g., "dirichlet").
     dealias : bool
-        If True, apply 2/3-rule dealiasing mask in spectral space (Fourier only).
+        If True, use the 2/3 Fourier mask or 3/2 polynomial flux overintegration.
     filter_params : Optional[Dict[str, Any]]
         Basis-specific stabilization configuration. Fourier grids accept only
-        timestep-aware ``spectral_dissipation`` settings; Legendre grids use an
+        timestep-aware ``spectral_dissipation`` settings; polynomial grids use an
         independent accepted-step ``modal_filter``.
     """
 
     N: int
     Lx: float
     basis: str = "fourier"
-    bc: Optional[str] = None
+    bc: Optional[str | Dict[str, Any]] = None
     dealias: bool = True
     filter_params: Optional[Dict[str, Any]] = None
     fft_workers: int = 1
@@ -538,14 +538,23 @@ class Grid1D:
             self.backend, self.torch_device
         )
 
-        # Normalize/parse boundary condition configuration (string, dict, or per-boundary dict)
+        if int(self.N) != self.N or self.N < 2:
+            raise ValueError("Grid1D requires at least two nodes")
+        if not np.isfinite(self.Lx) or self.Lx <= 0.0:
+            raise ValueError("Lx must be positive and finite")
+
+        # Normalize global, per-variable, or per-endpoint boundary conditions.
         def _normalize_bc_value(name: str) -> str:
             n = str(name).strip().lower()
-            if n in ("reflective", "dirichlet", "wall"):
+            if n in ("reflective", "reflecting", "wall"):
                 return "wall"
-            if n in ("neumann", "open"):
-                return "neumann"
-            return n
+            if n in ("neumann", "open", "outflow"):
+                return "outflow"
+            if n in ("dirichlet", "fixed"):
+                return "fixed"
+            if n == "periodic":
+                return n
+            raise ValueError(f"Unknown 1D boundary condition: {name}")
 
         def _normalize_var_name(v: str) -> str:
             n = str(v).strip().lower()
@@ -555,6 +564,8 @@ class Grid1D:
                 return "pressure"
             if n in ("u", "velocity", "mom", "momentum", "momentum_x"):
                 return "momentum"
+            if n not in ("momentum_y", "momentum_z", "bx", "by", "bz", "default"):
+                raise ValueError(f"Unknown 1D boundary variable: {v}")
             return n
 
         def _normalize_boundary_name(b: str) -> str:
@@ -563,13 +574,14 @@ class Grid1D:
                 return "left"
             if n in ("right", "x1", "x_max", "end"):
                 return "right"
-            return n
+            raise ValueError(f"Unknown 1D boundary: {b}")
 
         # bc may be a string, per-variable dict, or per-boundary dict
         self._bc_global: str | None = None
         self._bc_map: dict[str, str] | None = None
         self._bc_boundary_map: dict[str, dict[str, str]] | None = None  # {boundary: {var: bc}}
         self._dirichlet_values_map: dict[str, tuple[float, float]] | None = None
+        self._boundary_reference = None
         
         if isinstance(self.bc, dict):
             # Check if this is a per-boundary configuration
@@ -587,11 +599,7 @@ class Grid1D:
                     else:
                         # Single BC for all variables on this boundary
                         bc_value = _normalize_bc_value(var_bc_dict)
-                        self._bc_boundary_map[boundary] = {
-                            "density": bc_value,
-                            "momentum": bc_value,
-                            "pressure": bc_value
-                        }
+                        self._bc_boundary_map[boundary] = {"default": bc_value}
             else:
                 # Per-variable configuration: {var: bc}
                 self._bc_map = {}
@@ -599,11 +607,21 @@ class Grid1D:
                     self._bc_map[_normalize_var_name(k)] = _normalize_bc_value(v)
         elif isinstance(self.bc, str) and self.bc:
             self._bc_global = _normalize_bc_value(self.bc)
-        else:
-            self._bc_global = None
+        elif self.bc is not None:
+            raise ValueError("1D bc must be a boundary name or mapping")
 
         # Basis selection (Fourier default)
         self._basis_name = str(self.basis).lower()
+        configured_bcs = [self._bc_global] if self._bc_global else []
+        if self._bc_map:
+            configured_bcs.extend(self._bc_map.values())
+        if self._bc_boundary_map:
+            for values in self._bc_boundary_map.values():
+                configured_bcs.extend(values.values())
+        if self._basis_name == "fourier" and any(b != "periodic" for b in configured_bcs):
+            raise ValueError("Fourier grids require periodic boundary conditions")
+        if self._basis_name != "fourier" and "periodic" in configured_bcs:
+            raise ValueError("Periodic boundary conditions require the Fourier basis")
 
         if self._basis_name == "fourier":
             # Existing periodic uniform grid path
@@ -639,12 +657,12 @@ class Grid1D:
                 self._basis = FourierBasis1D(self.N, self.Lx, fft_workers=self.fft_workers)
             except Exception:
                 self._basis = None  # Fallback to direct FFT wrappers below
-        elif self._basis_name == "legendre":
-            # Legendre–Gauss–Lobatto nodes on [0, Lx]
+        elif self._basis_name in ("legendre", "chebyshev"):
+            # Lobatto nodes on [0, Lx], including both endpoints.
             try:
                 from .basis.legendre import LegendreLobattoBasis1D
 
-                bc = self.bc or "dirichlet"
+                bc = self._bc_global or "wall"
                 # Check if parallel threading is enabled via runtime.num_threads
                 use_parallel = False
                 if self.problem_config:
@@ -652,8 +670,17 @@ class Grid1D:
                     num_threads_cfg = runtime_cfg.get("num_threads", None)
                     if num_threads_cfg is not None and num_threads_cfg != 1:
                         use_parallel = True
-                self._basis = LegendreLobattoBasis1D(self.N, self.Lx, bc=bc, precision=self.precision, 
-                                                   use_parallel=use_parallel)
+                if self._basis_name == "chebyshev":
+                    from .basis.chebyshev import ChebyshevLobattoBasis1D
+
+                    self._basis = ChebyshevLobattoBasis1D(
+                        self.N, self.Lx, bc=bc, precision=self.precision
+                    )
+                else:
+                    self._basis = LegendreLobattoBasis1D(
+                        self.N, self.Lx, bc=bc, precision=self.precision,
+                        use_parallel=use_parallel,
+                    )
                 self.x = self._basis.nodes()
                 x_np = np.asarray(self.x)
                 if self.N > 1:
@@ -675,24 +702,14 @@ class Grid1D:
                 except Exception:
                     self.wx = None
             except Exception as e:
-                raise RuntimeError(f"Legendre basis initialization failed: {e}")
+                raise RuntimeError(f"{self._basis_name} basis initialization failed: {e}")
         else:
             raise ValueError(f"Unknown basis: {self.basis}")
 
-        # Backend (torch/numpy) setup for periodic Fourier grids. Non-Fourier
-        # bases keep the legacy path (backend set up in set_dirichlet_bc_values).
-        if self._basis_name == "fourier":
-            self._setup_fourier_backend()
+        self._setup_backend()
 
-    def _setup_fourier_backend(self) -> None:
-        """Set up the array backend (torch device / numpy) for a Fourier grid.
-
-        This was historically (and erroneously) only executed inside
-        ``set_dirichlet_bc_values`` — which is never called for periodic Fourier
-        problems — so a Fourier ``Grid1D`` silently ignored ``backend='torch'``.
-        It is now invoked from ``__post_init__`` so the torch/MPS (Metal) backend
-        works for periodic 1D problems (Euler and MHD).
-        """
+    def _setup_backend(self) -> None:
+        """Initialize arrays on the resolved backend for every 1D basis."""
         # Enable FFTW planning cache if available (no-op with SciPy backend)
         if scipy_fft_cache_enabled and fftw_cache is not None:
             try:
@@ -704,7 +721,6 @@ class Grid1D:
         self._use_torch = (
             (self.backend.lower() == "torch")
             and _TORCH_AVAILABLE
-            and (self._basis_name == "fourier")
         )
         if self._use_torch:
             assert torch is not None
@@ -713,67 +729,6 @@ class Grid1D:
                 self.precision, self.torch_device
             )
 
-            self.x = torch.from_numpy(np.asarray(self.x)).to(
-                dtype=torch_dtype, device=self.torch_device
-            )
-            k_t = torch.from_numpy(np.asarray(self.k)).to(
-                dtype=torch_dtype, device=self.torch_device
-            )
-            self.k = k_t
-            self.ik = k_t.to(dtype=torch_cdtype) * (1j)
-            self.dealias_mask = torch.from_numpy(np.asarray(self.dealias_mask)).to(
-                dtype=torch_dtype, device=self.torch_device
-            )
-            self.filter_rate = torch.from_numpy(np.asarray(self.filter_rate)).to(
-                dtype=torch_dtype, device=self.torch_device
-            )
-        else:
-            self.k = np.asarray(self.k)
-            self.ik = self.k * (1j)
-            self.dealias_mask = np.asarray(self.dealias_mask)
-            self.filter_rate = np.asarray(self.filter_rate)
-
-    def set_dirichlet_bc_values(self, values: dict[str, tuple[float, float]]) -> None:
-        """Set per-variable Dirichlet boundary values.
-
-        Args:
-            values: Mapping from variable name to (left_value, right_value). Variable
-                names use normalized keys: 'density', 'pressure', 'momentum'.
-        """
-        # Normalize keys
-        def _n(v: str) -> str:
-            vn = str(v).strip().lower()
-            if vn in ("rho", "density"):
-                return "density"
-            if vn in ("p", "pressure"):
-                return "pressure"
-            if vn in ("u", "velocity", "mom", "momentum", "momentum_x"):
-                return "momentum"
-            return vn
-        self._dirichlet_values_map = { _n(k): (float(v[0]), float(v[1])) for k, v in values.items() }
-
-        # Enable FFTW planning cache if available (no-op with SciPy backend)
-        if scipy_fft_cache_enabled and fftw_cache is not None:
-            try:
-                fftw_cache.enable()
-                # Use a reasonable cache size to avoid repeated planning
-                fftw_cache.set_keepalive_time(60.0)
-            except Exception:
-                pass
-
-        # Torch backend setup (Fourier, Legendre supported)
-        self._use_torch = (
-            (self.backend.lower() == "torch")
-            and _TORCH_AVAILABLE
-            and (self._basis_name in ("fourier", "legendre"))
-        )
-        if self._use_torch:
-            # Move arrays to torch (including CPU device)
-            assert torch is not None
-            _validate_torch_device(self.torch_device, self.debug)
-            torch_dtype, torch_cdtype, self.precision = _torch_dtypes(
-                self.precision, self.torch_device
-            )
             self.x = torch.from_numpy(np.asarray(self.x)).to(
                 dtype=torch_dtype, device=self.torch_device
             )
@@ -783,19 +738,34 @@ class Grid1D:
                 )
                 self.k = k_t
                 self.ik = k_t.to(dtype=torch_cdtype) * (1j)
-                self.dealias_mask = torch.from_numpy(np.asarray(self.dealias_mask)).to(
+                self.dealias_mask = torch.from_numpy(self.dealias_mask).to(
                     dtype=torch_dtype, device=self.torch_device
                 )
-                self.filter_rate = torch.from_numpy(np.asarray(self.filter_rate)).to(
+                self.filter_rate = torch.from_numpy(self.filter_rate).to(
                     dtype=torch_dtype, device=self.torch_device
                 )
-        else:
-            # Keep as numpy arrays for CPU backend
-            if self._basis_name == "fourier":
-                self.k = np.asarray(self.k)
-                self.ik = self.k * (1j)
-                self.dealias_mask = np.asarray(self.dealias_mask)
-                self.filter_rate = np.asarray(self.filter_rate)
+        elif self.precision == "single":
+            self.x = self.x.astype(np.float32)
+
+    def set_dirichlet_bc_values(self, values: dict[str, tuple[float, float]]) -> None:
+        """Set fixed endpoint density, momenta, thermal pressure, and B values.
+
+        Each value is a (left, right) pair. Unspecified fixed values are taken
+        from the initial endpoint state. Momentum aliases denote rho*u.
+        """
+        aliases = {"rho": "density", "p": "pressure", "mom": "momentum",
+                   "u": "momentum", "velocity": "momentum", "momentum_x": "momentum"}
+        allowed = {"density", "pressure", "momentum", "momentum_y", "momentum_z", "bx", "by", "bz"}
+        normalized = {}
+        for key, pair in values.items():
+            name = str(key).lower()
+            name = aliases.get(name, name)
+            if name not in allowed or len(pair) != 2 or not np.all(np.isfinite(pair)):
+                raise ValueError(f"Invalid fixed 1D boundary value: {key}")
+            if name == "bx" and pair[0] != pair[1]:
+                raise ValueError("1D fixed Bx values must match on both sides")
+            normalized[name] = (float(pair[0]), float(pair[1]))
+        self._dirichlet_values_map = normalized
 
     # FFT wrappers (Fourier basis only)
     def rfft(self, f: np.ndarray) -> np.ndarray:
@@ -841,6 +811,60 @@ class Grid1D:
             # Generic basis path (e.g., Legendre): delegate to basis implementation
             return self._basis.dx(f)  # type: ignore[union-attr]
 
+    def flux_derivative(self, U, equations):
+        """Differentiate nonlinear flux with 3/2 polynomial overintegration.
+
+        At inadmissible extra nodes, use the convex, piecewise-linear state
+        between adjacent original nodes. This changes only flux evaluation;
+        it does not clip the evolved conservative state or its energy.
+        """
+        if self._basis_name == "fourier" or not self.dealias:
+            return self.dx1(equations.flux(U))
+        if not hasattr(self, "_flux_matrices"):
+            n_pad = (3 * self.N + 1) // 2
+            precision = self._basis.precision
+            dtype = np.float32 if precision == "single" else np.float64
+            padded = type(self._basis)(n_pad, self.Lx, precision=precision)
+            identity, padded_identity = np.eye(self.N, dtype=dtype), np.eye(n_pad, dtype=dtype)
+            modes = self._basis.inverse(identity)
+            interpolation = self._basis.forward(identity) @ padded.inverse(padded_identity)[:self.N]
+            mode_derivatives = self._basis.dx(modes)
+            mode_derivatives[0] = 0.0
+            differentiation = padded.forward(padded_identity)[:, :self.N] @ mode_derivatives
+            x, xp = np.asarray(self._basis.nodes()), padded.nodes()
+            left = np.clip(np.searchsorted(x, xp, side="right") - 1, 0, self.N - 2)
+            fraction = (xp - x[left]) / (x[left + 1] - x[left])
+            self._flux_matrices = (interpolation, differentiation, left, fraction)
+            self._flux_backend_cache = {}
+        is_torch = _TORCH_AVAILABLE and isinstance(U, torch.Tensor)
+        key = (str(U.device) if is_torch else "numpy", str(U.dtype))
+        if key not in self._flux_backend_cache:
+            interp, diff, left, fraction = self._flux_matrices
+            if is_torch:
+                cached = (torch.as_tensor(interp, dtype=U.dtype, device=U.device),
+                          torch.as_tensor(diff, dtype=U.dtype, device=U.device),
+                          torch.as_tensor(left, dtype=torch.long, device=U.device),
+                          torch.as_tensor(fraction, dtype=U.dtype, device=U.device))
+            else:
+                cached = (interp.astype(U.dtype), diff.astype(U.dtype),
+                          left, fraction.astype(U.dtype))
+            self._flux_backend_cache[key] = cached
+        interp, diff, left, fraction = self._flux_backend_cache[key]
+        padded_U = (U - U[:, :1]) @ interp + U[:, :1]
+        energy = 4 if U.shape[0] == 8 else 2
+        rho = padded_U[0]
+        kinetic = sum(padded_U[i] ** 2 for i in range(1, energy)) / (2.0 * rho)
+        magnetic = 0.5 * sum(padded_U[i] ** 2 for i in (5, 6, 7)) if energy == 4 else 0.0
+        pressure = (equations.gamma - 1.0) * (padded_U[energy] - kinetic - magnetic)
+        bad = (rho <= 1e-10) | (pressure <= 1e-12)
+        linear_U = U[:, left] + (U[:, left + 1] - U[:, left]) * fraction
+        if is_torch:
+            padded_U = torch.where(bad[None, :], linear_U, padded_U)
+        else:
+            padded_U = np.where(bad[None, :], linear_U, padded_U)
+        flux = equations.flux(padded_U)
+        return (flux - flux[:, :1]) @ diff
+
     def project_dealiased(self, f: np.ndarray) -> np.ndarray:
         """Project a Fourier field onto the retained 2/3 modal subspace."""
         if self._basis_name == "fourier":
@@ -870,8 +894,8 @@ class Grid1D:
         return self.irfft(F)
 
     def apply_modal_filter(self, f: np.ndarray) -> np.ndarray:
-        """Apply the independent Legendre accepted-step modal filter."""
-        if self._basis_name != "legendre" or not self.modal_filter_enabled:
+        """Apply the polynomial basis accepted-step modal filter."""
+        if self._basis_name == "fourier" or not self.modal_filter_enabled:
             return f
         return self._basis.apply_spectral_filter(  # type: ignore[union-attr]
             f, p=self.modal_filter_order, alpha=self.modal_filter_alpha
@@ -880,7 +904,7 @@ class Grid1D:
     def apply_accepted_state_stabilization(
         self, f: np.ndarray, dt: float
     ) -> np.ndarray:
-        """Project Fourier states or apply the separate Legendre modal filter."""
+        """Project Fourier states or apply the polynomial modal filter."""
         if self._basis_name == "fourier":
             return self.apply_spectral_dissipation(f, dt, project=True)
         return self.apply_modal_filter(f)
@@ -907,12 +931,15 @@ class Grid1D:
         """1D Helmholtz (Leray) projection of the x-magnetic field.
 
         In 1D the only solenoidal constraint is d(Bx)/dx = 0, whose unique
-        periodic solution is Bx = const. The projection therefore keeps only the
-        k=0 (mean) mode of Bx so that div(B) is zero to machine precision. The
+        solution is Bx = const. Keep the mean (quadrature-weighted on Lobatto
+        grids) so that div(B) is zero to roundoff. The
         transverse components By, Bz are unconstrained in 1D and untouched here.
         """
         if self._basis_name != "fourier":
-            raise ValueError("project_solenoidal_x requires Fourier basis")
+            if getattr(self, "_use_torch", False):
+                weights = torch.as_tensor(self.wx, dtype=Bx.dtype, device=Bx.device)
+                return torch.ones_like(Bx) * (Bx * weights).sum() / weights.sum()
+            return np.full_like(Bx, np.dot(Bx, self.wx) / np.sum(self.wx))
         if getattr(self, "_use_torch", False) and torch is not None and isinstance(Bx, torch.Tensor):
             return torch.ones_like(Bx) * torch.mean(Bx)
         Bx = np.asarray(Bx)
@@ -921,7 +948,7 @@ class Grid1D:
     def laplacian(self, f: np.ndarray) -> np.ndarray:
         """1D spectral Laplacian d^2/dx^2 (for explicit resistivity/viscosity)."""
         if self._basis_name != "fourier":
-            raise ValueError("laplacian requires Fourier basis")
+            return self._basis.d2x(f)
         F = self.rfft(f)
         F = F * self.dealias_mask
         if getattr(self, "_use_torch", False) and torch is not None and isinstance(F, torch.Tensor):
@@ -979,121 +1006,78 @@ class Grid1D:
         return vals.astype(f_np.dtype)
 
     # --- Boundary conditions (1D) ---
+    def initialize_boundary_conditions(self, U, equations) -> np.ndarray:
+        """Capture fixed endpoints once at the start of a run."""
+        self._boundary_reference = None
+        return self.apply_boundary_conditions(U, equations)
+
     def apply_boundary_conditions(self, U: np.ndarray, equations) -> np.ndarray:
-        """Apply boundary conditions to conservative variables U in-place.
+        """Return a state with non-periodic endpoint conditions applied.
 
-        Supports global, per-variable, or per-boundary BCs for non-periodic bases. Semantics:
-        - "wall" (alias: reflective, dirichlet): velocity Dirichlet (u=0),
-          scalars density/pressure use zero-gradient (Neumann).
-        - "neumann" (alias: open): zero-gradient for all selected variables.
-        Variable keys accepted: density|rho, momentum|velocity|u, pressure|p.
-        Boundary keys accepted: left|x0|x_min|start, right|x1|x_max|end.
+        Fixed/Dirichlet values default to initial endpoints. Outflow (also
+        open/Neumann) copies adjacent primitive values. A wall sets normal
+        momentum to zero and extrapolates the other variables. Pressure is
+        thermal pressure; energy includes all kinetic and magnetic terms.
+        The input, including Runge--Kutta stage arrays, is never modified.
         """
-        if self._basis_name != "legendre":
+        if self._basis_name == "fourier":
             return U
-        
-        # Determine BCs for each variable and boundary
-        def _get_var_bc(var: str, boundary: str = None) -> str:
-            var_n = var
-            
-            # Check per-boundary configuration first
-            if boundary and self._bc_boundary_map is not None:
-                if boundary in self._bc_boundary_map:
-                    return self._bc_boundary_map[boundary].get(var_n, self._bc_global or "wall")
-            
-            # Fall back to per-variable configuration
-            if self._bc_map is not None:
-                return self._bc_map.get(var_n, self._bc_global or "wall")
-            
-            # No per-var map: interpret global
-            g = self._bc_global or "wall"
-            # For global "wall": momentum Dirichlet, scalars Neumann
-            if g == "wall":
-                if var_n == "momentum":
-                    return "wall"
+        if U.ndim != 2 or U.shape[-1] != self.N or U.shape[0] not in (3, 8):
+            raise ValueError("1D boundary conditions require a (3,N) hydro or (8,N) MHD state")
+        if equations is None:
+            raise ValueError("1D boundary conditions require equations")
+        is_torch = _TORCH_AVAILABLE and isinstance(U, torch.Tensor)
+
+        def copy(a):
+            return a.clone() if is_torch else a.copy()
+
+        if self._boundary_reference is None:
+            self._boundary_reference = copy(U[:, [0, -1]])
+        result = copy(U)
+        mhd = U.shape[0] == 8
+        energy = 4 if mhd else 2
+        variables = {"density": 0, "momentum": 1}
+        if mhd:
+            variables.update(momentum_y=2, momentum_z=3, bx=5, by=6, bz=7)
+        gamma = equations.gamma
+
+        def fields(a):
+            values = {name: a[row] for name, row in variables.items()}
+            kinetic = sum(a[row] ** 2 for row in range(1, energy)) / (2.0 * a[0])
+            magnetic = 0.5 * sum(a[row] ** 2 for row in (5, 6, 7)) if mhd else 0.0
+            values["pressure"] = (gamma - 1.0) * (a[energy] - kinetic - magnetic)
+            return values
+
+        reference = fields(self._boundary_reference)
+        interior = fields(copy(U[:, [1, -2]]))
+        for side, endpoint in enumerate((0, -1)):
+            boundary = "left" if side == 0 else "right"
+            mapping = (self._bc_boundary_map or {}).get(boundary, self._bc_map or {})
+            default = mapping.get("default", self._bc_global or "wall")
+            values = {}
+            for name in (*variables, "pressure"):
+                kind = mapping.get(name, default)
+                if kind == "fixed":
+                    pair = (self._dirichlet_values_map or {}).get(name)
+                    value = pair[side] if pair is not None else reference[name][side]
+                elif kind == "wall" and name == "momentum":
+                    value = 0.0
                 else:
-                    return "neumann"
-            return g
-
-        if U.shape[-1] != self.N:
-            return U
-        if U.shape[0] < 2:
-            return U
-
-        # Resolve per-variable BCs for each boundary
-        bc_rho_left = _get_var_bc("density", "left")
-        bc_rho_right = _get_var_bc("density", "right")
-        bc_mom_left = _get_var_bc("momentum", "left")
-        bc_mom_right = _get_var_bc("momentum", "right")
-        bc_p_left = _get_var_bc("pressure", "left")
-        bc_p_right = _get_var_bc("pressure", "right")
-
-        # Helper: apply zero-gradient (copy nearest interior) on a component idx
-        def _apply_neumann(comp_idx: int, boundary: str) -> None:
-            if boundary == "left":
-                if self.N >= 2:
-                    U[..., comp_idx, 0] = U[..., comp_idx, 1]
-            elif boundary == "right":
-                if self.N >= 2:
-                    U[..., comp_idx, -1] = U[..., comp_idx, -2]
-
-        # Helpers for Dirichlet using configured values
-        def _apply_dirichlet(comp_idx: int, var_key: str, boundary: str) -> None:
-            if self._dirichlet_values_map is not None and var_key in self._dirichlet_values_map:
-                left_val, right_val = self._dirichlet_values_map[var_key]
-                if boundary == "left":
-                    U[..., comp_idx, 0] = left_val
-                elif boundary == "right":
-                    U[..., comp_idx, -1] = right_val
-            else:
-                # Fallback: zero for momentum, else copy interior (approximate Neumann)
-                if var_key == "momentum":
-                    if boundary == "left":
-                        U[..., comp_idx, 0] = 0
-                    elif boundary == "right":
-                        U[..., comp_idx, -1] = 0
-                else:
-                    _apply_neumann(comp_idx, boundary)
-
-        # Apply boundary conditions for each variable and boundary
-        # Density
-        if bc_rho_left in ("neumann", "open", "wall"):
-            _apply_neumann(0, "left")
-        elif bc_rho_left == "dirichlet":
-            _apply_dirichlet(0, "density", "left")
-            
-        if bc_rho_right in ("neumann", "open", "wall"):
-            _apply_neumann(0, "right")
-        elif bc_rho_right == "dirichlet":
-            _apply_dirichlet(0, "density", "right")
-            
-        # Momentum / velocity
-        if bc_mom_left in ("wall", "reflective"):
-            U[..., 1, 0] = 0
-        elif bc_mom_left == "dirichlet":
-            _apply_dirichlet(1, "momentum", "left")
-        elif bc_mom_left in ("neumann", "open"):
-            _apply_neumann(1, "left")
-            
-        if bc_mom_right in ("wall", "reflective"):
-            U[..., 1, -1] = 0
-        elif bc_mom_right == "dirichlet":
-            _apply_dirichlet(1, "momentum", "right")
-        elif bc_mom_right in ("neumann", "open"):
-            _apply_neumann(1, "right")
-            
-        # Pressure: approximate by applying to energy component
-        if bc_p_left in ("neumann", "open", "wall"):
-            _apply_neumann(2, "left")
-        elif bc_p_left == "dirichlet":
-            _apply_dirichlet(2, "pressure", "left")
-            
-        if bc_p_right in ("neumann", "open", "wall"):
-            _apply_neumann(2, "right")
-        elif bc_p_right == "dirichlet":
-            _apply_dirichlet(2, "pressure", "right")
-            
-        return U
+                    value = interior[name][side]
+                if mhd and name == "bx" and kind == "fixed" and pair is not None:
+                    tolerance = 32.0 * (torch.finfo(U.dtype).eps if is_torch else np.finfo(U.dtype).eps)
+                    if abs(float(value) - float(U[5, endpoint])) > tolerance * max(1.0, abs(float(value))):
+                        raise ValueError("Fixed Bx must match the longitudinal interior field")
+                values[name] = value
+            for name, row in variables.items():
+                result[row, endpoint] = values[name]
+            rho = values["density"]
+            if float(rho) <= 0.0 or float(values["pressure"]) <= 0.0:
+                raise ValueError("Boundary density and pressure must be positive")
+            kinetic = sum(result[row, endpoint] ** 2 for row in range(1, energy)) / (2.0 * rho)
+            magnetic = 0.5 * sum(result[row, endpoint] ** 2 for row in (5, 6, 7)) if mhd else 0.0
+            result[energy, endpoint] = values["pressure"] / (gamma - 1.0) + kinetic + magnetic
+        return result
 
 
 def _build_legendre_diff_matrix_1d(x: np.ndarray, L: float) -> np.ndarray:

@@ -66,9 +66,7 @@ def _compute_rhs(grid: Grid1D, eqs: EulerEquations1D, U: Array,
     # Enforce boundary conditions for non-periodic bases before computing flux
     if hasattr(grid, "apply_boundary_conditions"):
         U = grid.apply_boundary_conditions(U, eqs)
-    F = eqs.flux(U)
-    # Batched spectral derivative across components (shape (3, N))
-    dFdx = grid.dx1(F)
+    dFdx = grid.flux_derivative(U, eqs)
     # Euler in conservation form: dU/dt = - dF/dx
     rhs = -dFdx
     
@@ -128,11 +126,26 @@ def _apply_accepted_state_stabilization(
     U_filtered = grid.apply_accepted_state_stabilization(U, dt)
     # Re-apply boundary conditions after filtering to prevent endpoint drift
     if equations is not None and hasattr(grid, "apply_boundary_conditions"):
-        try:
-            U_filtered = grid.apply_boundary_conditions(U_filtered, equations)
-        except Exception:
-            pass
+        U_filtered = grid.apply_boundary_conditions(U_filtered, equations)
     return U_filtered
+
+
+def _artificial_viscosity_dt(grid, viscosity) -> float:
+    if viscosity is None:
+        return float("inf")
+    config = viscosity.config
+    nu = (config.nu_constant or config.nu_max) if config.mode == "constant" else config.nu_max
+    weight = max([1.0, *config.variable_weights.values()])
+    if nu <= 0.0:
+        return float("inf")
+    if (config.mode == "constant" and grid._basis_name != "fourier"
+            and grid._bc_global == "fixed" and grid.N > 2):
+        if not hasattr(grid, "_fixed_diffusion_bound"):
+            laplacian = grid._basis.d2x(np.eye(grid.N)).T
+            grid._fixed_diffusion_bound = float(np.max(np.sum(np.abs(laplacian[1:-1, 1:-1]), axis=1)))
+        # Bound the fixed-endpoint diffusion matrix, with a unit RK stability margin.
+        return 1.0 / (nu * weight * grid._fixed_diffusion_bound)
+    return 0.2 * grid.dx ** 2 / (nu * weight)
 
 
 class SpectralSolver1D:
@@ -218,7 +231,8 @@ class SpectralSolver1D:
         # CFL for spectral (heuristic): dt <= cfl * dx / max_speed
         if max_speed <= 0.0:
             return 1e-6
-        return self.cfl * self.grid.dx / max_speed
+        return min(self.cfl * self.grid.dx / max_speed,
+                   _artificial_viscosity_dt(self.grid, self.artificial_viscosity))
 
     def step(self, U: Array, dt: float) -> Array:
         """Perform one time step using the configured scheme.
@@ -343,6 +357,7 @@ class SpectralSolver1D:
             self.U = U0.copy()
         # Start Fourier runs in the same retained subspace enforced after steps.
         self.U = self.grid.project_dealiased(self.U)
+        self.U = self.grid.initialize_boundary_conditions(self.U, self.equations)
         self.t = float(t0)
         next_output = self.t + output_interval
         next_checkpoint = (
@@ -375,7 +390,7 @@ class SpectralSolver1D:
         
         while self.t < t_end - 1e-12:
             # Ensure we don't overshoot the end time
-            dt = min(dt, t_end - self.t)
+            dt = min(dt, self.compute_dt(self.U), t_end - self.t)
             dt_used = dt
             state_before = self.U
             time_before = self.t
@@ -895,6 +910,11 @@ class SpectralSolverMHD:
         # the negative real axis extends to ~2.78; 1.0 leaves a comfortable margin).
         self.cfl_diff = float(cfg.get("cfl_diff", 1.0))
         self._k2_max = self._grid_k2_max()
+        self.artificial_viscosity = None
+        if self.dim == 1 and artificial_viscosity_config and artificial_viscosity_config.get("enabled", False):
+            from .artificial_viscosity import create_artificial_viscosity
+
+            self.artificial_viscosity = create_artificial_viscosity(artificial_viscosity_config)
 
         # Adaptive time-stepping
         self.adaptive_enabled = False
@@ -923,6 +943,8 @@ class SpectralSolverMHD:
         g = self.grid
         try:
             if self.dim == 1:
+                if g._basis_name != "fourier":
+                    return 4.0 / g.dx ** 2
                 k = g.k
                 k2 = k * k
             else:
@@ -935,9 +957,9 @@ class SpectralSolverMHD:
 
     # --- physics helpers ---
     def _flux_divergence(self, U: Array) -> Array:
-        F = self.equations.flux(U)
         if self.dim == 1:
-            return -self.grid.dx1(F)
+            return -self.grid.flux_derivative(U, self.equations)
+        F = self.equations.flux(U)
         if self.dim == 2:
             Fx, Fy = F
             return -(self.grid.dx1(Fx) + self.grid.dy1(Fy))
@@ -945,7 +967,14 @@ class SpectralSolverMHD:
         return -(self.grid.dx1(Fx) + self.grid.dy1(Fy) + self.grid.dz1(Fz))
 
     def _compute_rhs(self, U: Array) -> Array:
+        if self.dim == 1:
+            U = self.grid.apply_boundary_conditions(U, self.equations)
         rhs = self._flux_divergence(U)
+        if self.artificial_viscosity is not None:
+            terms = self.artificial_viscosity.compute_viscosity_terms(U, self.grid, self.equations)
+            for i, term in enumerate(terms):
+                if i != 5:  # Preserve the longitudinal magnetic field in 1D.
+                    rhs[i] += term
         eta = self.resistivity
         nu = self.viscosity
         if eta != 0.0:
@@ -1031,6 +1060,8 @@ class SpectralSolverMHD:
         else:
             dx = min(self.grid.dx, self.grid.dy, self.grid.dz)
         dt_hyp = self.cfl * dx / max_speed
+        if self.dim == 1:
+            dt_hyp = min(dt_hyp, _artificial_viscosity_dt(self.grid, self.artificial_viscosity))
         # Parabolic CFL for explicit resistivity/viscosity: dt <= cfl_diff/(D k^2_max)
         diff = max(self.resistivity, self.viscosity)
         if diff > 0.0 and self._k2_max > 0.0:
@@ -1050,6 +1081,8 @@ class SpectralSolverMHD:
         # divergence, so the stored state remains both band-limited and div-free.
         Un = self._project_B(Un)
         Un = self.grid.apply_accepted_state_stabilization(Un, 0.5 * dt)
+        if self.dim == 1:
+            Un = self.grid.apply_boundary_conditions(Un, self.equations)
         return Un
 
     def _adaptive_step(self, U: Array, dt: float) -> Array:
@@ -1065,6 +1098,8 @@ class SpectralSolverMHD:
         if result.accepted:
             Un = self._project_B(self._clamp(result.U_new))
             Un = self.grid.apply_accepted_state_stabilization(Un, 0.5 * dt)
+            if self.dim == 1:
+                Un = self.grid.apply_boundary_conditions(Un, self.equations)
         else:
             Un = U
         return Un
@@ -1083,6 +1118,8 @@ class SpectralSolverMHD:
         if result.accepted:
             Un = self._project_B(self._clamp(result.U_new))
             Un = self.grid.apply_accepted_state_stabilization(Un, 0.5 * dt)
+            if self.dim == 1:
+                Un = self.grid.apply_boundary_conditions(Un, self.equations)
             self.U = Un
             self.t += dt
             if on_step is not None:
@@ -1114,6 +1151,8 @@ class SpectralSolverMHD:
         # Project the initial state so div(B)=0 from the first stored step.
         self.U = self._project_B(self.U)
         self.U = self.grid.project_dealiased(self.U)
+        if self.dim == 1:
+            self.U = self.grid.initialize_boundary_conditions(self.U, self.equations)
         self.t = float(t0)
         next_output = self.t + output_interval
         next_checkpoint = (
@@ -1143,6 +1182,8 @@ class SpectralSolverMHD:
 
         dt = self.compute_dt(self.U) if self.U is not None else 1e-6
         while self.t < t_end - 1e-12:
+            if self.dim == 1:
+                dt = min(dt, self.compute_dt(self.U))
             dt = min(dt, t_end - self.t)
             dt_used = dt
             state_before = self.U

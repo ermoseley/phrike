@@ -51,14 +51,14 @@ Examples:
         "--basis",
         type=str,
         default=None,
-        choices=["fourier", "legendre"],
-        help="Spectral basis (1D problems): fourier|legendre",
+        choices=["fourier", "legendre", "chebyshev"],
+        help="Spectral basis (1D problems): fourier|legendre|chebyshev",
     )
     parser.add_argument(
         "--bc",
         type=str,
         default=None,
-        help="Boundary condition for non-periodic basis (e.g., dirichlet, reflective)",
+        help="1D boundary condition: periodic (Fourier), fixed, outflow, or wall",
     )
     parser.add_argument(
         "--device",

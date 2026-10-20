@@ -128,11 +128,14 @@ class GradientBasedSensor(SmoothnessSensor):
         if self.config.sensor_variable == "density":
             q = U[0]  # density
         elif self.config.sensor_variable == "pressure":
-            _, _, p, _ = equations.primitive(U)
-            q = p
+            primitives = equations.primitive(U)
+            q = primitives[4] if len(U) == 8 else primitives[2]
         elif self.config.sensor_variable == "velocity_magnitude":
-            rho, u, p, _ = equations.primitive(U)
-            if len(u.shape) == 1:  # 1D
+            primitives = equations.primitive(U)
+            u = primitives[1]
+            if len(U) == 8:
+                q = sum(v ** 2 for v in primitives[1:4]) ** 0.5
+            elif len(u.shape) == 1:  # 1D
                 q = np.abs(u)
             elif len(u.shape) == 2:  # 2D
                 q = np.sqrt(u[0]**2 + u[1]**2)
@@ -233,7 +236,7 @@ class ArtificialViscosityCoefficient:
             else:
                 scaled_sensor = active_sensor
             nu_max = torch.tensor(float(self.config.nu_max), dtype=sensor.dtype, device=sensor.device)
-            viscosity = nu_max * (scaled_sensor ** float(self.config.p))
+            viscosity = nu_max * torch.clamp(scaled_sensor, min=0.0, max=1.0) ** float(self.config.p)
             return viscosity
         else:
             active_sensor = np.where(sensor > self.config.s_min, sensor, 0.0)
@@ -241,7 +244,7 @@ class ArtificialViscosityCoefficient:
                 scaled_sensor = active_sensor / self.config.s_ref
             else:
                 scaled_sensor = active_sensor
-            viscosity = self.config.nu_max * (scaled_sensor ** self.config.p)
+            viscosity = self.config.nu_max * np.clip(scaled_sensor, 0.0, 1.0) ** self.config.p
             return viscosity
 
 
@@ -308,18 +311,25 @@ class SpectralArtificialViscosity:
         
         # Compute viscosity terms for each conserved variable
         viscosity_terms = []
-        variable_names = ["density", "momentum_x", "momentum_y", "momentum_z", "energy"]
+        if len(U) == 8:
+            variable_names = ["density", "momentum_x", "momentum_y", "momentum_z", "energy", "bx", "by", "bz"]
+        elif len(U) == 3:
+            variable_names = ["density", "momentum_x", "energy"]
+        else:
+            variable_names = ["density", "momentum_x", "momentum_y", "momentum_z", "energy"]
         
-        for i, var_name in enumerate(variable_names[:len(U)]):
-            if i < len(U):
-                # Get weight for this variable
+        if (self.config.mode == "constant" and not hasattr(grid, "dy1")
+                and getattr(grid, "_basis_name", "fourier") != "fourier"):
+            laplacian = grid.laplacian(U)
+            viscosity_terms = [
+                nu_val * self.config.variable_weights.get(name, 1.0) * laplacian[i]
+                for i, name in enumerate(variable_names[:len(U)])
+            ]
+        else:
+            for i, var_name in enumerate(variable_names[:len(U)]):
                 weight = self.config.variable_weights.get(var_name, 1.0)
-                
-                # Compute ∇·(ν ∇U[i])
                 viscosity_term = self._compute_viscosity_term(U[i], viscosity * weight, grid)
                 viscosity_terms.append(viscosity_term)
-            else:
-                viscosity_terms.append(np.zeros_like(U[0]))
         
         # Store diagnostics
         if self.config.diagnostic_output:

@@ -74,7 +74,7 @@ class SodProblem(BaseProblem):
         basis = str(self.config["grid"].get("basis", "fourier")).lower()
         bc = self.config["grid"].get("bc", None)
 
-        return Grid1D(
+        grid = Grid1D(
             N=N,
             Lx=Lx,
             basis=basis,
@@ -85,7 +85,11 @@ class SodProblem(BaseProblem):
             backend=backend,
             torch_device=device,
             precision=self.precision,
+            debug=debug,
         )
+        if self.config["grid"].get("bc_values"):
+            grid.set_dirichlet_bc_values(self.config["grid"]["bc_values"])
+        return grid
 
     def create_equations(self) -> EulerEquations1D:
         """Create 1D Euler equations."""
@@ -145,24 +149,6 @@ class SodProblem(BaseProblem):
             rho, u, p, _ = eq.primitive(U0)
             rho_s, u_s, p_s = self.apply_initial_conditions_smoothing(rho, u, p, grid)
             U0 = eq.conservative(rho_s, u_s, p_s)
-
-        # If non-periodic basis and Dirichlet BCs are specified per-var, pass values to grid
-        # so that BCs like pressure Dirichlet can be enforced if requested.
-        bc = self.config.get("grid", {}).get("bc", None)
-        if isinstance(bc, dict):
-            dirichlet_values = {}
-            # Allow optional boundary_values map under grid.bc_values
-            bc_vals = self.config.get("grid", {}).get("bc_values", {})
-            for key in ("density", "rho", "pressure", "p", "momentum", "velocity", "u"):
-                if key in bc_vals:
-                    vals = bc_vals[key]
-                    if isinstance(vals, (list, tuple)) and len(vals) == 2:
-                        dirichlet_values[key] = (float(vals[0]), float(vals[1]))
-            if dirichlet_values:
-                try:
-                    grid.set_dirichlet_bc_values(dirichlet_values)
-                except Exception:
-                    pass
 
         return U0
 

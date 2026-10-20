@@ -1,0 +1,47 @@
+problem: sod
+
+grid:
+  N: 192
+  Lx: 1.0
+  x0: 0.5
+  basis: chebyshev
+  bc: fixed
+  dealias: true
+  precision: double
+
+physics:
+  gamma: 1.4
+
+integration:
+  t0: 0.0
+  t_end: 0.2
+  cfl: 0.2
+  scheme: rk4
+  output_interval: 0.04
+  checkpoint_interval: 0.0
+  modal_filter:
+    enabled: false
+
+initial_conditions:
+  left:
+    rho: 1.0
+    u: 0.0
+    p: 1.0
+  right:
+    rho: 0.125
+    u: 0.0
+    p: 0.1
+  smoothing:
+    enabled: false
+
+artificial_viscosity:
+  enabled: true
+  mode: constant
+  nu_constant: 0.001
+
+io:
+  outdir: outputs/sod_chebyshev_1d
+
+monitoring:
+  enabled: true
+  step_interval: 100

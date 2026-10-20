@@ -7,9 +7,11 @@ Modules:
     - base: Abstract interface for 1D/2D/3D spectral bases
     - fourier: Periodic Fourier basis using FFT
     - legendre: Legendre–Gauss–Lobatto collocation basis
+    - chebyshev: Chebyshev–Lobatto collocation basis
 """
 
 from .base import Basis1D  # noqa: F401
 from .legendre import LegendreLobattoBasis1D  # noqa: F401
+from .chebyshev import ChebyshevLobattoBasis1D  # noqa: F401
 
 
