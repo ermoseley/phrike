@@ -11,14 +11,17 @@ portable NumPy/PyTorch backends—not a production CFD package.
 ## What is implemented
 
 - 1D, 2D, and 3D hydrodynamic and ideal-MHD problem setups.
-- Fourier and Legendre bases, with hard 2/3 Fourier dealiasing, optional
+- Fourier and Legendre bases, plus a 1D Chebyshev–Lobatto basis, with hard
+  2/3 Fourier dealiasing, 3/2 polynomial flux overintegration, optional
   timestep-aware spectral dissipation, and artificial viscosity for
   exploratory shock problems.
+- 1D fixed/Dirichlet, outflow, and wall boundaries for hydro and MHD,
+  including independent endpoint and per-variable settings.
 - Fixed-step RK2/RK4 and embedded RK23, RK45, and Fehlberg RKF78 integration.
 - NumPy CPU execution plus optional PyTorch CPU, CUDA, and Apple Metal/MPS
   backends.
 - YAML-configured example problems, including acoustic waves, Kelvin-Helmholtz,
-  Alfvén waves, and Orszag-Tang.
+  Alfvén waves, Brio–Wu, and Orszag-Tang.
 
 ## Quick start
 
@@ -59,7 +62,7 @@ Use the code as experimental research software. In particular:
   hardware- and configuration-specific measurement.
 - Pseudo-spectral shock problems require filtering/viscosity choices to be
   validated for the case at hand.
-- Non-periodic Legendre workflows are still exploratory; the 3D Legendre path
+- Non-periodic polynomial workflows are still exploratory; the 3D Legendre path
   is not implemented.
 - CUDA and Metal/MPS hardware are not exercised in continuous integration.
 
@@ -73,7 +76,7 @@ one of `rate` or `e_folding_time_at_cutoff`. The exponential is integrated in
 simulation time with a Strang half-step on either side of the Runge--Kutta
 step. Optional `onset_fraction` confines damping to the corresponding upper
 fraction of the retained band (for example, `0.8` leaves the lower 80% exactly
-untouched). Legendre grids instead use the independently named
+untouched). Legendre and Chebyshev grids instead use the independently named
 `integration.modal_filter`; its `alpha` remains a dimensionless modal-filter
 strength.
 
@@ -93,3 +96,14 @@ include the command(s) used to validate a change.
 ## License
 
 PHRIKE is released under the [MIT License](LICENSE).
+
+For the 1D shock examples:
+
+```bash
+python -m phrike sod --config configs/sod_chebyshev_1d.yaml --backend cpu
+python -m phrike brio_wu1d --config configs/brio_wu1d.yaml --backend cpu
+# Either example also accepts --basis legendre and --bc outflow or --bc wall.
+```
+
+See [1D boundary configuration and validation](docs/validation.rst) for the
+endpoint semantics, fixed-value overrides, and measured shock-profile errors.

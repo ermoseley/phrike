@@ -722,6 +722,8 @@ class LegendreLobattoBasis1D(Basis1D):
         # Modal scaling: a_k = (2k+1)/2 ∫_{-1}^1 f(y) P_k(y) dy (use w_ref)
         k = np.arange(self.N, dtype=float)
         self._proj_scale = (2.0 * k + 1.0) / 2.0  # shape (N,)
+        if self.N > 1:
+            self._proj_scale[-1] = (self.N - 1) / 2.0
 
         # Caches
         self._nodal_filter_cache_np: Dict[Tuple[int, float], np.ndarray] = {}
@@ -809,17 +811,17 @@ class LegendreLobattoBasis1D(Basis1D):
                 mats["D2_x"] = torch.matmul(mats["D_x"], mats["D_x"])  # (N,N)
             return torch.matmul(f, mats["D2_x"].T)
         
+        if not hasattr(self, "_D2_x"):
+            self._D2_x = self._D_x @ self._D_x
         # Use JIT-compiled kernel for NumPy backend if available
         if _NUMBA_AVAILABLE:
-            # Precompute D2_x for efficiency and ensure dtype match
-            D2_x = self._D_x @ self._D_x
-            D2_x_typed = D2_x.astype(f.dtype)
+            D2_x_typed = self._D2_x.astype(f.dtype)
             if self.use_parallel:
                 return _legendre_derivative_kernel_numba_parallel(f, D2_x_typed)
             else:
                 return _legendre_derivative_kernel_numba(f, D2_x_typed)
         else:
-            return _as_last_axis_matrix_apply((self._D_x @ self._D_x).T, f)
+            return _as_last_axis_matrix_apply(self._D2_x.T, f)
 
     # --- Spectral filtering: precomputed nodal filter ---
     def _sigma(self, p: int, alpha: float) -> np.ndarray:

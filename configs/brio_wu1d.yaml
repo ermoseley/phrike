@@ -1,0 +1,64 @@
+problem: brio_wu1d
+
+grid:
+  N: 192
+  Lx: 1.0
+  x0: 0.5
+  basis: chebyshev
+  bc: fixed
+  dealias: true
+  precision: double
+
+physics:
+  gamma: 2.0
+  mhd:
+    enabled: true
+    resistivity: 0.0
+    viscosity: 0.0
+    divergence_clean: none
+
+integration:
+  t0: 0.0
+  t_end: 0.1
+  cfl: 0.2
+  scheme: rk4
+  output_interval: 0.02
+  checkpoint_interval: 0.0
+  # Conservative modal filtering can overshoot thermal pressure in this case.
+  # Stabilize with the explicit artificial viscosity below instead.
+  modal_filter:
+    enabled: false
+
+initial_conditions:
+  left:
+    rho: 1.0
+    u: 0.0
+    v: 0.0
+    w: 0.0
+    p: 1.0
+    bx: 0.75
+    by: 1.0
+    bz: 0.0
+  right:
+    rho: 0.125
+    u: 0.0
+    v: 0.0
+    w: 0.0
+    p: 0.1
+    bx: 0.75
+    by: -1.0
+    bz: 0.0
+  smoothing:
+    enabled: false
+
+artificial_viscosity:
+  enabled: true
+  mode: constant
+  nu_constant: 0.0015
+
+io:
+  outdir: outputs/brio_wu1d
+
+monitoring:
+  enabled: true
+  step_interval: 100
