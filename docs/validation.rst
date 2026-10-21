@@ -323,6 +323,25 @@ energy balance, nonlinear second-order time accuracy, CG failure handling,
 and NumPy/Torch CPU agreement. These checks alone do not establish full MHD
 boundary transparency or general accelerator parity.
 
+Hydro acoustic pulse
+~~~~~~~~~~~~~~~~~~~~
+
+The same Fourier-x/SBP-y grid and KO6 damping are available to the two-dimensional
+Euler solver. A small acoustic pulse travels toward the open upper y boundary:
+
+.. code-block:: bash
+
+   python -m phrike gaussian_wave2d_y --config configs/gaussian_wave2d_y_sbp.yaml --backend numpy
+   python -m phrike gaussian_wave2d_y --config configs/gaussian_wave2d_y_sbp.yaml --backend torch --device cpu
+
+The example explicitly enables ``integration.sbp_dissipation`` with strength
+0.01. Its sound speed is one, and its initially upward-moving pulse reaches
+the upper boundary near t=1.5. The run continues to t=4, when a periodic-y
+pulse would have returned to its initial position twice. Snapshots and a final
+figure are written to ``outputs/gaussian_wave2d_y_sbp``. This is a smooth, small
+amplitude hydro example, not a shock test or a claim of exactly non-reflecting
+boundaries. ``direction: up`` means positive y; ``down`` means negative y.
+
 ADSI example
 ~~~~~~~~~~~~
 
