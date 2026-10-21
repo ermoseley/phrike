@@ -373,54 +373,65 @@ it by approximately 5e-13, and doubling its transverse domain changes it by
 production open boundary conditions. Set ``reference_alpha: 1`` when disabling
 ambipolar diffusion to retain identical initial data in an ideal-MHD control.
 
-Historical MPS refinement
-~~~~~~~~~~~~~~~~~~~~~~~~~~
+Measured MPS refinement
+~~~~~~~~~~~~~~~~~~~~~~~
 
-A local study on 2026-10-21 used the published ``b02275c`` solver with MPS
-float32, CPU fallback disabled, CFL 0.65, seed amplitude 0.001, and SBP
+A local study on 2026-10-21 used the published ``6653d3d`` split-advection solver
+with MPS float32, CPU fallback disabled, CFL 0.65, seed amplitude 0.001, and SBP
 dissipation strength 0.01. All four grids reached t=0.5 with the physical
 parameters above unchanged and ``Ny = 2*Nx + 1``. The ambipolar increment solve
 used tolerance 1e-5 and the Fourier-tensor preconditioner. Refinement reduced
 both the mesh spacing and timestep; this measures coupled space/time behavior.
 
-The relative error below compares the complex first x Fourier coefficient of
-``B_y`` with its initial profile multiplied by ``exp(lambda*t)``, using the
-physical SBP-weighted norm in y. It retains amplitude and phase errors.
+The relative errors below compare the complex first x Fourier coefficients
+with their initial profiles multiplied by ``exp(lambda*t)``, using the
+physical SBP-weighted norm in y. They retain amplitude and phase errors.
+Velocity and magnetic groups use the norm of all three corresponding primitive
+components, computed in host float64 from the saved states.
 
-.. list-table:: Fundamental-mode error at t=0.5
+.. list-table:: Linear-mode relative errors at t=0.5
    :header-rows: 1
 
    * - Grid
-     - Relative error
+     - B_y
+     - Velocity group
+     - Magnetic group
    * - 32 x 65
-     - 0.129218
+     - 0.0885034
+     - 0.256596
+     - 0.218142
    * - 64 x 129
-     - 0.0175508
+     - 0.0136797
+     - 0.0583893
+     - 0.0507484
    * - 128 x 257
-     - 0.00180458
+     - 0.00155027
+     - 0.00515733
+     - 0.00476882
    * - 256 x 513
-     - 0.00203268
+     - 0.00202771
+     - 0.00124618
+     - 0.00162361
 
-Adjacent-grid differences in the physical mode, without independently
-renormalizing its amplitude, were 0.114586, 0.0161964, and 0.00133268. The
-32/64/128 sequence gives an apparent coupled refinement rate of 2.82. This is
+Adjacent-grid differences in the physical B_y mode, without independently
+renormalizing its amplitude, were 0.0770476, 0.0126664, and 0.00118707. The
+32/64/128 sequence gives an apparent coupled refinement rate of 2.60. This is
 a coarse-range measurement: the shear width spans only 1.6 y cells on the
-coarsest grid. The reference error improves strongly through 128, then worsens
+coarsest grid. The B_y reference error improves strongly through 128, then worsens
 at 256; an asymptotic order is not established.
 
-A NumPy float64 run at 128 had reference error 0.00121653 and differed from
-MPS by 0.00109970, comparable to the finest adjacent-grid difference. Precision,
+A NumPy float64 run at 128 had B_y reference error 0.000916713 and differed from
+MPS by 0.00108509, comparable to the finest adjacent-grid difference. Precision,
 effective CG termination, finite amplitude, and discretization remain mixed
-in this comparison. Halving the seed did not produce clean harmonic scaling.
-Doubling the y domain gave a centered-core difference of 0.00039937, including
-an initial-profile difference of 0.00031384; this only checks early domain
-sensitivity. With AD disabled and exactly the same AD-mode initial state, the
-signed mode projection reversed sign and turned over by t=1.5. Its transient
-``log(abs(amplitude))/t`` is not an ideal-MHD instability growth rate.
+in this comparison; the finest B_y order is withheld.
+
+The weak compressible components are less accurately reproduced. At 128,
+density-mode error is 1209% of the expected mode: its initial norm is only
+3.479e-7 and its absolute error is 5.268e-6. Pressure-mode error is 8.37%.
+The supporting CPU run gives 9.39% and 0.103%, respectively. These comparisons
+do not qualify the full primitive mode. Host float64 recovery cannot restore
+perturbations lost during float32 evolution; the contributions from precision,
+projection, finite amplitude and solve tolerances have not been isolated.
 
 These measurements concern early mode evolution. They do not establish
 nonlinear saturation convergence or independence from numerical damping.
-They predate the momentum-advection split correction and do not validate that
-operator. The subsequent 128 x 257 continuation stopped at t=10.2101 because
-its velocity spectral-tail diagnostic exceeded the resolution-review guard.
-Saturation was not established.
