@@ -1,4 +1,6 @@
-"""Frozen midpoint-resolvent ambipolar diffusion on two-dimensional grids."""
+"""Non-ideal MHD operators: midpoint-resolvent ambipolar diffusion in 2D and Hall induction."""
+
+import math
 
 import numpy as np
 
@@ -26,6 +28,42 @@ def _sum(a):
 
 def _number(a):
     return float(a.item()) if _tensor(a) else float(a)
+
+
+def _host(a):
+    return a.detach().cpu().numpy() if _tensor(a) else np.asarray(a)
+
+
+def _sqrt(a):
+    return torch.sqrt(a) if _tensor(a) else np.sqrt(a)
+
+
+def _abs(a):
+    return torch.abs(a) if _tensor(a) else np.abs(a)
+
+
+def _floor(a, value):
+    return torch.clamp(a, min=value) if _tensor(a) else np.maximum(a, value)
+
+
+def _max(a):
+    return float(a.max().item()) if _tensor(a) else float(np.max(a))
+
+
+def _min(a):
+    return float(a.min().item()) if _tensor(a) else float(np.min(a))
+
+
+def _fft(V, dim):
+    axes = tuple(range(-dim, 0))
+    return torch.fft.fftn(V, dim=axes) if _tensor(V) else np.fft.fftn(V, axes=axes)
+
+
+def _ifft(F, dim, like):
+    axes = tuple(range(-dim, 0))
+    if _tensor(F):
+        return torch.fft.ifftn(F, dim=axes).real
+    return np.fft.ifftn(F, axes=axes).real.astype(like.dtype, copy=False)
 
 
 class MidpointAmbipolar:
@@ -225,4 +263,279 @@ class MidpointAmbipolar:
         result = _copy(U)
         result[4] = U[4]-h*(self.grid.dx1(flux_x)+self.grid.dy1(flux_y))
         result[5:8] = Bn
+        return result
+
+
+class Hall:
+    """Hall induction dB/dt = -curl(eta_H J x B/|B|) on periodic Fourier grids.
+
+    ``reference`` integrates the nonlinear equation with RK4 substeps limited by
+    the Hall rate max|eta_H| kmax^2 of the masked curl. ``inertia`` solves
+    (I + curl l^2 curl) dB/dt = -curl E_H with l frozen over the call: solenoidal
+    modes see eta_H/(1 + l^2 k^2) and curl-free parts are untouched. A uniform l
+    uses an exact Fourier inverse; l(x) uses preconditioned CG and raises if it
+    does not converge. Density, momentum and internal energy are held fixed, so
+    total energy changes only by the change of 0.5|B|^2.
+    """
+
+    def __init__(self, grid, config):
+        self.grid = grid
+        self.config = dict(config)
+        cfg = self.config
+        if (getattr(grid, "_mixed_open_y", False)
+                or any(getattr(grid, name, "fourier") != "fourier"
+                       for name in ("_basis_name", "basis_x", "basis_y"))):
+            raise ValueError("Hall requires a periodic Fourier grid")
+        self.dim = (3 if getattr(grid, "Nz", None) is not None
+                    else 2 if getattr(grid, "Ny", None) is not None else 1)
+        self.eta = float(cfg.get("eta_h", 0.0))
+        self.b0 = float(cfg.get("b0", 1.0))
+        self.rho0 = float(cfg.get("rho0", 1.0))
+        if not np.isfinite(self.eta):
+            raise ValueError("Hall eta_h must be finite")
+        if not (np.isfinite(self.b0) and np.isfinite(self.rho0) and self.b0 > 0 and self.rho0 > 0):
+            raise ValueError("Hall b0 and rho0 must be positive and finite")
+        self.form = str(cfg.get("eta_h_form", "constant")).lower()
+        if self.form not in ("constant", "proportional_to_b_over_rho"):
+            raise ValueError("Hall eta_h_form must be constant or proportional_to_B_over_rho")
+        self.method = str(cfg.get("method", "reference")).lower()
+        if self.method not in ("reference", "inertia"):
+            raise ValueError("Hall method must be reference or inertia")
+        self.safety = float(cfg.get("safety", 0.5))
+        if not 0.0 < self.safety <= 1.0:
+            raise ValueError("Hall safety must lie in (0, 1]")
+        self.length_mode = str(cfg.get("length_mode", "constant")).lower()
+        if self.length_mode not in ("constant", "local"):
+            raise ValueError("Hall length_mode must be constant or local")
+        self.length = None if cfg.get("length") is None else float(cfg["length"])
+        if self.length is not None and not (np.isfinite(self.length) and self.length >= 0.0):
+            raise ValueError("Hall length must be finite and nonnegative")
+        self.length_ratio = None if cfg.get("length_ratio") is None else float(cfg["length_ratio"])
+        if self.length_ratio is not None and not (np.isfinite(self.length_ratio)
+                                                  and self.length_ratio >= 1.0):
+            raise ValueError("Hall length_ratio must be finite and at least 1")
+        self.cg_tol = None if cfg.get("cg_tol") is None else float(cfg["cg_tol"])
+        self.cg_maxiter = int(cfg.get("cg_maxiter", 200))
+        if (self.cg_tol is not None and not self.cg_tol > 0) or self.cg_maxiter < 1:
+            raise ValueError("Hall CG tolerance and iteration limit must be positive")
+        self._k = self._k_key = self._kmax2 = None
+        self.last_stats = None
+        self.reset_stats()
+
+    def reset_stats(self):
+        self.total = dict(calls=0, substeps=0, cg_calls=0, cg_iterations=0,
+                          cg_max_iterations=0, cg_residual=0.0,
+                          length2_min=math.inf, length2_max=0.0)
+
+    def _record(self, stats):
+        """Keep the last call's statistics and fold them into the running totals."""
+        calls = max(stats["cg_calls"], 1)
+        stats["cg_mean_iterations"] = stats["cg_iterations"]/calls
+        self.last_stats = stats
+        t = self.total
+        t["calls"] += 1
+        for key in ("substeps", "cg_calls", "cg_iterations"):
+            t[key] += stats[key]
+        t["cg_max_iterations"] = max(t["cg_max_iterations"], stats["cg_max_iterations"])
+        t["cg_residual"] = max(t["cg_residual"], stats["cg_residual"])
+        t["length2_min"] = min(t["length2_min"], stats["length2_min"])
+        t["length2_max"] = max(t["length2_max"], stats["length2_max"])
+
+    def _wavevectors(self, ref):
+        """Symbols of the masked curl: dealias mask applied, Nyquist set to zero."""
+        key = (_tensor(ref), str(ref.dtype), str(getattr(ref, "device", "")))
+        if self._k_key != key:
+            g = self.grid
+            names = ("k",) if self.dim == 1 else ("kx", "ky", "kz")[:self.dim]
+            mask = _host(g.dealias_mask)
+            k = []
+            for axis, name in enumerate(names):
+                a = _host(getattr(g, name)).copy()
+                if len(a) % 2 == 0:
+                    a[len(a)//2] = 0.0
+                shape = [1]*self.dim
+                shape[self.dim-1-axis] = -1
+                k.append(a.reshape(shape)*mask)
+            k += [np.zeros_like(k[0])]*(3-self.dim)
+            self._kmax2 = float(max(np.max(k[0]**2+k[1]**2+k[2]**2), 1e-30))
+            if _tensor(ref):
+                self._k = [torch.as_tensor(a, dtype=ref.dtype, device=ref.device) for a in k]
+            else:
+                self._k = [a.astype(ref.dtype) for a in k]
+            self._k_key = key
+        return self._k
+
+    def kmax2(self, ref):
+        self._wavevectors(ref)
+        return self._kmax2
+
+    def curl(self, V):
+        kx, ky, kz = self._wavevectors(V)
+        F = _fft(V, self.dim)
+        C = _stack([ky*F[2]-kz*F[1], kz*F[0]-kx*F[2], kx*F[1]-ky*F[0]])
+        return _ifft(1j*C, self.dim, V)
+
+    def eta_field(self, B, rho):
+        """eta_H(x): constant, or eta_h (|B|/b0)(rho0/rho)."""
+        if self.form == "constant":
+            return self.eta+0*rho
+        return self.eta*_sqrt((B*B).sum(axis=0))/self.b0*self.rho0/_floor(rho, 1e-30)
+
+    def electric_field(self, B, rho):
+        """E_H = eta_H J x B/|B|; |B| cancels analytically in the proportional form."""
+        J = self.curl(B)
+        cross = _stack([J[1]*B[2]-J[2]*B[1], J[2]*B[0]-J[0]*B[2], J[0]*B[1]-J[1]*B[0]])
+        if self.form == "constant":
+            return (self.eta/_floor(_sqrt((B*B).sum(axis=0)), 1e-30))*cross
+        return (self.eta*self.rho0/self.b0/_floor(rho, 1e-30))*cross
+
+    def length_squared(self, U, dt):
+        """Inertia metric l^2 frozen for one call; an explicit length wins over the automatic one.
+
+        Automatic: l^2 = max(0, max|eta_H| dt/safety - 1/kmax^2), which makes one RK4
+        step stable and is zero when the Hall rate is already resolved. With
+        length_mode local, |eta_H(x)| replaces the maximum (or l^2 ~ rho0/rho for an
+        explicit length) and length_ratio raises l^2 so that max(l)/min(l) <= ratio.
+        """
+        B, rho = U[5:8], U[0]
+        local = self.length_mode == "local"
+        if self.length is not None:
+            if not local:
+                return self.length**2
+            length2 = self.length**2*self.rho0/_floor(rho, 1e-30)
+        else:
+            eta = _abs(self.eta_field(B, rho))
+            length2 = (eta if local else _max(eta))*dt/self.safety-1.0/self.kmax2(B)
+            if not local:
+                return max(0.0, length2)
+            length2 = _floor(length2, 0.0)
+        if self.length_ratio is not None:
+            length2 = _floor(length2, _max(length2)/self.length_ratio**2)
+        return length2
+
+    def _inverse_constant(self, V, length2):
+        """(I + l^2 curl curl)^-1 for uniform l: (v + l^2 k (k.v))/(1 + l^2 k^2)."""
+        kx, ky, kz = self._wavevectors(V)
+        F = _fft(V, self.dim)
+        dot = kx*F[0]+ky*F[1]+kz*F[2]
+        G = _stack([F[0]+length2*kx*dot, F[1]+length2*ky*dot, F[2]+length2*kz*dot])
+        return _ifft(G/(1.0+length2*(kx*kx+ky*ky+kz*kz)), self.dim, V)
+
+    def inertia_solve(self, rhs, length2, tol=None, maxiter=None):
+        """Solve (I + curl l^2 curl) x = rhs; returns (x, iterations, relative residual)."""
+        if isinstance(length2, float):
+            if not np.isfinite(length2) or length2 < 0.0:
+                raise ValueError("Hall length squared must be finite and nonnegative")
+            return self._inverse_constant(rhs, length2), 0, 0.0
+        if not np.isfinite(_max(length2)) or _min(length2) < 0.0:
+            raise ValueError("Hall length squared must be finite and nonnegative")
+        if tol is None:
+            tol = self.cg_tol or (2e-5 if str(rhs.dtype).endswith("float32") else 1e-10)
+        maxiter = self.cg_maxiter if maxiter is None else int(maxiter)
+        mu = _number(length2.mean())
+        precondition = lambda v: self._inverse_constant(v, mu)
+        matvec = lambda v: v+self.curl(length2*self.curl(v))
+        norm2 = _number(_sum(rhs*rhs))
+        # Corrections lie in range(curl), so curl-free parts of rhs are preserved.
+        x = _copy(rhs)
+        if norm2 == 0.0:
+            return x, 0, 0.0
+        r = -self.curl(length2*self.curl(x))
+        residual = (_number(_sum(r*r))/norm2)**0.5
+        if residual <= tol:
+            return x, 0, residual
+        z = precondition(r)
+        p, rz = _copy(z), _number(_sum(r*z))
+        for iterations in range(1, maxiter+1):
+            Ap = matvec(p)
+            curvature = _number(_sum(p*Ap))
+            if curvature <= 0 or not np.isfinite(curvature):
+                raise RuntimeError("Hall PCG lost positive curvature")
+            alpha = rz/curvature
+            x, r = x+alpha*p, r-alpha*Ap
+            residual = (_number(_sum(r*r))/norm2)**0.5
+            if residual <= tol:
+                r = rhs-matvec(x)
+                residual = (_number(_sum(r*r))/norm2)**0.5
+                if residual <= tol:
+                    return x, iterations, residual
+                # Reliable residual replacement restarts CG after roundoff drift.
+                z = precondition(r)
+                p, rz = _copy(z), _number(_sum(r*z))
+                continue
+            z = precondition(r)
+            new_rz = _number(_sum(r*z))
+            p, rz = z+(new_rz/rz)*p, new_rz
+        raise RuntimeError(f"Hall PCG failed: iterations={maxiter}, residual={residual:.3e}")
+
+    def reservoir_energy(self, B, length2):
+        """Volume mean 0.5 l^2 |curl B|^2, the inertia reservoir for a fixed l(x)."""
+        J = self.curl(B)
+        return _number((length2*0.5*(J*J).sum(axis=0)).mean())
+
+    def modified_energy(self, B, length2=0.0):
+        """Volume mean 0.5(|B|^2 + l^2 |curl B|^2), conserved by the Hall subflow at fixed l(x)."""
+        return _number((0.5*(B*B).sum(axis=0)).mean())+self.reservoir_energy(B, length2)
+
+    def step(self, U, equations, dt):
+        """Advance B by the Hall subflow; density, momentum and internal energy are preserved."""
+        h = float(dt)
+        if not np.isfinite(h) or h < 0.0:
+            raise ValueError("Hall timestep must be finite and nonnegative")
+        if U.ndim != self.dim+1 or U.shape[0] != 8:
+            raise ValueError("Hall requires an eight-field MHD state matching the grid")
+        stats = dict(substeps=0, cg_calls=0, cg_iterations=0, cg_max_iterations=0,
+                     cg_residual=0.0, length2_min=0.0, length2_max=0.0)
+        if h == 0 or self.eta == 0:
+            self._record(stats)
+            return _copy(U)
+        B0, rho = U[5:8], U[0]
+        inertia = self.method == "inertia"
+        length2 = self.length_squared(U, h) if inertia else 0.0
+        iterative = inertia and not isinstance(length2, float)
+        if inertia:
+            stats["length2_min"] = length2 if not iterative else _min(length2)
+            stats["length2_max"] = length2 if not iterative else _max(length2)
+        kmax2 = self.kmax2(B0)
+
+        def rhs(B):
+            value = -self.curl(self.electric_field(B, rho))
+            if inertia:
+                value, iterations, residual = self.inertia_solve(value, length2)
+                if iterative:
+                    stats["cg_calls"] += 1
+                    stats["cg_iterations"] += iterations
+                    stats["cg_max_iterations"] = max(stats["cg_max_iterations"], iterations)
+                    stats["cg_residual"] = max(stats["cg_residual"], residual)
+            return value
+
+        B, elapsed = _copy(B0), 0.0
+        while True:
+            # Reevaluate nonlinear eta_H each substep; the smallest l bounds the rate.
+            rate = (abs(self.eta) if self.form == "constant"
+                    else _max(_abs(self.eta_field(B, rho))))*kmax2
+            if inertia:
+                rate /= 1.0+stats["length2_min"]*kmax2
+            if not np.isfinite(rate):
+                raise RuntimeError("Nonfinite Hall rate")
+            remaining = h-elapsed
+            n = max(1, math.ceil(remaining*rate/self.safety-1e-9))
+            hs = remaining/n
+            if elapsed+hs == elapsed:
+                raise RuntimeError("Hall substep underflow")
+            k1 = rhs(B)
+            k2 = rhs(B+0.5*hs*k1)
+            k3 = rhs(B+0.5*hs*k2)
+            k4 = rhs(B+hs*k3)
+            B = B+(hs/6.0)*(k1+2*k2+2*k3+k4)
+            elapsed += hs
+            stats["substeps"] += 1
+            if n == 1:
+                break
+        if not np.isfinite(_max(_abs(B))):
+            raise RuntimeError("Nonfinite Hall magnetic field")
+        result = _copy(U)
+        result[5:8] = B
+        result[4] = U[4]+0.5*((B*B).sum(axis=0)-(B0*B0).sum(axis=0))
+        self._record(stats)
         return result

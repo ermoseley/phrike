@@ -15,6 +15,7 @@ from .problem_list.rti import RTIProblem
 from .problem_list.hse_1d import HSE1DProblem
 from .problem_list.rti_1d import RTI1DProblem
 from .problem_list.uniform2d import Uniform2DProblem
+from .problem_list.hall_mri1d import HallMRI1DProblem
 
 __all__ = [
     "BaseProblem", 
@@ -29,5 +30,6 @@ __all__ = [
     "RTIProblem",
     "HSE1DProblem",
     "RTI1DProblem",
-    "Uniform2DProblem"
+    "Uniform2DProblem",
+    "HallMRI1DProblem",
 ]

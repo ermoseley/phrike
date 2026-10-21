@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 import warnings
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -1424,6 +1424,13 @@ def _mhd_clone(U: Array) -> Array:
     return U.copy()
 
 
+def shearing_sheet_axes(vertical: int, radial: int) -> Tuple[int, int]:
+    """Component index and sign of phi = z_v x r in the right-handed (x, y, z) basis."""
+    if vertical == radial or not {vertical, radial} <= {0, 1, 2}:
+        raise ValueError("Shearing-sheet vertical_axis and radial_axis must be distinct in {0, 1, 2}")
+    return 3 - vertical - radial, 1 if (radial - vertical) % 3 == 1 else -1
+
+
 def _max_abs_float(a: Array) -> float:
     if _TORCH_AVAILABLE and isinstance(a, torch.Tensor):
         return float(torch.max(torch.abs(a)).item())
@@ -1484,6 +1491,33 @@ class SpectralSolverMHD:
             self.ambipolar = MidpointAmbipolar(grid, ambipolar_config)
             if adaptive_config and adaptive_config.get("enabled", False):
                 raise ValueError("Ambipolar splitting currently requires fixed-step RK integration")
+        self.hall = None
+        hall_config = cfg.get("hall", {})
+        if hall_config.get("enabled", False):
+            from .nonideal import Hall
+
+            self.hall = Hall(grid, hall_config)
+            if adaptive_config and adaptive_config.get("enabled", False):
+                raise ValueError("Hall splitting currently requires fixed-step RK integration")
+        self.shearing_sheet = None
+        shear_config = cfg.get("shearing_sheet") or {}
+        if shear_config.get("enabled", True) and shear_config:
+            omega = float(shear_config.get("omega", 0.0))
+            shear = (float(shear_config["shear"]) if "shear" in shear_config
+                     else float(shear_config.get("q", 1.5)) * omega)
+            vertical = int(shear_config.get("vertical_axis", 0))
+            radial = int(shear_config.get("radial_axis", 1))
+            if not (np.isfinite(omega) and np.isfinite(shear)):
+                raise ValueError("Shearing-sheet omega and shear must be finite")
+            if self.dim > 1:
+                raise NotImplementedError(
+                    "Shearing-sheet sources assume fields independent of the radial axis "
+                    "and are implemented for 1D grids only")
+            if vertical != 0 or radial not in (1, 2):
+                raise ValueError("1D shearing sheet requires vertical_axis 0 and radial_axis 1 or 2")
+            azimuthal, sign = shearing_sheet_axes(vertical, radial)
+            self.shearing_sheet = dict(omega=omega, shear=shear, radial=radial,
+                                       azimuthal=azimuthal, sign=sign)
         # Parabolic-CFL safety factor for explicit diffusion (RK4 stable region on
         # the negative real axis extends to ~2.78; 1.0 leaves a comfortable margin).
         self.cfl_diff = float(cfg.get("cfl_diff", 1.0))
@@ -1569,7 +1603,24 @@ class SpectralSolverMHD:
             rhs[1] = rhs[1] + nu * _diffusion(self.grid, U[1])
             rhs[2] = rhs[2] + nu * _diffusion(self.grid, U[2])
             rhs[3] = rhs[3] + nu * _diffusion(self.grid, U[3])
+        if self.shearing_sheet is not None:
+            self._add_shearing_sheet(U, rhs)
         return rhs
+
+    def _add_shearing_sheet(self, U: Array, rhs: Array) -> None:
+        """Axisymmetric shearing-sheet terms for the velocity u relative to v0 = -S r phi.
+
+        d(rho u_r)/dt += 2 Omega rho u_phi, d(rho u_phi)/dt -= (2 Omega - S) rho u_r,
+        dB_phi/dt -= S B_r, dE/dt += S (rho u_r u_phi - B_r B_phi); internal energy is
+        unchanged and B_phi is generated along phi, so div B is untouched.
+        """
+        s = self.shearing_sheet
+        r, f, sign = s["radial"], s["azimuthal"], s["sign"]
+        mr, mf, Br, Bf = U[1 + r], U[1 + f], U[5 + r], U[5 + f]
+        rhs[1 + r] += 2.0 * s["omega"] * sign * mf
+        rhs[1 + f] -= (2.0 * s["omega"] - s["shear"]) * sign * mr
+        rhs[5 + f] -= s["shear"] * sign * Br
+        rhs[4] += s["shear"] * sign * (mr * mf / U[0] - Br * Bf)
 
     def _clamp(self, U: Array, *, rebuild_always: bool = True) -> Array:
         """Floor density and thermal pressure, rebuilding the total energy.
@@ -1662,6 +1713,10 @@ class SpectralSolverMHD:
         bounds = [_hyperbolic_dt(self.cfl, _min_spacing(self.grid), speed)]
         if self.dim == 1:
             bounds.append(_artificial_viscosity_dt(self.grid, self.artificial_viscosity))
+        if self.shearing_sheet is not None:
+            rate_shear = 2.0 * abs(self.shearing_sheet["omega"]) + abs(self.shearing_sheet["shear"])
+            if rate_shear > 0.0:
+                bounds.append(self.cfl / rate_shear)
         # Parabolic CFL for explicit resistivity/viscosity: dt <= cfl_diff/(D k^2_max)
         diff = max(self.resistivity, self.viscosity)
         rate = diff * self._k2_max
@@ -1688,6 +1743,9 @@ class SpectralSolverMHD:
         if getattr(self.grid, "_mixed_open_y", False):
             U = self.grid.apply_boundary_conditions(U, self.equations)
         U_split = self.grid.apply_spectral_dissipation(U, 0.5 * dt)
+        # Hall and ambipolar halves mirror each other around the ideal step.
+        if self.hall is not None:
+            U_split = self.hall.step(U_split, self.equations, 0.5 * dt)
         if self.ambipolar is not None:
             U_split = self.ambipolar.step(U_split, self.equations, 0.5 * dt)
         Un = self._rk_substages(U_split, dt)
@@ -1696,6 +1754,8 @@ class SpectralSolverMHD:
         Un = self._project_B(Un)
         if self.ambipolar is not None:
             Un = self.ambipolar.step(Un, self.equations, 0.5 * dt)
+        if self.hall is not None:
+            Un = self.hall.step(Un, self.equations, 0.5 * dt)
         Un = self._limit_accepted(self.grid.apply_accepted_state_stabilization(Un, 0.5 * dt))
         if self.dim == 1:
             Un = self.grid.apply_boundary_conditions(Un, self.equations)
