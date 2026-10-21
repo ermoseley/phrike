@@ -42,6 +42,10 @@ def _abs(a):
     return torch.abs(a) if _tensor(a) else np.abs(a)
 
 
+def _eps(a):
+    return float(torch.finfo(a.dtype).eps if _tensor(a) else np.finfo(a.dtype).eps)
+
+
 def _floor(a, value):
     return torch.clamp(a, min=value) if _tensor(a) else np.maximum(a, value)
 
@@ -273,8 +277,8 @@ class Hall:
     the Hall rate max|eta_H| kmax^2 of the masked curl. ``inertia`` solves
     (I + curl l^2 curl) dB/dt = -curl E_H with l frozen over the call: solenoidal
     modes see eta_H/(1 + l^2 k^2) and curl-free parts are untouched. A uniform l
-    uses an exact Fourier inverse; l(x) uses preconditioned CG and raises if it
-    does not converge. Density, momentum and internal energy are held fixed, so
+    uses an exact Fourier inverse; l(x) uses preconditioned CG, with a tolerance
+    floored at 10 eps of the dtype, and raises if it does not converge. Density, momentum and internal energy are held fixed, so
     total energy changes only by the change of 0.5|B|^2.
     """
 
@@ -431,6 +435,7 @@ class Hall:
             raise ValueError("Hall length squared must be finite and nonnegative")
         if tol is None:
             tol = self.cg_tol or (2e-5 if str(rhs.dtype).endswith("float32") else 1e-10)
+        tol = max(tol, 10*_eps(rhs))  # a smaller relative residual is below roundoff
         maxiter = self.cg_maxiter if maxiter is None else int(maxiter)
         mu = _number(length2.mean())
         precondition = lambda v: self._inverse_constant(v, mu)

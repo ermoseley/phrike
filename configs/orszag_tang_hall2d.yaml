@@ -1,0 +1,59 @@
+# 2D Orszag-Tang vortex with Hall induction and the inertia regularization:
+#   python -m phrike orszag_tang2d --config configs/orszag_tang_hall2d.yaml \
+#       --backend torch --device cuda
+# eta_H = eta_h (|B|/b0)(rho0/rho) with b0, rho0 the Orszag-Tang amplitude and density, so
+# d_i = eta_H/v_A = 0.03/0.6 = 0.05 at the mean state (box L = 1). Same as orszag_tang2d otherwise.
+problem: orszag_tang2d
+
+grid:
+  Nx: 512
+  Ny: 512
+  Lx: 1.0
+  Ly: 1.0
+  dealias: true
+  precision: double
+
+physics:
+  gamma: 1.6666666666666667   # 5/3
+  mhd:
+    enabled: true
+    resistivity: 0.0
+    viscosity: 0.0
+    divergence_clean: projection
+    project_each_substage: true
+    hall:
+      enabled: true
+      eta_h: 0.03
+      eta_h_form: proportional_to_B_over_rho
+      b0: 0.282094791773     # 1/sqrt(4 pi)
+      rho0: 0.221048532072   # 25/(36 pi)
+      method: inertia        # reference | inertia
+      length_mode: local     # automatic l(x) from |eta_H(x)| and the call dt
+      length_ratio: 4.0
+      safety: 0.5
+
+integration:
+  t0: 0.0
+  t_end: 0.5
+  cfl: 0.25
+  scheme: rk4
+  output_interval: 0.05
+  checkpoint_interval: 0.0
+  spectral_dissipation:
+    enabled: false
+
+initial_conditions: {}        # standard Stone/Athena OT normalization
+
+io:
+  outdir: outputs/orszag_tang_hall2d
+
+video:
+  fps: 20
+  frame_dpi: 130
+
+monitoring:
+  enabled: true
+  step_interval: 50
+  include_conservation: true
+  include_timestep: true
+  include_time: true

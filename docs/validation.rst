@@ -576,8 +576,10 @@ Hall/2, which is palindromic; without a ``hall`` block it is unchanged.
 
 ``reference`` is nonlinear RK4 subcycled to ``h <= safety/(max|eta_H| kmax**2)``
 of the masked curl. ``inertia`` solves ``(I + curl l**2 curl) dB/dt = -curl E_H``
-with ``l`` frozen per call, which divides the Hall rate of solenoidal modes by
-``1 + l**2 k**2`` and leaves curl-free parts unchanged. The automatic
+with ``l`` frozen per call. For a uniform ``l`` this divides the Hall rate of each
+solenoidal mode by ``1 + l**2 k**2`` and leaves curl-free parts unchanged; a variable
+``l(x)`` couples modes, so the division is only local and the curl-free part is the
+only exactly preserved piece. The automatic
 ``l**2 = max(0, max|eta_H| dt/safety - 1/kmax**2)`` uses the Hall call's ``dt``
 (half the solver step) and is zero when the Hall rate is already resolved. A
 uniform ``l`` uses an exact Fourier inverse; ``l(x)`` uses preconditioned CG with
@@ -588,13 +590,24 @@ The regularization is a scale filter, not a frequency filter: for a uniform,
 resolved, unfiltered mode both the whistler and ion-cyclotron branches are
 off by about ``(k l)**2``. With automatic ``l`` at fixed resolution the error
 converges to true Hall at first order in ``dt`` in the regularized regime, while
-a small ``dt`` recovers the unregularized Hall step. For fixed ``l(x)`` a Hall call
-conserves ``0.5 (|B|**2 + l**2 |curl B|**2)``; the second term is the reservoir
-(``Hall.reservoir_energy``). The ideal step and a changing automatic ``l``
-exchange energy with it, so total energy is not conserved in coupled runs. The outer
-step keeps the ideal CFL limit. ``scripts/hall_viability.py`` reports these
-pieces (``--suite waves|invariants|convergence|energy|cost|shear|mri``) and must
-be run on a cluster.
+a small ``dt`` recovers the unregularized Hall step. For fixed ``l(x)`` the semidiscrete Hall
+flow conserves ``0.5 (|B|**2 + l**2 |curl B|**2)``; the second term is the reservoir
+(``Hall.reservoir_energy``). The discrete call conserves it only up to the RK4
+substep truncation and the PCG residual. The coupled energy is not closed: the
+reservoir is exchanged with the ideal step and with a changing automatic ``l``, so the
+physical energy drifts by an amount that scales with ``(k l)**2`` (the ``energy`` sweep
+over fixed ``k l`` reports the drift per unit perturbation energy, its fitted order in
+``l``, and the Hall, ideal, metric-change and accepted-state stabilization
+contributions separately; the stabilization filters the total energy field, which leaves
+its volume mean unchanged). The outer step keeps the ideal CFL limit.
+``scripts/hall_viability.py`` reports these pieces
+(``--suite waves|invariants|convergence|energy|cost|shear|mri|ot|stability|precision``)
+and must be run on a cluster. The ``cost`` suite times Hall-only steps under a shared
+phase-error ceiling; it is not an equal-error comparison of coupled runs. The ``ot``
+suite is the coupled comparison: inertia runs against the reference at ``N`` with
+the reference's own ``2N -> N`` resolution error as the accuracy gate. ``waves`` also
+runs on a 3D grid (``--dim 3``), and ``mri --mri-quick`` keeps only the unstable
+eigenmode runs.
 
 Shearing sheet and Hall-MRI
 ---------------------------

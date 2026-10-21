@@ -115,7 +115,22 @@ class HallMRI1DProblem(BaseProblem):
             debug=debug,
         )
         grid.mhd_config = self.config.get("physics", {}).get("mhd", {})
+        self._setup_mode(grid)
         return grid
+
+    def _setup_mode(self, grid: Grid1D) -> None:
+        """Mode metadata and amplitude history; shared by fresh starts and restarts."""
+        ic = self.config.get("initial_conditions", {})
+        shear = self.config.get("physics", {}).get("mhd", {}).get("shearing_sheet") or {}
+        params = self._params()
+        self._mode = int(ic.get("mode", 1))
+        self._radial = int(shear.get("radial_axis", 1))
+        self._azimuthal, self._sign = shearing_sheet_axes(0, self._radial)
+        k = 2.0 * np.pi * self._mode / grid.Lx
+        s, self._vector = hall_mri_mode(k, **params)
+        self.linear_mode = dict(k=float(k), growth=float(s.real), frequency=float(s.imag),
+                                **params)
+        self.amplitude_history = []
 
     def create_equations(self) -> MHDEquations1D:
         return MHDEquations1D(gamma=self.gamma)
@@ -128,15 +143,8 @@ class HallMRI1DProblem(BaseProblem):
 
     def create_initial_conditions(self, grid: Grid1D):
         ic = self.config.get("initial_conditions", {})
-        shear = self.config.get("physics", {}).get("mhd", {}).get("shearing_sheet") or {}
-        params = self._params()
-        self._mode = int(ic.get("mode", 1))
-        self._radial = int(shear.get("radial_axis", 1))
-        self._azimuthal, sign = shearing_sheet_axes(0, self._radial)
-        k = 2.0 * np.pi * self._mode / grid.Lx
-        s, v = hall_mri_mode(k, **params)
-        self.linear_mode = dict(k=float(k), growth=float(s.real), frequency=float(s.imag),
-                                **params)
+        params, sign, v = self._params(), self._sign, self._vector
+        k = self.linear_mode["k"]
         x = self.convert_torch_to_numpy(grid.x)[0]
         wave = (float(ic.get("amplitude", 1e-6)) * abs(params["field"])
                 * np.real(v[:, None] * np.exp(1j * k * x)[None, :]))
@@ -154,6 +162,11 @@ class HallMRI1DProblem(BaseProblem):
         U = self.create_equations().conservative(*fields)
         self.amplitude_history = [(self.t0, self._amplitude(U))]
         return U
+
+    def initialize_monitoring(self, solver, U):
+        # Also reached on restart, where the history starts from the loaded state.
+        self.amplitude_history = [(self.t0, self._amplitude(U))]
+        super().initialize_monitoring(solver, U)
 
     def output_monitoring_info(self, solver, U, step_count, dt):
         # Requires monitoring.enabled; the history is sampled every step_interval steps.
