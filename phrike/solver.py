@@ -455,6 +455,7 @@ def _compute_rhs_2d(grid: Grid2D, eqs: EulerEquations2D, U: Array,
     rhs = -(dFdx + dFdy)
 
     if getattr(grid, "_mixed_open_y", False):
+        rhs = grid.apply_split_advection(rhs, U)
         rhs = grid.apply_boundary_flux(rhs, U, eqs, Fy)
         rhs = grid.project_dealiased(rhs)
         if grid.sbp_dissipation_strength > 0.0:
@@ -998,6 +999,7 @@ class SpectralSolverMHD:
             Fx, Fy = F
             rhs = -(self.grid.dx1(Fx) + self.grid.dy1(Fy))
             if getattr(self.grid, "_mixed_open_y", False):
+                rhs = self.grid.apply_split_advection(rhs, U)
                 rhs = self.grid.apply_boundary_flux(rhs, U, self.equations, Fy)
                 rhs = self.grid.project_dealiased(rhs)
             return rhs

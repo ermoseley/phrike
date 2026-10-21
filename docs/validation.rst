@@ -265,6 +265,13 @@ weights are used for mixed-grid conservation diagnostics and magnetic
 projection. The hard 2/3 projection acts only in x. There is no periodic y
 transform or smooth y filter on this path.
 
+Hydro and MHD momentum advection use a conservative split form in y. It
+preserves the SBP-weighted momentum integral and gives the advective
+kinetic-energy boundary balance before the x projection, avoiding a spurious
+energy source from the discrete product-rule error. This identity excludes
+pressure, magnetic stresses, boundary penalties and dissipation; it is not a
+stability or positivity guarantee for the complete projected system.
+
 For nonlinear mixed-grid runs, ``integration.sbp_dissipation`` can enable
 conservative high-order numerical damping with ``strength: 0.01``. It applies
 the negative SBP-weighted transpose product of third forward differences to
@@ -366,8 +373,8 @@ it by approximately 5e-13, and doubling its transverse domain changes it by
 production open boundary conditions. Set ``reference_alpha: 1`` when disabling
 ambipolar diffusion to retain identical initial data in an ideal-MHD control.
 
-Measured MPS refinement
-~~~~~~~~~~~~~~~~~~~~~~~
+Historical MPS refinement
+~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 A local study on 2026-10-21 used the published ``b02275c`` solver with MPS
 float32, CPU fallback disabled, CFL 0.65, seed amplitude 0.001, and SBP
@@ -413,5 +420,7 @@ signed mode projection reversed sign and turned over by t=1.5. Its transient
 
 These measurements concern early mode evolution. They do not establish
 nonlinear saturation convergence or independence from numerical damping.
-The separate coarse saturation continuation uses strength 0.02 after a
-clearly linear t=0.5 restart and therefore has different numerical controls.
+They predate the momentum-advection split correction and do not validate that
+operator. The subsequent 128 x 257 continuation stopped at t=10.2101 because
+its velocity spectral-tail diagnostic exceeded the resolution-review guard.
+Saturation was not established.

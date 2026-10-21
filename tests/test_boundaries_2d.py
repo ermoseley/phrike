@@ -156,3 +156,69 @@ def test_mixed_projection_allows_normal_flux_and_preserves_divergence(backend):
         bx, by = bx.numpy(), by.numpy()
     np.testing.assert_allclose(bx, 0.0, atol=1e-14)
     np.testing.assert_allclose(by, .7, atol=1e-14)
+
+
+@pytest.mark.parametrize("backend", ["numpy", "torch"])
+@pytest.mark.parametrize("mhd", [False, True])
+@pytest.mark.parametrize("basis_y", ["sbp", "fourier"])
+def test_split_advection_preserves_momentum_and_other_components(backend, mhd, basis_y):
+    if backend == "torch":
+        torch = pytest.importorskip("torch")
+    grid = Grid2D(8, 33, 1.0, 2.0, basis_y=basis_y, backend=backend,
+                  torch_device="cpu" if backend == "torch" else None)
+    X, Y = grid.xy_mesh()
+    sin, cos = (torch.sin, torch.cos) if backend == "torch" else (np.sin, np.cos)
+    rho = 1+.12*cos(2*np.pi*Y/grid.Ly)+.03*cos(2*np.pi*X)
+    vx, vy = .4+.2*sin(16*np.pi*Y/grid.Ly), .3+.06*cos(18*np.pi*Y/grid.Ly)
+    eq = MHDEquations2D() if mhd else EulerEquations2D()
+    U = (eq.conservative(rho, vx, vy, .2+.1*cos(14*np.pi*Y/grid.Ly),
+                         X*0+2, X*0+.3, X*0+.2, X*0+.1)
+         if mhd else eq.conservative(rho, vx, vy, X*0+2))
+    original = np.asarray(U).copy()
+    rhs = U*.01
+    before = np.asarray(rhs).copy()
+    assert grid.apply_split_advection(rhs, U) is rhs
+    np.testing.assert_array_equal(U, original)
+    if basis_y == "fourier":
+        np.testing.assert_array_equal(rhs, before)
+        return
+    momentum = slice(1, 4 if mhd else 3)
+    change = np.asarray(rhs)-before
+    np.testing.assert_allclose(np.sum(change[momentum]*grid.wy[:, None],
+                                     axis=(-2, -1))*grid.dx, 0, atol=2e-14)
+    unchanged = [0, 4, 5, 6, 7] if mhd else [0, 3]
+    np.testing.assert_array_equal(np.asarray(rhs)[unchanged], before[unchanged])
+
+
+@pytest.mark.parametrize("backend", ["numpy", "torch"])
+@pytest.mark.parametrize("mhd", [False, True])
+def test_split_advection_obeys_sbp_kinetic_energy_boundary_balance(backend, mhd):
+    if backend == "torch":
+        torch = pytest.importorskip("torch")
+    grid = Grid2D(8, 33, 1.0, 2.0, basis_y="sbp", backend=backend,
+                  torch_device="cpu" if backend == "torch" else None)
+    X, Y = grid.xy_mesh()
+    sin, cos = (torch.sin, torch.cos) if backend == "torch" else (np.sin, np.cos)
+    rho = 1+.12*cos(2*np.pi*Y/grid.Ly)
+    vx = .4+.2*sin(16*np.pi*Y/grid.Ly)
+    vy = .3+.06*cos(18*np.pi*Y/grid.Ly)+.02*Y
+    eq = MHDEquations2D() if mhd else EulerEquations2D()
+    U = (eq.conservative(rho, vx, vy, .2+.1*cos(14*np.pi*Y/grid.Ly),
+                         X*0+2, X*0+.3, X*0+.2, X*0+.1)
+         if mhd else eq.conservative(rho, vx, vy, X*0+2))
+    momentum = slice(1, 4 if mhd else 3)
+    velocity, q = U[momentum]/U[0], U[2]
+    rhs = U*0
+    rhs[0], rhs[momentum] = -grid.dy1(q), -grid.dy1(q*velocity)
+    conservative = np.asarray(rhs).copy()
+    grid.apply_split_advection(rhs, U)
+    velocity, q = np.asarray(velocity), np.asarray(q)
+    speed2 = np.sum(velocity**2, axis=0)
+    expected = -.5*grid.dx*np.sum(q[-1]*speed2[-1]-q[0]*speed2[0])
+    corrected = np.asarray(rhs)
+    rate = np.sum(grid.dx*grid.wy[:, None]*(np.sum(velocity*corrected[momentum],
+                  axis=0)-.5*speed2*corrected[0]))
+    assert rate == pytest.approx(expected, rel=1e-12, abs=1e-13)
+    conservative_rate = np.sum(grid.dx*grid.wy[:, None]*(np.sum(
+        velocity*conservative[momentum], axis=0)-.5*speed2*conservative[0]))
+    assert abs(conservative_rate-expected) > 1e-4
