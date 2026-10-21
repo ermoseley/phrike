@@ -1,8 +1,8 @@
 """3D circularly polarized Alfven wave (propagating along x in a 3D box).
 
 Same exact nonlinear solution as the 1D problem, but run through the full 3D MHD
-machinery (Grid3D.project_solenoidal, MHDEquations3D flux). Primary 3D
-convergence / div(B) validation from mhd_plan.md.
+machinery (Grid3D.project_solenoidal, MHDEquations3D flux). Used as the 3D
+convergence and div(B) check.
 """
 
 import os

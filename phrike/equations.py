@@ -649,7 +649,6 @@ class EulerEquations3D:
 #
 # The magnetic-flux rows form the antisymmetric (uB - Bu) tensor, i.e. the
 # induction equation  dB/dt + div(uB - Bu) = 0  <=>  dB/dt = curl(u x B).
-# See mhd_plan.md for the full derivation and references.
 
 
 def _is_torch(x: Array) -> bool:

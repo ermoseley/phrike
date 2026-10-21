@@ -1,39 +1,29 @@
+# Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+
+# Numba caches
 *.nbc
 *.nbi
-.pytest_cache/
-dist/
-build/
-*.egg-info/
+
+# Simulation outputs
 outputs/
+frames/
+vids/
 *.npz
 *.png
 *.mp4
-.ruff_cache/
-.DS_Store
-.venv/
 
-# Additional files and directories
-frames/
-colormaps.py
-ramses-utils/
-example.py
-dedalus_dir/
-vids/
-.mypy_cache/
-dgpy/
-FastGaussQuadrature.jl/
-quail/
-LagrangianPhaseSpaceSheetEasy/
-
-# Generated documentation and local agent/run artifacts
+# Generated documentation
 docs/_build/
-.coverage
-.claude/
-.codex-pets/
-pet-runs/
-runs/
-clawd.zip
-coral.zip
+
+# OS / editor
+.DS_Store

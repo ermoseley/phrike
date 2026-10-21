@@ -1,4 +1,4 @@
-"""1D periodic acoustic wave problem for comprehensive testing.
+"""1D periodic acoustic wave problem.
 
 This problem uses sinusoidal density perturbations in a periodic domain,
 creating acoustic waves that are ideal for:
@@ -17,7 +17,6 @@ import matplotlib.pyplot as plt
 
 from phrike.grid import Grid1D
 from phrike.equations import EulerEquations1D
-# Initial condition function moved from phrike.initial_conditions
 from phrike.solver import SpectralSolver1D
 from phrike.visualization import plot_fields, plot_conserved_time_series
 from phrike.io import save_solution_snapshot
@@ -52,7 +51,7 @@ def sinusoidal_density(
 class Acoustic1DProblem(BaseProblem):
     """1D periodic acoustic wave problem with sinusoidal density perturbations.
 
-    This problem is designed specifically for comprehensive testing of the 1D solver:
+    Intended as a smooth, periodic check of the 1D solver:
     - Uses periodic boundary conditions (natural for spectral methods)
     - Small amplitude perturbations for linear regime testing
     - Predictable evolution for validation

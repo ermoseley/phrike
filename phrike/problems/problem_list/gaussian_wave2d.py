@@ -245,11 +245,11 @@ class GaussianWave2DProblem(BaseProblem):
         )
         print(f"Saved final snapshot: {snapshot_path}")
 
-        # Create comprehensive visualization
+        # Create visualization
         self._create_wave_analysis_plots(solver)
 
     def _create_wave_analysis_plots(self, solver) -> None:
-        """Create comprehensive analysis plots for the 2D wave packet."""
+        """Create analysis plots for the 2D wave packet."""
         U_primitive = solver.equations.primitive(solver.U)
         X, Y = np.meshgrid(solver.grid.x, solver.grid.y, indexing='ij')
         rho, u, v, p = U_primitive

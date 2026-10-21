@@ -865,8 +865,8 @@ class SpectralSolver2D:
 # 8-component conservative state U = [rho, rho*ux, rho*uy, rho*uz, E, Bx, By, Bz].
 # The RHS is the same conservative flux-divergence structure as Euler; the
 # magnetic solenoidal constraint div(B)=0 is enforced by Helmholtz (Leray)
-# projection of B after every RK substage and (last) after spectral dissipation
-# (see mhd_plan.md). Optional explicit resistivity/viscosity are applied as
+# projection of B after every RK substage and (last) after spectral dissipation.
+# Optional explicit resistivity/viscosity are applied as
 # spectral Laplacians on the B and momentum rows; the energy row is left to the
 # ideal flux so that dissipated magnetic/kinetic energy is converted to thermal
 # energy through the pressure recovery (total energy conserving, div(B)-safe
