@@ -3,10 +3,12 @@ import pytest
 
 from phrike.equations import MHDEquations1D, MHDEquations2D, MHDEquations3D
 from phrike.grid import Grid1D, Grid2D, Grid3D
+from phrike.io import load_checkpoint, save_solution_snapshot
 from phrike.nonideal import Hall
 from phrike.problems.problem_list.hall_mri1d import (
     HallMRI1DProblem, hall_mri_fastest, hall_mri_mode,
 )
+from phrike.problems.problem_list.orszag_tang2d import orszag_tang_2d
 from phrike.solver import SpectralSolverMHD1D, SpectralSolverMHD2D
 
 
@@ -352,3 +354,81 @@ def test_hall_mri_eigenmode_grows_at_the_linear_rate(hall, tmp_path):
     growth = np.log(amplitude[2]/amplitude[1])/(dt*(steps-steps//2))
     assert growth == pytest.approx(problem.linear_mode["growth"], rel=0.02)
     assert problem.linear_mode["growth"] > 0.1
+
+
+def test_float32_inertia_cg_tolerance_is_floored_at_roundoff():
+    g = Grid2D(Nx=24, Ny=24, Lx=2*np.pi, Ly=2*np.pi, backend="numpy")
+    X, Y = np.meshgrid(g.x, g.y)
+    hall = Hall(g, dict(eta_h=1.0, method="inertia"))
+    B = np.array([1+0*X, 0.1*np.cos(X+Y), 0.1*np.sin(Y)])
+    rhs = hall.curl(B).astype(np.float32)
+    length2 = (0.01*(1+0.5*np.sin(X))).astype(np.float32)
+    # A float32 residual of 1e-10 is unreachable; the request is raised to 10 eps.
+    x, iterations, residual = hall.inertia_solve(rhs, length2, tol=1e-10)
+    assert x.dtype == np.float32 and iterations > 0
+    assert residual <= 10*np.finfo(np.float32).eps
+    # Double precision keeps the requested tolerance.
+    _, _, residual = hall.inertia_solve(rhs.astype(np.float64), length2.astype(np.float64), tol=1e-10)
+    assert residual <= 1e-10
+
+
+@pytest.mark.parametrize("length_mode", ["constant", "local"])
+def test_hall_inertia_restart_is_bitwise(length_mode, tmp_path):
+    n, half = 16, 3
+    hall = dict(enabled=True, eta_h=0.5, eta_h_form="proportional_to_B_over_rho", method="inertia",
+                length_mode=length_mode, length_ratio=4.0, b0=1/np.sqrt(4*np.pi),
+                rho0=25/(36*np.pi), cg_tol=1e-12)
+    filters = dict(spectral_dissipation=dict(enabled=True, order=2, onset_fraction=0.8,
+                                             e_folding_time_at_cutoff=0.05))
+
+    def make():
+        g = Grid2D(Nx=n, Ny=n, Lx=1.0, Ly=1.0, backend="numpy", filter_params=filters)
+        g.mhd_config = dict(resistivity=0.0, viscosity=0.0, hall=dict(hall))
+        return g, SpectralSolverMHD2D(grid=g, equations=MHDEquations2D(gamma=5.0/3.0), cfl=0.25)
+
+    g, s = make()
+    U0 = orszag_tang_2d(*g.xy_mesh(), gamma=5.0/3.0)
+    dt = s.compute_dt(U0)
+    U = U0
+    for _ in range(2*half):
+        U = s.step(U, dt)
+    assert s.hall.total["substeps"] > 0
+    assert length_mode == "constant" or s.hall.total["cg_calls"] > 0
+    # Hall is stateless: a fresh grid, solver and Hall object rebuilt from the same
+    # config continue exactly from a saved snapshot.
+    g, s = make()
+    V = U0
+    for _ in range(half):
+        V = s.step(V, dt)
+    path = save_solution_snapshot(str(tmp_path), half*dt, U=V, grid=g, equations=s.equations)
+    restart = load_checkpoint(path)
+    assert restart["t"] == half*dt
+    g, s = make()
+    V = restart["U"]
+    for _ in range(half):
+        V = s.step(V, dt)
+    assert np.array_equal(V, U)
+
+
+def test_hall_mri_restart_rebuilds_mode_metadata_and_history(tmp_path):
+    def config():
+        return dict(
+            problem="hall_mri1d", grid=dict(N=16, Lx="auto", precision="double"),
+            physics=dict(gamma=5.0/3.0, mhd=dict(enabled=True,
+                                                 shearing_sheet=dict(omega=1.0, q=1.5))),
+            integration=dict(t0=0.0, t_end=1.0, cfl=0.3, scheme="rk4"),
+            initial_conditions=dict(rho0=1.0, B0=1.0, beta=100.0, mode=1, amplitude=1e-6),
+            io=dict(outdir=str(tmp_path)), monitoring=dict(enabled=True))
+
+    fresh = HallMRI1DProblem(config=config())
+    g = fresh.create_grid("numpy")
+    s = SpectralSolverMHD1D(grid=g, equations=fresh.create_equations(), cfl=0.3)
+    U = s.step(fresh.create_initial_conditions(g), 0.1)
+    snapshot = save_solution_snapshot(str(tmp_path), 0.1, U=U, grid=g, equations=s.equations)
+    restarted = HallMRI1DProblem(config=config(), restart_from=snapshot)
+    g2 = restarted.create_grid("numpy")  # restart never calls create_initial_conditions
+    s2 = SpectralSolverMHD1D(grid=g2, equations=restarted.create_equations(), cfl=0.3)
+    restarted.initialize_monitoring(s2, restarted.restart_data["U"])
+    assert restarted.linear_mode == fresh.linear_mode
+    (t, amplitude), = restarted.amplitude_history
+    assert t == 0.1 and amplitude == pytest.approx(fresh._amplitude(U), rel=1e-14)
