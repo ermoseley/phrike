@@ -1,4 +1,4 @@
-"""Problem registry and base classes for SpectralHydro simulations."""
+"""Problem registry and base classes for PHRIKE."""
 
 from .base import BaseProblem
 from .registry import ProblemRegistry

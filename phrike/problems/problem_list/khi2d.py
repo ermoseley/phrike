@@ -8,7 +8,6 @@ import numpy as np
 
 from phrike.grid import Grid2D
 from phrike.equations import EulerEquations2D
-# Initial condition function moved from phrike.initial_conditions
 from phrike.solver import SpectralSolver2D
 from ..base import BaseProblem
 

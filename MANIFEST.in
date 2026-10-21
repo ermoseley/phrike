@@ -8,17 +8,7 @@ recursive-include scripts *.py *.md
 prune build
 prune dist
 prune docs/_build
-prune .claude
-prune .codex-pets
 prune outputs
-prune pet-runs
-prune runs
-prune dgpy
-prune dedalus_dir
-prune ramses-utils
-prune FastGaussQuadrature.jl
-prune quail
-prune LagrangianPhaseSpaceSheetEasy
 
 global-exclude __pycache__
 global-exclude *.py[cod]

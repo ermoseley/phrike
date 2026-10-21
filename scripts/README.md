@@ -46,13 +46,3 @@ python -m scripts.validate_alfven1d
 
 The benchmark intentionally calls an internal solver step and is therefore a
 developer measurement, not part of the stable public API or test suite.
-
-## Retired root helpers
-
-| Retired helper | Supported replacement |
-| --- | --- |
-| `visualize_turb3d_snapshot.py` | `python -m scripts.postprocess plot ...` |
-| `analyze_turb3d_lpsse.py` | `python -m scripts.postprocess tracer-density ...` |
-| `phrike2vid.py`, `create_video_python.py` | Run the problem with `python -m phrike ... --video` |
-| `run_orszag_tang2d.py` | `python -m phrike orszag_tang2d --config configs/orszag_tang2d.yaml` |
-| ad-hoc `test_*.py` demos | Version-controlled configs and `python -m pytest -q` |

@@ -8,7 +8,6 @@ import numpy as np
 
 from phrike.grid import Grid3D
 from phrike.equations import EulerEquations3D
-# Initial condition function moved from phrike.initial_conditions
 from phrike.solver import SpectralSolver3D
 from phrike.io import save_solution_snapshot
 from phrike.visualization import (
@@ -367,7 +366,7 @@ class Turb3DProblem(BaseProblem):
         rho, ux, uy, uz, p = solver.equations.primitive(solver.U)
         rho, ux, uy, uz, p = self.convert_torch_to_numpy(rho, ux, uy, uz, p)
 
-        # Create comprehensive analysis plot
+        # Create analysis plot
         fig, axes = plt.subplots(2, 3, figsize=(18, 12), constrained_layout=True)
 
         mid = rho.shape[0] // 2

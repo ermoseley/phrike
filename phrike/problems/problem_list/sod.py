@@ -8,7 +8,6 @@ import numpy as np
 
 from phrike.grid import Grid1D
 from phrike.equations import EulerEquations1D
-# Initial condition function moved from phrike.initial_conditions
 from phrike.solver import SpectralSolver1D
 from phrike.visualization import plot_fields, plot_conserved_time_series
 from phrike.io import save_solution_snapshot

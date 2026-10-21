@@ -49,11 +49,7 @@ jobs:
           sdist = next(Path("dist").glob("*.tar.gz"))
           with open_tar(sdist) as archive:
               names = archive.getnames()
-          excluded = (
-              "/build/", "/dist/", "/docs/_build/", "/runs/", "/pet-runs/",
-              "/outputs/", "/dedalus_dir/", "/dgpy/", "/quail/",
-              "/ramses-utils/", "/LagrangianPhaseSpaceSheetEasy/",
-          )
+          excluded = ("/build/", "/dist/", "/docs/_build/", "/outputs/", "__pycache__")
           unexpected = [name for name in names if any(item in name for item in excluded)]
           assert not unexpected, unexpected
           PY
