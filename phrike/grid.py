@@ -1550,6 +1550,22 @@ class Grid2D:
                                         and isinstance(U, torch.Tensor) else boundary.copy())
         return self.apply_boundary_conditions(U, equations)
 
+    def apply_split_advection(self, rhs, U):
+        """Conservative y-advection split with SBP kinetic-energy balance.
+
+        The balance applies before the Fourier projection and excludes pressure,
+        magnetic stresses, boundary penalties and dissipation.
+        """
+        if not self._mixed_open_y:
+            return rhs
+        momentum = slice(1, 4 if U.shape[0] == 8 else 3)
+        velocity = U[momentum]/U[0]
+        mass_flux = U[2]
+        rhs[momentum] += 0.5*(self.dy1(mass_flux*velocity)
+                              - mass_flux*self.dy1(velocity)
+                              - velocity*self.dy1(mass_flux))
+        return rhs
+
     def apply_boundary_flux(self, rhs, U, equations, Fy):
         """Strong SBP/Rusanov penalty against the initial ambient exterior.
 
