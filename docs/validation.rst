@@ -365,3 +365,53 @@ it by approximately 5e-13, and doubling its transverse domain changes it by
 4.2e-9. This is a padded linear reference, not an exact solution of the
 production open boundary conditions. Set ``reference_alpha: 1`` when disabling
 ambipolar diffusion to retain identical initial data in an ideal-MHD control.
+
+Measured MPS refinement
+~~~~~~~~~~~~~~~~~~~~~~~
+
+A local study on 2026-10-21 used the published ``b02275c`` solver with MPS
+float32, CPU fallback disabled, CFL 0.65, seed amplitude 0.001, and SBP
+dissipation strength 0.01. All four grids reached t=0.5 with the physical
+parameters above unchanged and ``Ny = 2*Nx + 1``. The ambipolar increment solve
+used tolerance 1e-5 and the Fourier-tensor preconditioner. Refinement reduced
+both the mesh spacing and timestep; this measures coupled space/time behavior.
+
+The relative error below compares the complex first x Fourier coefficient of
+``B_y`` with its initial profile multiplied by ``exp(lambda*t)``, using the
+physical SBP-weighted norm in y. It retains amplitude and phase errors.
+
+.. list-table:: Fundamental-mode error at t=0.5
+   :header-rows: 1
+
+   * - Grid
+     - Relative error
+   * - 32 x 65
+     - 0.129218
+   * - 64 x 129
+     - 0.0175508
+   * - 128 x 257
+     - 0.00180458
+   * - 256 x 513
+     - 0.00203268
+
+Adjacent-grid differences in the physical mode, without independently
+renormalizing its amplitude, were 0.114586, 0.0161964, and 0.00133268. The
+32/64/128 sequence gives an apparent coupled refinement rate of 2.82. This is
+a coarse-range measurement: the shear width spans only 1.6 y cells on the
+coarsest grid. The reference error improves strongly through 128, then worsens
+at 256; an asymptotic order is not established.
+
+A NumPy float64 run at 128 had reference error 0.00121653 and differed from
+MPS by 0.00109970, comparable to the finest adjacent-grid difference. Precision,
+effective CG termination, finite amplitude, and discretization remain mixed
+in this comparison. Halving the seed did not produce clean harmonic scaling.
+Doubling the y domain gave a centered-core difference of 0.00039937, including
+an initial-profile difference of 0.00031384; this only checks early domain
+sensitivity. With AD disabled and exactly the same AD-mode initial state, the
+signed mode projection reversed sign and turned over by t=1.5. Its transient
+``log(abs(amplitude))/t`` is not an ideal-MHD instability growth rate.
+
+These measurements concern early mode evolution. They do not establish
+nonlinear saturation convergence or independence from numerical damping.
+The separate coarse saturation continuation uses strength 0.02 after a
+clearly linear t=0.5 restart and therefore has different numerical controls.
