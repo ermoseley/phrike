@@ -1,9 +1,10 @@
 """
 2D Gaussian Wave Packet Problem - Y-direction only
 A 1D Gaussian wave packet copied along x-direction, traveling purely in y-direction.
-This tests the 2D Legendre implementation with a problem that should behave identically to 1D.
+The transverse basis and boundary conditions are selected by the configuration.
 """
 
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import Dict, Optional
@@ -21,7 +22,7 @@ class GaussianWave2DYProblem(BaseProblem):
         self.gamma = float(self.config["physics"]["gamma"])
 
     def create_grid(self, backend: str = "numpy", device: Optional[str] = None, debug: bool = False) -> Grid2D:
-        """Create 2D grid with Legendre basis."""
+        """Create the configured transverse grid and boundary conditions."""
         Nx = int(self.config["grid"]["Nx"])
         Ny = int(self.config["grid"]["Ny"])
         Lx = float(self.config["grid"]["Lx"])
@@ -34,6 +35,7 @@ class GaussianWave2DYProblem(BaseProblem):
         return Grid2D(
             Nx=Nx, Ny=Ny, Lx=Lx, Ly=Ly,
             basis_x=basis_x, basis_y=basis_y, bc=bc,
+            bc_config=self.config["grid"].get("bc_config"),
             dealias=dealias, filter_params=self.filter_config,
             fft_workers=self.fft_workers, backend=backend,
             torch_device=device, precision=self.precision,
@@ -60,14 +62,12 @@ class GaussianWave2DYProblem(BaseProblem):
         y0 = float(ic_config.get("y0", 0.5))               # Center of domain in y
         direction = ic_config.get("direction", "up")       # "up" or "down"
 
-        x, y = grid.x, grid.y
-        X, Y = np.meshgrid(x, y, indexing='ij')
-
         # Create 1D Gaussian perturbation in y-direction only
-        gaussian_y = amplitude * np.exp(-((y - y0) ** 2) / (2.0 * sigma**2))
+        exponent = -((grid.y - y0) ** 2) / (2.0 * sigma**2)
+        gaussian_y = amplitude * (exponent.exp() if grid._use_torch else np.exp(exponent))
         
         # Broadcast to 2D (constant along x)
-        gaussian_2d = np.tile(gaussian_y, (len(x), 1)).T
+        gaussian_2d = gaussian_y[:, None] + grid.x[None, :]*0
 
         # Calculate sound speed
         c_s = np.sqrt(self.gamma * p0 / rho0)
@@ -80,11 +80,11 @@ class GaussianWave2DYProblem(BaseProblem):
         
         # Apply proper linear acoustic wave relations (same as 1D)
         # For a wave traveling in y-direction:
-        # δp = c_s² δρ, δu = 0, δv = -c_s * ny * δρ/ρ₀
+        # δp = c_s² δρ, δu = 0, δv = c_s * ny * δρ/ρ₀
         delta_rho = gaussian_2d
         delta_p = c_s**2 * delta_rho
-        delta_u = np.zeros_like(delta_rho)  # No x-velocity perturbation
-        delta_v = -c_s * ny * delta_rho / rho0  # y-velocity perturbation
+        delta_u = delta_rho*0  # No x-velocity perturbation
+        delta_v = c_s * ny * delta_rho / rho0
 
         # Set up the fields
         rho = rho0 + delta_rho
@@ -98,7 +98,7 @@ class GaussianWave2DYProblem(BaseProblem):
     def get_analytical_solution(
         self, grid: Grid2D, t: float
     ) -> Optional[Dict[str, np.ndarray]]:
-        """Get analytical solution at time t (without reflections for simplicity)."""
+        """Translate the linear acoustic reference before boundary interactions."""
         ic_config = self.config["initial_conditions"]
         rho0 = float(ic_config.get("rho0", 1.0))
         u0 = float(ic_config.get("u0", 0.0))
@@ -119,17 +119,18 @@ class GaussianWave2DYProblem(BaseProblem):
             ny = -1.0
         
         # Translate the wave packet
-        y_translated = y + c_s * ny * t
-        gaussian_y = amplitude * np.exp(-((y_translated - y0) ** 2) / (2.0 * sigma**2))
+        y_translated = y - (v0 + c_s * ny) * t
+        exponent = -((y_translated - y0) ** 2) / (2.0 * sigma**2)
+        gaussian_y = amplitude * (exponent.exp() if grid._use_torch else np.exp(exponent))
         
         # Broadcast to 2D
-        gaussian_2d = np.tile(gaussian_y, (len(grid.x), 1)).T
+        gaussian_2d = gaussian_y[:, None] + grid.x[None, :]*0
         
         # Apply acoustic relations
         delta_rho = gaussian_2d
         delta_p = c_s**2 * delta_rho
-        delta_u = np.zeros_like(delta_rho)
-        delta_v = -c_s * ny * delta_rho / rho0
+        delta_u = delta_rho*0
+        delta_v = c_s * ny * delta_rho / rho0
 
         rho_analytical = rho0 + delta_rho
         u_analytical = u0 + delta_u
@@ -139,13 +140,13 @@ class GaussianWave2DYProblem(BaseProblem):
         equations = EulerEquations2D(gamma=self.gamma)
         return equations.conservative(rho_analytical, u_analytical, v_analytical, p_analytical)
 
-    def create_visualization(self, grid: Grid2D, U: np.ndarray, t: float) -> None:
+    def create_visualization(self, solver, t: float, U):
         """Create visualization of the 2D Gaussian wave packet."""
+        grid = solver.grid
         equations = EulerEquations2D(gamma=self.gamma)
         rho, u, v, p = equations.primitive(U)
         
-        x, y = grid.x, grid.y
-        X, Y = np.meshgrid(x, y, indexing='ij')
+        rho, u, v, p, x, y = self.convert_torch_to_numpy(rho, u, v, p, grid.x, grid.y)
         
         fig, axes = plt.subplots(2, 2, figsize=(12, 10))
         fig.suptitle(f'2D Gaussian Wave Packet (Y-direction) at t={t:.3f}', fontsize=14)
@@ -188,7 +189,9 @@ class GaussianWave2DYProblem(BaseProblem):
 
     def create_final_visualization(self, solver) -> None:
         """Create final visualization with analysis."""
-        return self.create_visualization(solver.grid, solver.U, solver.t)
+        figure = self.create_visualization(solver, solver.t, solver.U)
+        figure.savefig(os.path.join(self.outdir, "gaussian_wave2d_y_final.png"))
+        plt.close(figure)
 
     def get_solver_class(self):
         """Get the solver class for this problem."""

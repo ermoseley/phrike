@@ -1,0 +1,49 @@
+# Small-amplitude acoustic pulse: periodic x, open y, no periodic y wrapping.
+problem: gaussian_wave2d_y
+
+grid:
+  Nx: 8
+  Ny: 129
+  Lx: 1.0
+  Ly: 2.0
+  basis_x: fourier
+  basis_y: sbp
+  bc_config:
+    left: periodic
+    right: periodic
+    bottom: open
+    top: open
+  dealias: true
+  precision: double
+
+physics:
+  gamma: 1.6666666666666667
+
+initial_conditions:
+  rho0: 1.0
+  p0: 0.6
+  u0: 0.0
+  v0: 0.0
+  amplitude: 0.0001
+  sigma: 0.1
+  y0: 0.5
+  direction: up
+
+integration:
+  t0: 0.0
+  t_end: 4.0
+  cfl: 0.25
+  scheme: rk4
+  output_interval: 0.5
+  sbp_dissipation:
+    enabled: true
+    strength: 0.01
+
+runtime:
+  num_threads: 1
+
+io:
+  outdir: outputs/gaussian_wave2d_y_sbp
+
+monitoring:
+  enabled: false
