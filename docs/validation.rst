@@ -546,3 +546,76 @@ projection, finite amplitude and solve tolerances have not been isolated.
 
 These measurements concern early mode evolution. They do not establish
 nonlinear saturation convergence or independence from numerical damping.
+
+Hall term
+---------
+
+``physics.mhd.hall`` adds Hall induction ``dB/dt = -curl E_H`` with
+``E_H = eta_H (J x B)/|B|`` and a signed ``eta_h`` (``J = curl B``, Heaviside
+units). It is implemented for 1D, 2D, and 3D periodic Fourier grids; mixed-open
+and polynomial grids and adaptive RK stepping are rejected. Density, momentum,
+and internal energy are frozen during a Hall call, so total energy changes only
+by the change of ``0.5 |B|**2``. The curl uses the grid's dealias mask with zero
+Nyquist symbols. The step is Hall/2, ambipolar/2, RK, projection, ambipolar/2,
+Hall/2, which is palindromic; without a ``hall`` block it is unchanged.
+
+.. code-block:: yaml
+
+   physics:
+     mhd:
+       hall:
+         enabled: true
+         eta_h: 0.03             # signed
+         eta_h_form: constant    # or proportional_to_B_over_rho (uses b0, rho0)
+         method: inertia         # reference | inertia
+         length: 0.05            # inertia only; omit for the automatic length
+         length_mode: constant   # constant | local
+         length_ratio: 4.0       # local only: raise l so max(l)/min(l) <= ratio
+         safety: 0.5
+         cg_tol: 1.0e-10
+
+``reference`` is nonlinear RK4 subcycled to ``h <= safety/(max|eta_H| kmax**2)``
+of the masked curl. ``inertia`` solves ``(I + curl l**2 curl) dB/dt = -curl E_H``
+with ``l`` frozen per call, which divides the Hall rate of solenoidal modes by
+``1 + l**2 k**2`` and leaves curl-free parts unchanged. The automatic
+``l**2 = max(0, max|eta_H| dt/safety - 1/kmax**2)`` uses the Hall call's ``dt``
+(half the solver step) and is zero when the Hall rate is already resolved. A
+uniform ``l`` uses an exact Fourier inverse; ``l(x)`` uses preconditioned CG with
+the mean-``l`` Fourier preconditioner and raises if it does not converge. Without
+``length_ratio`` the CG iteration count grows with the dynamic range of ``l``.
+
+The regularization is a scale filter, not a frequency filter: for a uniform,
+resolved, unfiltered mode both the whistler and ion-cyclotron branches are
+off by about ``(k l)**2``. With automatic ``l`` at fixed resolution the error
+converges to true Hall at first order in ``dt`` in the regularized regime, while
+a small ``dt`` recovers the unregularized Hall step. For fixed ``l(x)`` a Hall call
+conserves ``0.5 (|B|**2 + l**2 |curl B|**2)``; the second term is the reservoir
+(``Hall.reservoir_energy``). The ideal step and a changing automatic ``l``
+exchange energy with it, so total energy is not conserved in coupled runs. The outer
+step keeps the ideal CFL limit. ``scripts/hall_viability.py`` reports these
+pieces (``--suite waves|invariants|convergence|energy|cost|shear|mri``) and must
+be run on a cluster.
+
+Shearing sheet and Hall-MRI
+---------------------------
+
+``physics.mhd.shearing_sheet`` (``omega``, ``shear`` or ``q`` with ``S = q omega``
+and default ``q = 1.5``, ``vertical_axis`` 0, ``radial_axis`` 1) adds the
+axisymmetric local-disc terms for the velocity ``u`` relative to
+``v0 = -S r phi`` inside every RK stage:
+``d(rho u_r)/dt += 2 Omega rho u_phi``, ``d(rho u_phi)/dt -= (2 Omega - S) rho u_r``,
+``dB_phi/dt -= S B_r``, ``dE/dt += S (rho u_r u_phi - B_r B_phi)``, with
+``phi = z_v x r`` taken from the right-handed basis (vertical x, radial y gives
+``+z``). Internal energy is unchanged and ``B_phi`` is generated along ``phi``,
+so ``div B`` is untouched. Fields must not vary along ``r``: only 1D grids with
+``vertical_axis: 0`` are accepted. ``omega: 0`` with ``shear != 0`` is pure shear.
+
+For ``k`` along ``B0`` the ``hall_mri1d`` problem seeds the fastest-growing
+eigenvector of the 4x4 system in ``phrike/problems/problem_list/hall_mri1d.py``,
+with ``h = eta_H sgn(B0) k**2`` and ``eta_H -> eta_H/(1 + l**2 k**2)`` for the
+inertia method. The sign that matters is that of ``eta_H (Omega . B0)``. It
+reproduces Balbus-Hawley at ``h = 0`` (0.75 Omega at ``k v_A = sqrt(15) Omega/4``)
+and, with ``v_H**2 = 2 Omega eta_H sgn(B0)``, Balbus and Terquem (2001) eqs. 45
+and 57 for ``eta = 0`` (checked by hand, not by a published table): the neutral
+Keplerian wavenumbers are ``(k v_A)**2 = 3 Omega**2 - 2 Omega h`` and
+``-Omega h/2``. Wardle (1999) and Sano and Stone (2002) were not compared.
