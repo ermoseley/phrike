@@ -618,6 +618,12 @@ def conserved_diagnostics(grid, equations, U) -> Dict[str, float]:
     }
 
 
+def _diffusion(grid, f: Array) -> Array:
+    """Diffusion operator: zero-flux endpoint closure on 1D polynomial grids."""
+    diffusion = getattr(grid, "diffusion", None)
+    return diffusion(f) if diffusion is not None else grid.laplacian(f)
+
+
 def _compute_rhs(grid: Grid1D, eqs: EulerEquations1D, U: Array, 
                 artificial_viscosity: Optional[SpectralArtificialViscosity] = None,
                 gravity_config: Optional[Dict] = None) -> Array:
@@ -625,9 +631,11 @@ def _compute_rhs(grid: Grid1D, eqs: EulerEquations1D, U: Array,
     # Enforce boundary conditions for non-periodic bases before computing flux
     if hasattr(grid, "apply_boundary_conditions"):
         U = grid.apply_boundary_conditions(U, eqs)
-    dFdx = grid.flux_derivative(U, eqs)
-    # Euler in conservation form: dU/dt = - dF/dx
-    rhs = -dFdx
+    if hasattr(grid, "apply_boundary_flux"):
+        dFdx, boundary_flux = grid.flux_derivative(U, eqs, return_boundary_flux=True)
+        rhs = grid.apply_boundary_flux(-dFdx, U, eqs, boundary_flux)
+    else:
+        rhs = -grid.flux_derivative(U, eqs)
     
     # Add artificial viscosity if enabled
     if artificial_viscosity is not None:
@@ -1523,7 +1531,10 @@ class SpectralSolverMHD:
     # --- physics helpers ---
     def _flux_divergence(self, U: Array) -> Array:
         if self.dim == 1:
-            return -self.grid.flux_derivative(U, self.equations)
+            dFdx, boundary_flux = self.grid.flux_derivative(
+                U, self.equations, return_boundary_flux=True
+            )
+            return self.grid.apply_boundary_flux(-dFdx, U, self.equations, boundary_flux)
         F = self.equations.flux(U)
         if self.dim == 2:
             Fx, Fy = F
@@ -1551,13 +1562,13 @@ class SpectralSolverMHD:
         eta = self.resistivity
         nu = self.viscosity
         if eta != 0.0:
-            rhs[5] = rhs[5] + eta * self.grid.laplacian(U[5])
-            rhs[6] = rhs[6] + eta * self.grid.laplacian(U[6])
-            rhs[7] = rhs[7] + eta * self.grid.laplacian(U[7])
+            rhs[5] = rhs[5] + eta * _diffusion(self.grid, U[5])
+            rhs[6] = rhs[6] + eta * _diffusion(self.grid, U[6])
+            rhs[7] = rhs[7] + eta * _diffusion(self.grid, U[7])
         if nu != 0.0:
-            rhs[1] = rhs[1] + nu * self.grid.laplacian(U[1])
-            rhs[2] = rhs[2] + nu * self.grid.laplacian(U[2])
-            rhs[3] = rhs[3] + nu * self.grid.laplacian(U[3])
+            rhs[1] = rhs[1] + nu * _diffusion(self.grid, U[1])
+            rhs[2] = rhs[2] + nu * _diffusion(self.grid, U[2])
+            rhs[3] = rhs[3] + nu * _diffusion(self.grid, U[3])
         return rhs
 
     def _clamp(self, U: Array, *, rebuild_always: bool = True) -> Array:

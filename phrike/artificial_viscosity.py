@@ -410,7 +410,8 @@ class SpectralArtificialViscosity:
 
         if (self.config.mode == "constant" and not hasattr(grid, "dy1")
                 and getattr(grid, "_basis_name", "fourier") != "fourier"):
-            laplacian = grid.laplacian(U)
+            laplacian = (grid.diffusion(U) if hasattr(grid, "diffusion")
+                         else grid.laplacian(U))
             viscosity_terms = [
                 nu_val * self.config.variable_weights.get(name, 1.0) * laplacian[i]
                 for i, name in enumerate(variable_names[:len(U)])

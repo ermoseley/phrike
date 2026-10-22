@@ -37,39 +37,41 @@ transforms, derivatives, and filters currently use dense matrices.
 ``wall``. Supported names have the following meaning:
 
 * ``fixed`` (alias ``dirichlet``) holds the initial endpoint density, momenta,
-  thermal pressure, and magnetic field. Set paired overrides with
-  ``grid.bc_values``. Unlike older versions, ``dirichlet`` means fixed data;
-  use ``wall`` to request an impermeable endpoint.
-* ``outflow`` (aliases ``open``, ``neumann``) copies adjacent nodal density,
-  momenta, thermal pressure, and field values. This is endpoint extrapolation,
-  not an exact polynomial derivative constraint or a characteristic
-  non-reflecting boundary.
-* ``wall`` (aliases ``reflective``, ``reflecting``) sets normal momentum to
-  zero and extrapolates the other fields. This is a kinematic wall; no
-  additional magnetic conducting-wall model is imposed.
+  thermal pressure, and magnetic field, imposed strongly at the endpoint node.
+  Set paired overrides with ``grid.bc_values``. Unlike older versions,
+  ``dirichlet`` means fixed data; use ``wall`` to request an impermeable
+  endpoint.
+* ``outflow`` (aliases ``open``, ``neumann``) is a far-field closure imposed
+  weakly: the endpoint right-hand side receives the SBP/Rusanov penalty
+  ``-(F*(u_b, g) - F(u_b)) . n / w_b`` against the initial endpoint state
+  ``g``, the same closure as the open faces of the 2D Fourier/SBP grid.
+  Outgoing waves leave; incoming characteristics relax to the initial state.
+* ``wall`` (aliases ``reflective``, ``reflecting``) uses the same penalty
+  against the mirror state with reversed normal momentum, so the mass flux
+  through the wall vanishes exactly. This is a kinematic wall; no additional
+  magnetic conducting-wall model is imposed.
 * ``periodic`` requires Fourier. Non-periodic BCs on Fourier are rejected.
 
-Only ``fixed`` endpoints are validated. ``outflow`` and ``wall`` copy or
-reflect nodal values, which is not a characteristic closure for the global
-polynomial derivative, so endpoint states drift before any wave reaches the
-boundary; ``Grid1D`` warns when either is used, including the implicit
-``wall`` default. With the shipped ``sod.yaml`` and ``brio_wu1d.yaml``
-settings at N=64 (Sod) and N=48 (Brio–Wu), the largest relative change of
-the endpoint density from its initial value is as follows, although no wave
-reaches either boundary by t=0.02:
+The penalty uses the endpoint value of the flux polynomial that the volume
+term differentiates (with 3/2 overintegration this differs from the flux of
+the endpoint state), and diffusion terms (artificial viscosity, explicit
+resistivity and viscosity) use a zero-flux endpoint closure. Together these
+keep the summation-by-parts balance: with ``wall`` endpoints the total mass
+changes only at round-off. Earlier versions copied neighbouring nodal values
+instead; that closure is unstable for the global polynomial derivative.
 
-=====================  ==========  ===========  ==========
-Case, t=0.02           Basis       ``outflow``  ``wall``
-=====================  ==========  ===========  ==========
-Sod                    Chebyshev   4.5%         1.0%
-Sod                    Legendre    37%          6.6%
-Brio–Wu                Chebyshev   14%          4.5%
-Brio–Wu                Legendre    61%          35%
-=====================  ==========  ===========  ==========
-
-The drift grows faster than linearly in time (Legendre ``outflow`` Brio–Wu
-left endpoint: 3e-4, 4e-3, 2e-2 and 7e-2 at t = 0.0005, 0.002, 0.005 and
-0.01). Treat results from these boundaries as experimental.
+On a smooth right-going acoustic pulse (amplitude 1e-3, N=64, t=1) the
+remaining acoustic amplitude after the pulse has left through ``outflow`` is
+1.5e-6 (Chebyshev) and 1.2e-7 (Legendre); the copying closure grew the pulse
+seventy-fold on Chebyshev and produced NaN on Legendre. A ``wall`` returns the
+reflected pulse with the same amplitude. Near a discontinuity the global
+basis spreads Gibbs error to every node: on the shipped ``sod.yaml`` and
+``brio_wu1d.yaml`` settings at N=64 and N=48, the nodes next to a ``fixed``
+endpoint already deviate from the initial density by up to 3% (Sod) and 10%
+(Brio–Wu, Legendre) at t=0.02, before any wave arrives. ``outflow`` endpoints
+now stay within 0.5% of their initial density in those cases, and ``wall``
+endpoints stay within a factor of two of the error at the nodes next to a
+``fixed`` endpoint.
 
 For example:
 

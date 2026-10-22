@@ -684,28 +684,6 @@ class Grid1D:
             raise ValueError("Fourier grids require periodic boundary conditions")
         if self._basis_name != "fourier" and "periodic" in configured_bcs:
             raise ValueError("Periodic boundary conditions require the Fourier basis")
-        # Unset boundaries, and variables a mapping leaves unspecified, are walls.
-        effective_bcs = list(configured_bcs)
-        if not configured_bcs:
-            effective_bcs.append("wall")
-        if self._bc_map is not None and "default" not in self._bc_map:
-            effective_bcs.append("wall")
-        if self._bc_boundary_map is not None:
-            if len(self._bc_boundary_map) < 2 or any(
-                "default" not in m for m in self._bc_boundary_map.values()
-            ):
-                effective_bcs.append("wall")
-        if self._basis_name != "fourier" and any(b in ("outflow", "wall") for b in effective_bcs):
-            # Copying or reflecting endpoint values is not a characteristic
-            # closure for the global polynomial derivative; endpoint states drift
-            # from their initial values even before any wave arrives.
-            warnings.warn(
-                "Outflow and wall boundaries on 1D polynomial grids are experimental: "
-                "endpoint states can drift by percent levels before waves reach the "
-                "boundary (see docs/validation.rst). Fixed boundaries are validated.",
-                UserWarning,
-                stacklevel=3,
-            )
 
         if self._basis_name == "fourier":
             # Existing periodic uniform grid path
@@ -909,15 +887,25 @@ class Grid1D:
             # Generic basis path (e.g., Legendre): delegate to basis implementation
             return self._basis.dx(f)  # type: ignore[union-attr]
 
-    def flux_derivative(self, U, equations):
+    def flux_derivative(self, U, equations, return_boundary_flux=False):
         """Differentiate nonlinear flux with 3/2 polynomial overintegration.
 
         At inadmissible extra nodes, use the convex, piecewise-linear state
         between adjacent original nodes. This changes only flux evaluation;
         it does not clip the evolved conservative state or its energy.
+
+        With ``return_boundary_flux`` the endpoint values of the flux
+        polynomial that is differentiated are also returned, shape ``(C, 2)``.
+        They are the boundary fluxes consistent with the derivative, which
+        :meth:`apply_boundary_flux` needs; with overintegration they differ
+        from the flux of the endpoint states.
         """
         if self._basis_name == "fourier" or not self.dealias:
-            return self.dx1(equations.flux(U))
+            flux = equations.flux(U)
+            derivative = self.dx1(flux)
+            if return_boundary_flux:
+                return derivative, flux[:, [0, -1]]
+            return derivative
         if not hasattr(self, "_flux_matrices"):
             n_pad = (3 * self.N + 1) // 2
             precision = self._basis.precision
@@ -928,26 +916,29 @@ class Grid1D:
             interpolation = self._basis.forward(identity) @ padded.inverse(padded_identity)[:self.N]
             mode_derivatives = self._basis.dx(modes)
             mode_derivatives[0] = 0.0
-            differentiation = padded.forward(padded_identity)[:, :self.N] @ mode_derivatives
+            projection = padded.forward(padded_identity)[:, :self.N]
+            differentiation = projection @ mode_derivatives
+            endpoints = projection @ modes[:, [0, -1]]
             x, xp = np.asarray(self._basis.nodes()), padded.nodes()
             left = np.clip(np.searchsorted(x, xp, side="right") - 1, 0, self.N - 2)
             fraction = (xp - x[left]) / (x[left + 1] - x[left])
-            self._flux_matrices = (interpolation, differentiation, left, fraction)
+            self._flux_matrices = (interpolation, differentiation, left, fraction, endpoints)
             self._flux_backend_cache = {}
         is_torch = _TORCH_AVAILABLE and isinstance(U, torch.Tensor)
         key = (str(U.device) if is_torch else "numpy", str(U.dtype))
         if key not in self._flux_backend_cache:
-            interp, diff, left, fraction = self._flux_matrices
+            interp, diff, left, fraction, endpoints = self._flux_matrices
             if is_torch:
                 cached = (torch.as_tensor(interp, dtype=U.dtype, device=U.device),
                           torch.as_tensor(diff, dtype=U.dtype, device=U.device),
                           torch.as_tensor(left, dtype=torch.long, device=U.device),
-                          torch.as_tensor(fraction, dtype=U.dtype, device=U.device))
+                          torch.as_tensor(fraction, dtype=U.dtype, device=U.device),
+                          torch.as_tensor(endpoints, dtype=U.dtype, device=U.device))
             else:
                 cached = (interp.astype(U.dtype), diff.astype(U.dtype),
-                          left, fraction.astype(U.dtype))
+                          left, fraction.astype(U.dtype), endpoints.astype(U.dtype))
             self._flux_backend_cache[key] = cached
-        interp, diff, left, fraction = self._flux_backend_cache[key]
+        interp, diff, left, fraction, endpoints = self._flux_backend_cache[key]
         padded_U = (U - U[:, :1]) @ interp + U[:, :1]
         energy = 4 if U.shape[0] == 8 else 2
         rho = padded_U[0]
@@ -961,7 +952,10 @@ class Grid1D:
         else:
             padded_U = np.where(bad[None, :], linear_U, padded_U)
         flux = equations.flux(padded_U)
-        return (flux - flux[:, :1]) @ diff
+        derivative = (flux - flux[:, :1]) @ diff
+        if return_boundary_flux:
+            return derivative, (flux - flux[:, :1]) @ endpoints + flux[:, :1]
+        return derivative
 
     def project_dealiased(self, f: np.ndarray) -> np.ndarray:
         """Project a Fourier field onto the retained 2/3 modal subspace."""
@@ -1064,6 +1058,30 @@ class Grid1D:
             k2 = np.asarray(self.k) ** 2
         return self.irfft(-k2 * F)
 
+    def diffusion(self, f):
+        """Second derivative used for diffusion terms, with zero boundary flux.
+
+        Fourier grids return :meth:`laplacian`. On Chebyshev and Legendre grids
+        the endpoint rows drop the boundary term of the summation-by-parts
+        identity ``H D D f = B D f - D^T H D f``, i.e. the diffusive flux
+        through the endpoints is zero. That is the closure that ``outflow``
+        and ``wall`` endpoints need; ``fixed`` endpoints are overwritten after
+        each stage, so their result does not depend on it. Interior rows equal
+        :meth:`laplacian`.
+        """
+        result = self.laplacian(f)
+        if self._basis_name == "fourier":
+            return result
+        gradient = self.dx1(f)
+        if _TORCH_AVAILABLE and isinstance(result, torch.Tensor):
+            result = result.clone()
+        else:
+            result = np.array(result, copy=True)
+        weights = self.wx
+        result[..., 0] = result[..., 0] + gradient[..., 0] / float(weights[0])
+        result[..., -1] = result[..., -1] - gradient[..., -1] / float(weights[-1])
+        return result
+
     def interpolate_periodic_linear_at_points_1d(
         self, f: np.ndarray, xp: np.ndarray
     ) -> np.ndarray:
@@ -1129,14 +1147,43 @@ class Grid1D:
         self._boundary_reference = None
         return self.apply_boundary_conditions(U, equations)
 
-    def apply_boundary_conditions(self, U: np.ndarray, equations) -> np.ndarray:
-        """Return a state with non-periodic endpoint conditions applied.
+    def _boundary_layout(self, U):
+        """Conservative rows of the boundary variables and the energy row."""
+        mhd = U.shape[0] == 8
+        variables = {"density": 0, "momentum": 1}
+        if mhd:
+            variables.update(momentum_y=2, momentum_z=3, bx=5, by=6, bz=7)
+        return variables, (4 if mhd else 2), mhd
 
-        Fixed/Dirichlet values default to initial endpoints. Outflow (also
-        open/Neumann) copies adjacent primitive values. A wall sets normal
-        momentum to zero and extrapolates the other variables. Pressure is
-        thermal pressure; energy includes all kinetic and magnetic terms.
-        The input, including Runge--Kutta stage arrays, is never modified.
+    def _boundary_kinds(self, side, names):
+        """Boundary kind of every variable on one side (0 left, 1 right)."""
+        boundary = "left" if side == 0 else "right"
+        mapping = (self._bc_boundary_map or {}).get(boundary, self._bc_map or {})
+        default = mapping.get("default", self._bc_global or "wall")
+        return {name: mapping.get(name, default) for name in names}
+
+    def _boundary_fields(self, a, equations):
+        """Primitive boundary fields of conservative columns ``a``."""
+        variables, energy, mhd = self._boundary_layout(a)
+        values = {name: a[row] for name, row in variables.items()}
+        kinetic = sum(a[row] ** 2 for row in range(1, energy)) / (2.0 * a[0])
+        magnetic = 0.5 * sum(a[row] ** 2 for row in (5, 6, 7)) if mhd else 0.0
+        values["pressure"] = (equations.gamma - 1.0) * (a[energy] - kinetic - magnetic)
+        return values
+
+    def _fixed_boundary_value(self, name, side, reference):
+        pair = (self._dirichlet_values_map or {}).get(name)
+        return pair[side] if pair is not None else reference[name][side]
+
+    def apply_boundary_conditions(self, U: np.ndarray, equations) -> np.ndarray:
+        """Return a state with the fixed endpoint values imposed.
+
+        ``fixed`` (Dirichlet) variables are set strongly to the initial
+        endpoint values or ``grid.bc_values``. ``outflow`` and ``wall``
+        variables are left untouched here: they are imposed weakly by
+        :meth:`apply_boundary_flux` in the right-hand side. Pressure is thermal
+        pressure; energy includes all kinetic and magnetic terms. The input,
+        including Runge--Kutta stage arrays, is never modified.
         """
         if self._basis_name == "fourier":
             return U
@@ -1151,41 +1198,28 @@ class Grid1D:
 
         if self._boundary_reference is None:
             self._boundary_reference = copy(U[:, [0, -1]])
-        result = copy(U)
-        mhd = U.shape[0] == 8
-        energy = 4 if mhd else 2
-        variables = {"density": 0, "momentum": 1}
-        if mhd:
-            variables.update(momentum_y=2, momentum_z=3, bx=5, by=6, bz=7)
-        gamma = equations.gamma
-
-        def fields(a):
-            values = {name: a[row] for name, row in variables.items()}
-            kinetic = sum(a[row] ** 2 for row in range(1, energy)) / (2.0 * a[0])
-            magnetic = 0.5 * sum(a[row] ** 2 for row in (5, 6, 7)) if mhd else 0.0
-            values["pressure"] = (gamma - 1.0) * (a[energy] - kinetic - magnetic)
-            return values
-
-        reference = fields(self._boundary_reference)
-        interior = fields(copy(U[:, [1, -2]]))
+        variables, energy, mhd = self._boundary_layout(U)
+        names = (*variables, "pressure")
+        reference = self._boundary_fields(self._boundary_reference, equations)
+        current = self._boundary_fields(copy(U[:, [0, -1]]), equations)
+        result = None
         for side, endpoint in enumerate((0, -1)):
-            boundary = "left" if side == 0 else "right"
-            mapping = (self._bc_boundary_map or {}).get(boundary, self._bc_map or {})
-            default = mapping.get("default", self._bc_global or "wall")
+            kinds = self._boundary_kinds(side, names)
+            if not any(kind == "fixed" for kind in kinds.values()):
+                continue
+            if result is None:
+                result = copy(U)
             values = {}
-            for name in (*variables, "pressure"):
-                kind = mapping.get(name, default)
-                if kind == "fixed":
+            for name in names:
+                if kinds[name] == "fixed":
+                    value = self._fixed_boundary_value(name, side, reference)
                     pair = (self._dirichlet_values_map or {}).get(name)
-                    value = pair[side] if pair is not None else reference[name][side]
-                elif kind == "wall" and name == "momentum":
-                    value = 0.0
+                    if mhd and name == "bx" and pair is not None:
+                        tolerance = 32.0 * (torch.finfo(U.dtype).eps if is_torch else np.finfo(U.dtype).eps)
+                        if abs(float(value) - float(U[5, endpoint])) > tolerance * max(1.0, abs(float(value))):
+                            raise ValueError("Fixed Bx must match the longitudinal interior field")
                 else:
-                    value = interior[name][side]
-                if mhd and name == "bx" and kind == "fixed" and pair is not None:
-                    tolerance = 32.0 * (torch.finfo(U.dtype).eps if is_torch else np.finfo(U.dtype).eps)
-                    if abs(float(value) - float(U[5, endpoint])) > tolerance * max(1.0, abs(float(value))):
-                        raise ValueError("Fixed Bx must match the longitudinal interior field")
+                    value = current[name][side]
                 values[name] = value
             for name, row in variables.items():
                 result[row, endpoint] = values[name]
@@ -1194,8 +1228,81 @@ class Grid1D:
                 raise ValueError("Boundary density and pressure must be positive")
             kinetic = sum(result[row, endpoint] ** 2 for row in range(1, energy)) / (2.0 * rho)
             magnetic = 0.5 * sum(result[row, endpoint] ** 2 for row in (5, 6, 7)) if mhd else 0.0
-            result[energy, endpoint] = values["pressure"] / (gamma - 1.0) + kinetic + magnetic
-        return result
+            result[energy, endpoint] = values["pressure"] / (equations.gamma - 1.0) + kinetic + magnetic
+        return U if result is None else result
+
+    def apply_boundary_flux(self, rhs, U, equations, boundary_flux=None):
+        """Weakly impose ``outflow`` and ``wall`` endpoints with an SBP/Rusanov flux.
+
+        At each endpoint that is not entirely ``fixed`` the right-hand side is
+        corrected by ``-(F*(u_b, g) - F(u_b)) . n / w_b``, where ``w_b`` is the
+        endpoint quadrature weight and ``F*`` the Rusanov flux against an
+        exterior state ``g``. For ``outflow`` the exterior is the initial
+        endpoint state (a far-field closure through which waves leave); for
+        ``wall`` it is the mirror state with the normal momentum reversed, so
+        the mass flux through the wall is exactly zero. ``fixed`` variables
+        take their fixed values in ``g`` and are also imposed strongly by
+        :meth:`apply_boundary_conditions`. ``boundary_flux`` is the endpoint
+        flux consistent with the volume derivative (see
+        :meth:`flux_derivative`); it defaults to the flux of the endpoint
+        states. Copying endpoint values instead is not a characteristic
+        closure for the global polynomial derivative and lets the endpoint
+        states drift.
+        """
+        if self._basis_name == "fourier":
+            return rhs
+        if self._boundary_reference is None:
+            self.initialize_boundary_conditions(U, equations)
+        is_torch = _TORCH_AVAILABLE and isinstance(U, torch.Tensor)
+        variables, energy, mhd = self._boundary_layout(U)
+        names = (*variables, "pressure")
+        boundary_states = U[:, [0, -1]]
+        reference = self._boundary_fields(self._boundary_reference, equations)
+        current = self._boundary_fields(boundary_states, equations)
+        gamma = equations.gamma
+        sqrt = torch.sqrt if is_torch else np.sqrt
+        absolute = torch.abs if is_torch else np.abs
+
+        def speed(state):
+            rho = state[0]
+            fields = self._boundary_fields(state, equations)
+            c2 = gamma * fields["pressure"] / rho
+            if mhd:
+                c2 = c2 + (state[5] ** 2 + state[6] ** 2 + state[7] ** 2) / rho
+            c2 = torch.clamp(c2, min=0) if is_torch else np.maximum(c2, 0.0)
+            return absolute(state[1] / rho) + sqrt(c2)
+
+        weights = self.wx
+        for side, endpoint, normal in ((0, 0, -1.0), (1, -1, 1.0)):
+            kinds = self._boundary_kinds(side, names)
+            if all(kind == "fixed" for kind in kinds.values()):
+                continue
+            values = {}
+            for name in names:
+                kind = kinds[name]
+                if kind == "fixed":
+                    values[name] = self._fixed_boundary_value(name, side, reference)
+                elif kind == "outflow":
+                    values[name] = reference[name][side]
+                elif name == "momentum":
+                    values[name] = -current[name][side]
+                else:
+                    values[name] = current[name][side]
+            u_b = boundary_states[:, side:side + 1]
+            g = u_b.clone() if is_torch else u_b.copy()
+            for name, row in variables.items():
+                g[row, 0] = values[name]
+            kinetic = sum(g[row, 0] ** 2 for row in range(1, energy)) / (2.0 * g[0, 0])
+            magnetic = 0.5 * sum(g[row, 0] ** 2 for row in (5, 6, 7)) if mhd else 0.0
+            g[energy, 0] = values["pressure"] / (gamma - 1.0) + kinetic + magnetic
+            flux_b = (equations.flux(u_b)[:, 0] if boundary_flux is None
+                      else boundary_flux[:, side])
+            flux_g = equations.flux(g)[:, 0]
+            signal = max(float(speed(u_b)[0]), float(speed(g)[0]))
+            outward = normal * flux_b
+            numerical = 0.5 * (outward + normal * flux_g) - 0.5 * signal * (g[:, 0] - u_b[:, 0])
+            rhs[:, endpoint] = rhs[:, endpoint] - (numerical - outward) / float(weights[endpoint])
+        return rhs
 
 
 @dataclass

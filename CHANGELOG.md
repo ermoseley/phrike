@@ -5,6 +5,14 @@ All notable changes to PHRIKE are recorded here. The format follows
 
 ## Unreleased
 
+### Fixed
+
+- 1D `outflow` and `wall` boundaries on Chebyshev/Legendre grids are now
+  imposed weakly with an SBP/Rusanov boundary flux (far-field and mirror
+  exterior states), consistent with the overintegrated flux and with a
+  zero-flux closure for diffusion terms. The previous copy-the-neighbour
+  closure was unstable: a smooth acoustic pulse grew instead of leaving.
+
 ### Changed
 
 - Document the equations that are integrated, the shared YAML keys, the
