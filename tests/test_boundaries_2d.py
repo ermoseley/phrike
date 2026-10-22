@@ -120,7 +120,7 @@ def test_transverse_flow_enters_hydro_cfl(backend):
 
 @pytest.mark.parametrize("mhd", [False, True])
 def test_transverse_nonlinear_rhs_stays_in_retained_fourier_band(mhd):
-    grid = Grid2D(24, 17, 1.0, 2.0, basis_y="sbp", fft_workers=1)
+    grid = Grid2D(24, 17, 1.0, 2.0, basis_y="sbp", fft_workers=1, backend="numpy")
     X, Y = grid.xy_mesh()
     zero, one = X*0, X*0+1
     vy = 0.01*Y*np.cos(14*np.pi*X)

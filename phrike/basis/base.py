@@ -11,7 +11,8 @@ class Basis1D(ABC):
 
     Implementations provide transform pairs and differentiation operators on
     the last axis (spatial axis). Inputs may be batched with arbitrary leading
-    dimensions (..., N). Implementations must be pure NumPy for now.
+    dimensions (..., N). Concrete bases accept NumPy arrays and may accept
+    Torch tensors.
     """
 
     def __init__(self, N: int, Lx: float, bc: str = "periodic") -> None:
@@ -56,18 +57,28 @@ class Basis1D(ABC):
         """Compute ∂²f/∂x². Default via two applications of dx."""
         return self.dx(self.dx(f))
 
+    def _spectral_filter_eta(self) -> np.ndarray:
+        """Modal coordinate in ``[0, 1]`` for the exponential filter.
+
+        The default uses polynomial degree ``k = 0 .. N-1``, with the
+        highest degree at 1. Fourier overrides this with ``|k| / k_Nyquist``.
+        """
+        degree = np.arange(self.N, dtype=float)
+        degree_max = max(float(self.N - 1), 1.0)
+        return degree / degree_max
+
     # --- Optional spectral filtering ---
     def apply_spectral_filter(self, f: np.ndarray, *, p: int = 8, alpha: float = 36.0) -> np.ndarray:
-        """Apply high-order exponential filter in spectral space.
+        """Apply a high-order exponential filter in spectral space.
 
-        The default implementation maps modal index k to [0,1] and uses
-        sigma(k) = exp(-alpha * (k/kmax)^p).
+        The default multiplies modal coefficient ``k`` by
+        ``sigma(k) = exp(-alpha * (k / (N - 1))^p)``, where ``k`` is the
+        polynomial degree. :class:`FourierBasis1D` uses ``|wavenumber| /
+        k_Nyquist`` instead of the degree index.
         """
         F = self.forward(f)
         N = self.N
-        k = np.arange(N, dtype=float)
-        kmax = max(float(N - 1), 1.0)
-        eta = k / kmax
+        eta = self._spectral_filter_eta()
         sigma_np = np.exp(-float(alpha) * eta**int(p))
         # Match backend of F (torch or numpy)
         try:

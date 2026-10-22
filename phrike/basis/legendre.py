@@ -528,8 +528,9 @@ def _legendre_gauss_lobatto_nodes_weights(N: int, precision: str = "double") -> 
 
         w_j = 2 / [N(N-1) (P_{N-1}(y_j))^2].
 
-    Uses high-precision computation (quadruple precision) for accuracy,
-    then converts to the requested precision.
+    Interior nodes and the weight formula are evaluated in float64.
+    ``precision`` only selects the dtype of the returned arrays. Weights
+    are accurate to about 1e-13 for N near 256.
 
     Args:
         N: number of nodes (>= 2). If N == 1, returns y=[0], w=[2].
@@ -547,7 +548,8 @@ def _legendre_gauss_lobatto_nodes_weights(N: int, precision: str = "double") -> 
 
     # Use high-precision computation if available
     if _MPMATH_AVAILABLE:
-        # Compute in quadruple precision (32 digits) for maximum accuracy
+        # Weight arithmetic uses 32 decimal digits, but the interior nodes
+        # themselves come from float64 Jacobi roots (see _gausslobatto_mpmath).
         x_mp, w_mp = _gausslobatto_mpmath(N, precision=32)
         
         # Convert to numpy arrays
@@ -626,7 +628,14 @@ def _stable_legendre_diff_matrix(y: np.ndarray) -> np.ndarray:
 
 # High-precision LGL computation functions
 def _gausslobatto_mpmath(n: int, precision: int = 32):
-    """mpmath implementation of Gauss-Lobatto quadrature with arbitrary precision."""
+    """Gauss-Lobatto nodes and weights at float64 node accuracy.
+
+    Interior nodes come from ``scipy.special.roots_jacobi`` in float64.
+    ``precision`` only raises the working precision of the weight formula
+    after those nodes have already been rounded. Nodes agree with a
+    40-digit reference to about 1e-16; relative weight errors grow to
+    about 1e-13 near N=256.
+    """
     if not _MPMATH_AVAILABLE:
         raise ImportError("mpmath is required for high-precision computation but not installed")
     
@@ -643,10 +652,8 @@ def _gausslobatto_mpmath(n: int, precision: int = 32):
             w = mpmath.matrix([1/3, 4/3, 1/3])
             return x, w
         else:
-            # For n > 3, we need to compute Jacobi quadrature in high precision
-            # This is a simplified version - a full implementation would use
-            # mpmath's own quadrature routines
-            
+            # Interior nodes are the float64 Jacobi roots. The weight formula
+            # is then evaluated at those already-rounded nodes.
             # Get interior points using scipy (double precision)
             x_interior_scipy, w_interior_scipy = roots_jacobi(n - 2, 1.0, 1.0)
             P_values_scipy = eval_legendre(n - 1, x_interior_scipy)
@@ -672,10 +679,56 @@ def _gausslobatto_mpmath(n: int, precision: int = 32):
 
 
 def gausslobatto_mpmath(n: int, precision: int = 32):
-    """Convenience function for mpmath backend with specified precision."""
+    """Call the Lobatto helper. Interior nodes remain float64."""
     if not _MPMATH_AVAILABLE:
         raise ImportError("mpmath is required for mpmath backend but not installed")
     return _gausslobatto_mpmath(n, precision=precision)
+
+
+def _as_float_array(values: np.ndarray) -> np.ndarray:
+    """Return ``values`` as a floating NumPy array."""
+    array = np.asarray(values)
+    if not np.issubdtype(array.dtype, np.floating):
+        return array.astype(np.float64)
+    return array
+
+
+def _match_dtype(array: np.ndarray, dtype: np.dtype) -> np.ndarray:
+    array = np.asarray(array)
+    if array.dtype == dtype:
+        return array
+    return np.ascontiguousarray(array, dtype=dtype)
+
+
+def _numba_along_last_axis(kernel, values: np.ndarray, *arrays: np.ndarray) -> np.ndarray:
+    """Apply a Numba matmul kernel along the last axis of ``(..., N)``.
+
+    Numba matrix products accept only one or two dimensions, so deeper
+    batches are reshaped to ``(batch, N)`` and restored afterwards.
+    Operator arrays are cast to ``values.dtype`` so a float64 field can
+    use a single-precision basis without a Numba typing error.
+    """
+    dtype = values.dtype
+    cast = tuple(_match_dtype(array, dtype) for array in arrays)
+    if values.ndim > 2:
+        flat = np.ascontiguousarray(values).reshape(-1, values.shape[-1])
+        return np.asarray(kernel(flat, *cast)).reshape(values.shape)
+    return kernel(values, *cast)
+
+
+def _torch_from_numpy(array: np.ndarray, ref: "torch.Tensor") -> "torch.Tensor":
+    """Copy a host matrix onto ``ref``'s device.
+
+    ``torch.from_numpy(float64).to(dtype=float32, device="mps",
+    non_blocking=True)`` frees the temporary CPU tensor before the
+    asynchronous copy finishes and corrupts the MPS data. Cast on the
+    host, then copy synchronously.
+    """
+    if not _TORCH_AVAILABLE or torch is None:
+        raise RuntimeError("Torch is required to move a Legendre matrix")
+    np_dtype = np.float32 if ref.dtype == torch.float32 else np.float64
+    host = np.ascontiguousarray(array, dtype=np_dtype)
+    return torch.from_numpy(host).to(device=ref.device)
 
 
 class LegendreLobattoBasis1D(Basis1D):
@@ -683,7 +736,7 @@ class LegendreLobattoBasis1D(Basis1D):
 
     - Nodes: LGL points mapped from [-1, 1] to [0, Lx]
     - Quadrature: LGL weights (exact for degree ≤ 2N-3), scaled by Lx/2
-    - Derivatives: barycentric differentiation matrix (O(N^2) apply)
+    - Derivatives: Vandermonde differentiation matrix D = dV V^{-1}
     - Transforms: modal Legendre coefficients via LGL projection
 
     This basis does not use FFTs. Operations are optimized around:
@@ -741,7 +794,9 @@ class LegendreLobattoBasis1D(Basis1D):
     def forward(self, f: np.ndarray) -> np.ndarray:
         """Compute modal Legendre coefficients a_k from nodal values f(..., N).
 
-        Uses LGL projection: a_k ≈ (2k+1)/2 * Σ_j w_x[j] f_j P_k(y_j).
+        ``a_k = c_k * sum_j w_ref[j] f_j P_k(y_j)``, where ``w_ref`` are
+        the reference-interval LGL weights, ``c_k = (2k+1)/2`` for
+        ``k < N-1``, and ``c_{N-1} = (N-1)/2``.
         """
         if _TORCH_AVAILABLE and isinstance(f, torch.Tensor):  # type: ignore[arg-type]
             mats = self._get_torch_mats(f)
@@ -749,20 +804,23 @@ class LegendreLobattoBasis1D(Basis1D):
             a = torch.matmul(fw, mats["V"])  # (..., N)
             a = a * mats["proj"].reshape((1,) * (a.ndim - 1) + (self.N,))
             return a
-        f_arr = np.asarray(f)
-        w_ref = self._w_ref
-        V = self._V
+        f_arr = _as_float_array(f)
+        w_ref = _match_dtype(self._w_ref, f_arr.dtype)
         fw = f_arr * w_ref.reshape((1,) * (f_arr.ndim - 1) + (self.N,))
-        
+
         # Use JIT-compiled kernel for NumPy backend if available
         if _NUMBA_AVAILABLE:
-            if self.use_parallel:
-                return _legendre_forward_kernel_numba_parallel(fw, V, self._proj_scale)
-            else:
-                return _legendre_forward_kernel_numba(fw, V, self._proj_scale)
+            kernel = (
+                _legendre_forward_kernel_numba_parallel
+                if self.use_parallel
+                else _legendre_forward_kernel_numba
+            )
+            return _numba_along_last_axis(kernel, fw, self._V, self._proj_scale)
         else:
+            V = _match_dtype(self._V, fw.dtype)
+            proj = _match_dtype(self._proj_scale, fw.dtype)
             a = np.tensordot(fw, V, axes=([-1], [0]))
-            a = a * self._proj_scale.reshape((1,) * (a.ndim - 1) + (self.N,))
+            a = a * proj.reshape((1,) * (a.ndim - 1) + (self.N,))
             return a
 
     def inverse(self, F: np.ndarray) -> np.ndarray:
@@ -773,16 +831,18 @@ class LegendreLobattoBasis1D(Basis1D):
         if _TORCH_AVAILABLE and isinstance(F, torch.Tensor):  # type: ignore[arg-type]
             mats = self._get_torch_mats(F)
             return torch.matmul(F, mats["V"].T)
-        F_arr = np.asarray(F)
-        V = self._V
-        
+        F_arr = _as_float_array(F)
+
         # Use JIT-compiled kernel for NumPy backend if available
         if _NUMBA_AVAILABLE:
-            if self.use_parallel:
-                return _legendre_inverse_kernel_numba_parallel(F_arr, V)
-            else:
-                return _legendre_inverse_kernel_numba(F_arr, V)
+            kernel = (
+                _legendre_inverse_kernel_numba_parallel
+                if self.use_parallel
+                else _legendre_inverse_kernel_numba
+            )
+            return _numba_along_last_axis(kernel, F_arr, self._V)
         else:
+            V = _match_dtype(self._V, F_arr.dtype)
             return np.tensordot(F_arr, V.T, axes=([-1], [0]))
 
     # Derivatives
@@ -792,16 +852,18 @@ class LegendreLobattoBasis1D(Basis1D):
             mats = self._get_torch_mats(f)
             return torch.matmul(f, mats["D_x"].T)
         
+        f_arr = _as_float_array(f)
         # Use JIT-compiled kernel for NumPy backend if available
         if _NUMBA_AVAILABLE:
-            # Ensure matrix has same dtype as input to avoid Numba dtype mismatch
-            D_x_typed = self._D_x.astype(f.dtype)
-            if self.use_parallel:
-                return _legendre_derivative_kernel_numba_parallel(f, D_x_typed)
-            else:
-                return _legendre_derivative_kernel_numba(f, D_x_typed)
+            kernel = (
+                _legendre_derivative_kernel_numba_parallel
+                if self.use_parallel
+                else _legendre_derivative_kernel_numba
+            )
+            return _numba_along_last_axis(kernel, f_arr, self._D_x)
         else:
-            return _as_last_axis_matrix_apply(self._D_x.T, f)
+            D_x = _match_dtype(self._D_x, f_arr.dtype)
+            return _as_last_axis_matrix_apply(D_x.T, f_arr)
 
     def d2x(self, f: np.ndarray) -> np.ndarray:
         # Apply D_x twice; cache D2_x on device to avoid recomputation
@@ -814,14 +876,17 @@ class LegendreLobattoBasis1D(Basis1D):
         if not hasattr(self, "_D2_x"):
             self._D2_x = self._D_x @ self._D_x
         # Use JIT-compiled kernel for NumPy backend if available
+        f_arr = _as_float_array(f)
         if _NUMBA_AVAILABLE:
-            D2_x_typed = self._D2_x.astype(f.dtype)
-            if self.use_parallel:
-                return _legendre_derivative_kernel_numba_parallel(f, D2_x_typed)
-            else:
-                return _legendre_derivative_kernel_numba(f, D2_x_typed)
+            kernel = (
+                _legendre_derivative_kernel_numba_parallel
+                if self.use_parallel
+                else _legendre_derivative_kernel_numba
+            )
+            return _numba_along_last_axis(kernel, f_arr, self._D2_x)
         else:
-            return _as_last_axis_matrix_apply(self._D2_x.T, f)
+            D2_x = _match_dtype(self._D2_x, f_arr.dtype)
+            return _as_last_axis_matrix_apply(D2_x.T, f_arr)
 
     # --- Spectral filtering: precomputed nodal filter ---
     def _sigma(self, p: int, alpha: float) -> np.ndarray:
@@ -860,18 +925,20 @@ class LegendreLobattoBasis1D(Basis1D):
             Fn = cache[kname]
             return torch.matmul(f, Fn.T)
         
+        f_arr = _as_float_array(f)
         Fn_np = self._build_nodal_filter_np(p, alpha)
-        
+
         # Use JIT-compiled kernel for NumPy backend if available
         if _NUMBA_AVAILABLE:
-            # Ensure filter matrix has same dtype as input to avoid Numba dtype mismatch
-            Fn_np_typed = Fn_np.astype(f.dtype)
-            if self.use_parallel:
-                return _legendre_filter_kernel_numba_parallel(f, Fn_np_typed)
-            else:
-                return _legendre_filter_kernel_numba(f, Fn_np_typed)
+            kernel = (
+                _legendre_filter_kernel_numba_parallel
+                if self.use_parallel
+                else _legendre_filter_kernel_numba
+            )
+            return _numba_along_last_axis(kernel, f_arr, Fn_np)
         else:
-            return _as_last_axis_matrix_apply(Fn_np.T, f)
+            Fn_typed = _match_dtype(Fn_np, f_arr.dtype)
+            return _as_last_axis_matrix_apply(Fn_typed.T, f_arr)
 
     # --- Torch helpers ---
     def _get_torch_mats(self, ref: "torch.Tensor") -> Dict[str, "torch.Tensor"]:  # type: ignore[name-defined]
@@ -881,14 +948,14 @@ class LegendreLobattoBasis1D(Basis1D):
         if cache is None:
             cache = {}
             self._torch_cache[dev_key] = cache
-        if "V" not in cache:
-            cache["V"] = torch.from_numpy(self._V).to(dtype=ref.dtype, device=ref.device, non_blocking=True)
-        if "D_x" not in cache:
-            cache["D_x"] = torch.from_numpy(self._D_x).to(dtype=ref.dtype, device=ref.device, non_blocking=True)
-        if "w_ref" not in cache:
-            cache["w_ref"] = torch.from_numpy(self._w_ref).to(dtype=ref.dtype, device=ref.device, non_blocking=True)
-        if "proj" not in cache:
-            cache["proj"] = torch.from_numpy(self._proj_scale).to(dtype=ref.dtype, device=ref.device, non_blocking=True)
+        for name, array in (
+            ("V", self._V),
+            ("D_x", self._D_x),
+            ("w_ref", self._w_ref),
+            ("proj", self._proj_scale),
+        ):
+            if name not in cache:
+                cache[name] = _torch_from_numpy(array, ref)
         return cache
 
 
@@ -969,16 +1036,13 @@ class LegendreLobattoBasis2D:
             a = a * mats["proj_y"].reshape(shape_y)
             return a
 
-        # NumPy path
+        # NumPy path. einsum keeps the free mode axis in place; tensordot
+        # would append it and swap y with x.
         f_arr = np.asarray(f)
-        # Apply reference weights along both axes
         fw = f_arr * self._w_ref_x.reshape((1,) * (f_arr.ndim - 1) + (self.Nx,))
         fw = fw * self._w_ref_y.reshape((1,) * (f_arr.ndim - 2) + (self.Ny, 1))
-        # Along x (last axis)
-        ax = np.tensordot(fw, self._Vx, axes=([-1], [0]))  # (..., Ny, Nx)
-        # Along y (second-to-last axis)
-        ay = np.tensordot(ax, self._Vy, axes=([-2], [0]))  # (..., Ny, Nx)
-        # Apply projection scaling along both axes
+        ax = np.einsum("jk,...j->...k", self._Vx, fw)
+        ay = np.einsum("jk,...jx->...kx", self._Vy, ax)
         ay *= self._proj_x.reshape((1,) * (ay.ndim - 1) + (self.Nx,))
         ay *= self._proj_y.reshape((1,) * (ay.ndim - 2) + (self.Ny, 1))
         return ay
@@ -995,9 +1059,8 @@ class LegendreLobattoBasis2D:
             return A.reshape(F.shape)
 
         F_arr = np.asarray(F)
-        tmp = np.tensordot(F_arr, self._Vy.T, axes=([-2], [0]))
-        f = np.tensordot(tmp, self._Vx.T, axes=([-1], [0]))
-        return f
+        tmp = np.einsum("jk,...kx->...jx", self._Vy, F_arr)
+        return np.einsum("im,...jm->...ji", self._Vx, tmp)
 
     # Derivatives
     def dx(self, f: np.ndarray) -> np.ndarray:
@@ -1036,8 +1099,9 @@ class LegendreLobattoBasis2D:
             else:
                 return _legendre_2d_derivative_kernel_numba(np.asarray(f), D_typed, -2)  # type: ignore[arg-type]
         else:
-            # tensordot along second-to-last axis by D^T
-            return np.tensordot(f, D_typed.T, axes=([-2], [0]))
+            # D[i, k] contracts the y nodes. tensordot would leave that
+            # axis last and transpose the field.
+            return np.einsum("ik,...kj->...ij", D_typed, np.asarray(f))
 
     # Filtering
     def apply_spectral_filter(self, f: np.ndarray, *, p: int = 8, alpha: float = 36.0) -> np.ndarray:
@@ -1092,9 +1156,7 @@ class LegendreLobattoBasis2D:
             return out
         else:
             out = np.tensordot(out, Fn_x_typed.T, axes=([-1], [0]))
-            # For y, need to apply along second-to-last axis
-            out = np.tensordot(out, Fn_y_typed.T, axes=([-2], [0]))
-            return out
+            return np.einsum("ik,...kj->...ij", Fn_y_typed, out)
 
     # Torch helpers
     def _get_torch_mats(self, ref: "torch.Tensor") -> Dict[str, "torch.Tensor"]:  # type: ignore[name-defined]
@@ -1104,22 +1166,18 @@ class LegendreLobattoBasis2D:
         if cache is None:
             cache = {}
             self._torch_cache[dev_key] = cache
-        if "Vx" not in cache:
-            cache["Vx"] = torch.from_numpy(self._Vx).to(dtype=ref.dtype, device=ref.device, non_blocking=True)
-        if "Vy" not in cache:
-            cache["Vy"] = torch.from_numpy(self._Vy).to(dtype=ref.dtype, device=ref.device, non_blocking=True)
-        if "Dx" not in cache:
-            cache["Dx"] = torch.from_numpy(self._Dx).to(dtype=ref.dtype, device=ref.device, non_blocking=True)
-        if "Dy" not in cache:
-            cache["Dy"] = torch.from_numpy(self._Dy).to(dtype=ref.dtype, device=ref.device, non_blocking=True)
-        if "w_ref_x" not in cache:
-            cache["w_ref_x"] = torch.from_numpy(self._w_ref_x).to(dtype=ref.dtype, device=ref.device, non_blocking=True)
-        if "w_ref_y" not in cache:
-            cache["w_ref_y"] = torch.from_numpy(self._w_ref_y).to(dtype=ref.dtype, device=ref.device, non_blocking=True)
-        if "proj_x" not in cache:
-            cache["proj_x"] = torch.from_numpy(self._proj_x).to(dtype=ref.dtype, device=ref.device, non_blocking=True)
-        if "proj_y" not in cache:
-            cache["proj_y"] = torch.from_numpy(self._proj_y).to(dtype=ref.dtype, device=ref.device, non_blocking=True)
+        for name, array in (
+            ("Vx", self._Vx),
+            ("Vy", self._Vy),
+            ("Dx", self._Dx),
+            ("Dy", self._Dy),
+            ("w_ref_x", self._w_ref_x),
+            ("w_ref_y", self._w_ref_y),
+            ("proj_x", self._proj_x),
+            ("proj_y", self._proj_y),
+        ):
+            if name not in cache:
+                cache[name] = _torch_from_numpy(array, ref)
         return cache
 
 
