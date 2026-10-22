@@ -38,18 +38,20 @@ def rti_initial_conditions(
     """Create Rayleigh-Taylor instability initial conditions following Athena++ conventions.
     
     Standard RTI setup:
-    - Heavy fluid (high density) on top, light fluid (low density) on bottom
-    - Gravity points downward (negative y direction)
-    - Hydrostatic equilibrium: dp/dy = -rho * g
+    - Heavy fluid (high density) at large y, light fluid at small y
+    - Signed acceleration: +gravity accelerates toward +y, so an unstable
+      stack needs gravity < 0
+    - Hydrostatic equilibrium: dp/dy = rho * gravity, integrated on the
+      actual node spacing from the top boundary
     - Small amplitude perturbations at the interface
     
     Args:
         x, y: 2D coordinate arrays (Ny, Nx)
-        rho_heavy: Density of heavy fluid (top)
-        rho_light: Density of light fluid (bottom)
-        pressure_top: Pressure at top boundary
+        rho_heavy: Density of heavy fluid (large y)
+        rho_light: Density of light fluid (small y)
+        pressure_top: Pressure at the large-y boundary
         gamma: Adiabatic index
-        gravity: Gravitational acceleration (positive value, points downward)
+        gravity: Signed acceleration (positive toward +y)
         interface_thickness: Thickness of density transition layer
         perturb_amplitude: Amplitude of initial perturbation
         perturb_wavelength: Wavelength of perturbation
@@ -104,8 +106,7 @@ def rti_initial_conditions(
         v = perturb_amplitude * torch.sin(two_pi * x / perturb_wavelength) * \
             torch.exp(-half * (y_centered / interface_thickness) ** 2)
         
-        # Hydrostatic pressure integration: dp/dy = -rho * g
-        # Integrate from top to bottom: p(y) = p_top - integral(rho * g * dy)
+        # dp/dy = rho * gravity, using the local node spacing.
         Ny, Nx = y.shape
         p = torch.zeros_like(x)
         g_tensor = torch.tensor(gravity, dtype=x.dtype, device=x.device)
@@ -137,7 +138,7 @@ def rti_initial_conditions(
         v = perturb_amplitude * np.sin(2.0 * np.pi * x / perturb_wavelength) * \
             np.exp(-0.5 * (y_centered / interface_thickness) ** 2)
         
-        # Hydrostatic pressure integration: dp/dy = -rho * g
+        # dp/dy = rho * gravity, using the local node spacing.
         Ny, Nx = y.shape
         p = np.zeros_like(x)
         
@@ -154,9 +155,29 @@ def rti_initial_conditions(
         
         p = np.repeat(p_line[:, None], Nx, axis=1)
 
+    p_min = _field_min(p)
+    if p_min <= 0.0:
+        raise ValueError(
+            "Rayleigh-Taylor hydrostatic pressure is not positive "
+            f"(minimum {p_min:.3g}). +gravity accelerates toward +y; "
+            "heavy fluid at large y is unstable only for gravity < 0, "
+            "and the top pressure must cover the weight of the column."
+        )
+
     # Convert to conservative variables
     eqs = EulerEquations2D(gamma=gamma)
     return eqs.conservative(rho, u, v, p)
+
+
+def _field_min(values) -> float:
+    try:
+        import torch
+
+        if isinstance(values, torch.Tensor):
+            return float(torch.min(values).detach().cpu())
+    except Exception:
+        pass
+    return float(np.min(np.asarray(values)))
 
 
 class RTIProblem(BaseProblem):
@@ -244,7 +265,7 @@ class RTIProblem(BaseProblem):
         # Gravity configuration
         gravity = 0.0
         if self.gravity_config and self.gravity_config.get("enabled", False):
-            gravity = float(self.gravity_config.get("gy", 1.0))
+            gravity = float(self.gravity_config.get("gy", 0.0))
         
         # Get coordinate arrays
         X, Y = grid.xy_mesh()

@@ -5,9 +5,10 @@ The transverse basis and boundary conditions are selected by the configuration.
 """
 
 import os
+import warnings
 import numpy as np
 import matplotlib.pyplot as plt
-from typing import Dict, Optional
+from typing import Optional
 
 from phrike.problems.base import BaseProblem
 from phrike.grid import Grid2D
@@ -15,11 +16,12 @@ from phrike.equations import EulerEquations2D
 
 
 class GaussianWave2DYProblem(BaseProblem):
-    """2D Gaussian wave packet problem - traveling in y-direction only."""
+    """2D Gaussian wave packet problem - traveling in y-direction only.
 
-    def __init__(self, config: Dict = None, config_path: str = None, restart_from: str = None):
-        super().__init__(config=config, config_path=config_path, restart_from=restart_from)
-        self.gamma = float(self.config["physics"]["gamma"])
+    ``gamma`` comes from ``BaseProblem`` (``equations.gamma`` or
+    ``physics.gamma``). The constructor argument order is the base-class
+    order ``(config_path, config, restart_from)``.
+    """
 
     def create_grid(self, backend: str = "numpy", device: Optional[str] = None, debug: bool = False) -> Grid2D:
         """Create the configured transverse grid and boundary conditions."""
@@ -31,6 +33,18 @@ class GaussianWave2DYProblem(BaseProblem):
         basis_x = str(self.config["grid"].get("basis_x", "legendre")).lower()
         basis_y = str(self.config["grid"].get("basis_y", "legendre")).lower()
         bc = self.config["grid"].get("bc", "dirichlet")
+        if (
+            basis_x == "fourier"
+            and basis_y == "fourier"
+            and str(bc).strip().lower() == "periodic"
+        ):
+            warnings.warn(
+                "bc: periodic is not accepted by Grid2D. A Fourier-Fourier "
+                "grid is already periodic, so this boundary name is ignored.",
+                UserWarning,
+                stacklevel=2,
+            )
+            bc = "dirichlet"
 
         return Grid2D(
             Nx=Nx, Ny=Ny, Lx=Lx, Ly=Ly,
@@ -95,9 +109,7 @@ class GaussianWave2DYProblem(BaseProblem):
         equations = EulerEquations2D(gamma=self.gamma)
         return equations.conservative(rho, u, v, p)
 
-    def get_analytical_solution(
-        self, grid: Grid2D, t: float
-    ) -> Optional[Dict[str, np.ndarray]]:
+    def get_analytical_solution(self, grid: Grid2D, t: float):
         """Translate the linear acoustic reference before boundary interactions."""
         ic_config = self.config["initial_conditions"]
         rho0 = float(ic_config.get("rho0", 1.0))
@@ -140,8 +152,8 @@ class GaussianWave2DYProblem(BaseProblem):
         equations = EulerEquations2D(gamma=self.gamma)
         return equations.conservative(rho_analytical, u_analytical, v_analytical, p_analytical)
 
-    def create_visualization(self, solver, t: float, U):
-        """Create visualization of the 2D Gaussian wave packet."""
+    def _render_state(self, solver, t: float, U):
+        """Draw the current state. The caller saves and closes the figure."""
         grid = solver.grid
         equations = EulerEquations2D(gamma=self.gamma)
         rho, u, v, p = equations.primitive(U)
@@ -187,10 +199,26 @@ class GaussianWave2DYProblem(BaseProblem):
         plt.tight_layout()
         return fig
 
+    def create_visualization(self, solver, t: float, U):
+        """Save one frame and close it. The run callback ignores the return value."""
+        figure = self._render_state(solver, t, U)
+        frames_dir = os.path.join(self.outdir, "frames")
+        os.makedirs(frames_dir, exist_ok=True)
+        figure.savefig(
+            os.path.join(frames_dir, f"frame_{t:08.3f}.png"),
+            dpi=100,
+            bbox_inches="tight",
+        )
+        plt.close(figure)
+
     def create_final_visualization(self, solver) -> None:
         """Create final visualization with analysis."""
-        figure = self.create_visualization(solver, solver.t, solver.U)
-        figure.savefig(os.path.join(self.outdir, "gaussian_wave2d_y_final.png"))
+        figure = self._render_state(solver, solver.t, solver.U)
+        figure.savefig(
+            os.path.join(self.outdir, "gaussian_wave2d_y_final.png"),
+            dpi=120,
+            bbox_inches="tight",
+        )
         plt.close(figure)
 
     def get_solver_class(self):

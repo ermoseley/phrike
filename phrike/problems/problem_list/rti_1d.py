@@ -36,19 +36,21 @@ def rti_1d_initial_conditions(
 ) -> np.ndarray:
     """Create 1D Rayleigh-Taylor instability initial conditions following Athena++ conventions.
     
-    Standard RTI setup in 1D:
-    - Heavy fluid (high density) on top, light fluid (low density) on bottom
-    - Gravity points downward (negative y direction in 2D, but here we use x as vertical)
-    - Hydrostatic equilibrium: dp/dx = -rho * g
+    Standard RTI setup in 1D, with x the vertical coordinate:
+    - Heavy fluid at large x, light fluid at small x
+    - Signed acceleration: +gravity accelerates toward +x, so an unstable
+      stack needs gravity < 0
+    - Hydrostatic equilibrium: dp/dx = rho * gravity, integrated on the
+      actual node spacing from the large-x boundary
     - Small amplitude perturbations at the interface
     
     Args:
         x: 1D coordinate array (N,)
-        rho_heavy: Density of heavy fluid (top)
-        rho_light: Density of light fluid (bottom)
-        pressure_top: Pressure at top boundary
+        rho_heavy: Density of heavy fluid (large x)
+        rho_light: Density of light fluid (small x)
+        pressure_top: Pressure at the large-x boundary
         gamma: Adiabatic index
-        gravity: Gravitational acceleration (positive value, points downward)
+        gravity: Signed acceleration (positive toward +x)
         interface_thickness: Thickness of density transition layer
         perturb_amplitude: Amplitude of initial perturbation
         perturb_wavelength: Wavelength of perturbation
@@ -97,8 +99,7 @@ def rti_1d_initial_conditions(
         u = perturb_amplitude * torch.sin(2.0 * np.pi * x / perturb_wavelength) * \
             torch.exp(-half * (x_centered / interface_thickness) ** 2)
         
-        # Hydrostatic pressure integration: dp/dx = -rho * g
-        # Integrate from top to bottom: p(x) = p_top - integral(rho * g * dx)
+        # dp/dx = rho * gravity, using the local node spacing.
         Nx = x.shape[0]
         p = torch.zeros_like(x)
         g_tensor = torch.tensor(gravity, dtype=x.dtype, device=x.device)
@@ -128,7 +129,7 @@ def rti_1d_initial_conditions(
         u = perturb_amplitude * np.sin(2.0 * np.pi * x / perturb_wavelength) * \
             np.exp(-0.5 * (x_centered / interface_thickness) ** 2)
         
-        # Hydrostatic pressure integration: dp/dx = -rho * g
+        # dp/dx = rho * gravity, using the local node spacing.
         Nx = x.shape[0]
         p = np.zeros_like(x)
         
@@ -144,9 +145,29 @@ def rti_1d_initial_conditions(
         
         p = p_line
 
+    p_min = _field_min(p)
+    if p_min <= 0.0:
+        raise ValueError(
+            "Rayleigh-Taylor hydrostatic pressure is not positive "
+            f"(minimum {p_min:.3g}). +gravity accelerates toward +x; "
+            "heavy fluid at large x is unstable only for gravity < 0, "
+            "and the top pressure must cover the weight of the column."
+        )
+
     # Convert to conservative variables
     eqs = EulerEquations1D(gamma=gamma)
     return eqs.conservative(rho, u, p)
+
+
+def _field_min(values) -> float:
+    try:
+        import torch
+
+        if isinstance(values, torch.Tensor):
+            return float(torch.min(values).detach().cpu())
+    except Exception:
+        pass
+    return float(np.min(np.asarray(values)))
 
 
 class RTI1DProblem(BaseProblem):
@@ -227,7 +248,7 @@ class RTI1DProblem(BaseProblem):
         # Gravity configuration
         gravity = 0.0
         if self.gravity_config and self.gravity_config.get("enabled", False):
-            gravity = float(self.gravity_config.get("gx", 1.0))  # Use gx for 1D
+            gravity = float(self.gravity_config.get("gx", 0.0))
         
         U = rti_1d_initial_conditions(
             x=grid.x,
@@ -262,10 +283,7 @@ class RTI1DProblem(BaseProblem):
         rho, u, p, _ = solver.equations.primitive(U)
         
         # Convert to numpy if needed
-        x = self.convert_torch_to_numpy(x)
-        rho = self.convert_torch_to_numpy(rho)
-        u = self.convert_torch_to_numpy(u)
-        p = self.convert_torch_to_numpy(p)
+        x, rho, u, p = self.convert_torch_to_numpy(x, rho, u, p)
         
         # Density
         axs[0].plot(x, rho, 'b-', linewidth=2)
@@ -310,48 +328,32 @@ class RTI1DProblem(BaseProblem):
         )
         print(f"Saved final snapshot: {snapshot_path}")
 
-        # Final 1D visualization
-        try:
-            import matplotlib.pyplot as plt
-            import numpy as _np
+        x = solver.grid.x
+        rho, u, p, _ = solver.equations.primitive(solver.U)
+        x, rho, u, p = self.convert_torch_to_numpy(x, rho, u, p)
 
-            x = solver.grid.x
-            rho, u, p, _ = solver.equations.primitive(solver.U)
+        fig, axs = plt.subplots(3, 1, figsize=(10, 12), constrained_layout=True)
+        fig.suptitle(f"Final 1D RTI State at t={solver.t:.3f}", fontsize=14)
 
-            # Convert to numpy if needed
-            x = self.convert_torch_to_numpy(x)
-            rho = self.convert_torch_to_numpy(rho)
-            u = self.convert_torch_to_numpy(u)
-            p = self.convert_torch_to_numpy(p)
+        axs[0].plot(x, rho, 'b-', linewidth=2)
+        axs[0].set_xlabel("x")
+        axs[0].set_ylabel("Density")
+        axs[0].set_title("Density")
+        axs[0].grid(True, alpha=0.3)
 
-            fig, axs = plt.subplots(3, 1, figsize=(10, 12), constrained_layout=True)
-            fig.suptitle(f"Final 1D RTI State at t={solver.t:.3f}", fontsize=14)
+        axs[1].plot(x, u, 'r-', linewidth=2)
+        axs[1].set_xlabel("x")
+        axs[1].set_ylabel("Velocity")
+        axs[1].set_title("Velocity")
+        axs[1].grid(True, alpha=0.3)
 
-            # Density
-            axs[0].plot(x, rho, 'b-', linewidth=2)
-            axs[0].set_xlabel("x")
-            axs[0].set_ylabel("Density")
-            axs[0].set_title("Density")
-            axs[0].grid(True, alpha=0.3)
+        axs[2].plot(x, p, 'g-', linewidth=2)
+        axs[2].set_xlabel("x")
+        axs[2].set_ylabel("Pressure")
+        axs[2].set_title("Pressure")
+        axs[2].grid(True, alpha=0.3)
 
-            # Velocity
-            axs[1].plot(x, u, 'r-', linewidth=2)
-            axs[1].set_xlabel("x")
-            axs[1].set_ylabel("Velocity")
-            axs[1].set_title("Velocity")
-            axs[1].grid(True, alpha=0.3)
-
-            # Pressure
-            axs[2].plot(x, p, 'g-', linewidth=2)
-            axs[2].set_xlabel("x")
-            axs[2].set_ylabel("Pressure")
-            axs[2].set_title("Pressure")
-            axs[2].grid(True, alpha=0.3)
-
-            final_plot_path = os.path.join(self.outdir, "final_state.png")
-            fig.savefig(final_plot_path, dpi=150)
-            plt.close(fig)
-            print(f"Saved final visualization: {final_plot_path}")
-
-        except Exception as e:
-            print(f"Error creating final visualization: {e}")
+        final_plot_path = os.path.join(self.outdir, "final_state.png")
+        fig.savefig(final_plot_path, dpi=150)
+        plt.close(fig)
+        print(f"Saved final visualization: {final_plot_path}")

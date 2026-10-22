@@ -1,11 +1,7 @@
 # 1D Gaussian Wave Packet Test Configuration
 # Simple traveling wave to understand proper setup
 
-problem:
-  name: "gaussian_wave1d"
-  description: "1D Gaussian traveling wave packet test"
-
-# Grid configuration
+problem: gaussian_wave1d
 grid:
   N: 64                    # Number of modes
   Lx: 1.0                  # Domain length
@@ -32,12 +28,9 @@ physics:
 integration:
   t0: 0.0                  # Start time
   t_end: 1.0               # End time
-  dt: 1e-4                 # Initial time step
   scheme: "rk4"            # 4th order Runge-Kutta
   cfl: 0.5                 # CFL number
-  adaptive_dt: true        # Use adaptive time stepping
-
-# Artificial viscosity (small amount for stability)
+  output_interval: 0.1
 artificial_viscosity:
   enabled: true
   nu_max: 1e-4             # Maximum viscosity
@@ -47,17 +40,13 @@ artificial_viscosity:
   epsilon: 1e-12           # Small number to avoid division by zero
   variable_weights:
     density: 1.0
-    momentum: 1.0
     energy: 1.0
+    momentum_x: 1.0
   sensor_variable: "density"
   diagnostic_output: false
 
 # Output
 io:
   outdir: "outputs/gaussian_wave1d_test"
-  output_interval: 0.1     # Output every 0.1 time units
-
-# Monitoring
 monitoring:
   step_interval: 10        # Print status every 10 steps
-  verbose: true            # Verbose output

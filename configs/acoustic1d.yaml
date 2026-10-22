@@ -1,5 +1,5 @@
-# Configuration for 1D periodic acoustic wave problem
-# Designed for comprehensive testing of the 1D spectral solver
+# Periodic right-going acoustic eigenmode: u' = c rho'/rho0, p' = c^2 rho'.
+# wave: entropy is the stationary density-only alternative.
 problem: acoustic1d
 
 grid:
@@ -41,23 +41,23 @@ adaptive:
   fallback_scheme: rk4
 
 initial_conditions:
-  rho0: 1.0         # background density
-  u0: 0.0           # background velocity (zero for pure acoustic test)
-  p0: 1.0           # background pressure
-  amplitude: 1.0e-3 # small amplitude for linear regime testing
-  k: 1              # fundamental mode (one wavelength in domain)
+  wave: acoustic
+  direction: right
+  rho0: 1.0
+  u0: 0.0
+  p0: 1.0
+  amplitude: 1.0e-3
+  k: 1
 
 io:
   outdir: outputs/acoustic1d
-  save_spectra: true
-
 video:
   fps: 30
   width: 1920
   height: 1080
   scale: 2.0
   frame_dpi: 150
-  codec: libopenh264
+  codec: libx264
   crf: 18
   preset: medium
   pix_fmt: yuv420p

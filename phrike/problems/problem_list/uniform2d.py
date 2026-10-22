@@ -8,7 +8,6 @@ from phrike.equations import EulerEquations2D
 from phrike.solver import SpectralSolver2D
 from ..base import BaseProblem
 from phrike.io import save_solution_snapshot
-import matplotlib.pyplot as plt
 
 
 def uniform2d_initial_conditions(x: np.ndarray, y: np.ndarray, rho0: float, p0: float, gamma: float):
@@ -45,14 +44,15 @@ class Uniform2DProblem(BaseProblem):
         Ly = float(self.config["grid"]["Ly"])
         basis_x = str(self.config["grid"].get("basis_x", "legendre")).lower()
         basis_y = str(self.config["grid"].get("basis_y", "legendre")).lower()
-        bc = "dirichlet"
+        bc = self.config["grid"].get("bc", "dirichlet")
+        dealias = bool(self.config["grid"].get("dealias", False))
 
         return Grid2D(
             Nx=Nx,
             Ny=Ny,
             Lx=Lx,
             Ly=Ly,
-            dealias=False,
+            dealias=dealias,
             filter_params=self.filter_config,
             fft_workers=self.fft_workers,
             backend=backend,
@@ -81,15 +81,16 @@ class Uniform2DProblem(BaseProblem):
         return U
 
     def create_visualization(self, solver, t: float, U):
-        # Minimal: save snapshot; optional quick diagnostic lineout of rho mean
-        try:
-            save_solution_snapshot(self.outdir, t, U=U, grid=solver.grid, equations=solver.equations)
-        except Exception:
-            pass
+        save_solution_snapshot(
+            self.outdir, t, U=U, grid=solver.grid, equations=solver.equations
+        )
 
     def create_final_visualization(self, solver) -> None:
-        try:
-            save_solution_snapshot(self.outdir, solver.t, U=solver.U, grid=solver.grid, equations=solver.equations)
-        except Exception:
-            pass
+        save_solution_snapshot(
+            self.outdir,
+            solver.t,
+            U=solver.U,
+            grid=solver.grid,
+            equations=solver.equations,
+        )
 

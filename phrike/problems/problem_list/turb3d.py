@@ -30,25 +30,31 @@ def turbulent_velocity_3d(
     kmax: float = 16.0,
     alpha: float = 0.3333,  # Compressive fraction (0=solenoidal, 1=compressive)
     spectrum_type: str = "parabolic",  # "parabolic" or "power_law"
-    power_law_slope: float = -5.0 / 3.0,  # Kolmogorov slope
+    power_law_slope: float = -5.0 / 3.0,  # Kolmogorov shell slope E(k) ~ k^s
     seed: int = 42,
     gamma: float = 1.4,
 ) -> np.ndarray:
-    """3D turbulent velocity initial condition matching RAMSES turb.py.
+    """3D turbulent velocity initial condition.
 
     Generates a divergence/rotation-controlled random velocity field using
-    spectral filtering between k_min and k_max.
+    spectral filtering between ``kmin`` and ``kmax``. Those bounds are integer
+    Fourier-mode magnitudes (cycles per domain), not radians.
+
+    ``power_law_slope`` is the spherical-shell kinetic-energy slope,
+    ``E(k) ~ k^s``. ``s = -5/3`` is the Kolmogorov spectrum. The field is
+    stored at the precision of the later conservative conversion; the Fourier
+    synthesis itself stays in float64.
 
     Args:
         X, Y, Z: 3D coordinate arrays (shape: Nz, Ny, Nx)
         rho0: Uniform density
         p0: Uniform pressure
         vrms: Target RMS velocity magnitude
-        kmin: Minimum wavenumber for band-pass
-        kmax: Maximum wavenumber for band-pass
+        kmin: Minimum integer mode for the band-pass
+        kmax: Maximum integer mode for the band-pass
         alpha: Compressive fraction [0..1] (1=compressive, 0=solenoidal)
         spectrum_type: "parabolic" (band-limited) or "power_law"
-        power_law_slope: Power law slope for spectrum='power_law'
+        power_law_slope: Shell spectrum slope E(k) ~ k^s for spectrum='power_law'
         seed: Random seed for reproducibility
         gamma: Adiabatic index
     """
@@ -65,26 +71,36 @@ def turbulent_velocity_3d(
         isinstance(a, (torch.Tensor,)) for a in (X, Y, Z)
     )
 
-    # Get grid dimensions
-    if is_torch:
-        nz, ny, nx = X.shape
-    else:
-        nz, ny, nx = X.shape
+    nz, ny, nx = X.shape
+
+    def _spacing_along(coord, axis: int) -> float:
+        """Physical spacing, or 0 when the coordinate array does not vary."""
+        if coord.shape[axis] < 2:
+            return 0.0
+        origin = (0, 0, 0)
+        stepped = [0, 0, 0]
+        stepped[axis] = 1
+        sample = coord[tuple(stepped)] - coord[tuple(origin)]
+        if is_torch and isinstance(sample, torch.Tensor):
+            sample = sample.detach().cpu()
+        value = float(np.asarray(sample).reshape(()))
+        if not np.isfinite(value) or value == 0.0:
+            return 0.0
+        return value
+
+    # x varies on the last axis, z on the first. A zero array (shape-only
+    # callers) falls back to integer modes inside the projector.
+    dx = _spacing_along(X, 2)
+    dy = _spacing_along(Y, 1)
+    dz = _spacing_along(Z, 0)
 
     # Set up random number generator
     rng = np.random.default_rng(seed)
 
-    # Generate k-grid for FFT
-    def generate_k_grid(n1, n2, n3):
-        kx = np.fft.fftfreq(n1, d=1.0 / n1).reshape(n1, 1, 1)
-        ky = np.fft.fftfreq(n2, d=1.0 / n2).reshape(1, n2, 1)
-        kz = np.fft.fftfreq(n3, d=1.0 / n3).reshape(1, 1, n3)
-        kmag = np.sqrt(kx * kx + ky * ky + kz * kz)
-        return kx, ky, kz, kmag
-
     # Generate turbulent velocity field
     def build_turbulent_velocity(
-        n1, n2, n3, kmin, kmax, alpha, vrms, rng, spectrum_type, power_law_slope
+        n1, n2, n3, kmin, kmax, alpha, vrms, rng, spectrum_type, power_law_slope,
+        dx, dy, dz,
     ):
         # Real-space Gaussian noise
         u0 = rng.standard_normal((n1, n2, n3)).astype(np.float64)
@@ -96,49 +112,70 @@ def turbulent_velocity_3d(
         V = np.fft.fftn(v0)
         W = np.fft.fftn(w0)
 
-        # k-grid and spectral envelope
-        kx, ky, kz, kmag = generate_k_grid(n1, n2, n3)
-        with np.errstate(invalid="ignore"):
-            band = (kmag >= kmin) & (kmag <= kmax)
+        # Integer modes on (z, y, x). The band and the shell spectrum use this
+        # magnitude. The projector uses the physical wavevector so that
+        # kx*u + ky*v + kz*w = 0 is the same statement as grid.dx1/dy1/dz1.
+        nx_mode = np.fft.fftfreq(n3, d=1.0 / n3).reshape(1, 1, n3)
+        ny_mode = np.fft.fftfreq(n2, d=1.0 / n2).reshape(1, n2, 1)
+        nz_mode = np.fft.fftfreq(n1, d=1.0 / n1).reshape(n1, 1, 1)
+        nmag = np.sqrt(nx_mode * nx_mode + ny_mode * ny_mode + nz_mode * nz_mode)
+
+        def _physical(mode, n, spacing):
+            if spacing > 0.0:
+                return mode * (2.0 * np.pi / (n * spacing))
+            return mode
+
+        kx = _physical(nx_mode, n3, dx)
+        ky = _physical(ny_mode, n2, dy)
+        kz = _physical(nz_mode, n1, dz)
+
+        with np.errstate(invalid="ignore", divide="ignore"):
+            band = (nmag >= kmin) & (nmag <= kmax)
+            nmag_safe = np.where(nmag == 0.0, 1.0, nmag)
 
             if spectrum_type == "parabolic":
                 # Parabolic band-pass: w(k) ∝ (k - kmin)(kmax - k) within [kmin,kmax]
-                envelope = (kmag - kmin) * (kmax - kmag)
+                envelope = (nmag - kmin) * (kmax - nmag)
                 envelope = np.where(band, envelope, 0.0)
                 envelope = np.clip(envelope, 0.0, None)
             elif spectrum_type == "power_law":
-                # Power law: w(k) ∝ k^slope within [kmin,kmax]
-                kmag_safe = np.where(kmag == 0.0, 1.0, kmag)
-                envelope = np.where(band, kmag_safe**power_law_slope, 0.0)
+                # Shell energy E(k) ~ k^s. A spherical shell holds ~k^2 modes,
+                # so the per-mode power is k^{s-2} and the amplitude is the
+                # square root of that.
+                envelope = np.where(
+                    band, nmag_safe ** (power_law_slope - 2.0), 0.0
+                )
                 # Apply smooth cutoff at boundaries
                 k_transition = 0.1
                 dk = kmax - kmin
                 k1 = kmin + k_transition * dk
                 k2 = kmax - k_transition * dk
                 low_transition = np.where(
-                    (kmag >= kmin) & (kmag < k1),
-                    0.5 * (1.0 + np.cos(np.pi * (kmag - kmin) / (k1 - kmin))),
+                    (nmag >= kmin) & (nmag < k1),
+                    0.5 * (1.0 + np.cos(np.pi * (nmag - kmin) / (k1 - kmin))),
                     1.0,
                 )
                 high_transition = np.where(
-                    (kmag > k2) & (kmag <= kmax),
-                    0.5 * (1.0 + np.cos(np.pi * (kmag - k2) / (kmax - k2))),
+                    (nmag > k2) & (nmag <= kmax),
+                    0.5 * (1.0 + np.cos(np.pi * (nmag - k2) / (kmax - k2))),
                     1.0,
                 )
                 envelope *= low_transition * high_transition
             else:
                 raise ValueError(f"Unknown spectrum_type: {spectrum_type}")
 
-            filt = np.sqrt(envelope, dtype=np.float64)
+            filt = np.sqrt(np.clip(envelope, 0.0, None), dtype=np.float64)
 
         # Avoid division by zero at k=0
-        kmag_safe = np.where(kmag == 0.0, 1.0, kmag)
+        k2 = kx * kx + ky * ky + kz * kz
+        k2_safe = np.where(k2 == 0.0, 1.0, k2)
 
-        # Projection to compressive (parallel) and solenoidal (perpendicular)
+        # Projection to compressive (parallel) and solenoidal (perpendicular).
+        # U, V, W are the x, y, z velocities; kx is on axis 2, kz on axis 0.
         dot = kx * U + ky * V + kz * W
-        U_par = kx * dot / (kmag_safe * kmag_safe)
-        V_par = ky * dot / (kmag_safe * kmag_safe)
-        W_par = kz * dot / (kmag_safe * kmag_safe)
+        U_par = kx * dot / k2_safe
+        V_par = ky * dot / k2_safe
+        W_par = kz * dot / k2_safe
         U_perp = U - U_par
         V_perp = V - V_par
         W_perp = W - W_par
@@ -159,10 +196,10 @@ def turbulent_velocity_3d(
         V_mix[0, 0, 0] = 0.0
         W_mix[0, 0, 0] = 0.0
 
-        # Back to real space
-        u = np.fft.ifftn(U_mix).real.astype(np.float32)
-        v = np.fft.ifftn(V_mix).real.astype(np.float32)
-        w = np.fft.ifftn(W_mix).real.astype(np.float32)
+        # Back to real space. Keep float64; the caller casts to the grid dtype.
+        u = np.fft.ifftn(U_mix).real
+        v = np.fft.ifftn(V_mix).real
+        w = np.fft.ifftn(W_mix).real
 
         # Normalize to desired vrms
         speed2 = u * u + v * v + w * w
@@ -177,7 +214,8 @@ def turbulent_velocity_3d(
 
     # Generate velocity field
     u, v, w = build_turbulent_velocity(
-        nz, ny, nx, kmin, kmax, alpha, vrms, rng, spectrum_type, power_law_slope
+        nz, ny, nx, kmin, kmax, alpha, vrms, rng, spectrum_type, power_law_slope,
+        dx, dy, dz,
     )
 
     # Convert to torch if needed
@@ -454,7 +492,7 @@ class Turb3DProblem(BaseProblem):
         plt.colorbar(im6, ax=axes[1, 2], shrink=0.8)
 
         plt.suptitle(
-            f"3D Turbulent Velocity Field (GPU/MPS)\nvrms={vrms:.3f}, α={alpha:.3f}, k=[{kmin:.1f},{kmax:.1f}]",
+            f"3D Turbulent Velocity Field\nvrms={vrms:.3f}, α={alpha:.3f}, k=[{kmin:.1f},{kmax:.1f}]",
             fontsize=16,
             fontweight="bold",
         )

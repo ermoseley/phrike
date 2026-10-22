@@ -14,7 +14,7 @@ physics:
 
 integration:
   t0: 0.0
-  t_end: 6.283185307179586  # one sound crossing time (2π/c_s)
+  t_end: 6.283185307179586  # one domain length; a sound crossing is Lx/c_s
   cfl: 0.4          # Upper bound for dt
   scheme: rk4       # Fallback for non-adaptive
   output_interval: 0.1      # Reasonable frame rate for video
@@ -53,15 +53,13 @@ initial_conditions:
 
 io:
   outdir: outputs/gaussian_wave_traveling
-  save_spectra: true
-
 video:
   fps: 30
   width: 1920
   height: 1080
   scale: 2.0
   frame_dpi: 150
-  codec: libopenh264
+  codec: libx264
   crf: 18
   preset: medium
   pix_fmt: yuv420p

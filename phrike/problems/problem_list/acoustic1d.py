@@ -1,26 +1,79 @@
-"""1D periodic acoustic wave problem.
+"""1D periodic acoustic wave.
 
-This problem uses sinusoidal density perturbations in a periodic domain,
-creating acoustic waves that are ideal for:
-- Conservation testing (mass, momentum, energy should be preserved exactly)
-- Spectral accuracy testing (smooth periodic functions are resolved exactly)
-- Convergence testing (can vary amplitude and wavenumber)
-- Monitoring system testing (predictable evolution)
-- Restart functionality testing (periodic state is easy to validate)
+The default initial condition is a right-going acoustic eigenmode,
+
+    u' = c * rho' / rho0,    p' = c^2 * rho',
+
+which translates at the sound speed. ``initial_conditions.wave: entropy``
+keeps the old stationary entropy mode (density perturbation only).
 """
 
 import os
 import numpy as np
 from typing import Optional, Dict, Any
 
-import matplotlib.pyplot as plt
-
 from phrike.grid import Grid1D
 from phrike.equations import EulerEquations1D
 from phrike.solver import SpectralSolver1D
-from phrike.visualization import plot_fields, plot_conserved_time_series
+from phrike.visualization import plot_fields
 from phrike.io import save_solution_snapshot
 from ..base import BaseProblem
+
+
+def _wave_sign(direction: str) -> float:
+    name = str(direction).lower()
+    if name == "right":
+        return 1.0
+    if name == "left":
+        return -1.0
+    raise ValueError("initial_conditions.direction must be 'right' or 'left'")
+
+
+def acoustic_primitives(
+    x: np.ndarray,
+    rho0: float,
+    u0: float,
+    p0: float,
+    amplitude: float,
+    k: int,
+    Lx: float,
+    gamma: float,
+    wave: str = "acoustic",
+    direction: str = "right",
+    t: float = 0.0,
+):
+    """Primitive fields of a sinusoidal acoustic eigenmode or entropy mode.
+
+    The acoustic mode is the exact linear translate. The entropy mode is
+    stationary. Both are periodic on ``[0, Lx)``.
+    """
+    c = float(np.sqrt(gamma * p0 / rho0))
+    kind = str(wave).lower()
+    if kind not in ("acoustic", "entropy"):
+        raise ValueError("initial_conditions.wave must be 'acoustic' or 'entropy'")
+    sign = _wave_sign(direction) if kind == "acoustic" else 0.0
+    phase_speed = sign * c if kind == "acoustic" else 0.0
+
+    if hasattr(x, "cpu"):
+        import torch
+
+        phase = 2.0 * torch.pi * k * (x - phase_speed * t) / Lx
+        sine = torch.sin(phase)
+        ones = torch.ones_like(x)
+    else:
+        phase = 2.0 * np.pi * k * (x - phase_speed * t) / Lx
+        sine = np.sin(phase)
+        ones = np.ones_like(x)
+
+    drho = rho0 * amplitude * sine
+    rho = rho0 + drho
+    if kind == "entropy":
+        u = u0 * ones
+        p = p0 * ones
+    else:
+        u = u0 + sign * c * (drho / rho0)
+        p = p0 + (c * c) * drho
+    return rho, u, p
 
 
 def sinusoidal_density(
@@ -32,31 +85,21 @@ def sinusoidal_density(
     k: int = 1,
     Lx: float = 1.0,
     gamma: float = 1.4,
+    wave: str = "acoustic",
+    direction: str = "right",
 ) -> np.ndarray:
-    # Handle both NumPy arrays and Torch tensors
-    if hasattr(x, 'cpu'):  # Torch tensor
-        import torch
-        rho = rho0 * (1.0 + amplitude * torch.sin(2.0 * torch.pi * k * x / Lx))
-        u = u0 * torch.ones_like(x)
-        p = p0 * torch.ones_like(x)
-    else:  # NumPy array
-        rho = rho0 * (1.0 + amplitude * np.sin(2.0 * np.pi * k * x / Lx))
-        u = u0 * np.ones_like(x)
-        p = p0 * np.ones_like(x)
-    
-    eqs = EulerEquations1D(gamma=gamma)
-    return eqs.conservative(rho, u, p)
+    rho, u, p = acoustic_primitives(
+        x, rho0, u0, p0, amplitude, k, Lx, gamma, wave=wave, direction=direction
+    )
+    return EulerEquations1D(gamma=gamma).conservative(rho, u, p)
 
 
 class Acoustic1DProblem(BaseProblem):
-    """1D periodic acoustic wave problem with sinusoidal density perturbations.
+    """Right-going acoustic eigenmode on a periodic interval.
 
-    Intended as a smooth, periodic check of the 1D solver:
-    - Uses periodic boundary conditions (natural for spectral methods)
-    - Small amplitude perturbations for linear regime testing
-    - Predictable evolution for validation
-    - Exact conservation properties
-    - Smooth initial conditions for spectral accuracy testing
+    ``initial_conditions.wave`` is ``acoustic`` (default) or ``entropy``.
+    The entropy option is a stationary density perturbation with uniform
+    pressure and velocity. It is not an acoustic wave.
     """
 
     def create_grid(
@@ -100,25 +143,32 @@ class Acoustic1DProblem(BaseProblem):
         """Create 1D Euler equations."""
         return EulerEquations1D(gamma=self.gamma)
 
-    def create_initial_conditions(self, grid: Grid1D):
-        """Create sinusoidal density perturbation initial conditions."""
-        # Get parameters from config
+    def _wave_parameters(self) -> Dict[str, Any]:
         ic_config = self.config["initial_conditions"]
-        rho0 = float(ic_config.get("rho0", 1.0))
-        u0 = float(ic_config.get("u0", 0.0))
-        p0 = float(ic_config.get("p0", 1.0))
-        amplitude = float(ic_config.get("amplitude", 1e-3))
-        k = int(ic_config.get("k", 1))
+        return {
+            "rho0": float(ic_config.get("rho0", 1.0)),
+            "u0": float(ic_config.get("u0", 0.0)),
+            "p0": float(ic_config.get("p0", 1.0)),
+            "amplitude": float(ic_config.get("amplitude", 1e-3)),
+            "k": int(ic_config.get("k", 1)),
+            "wave": str(ic_config.get("wave", "acoustic")),
+            "direction": str(ic_config.get("direction", "right")),
+        }
 
+    def create_initial_conditions(self, grid: Grid1D):
+        """Create the acoustic eigenmode, or a named stationary entropy mode."""
+        params = self._wave_parameters()
         return sinusoidal_density(
             x=grid.x,
-            rho0=rho0,
-            u0=u0,
-            p0=p0,
-            amplitude=amplitude,
-            k=k,
+            rho0=params["rho0"],
+            u0=params["u0"],
+            p0=params["p0"],
+            amplitude=params["amplitude"],
+            k=params["k"],
             Lx=grid.Lx,
             gamma=self.gamma,
+            wave=params["wave"],
+            direction=params["direction"],
         )
 
     def create_visualization(self, solver, t: float, U):
@@ -148,132 +198,31 @@ class Acoustic1DProblem(BaseProblem):
             outpath=os.path.join(self.outdir, f"fields_t{solver.t:.6f}.png"),
         )
 
-        # Plot conserved quantities if history is available
-        if (
-            hasattr(solver, "history")
-            and solver.history
-            and len(solver.history.get("time", [])) > 0
-        ):
-            plot_conserved_time_series(
-                solver.history, outpath=os.path.join(self.outdir, "conserved.png")
-            )
-
-            # Create additional analysis plots for testing
-            self._create_test_analysis_plots(solver)
-
-    def _create_test_analysis_plots(self, solver) -> None:
-        """Create additional analysis plots specific to testing."""
-        if not hasattr(solver, "history") or not solver.history:
-            return
-
-        history = solver.history
-        times = np.array(history.get("time", []))
-
-        if len(times) == 0:
-            return
-
-        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-        fig.suptitle("1D Test Problem Analysis", fontsize=14)
-
-        # Conservation errors over time
-        if "mass" in history and "momentum" in history and "energy" in history:
-            mass = np.array(history["mass"])
-            momentum = np.array(history["momentum"])
-            energy = np.array(history["energy"])
-
-            # Relative errors
-            mass_error = np.abs(mass - mass[0]) / np.abs(mass[0])
-            momentum_error = np.abs(momentum - momentum[0]) / (
-                np.abs(momentum[0]) + 1e-16
-            )
-            energy_error = np.abs(energy - energy[0]) / np.abs(energy[0])
-
-            axes[0, 0].semilogy(
-                times, mass_error, label="Mass", marker="o", markersize=3
-            )
-            axes[0, 0].semilogy(
-                times, momentum_error, label="Momentum", marker="s", markersize=3
-            )
-            axes[0, 0].semilogy(
-                times, energy_error, label="Energy", marker="^", markersize=3
-            )
-            axes[0, 0].set_xlabel("Time")
-            axes[0, 0].set_ylabel("Relative Error")
-            axes[0, 0].set_title("Conservation Errors")
-            axes[0, 0].legend()
-            axes[0, 0].grid(True, alpha=0.3)
-
-        # Time step evolution
-        if "dt" in history:
-            dt = np.array(history["dt"])
-            axes[0, 1].plot(times, dt, "b-", linewidth=1)
-            axes[0, 1].set_xlabel("Time")
-            axes[0, 1].set_ylabel("Time Step")
-            axes[0, 1].set_title("Adaptive Time Step")
-            axes[0, 1].grid(True, alpha=0.3)
-
-        # Spectral analysis of final state
-        rho, u, p, a = solver.equations.primitive(solver.U)
-        k_modes = np.fft.fftfreq(len(rho), d=solver.grid.dx)
-        rho_hat = np.fft.fft(rho)
-
-        # Only plot positive frequencies
-        positive_k = k_modes[: len(k_modes) // 2]
-        rho_spectrum = np.abs(rho_hat[: len(k_modes) // 2])
-
-        axes[1, 0].semilogy(positive_k[1:], rho_spectrum[1:], "r-", linewidth=1)
-        axes[1, 0].set_xlabel("Wavenumber")
-        axes[1, 0].set_ylabel("Density Spectrum")
-        axes[1, 0].set_title("Final Density Spectrum")
-        axes[1, 0].grid(True, alpha=0.3)
-
-        # Phase space plot (if there's motion)
-        if np.std(u) > 1e-12:
-            axes[1, 1].plot(rho, u, "g-", alpha=0.7, linewidth=1)
-            axes[1, 1].set_xlabel("Density")
-            axes[1, 1].set_ylabel("Velocity")
-            axes[1, 1].set_title("Phase Space (ρ-u)")
-            axes[1, 1].grid(True, alpha=0.3)
-        else:
-            # If no motion, plot density profile
-            axes[1, 1].plot(solver.grid.x, rho, "g-", linewidth=2)
-            axes[1, 1].set_xlabel("x")
-            axes[1, 1].set_ylabel("Density")
-            axes[1, 1].set_title("Final Density Profile")
-            axes[1, 1].grid(True, alpha=0.3)
-
-        plt.tight_layout()
-        plt.savefig(
-            os.path.join(self.outdir, "test_analysis.png"), dpi=150, bbox_inches="tight"
-        )
-        plt.close()
-
     def get_solver_class(self):
         """Get 1D solver class."""
         return SpectralSolver1D
 
-    def get_analytical_solution(self, t: float) -> Optional[Dict[str, Any]]:
-        """Get analytical solution at time t (if available).
+    def get_analytical_solution(self, grid: Grid1D, t: float) -> Optional[Dict[str, Any]]:
+        """Exact linear translate of the periodic eigenmode.
 
-        For small amplitude sinusoidal perturbations, the solution should
-        remain close to the initial conditions for short times.
-
-        Returns:
-            Dict with analytical values for validation, or None if not available.
+        The translate assumes a periodic Fourier domain. Wall reflections are
+        not included, so this returns None for a non-periodic basis.
         """
-        # For very small amplitude perturbations in the linear regime,
-        # we can provide some analytical expectations
-        ic_config = self.config["initial_conditions"]
-        amplitude = float(ic_config.get("amplitude", 1e-3))
-
-        if amplitude < 1e-2:  # Linear regime
-            # In the linear regime, small perturbations should evolve predictably
-            # This is a placeholder for more sophisticated analytical solutions
-            return {
-                "regime": "linear",
-                "expected_amplitude_growth": "bounded",
-                "conservation_tolerance": 1e-14,
-                "spectral_decay_rate": "exponential",
-            }
-
-        return None
+        basis = str(self.config["grid"].get("basis", "fourier")).lower()
+        if basis != "fourier":
+            return None
+        params = self._wave_parameters()
+        rho, u, p = acoustic_primitives(
+            grid.x,
+            params["rho0"],
+            params["u0"],
+            params["p0"],
+            params["amplitude"],
+            params["k"],
+            grid.Lx,
+            self.gamma,
+            wave=params["wave"],
+            direction=params["direction"],
+            t=t,
+        )
+        return {"rho": rho, "u": u, "p": p}

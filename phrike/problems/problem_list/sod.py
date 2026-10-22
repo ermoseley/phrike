@@ -9,7 +9,7 @@ import numpy as np
 from phrike.grid import Grid1D
 from phrike.equations import EulerEquations1D
 from phrike.solver import SpectralSolver1D
-from phrike.visualization import plot_fields, plot_conserved_time_series
+from phrike.visualization import plot_fields
 from phrike.io import save_solution_snapshot
 from ..base import BaseProblem
 
@@ -239,16 +239,6 @@ class SodProblem(BaseProblem):
             title=f"Sod at t={solver.t:.3f}",
             outpath=os.path.join(self.outdir, f"fields_t{solver.t:.3f}.png"),
         )
-
-        # Plot conserved quantities if history is available
-        if (
-            hasattr(solver, "history")
-            and solver.history
-            and len(solver.history.get("time", [])) > 0
-        ):
-            plot_conserved_time_series(
-                solver.history, outpath=os.path.join(self.outdir, "conserved.png")
-            )
 
     def get_solver_class(self):
         """Get 1D solver class."""

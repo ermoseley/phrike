@@ -25,6 +25,8 @@ def kelvin_helmholtz_2d(
     perturb_sigma: float = 0.02,
     perturb_kx: int = 2,
     gamma: float = 1.4,
+    Lx: Optional[float] = None,
+    Ly: Optional[float] = None,
 ) -> np.ndarray:
     """2D Kelvin-Helmholtz initial condition matching RAMSES khi.py profile.
 
@@ -44,10 +46,16 @@ def kelvin_helmholtz_2d(
 
     is_torch = _TORCH_AVAILABLE and isinstance(X, (torch.Tensor,))
 
+    if Lx is None or Ly is None:
+        raise ValueError(
+            "kelvin_helmholtz_2d requires the domain lengths Lx and Ly. "
+            "X.max() - X.min() is one grid spacing short of a periodic domain "
+            "and does not seed an integer Fourier mode."
+        )
+
     if is_torch:
-        # Normalize coordinates to [0,1) like RAMSES script
-        Lx = X.max() - X.min()
-        Ly = Y.max() - Y.min()
+        # Normalize coordinates by the periodic domain length, not by the
+        # span of the nodes (which excludes one spacing).
         yn = Y / Ly  # normalized y coordinates
 
         # Velocity profile: two tanh transitions at y=0.25 and y=0.75
@@ -78,10 +86,7 @@ def kelvin_helmholtz_2d(
         sinus = torch.sin(2.0 * torch.pi * perturb_kx * X / Lx)
         uy = perturb_eps * sinus * gauss
     else:
-        # Normalize coordinates to [0,1) like RAMSES script
-        Lx = X.max() - X.min()
-        Ly = Y.max() - Y.min()
-        yn = Y / Ly  # normalized y coordinates
+        yn = Y / float(Ly)  # normalized y coordinates
 
         # Velocity profile: two tanh transitions at y=0.25 and y=0.75
         U1 = -0.5 * u0  # outer regions
@@ -173,6 +178,8 @@ class KHI2DProblem(BaseProblem):
             perturb_sigma=perturb_sigma,
             perturb_kx=perturb_kx,
             gamma=self.gamma,
+            Lx=float(grid.Lx),
+            Ly=float(grid.Ly),
         )
 
     def create_visualization(self, solver, t: float, U) -> None:

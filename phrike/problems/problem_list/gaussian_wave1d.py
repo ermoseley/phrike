@@ -24,7 +24,7 @@ import matplotlib.pyplot as plt
 from phrike.grid import Grid1D
 from phrike.equations import EulerEquations1D
 from phrike.solver import SpectralSolver1D
-from phrike.visualization import plot_fields, plot_conserved_time_series
+from phrike.visualization import plot_fields
 from phrike.io import save_solution_snapshot
 from ..base import BaseProblem
 
@@ -120,14 +120,20 @@ class GaussianWave1DProblem(BaseProblem):
         equations = EulerEquations1D(gamma=self.gamma)
         return equations.conservative(rho, u, p)
 
+    def _periodic_reference(self) -> bool:
+        """The closed-form translate assumes a periodic Fourier domain."""
+        return str(self.config["grid"].get("basis", "fourier")).lower() == "fourier"
+
     def get_analytical_solution(
         self, grid: Grid1D, t: float
     ) -> Optional[Dict[str, np.ndarray]]:
-        """Get analytical solution at time t with proper acoustic wave relations.
+        """Periodic translate of the acoustic packet.
 
-        For the traveling wave packet, this returns the exact translated profile.
-        For the stationary wave packet, this returns the initial profile (should be unchanged).
+        Returns None on a non-periodic basis. Wall reflections are not part of
+        this reference, and overlaying it on a Legendre run is misleading.
         """
+        if not self._periodic_reference():
+            return None
         ic_config = self.config["initial_conditions"]
         rho0 = float(ic_config.get("rho0", 1.0))
         u0 = float(ic_config.get("u0", 0.0))
@@ -305,7 +311,7 @@ class GaussianWave1DProblem(BaseProblem):
                 ax[1, 1].text(
                     0.5,
                     0.5,
-                    "No analytical solution",
+                    "Periodic translate only\n(not valid for wall BCs)",
                     ha="center",
                     va="center",
                     transform=ax[1, 1].transAxes,
@@ -319,8 +325,9 @@ class GaussianWave1DProblem(BaseProblem):
             plt.savefig(frame_path, dpi=100, bbox_inches="tight")
             plt.close()
 
-            # Also save regular field plot at intervals (every 0.1 time units)
-            if t % 0.1 < 1e-6:  # Check if t is close to a multiple of 0.1
+            # Also save a field plot near multiples of 0.1. A float modulo test
+            # misses those multiples (0.3 % 0.1 is just under 0.1).
+            if abs(t / 0.1 - round(t / 0.1)) < 1e-6:
                 plot_fields(
                     grid=solver.grid,
                     U=U,
@@ -350,143 +357,6 @@ class GaussianWave1DProblem(BaseProblem):
             outpath=os.path.join(self.outdir, f"fields_t{solver.t:.6f}.png"),
         )
 
-        # Plot conserved quantities if history is available
-        if (
-            hasattr(solver, "history")
-            and solver.history
-            and len(solver.history.get("time", [])) > 0
-        ):
-            plot_conserved_time_series(
-                solver.history, outpath=os.path.join(self.outdir, "conserved.png")
-            )
-
-            # Create additional analysis plots for wave packet evolution
-            self._create_wave_packet_analysis_plots(solver)
-
-    def _create_wave_packet_analysis_plots(self, solver) -> None:
-        """Create additional analysis plots specific to wave packet evolution."""
-        if not hasattr(solver, "history") or not solver.history:
-            return
-
-        history = solver.history
-        times = np.array(history.get("time", []))
-
-        if len(times) == 0:
-            return
-
-        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-        fig.suptitle("Gaussian Wave Packet Analysis", fontsize=14)
-
-        # Get current solution
-        rho, u, p, a = solver.equations.primitive(solver.U)
-        x = solver.grid.x
-
-        # Plot 1: Current density profile vs analytical
-        analytical = self.get_analytical_solution(solver.grid, solver.t)
-        if analytical is not None:
-            axes[0, 0].plot(x, rho, "b-", linewidth=2, label="Numerical")
-            axes[0, 0].plot(
-                x, analytical["rho"], "r--", linewidth=2, label="Analytical"
-            )
-            axes[0, 0].set_xlabel("x")
-            axes[0, 0].set_ylabel("Density")
-            axes[0, 0].set_title(f"Density Profile at t={solver.t:.3f}")
-            axes[0, 0].legend()
-            axes[0, 0].grid(True, alpha=0.3)
-
-        # Plot 2: Conservation errors over time
-        if "mass" in history and "momentum" in history and "energy" in history:
-            mass = np.array(history["mass"])
-            momentum = np.array(history["momentum"])
-            energy = np.array(history["energy"])
-
-            mass_error = np.abs(mass - mass[0]) / np.abs(mass[0])
-            momentum_error = np.abs(momentum - momentum[0]) / (
-                np.abs(momentum[0]) + 1e-16
-            )
-            energy_error = np.abs(energy - energy[0]) / np.abs(energy[0])
-
-            axes[0, 1].semilogy(
-                times, mass_error, label="Mass", marker="o", markersize=3
-            )
-            axes[0, 1].semilogy(
-                times, momentum_error, label="Momentum", marker="s", markersize=3
-            )
-            axes[0, 1].semilogy(
-                times, energy_error, label="Energy", marker="^", markersize=3
-            )
-            axes[0, 1].set_xlabel("Time")
-            axes[0, 1].set_ylabel("Relative Error")
-            axes[0, 1].set_title("Conservation Errors")
-            axes[0, 1].legend()
-            axes[0, 1].grid(True, alpha=0.3)
-
-        # Plot 3: Wave packet evolution (if we have multiple time snapshots)
-        if len(times) > 1:
-            # Plot density at different times
-            time_indices = np.linspace(0, len(times) - 1, min(5, len(times)), dtype=int)
-            colors = plt.cm.viridis(np.linspace(0, 1, len(time_indices)))
-
-            for i, (idx, color) in enumerate(zip(time_indices, colors)):
-                if "density_history" in history:
-                    rho_t = history["density_history"][idx]
-                    axes[0, 2].plot(
-                        x,
-                        rho_t,
-                        color=color,
-                        linewidth=1.5,
-                        label=f"t={times[idx]:.3f}",
-                    )
-
-            axes[0, 2].set_xlabel("x")
-            axes[0, 2].set_ylabel("Density")
-            axes[0, 2].set_title("Wave Packet Evolution")
-            axes[0, 2].legend()
-            axes[0, 2].grid(True, alpha=0.3)
-
-        # Plot 4: Error evolution over time (if available)
-        if "l2_error_history" in history:
-            l2_errors = history["l2_error_history"]
-            axes[1, 0].semilogy(times, l2_errors, "b-", linewidth=2)
-            axes[1, 0].set_xlabel("Time")
-            axes[1, 0].set_ylabel("L2 Error")
-            axes[1, 0].set_title("L2 Error vs Time")
-            axes[1, 0].grid(True, alpha=0.3)
-
-        # Plot 5: Spectral analysis
-        rho_hat = np.fft.fft(rho)
-        k_modes = np.fft.fftfreq(len(rho), d=solver.grid.dx)
-        positive_k = k_modes[: len(k_modes) // 2]
-        rho_spectrum = np.abs(rho_hat[: len(k_modes) // 2])
-
-        axes[1, 1].semilogy(positive_k[1:], rho_spectrum[1:], "r-", linewidth=1)
-        axes[1, 1].set_xlabel("Wavenumber")
-        axes[1, 1].set_ylabel("Density Spectrum")
-        axes[1, 1].set_title("Final Density Spectrum")
-        axes[1, 1].grid(True, alpha=0.3)
-
-        # Plot 6: Phase space or velocity profile
-        if np.std(u) > 1e-12:
-            axes[1, 2].plot(x, u, "g-", linewidth=2)
-            axes[1, 2].set_xlabel("x")
-            axes[1, 2].set_ylabel("Velocity")
-            axes[1, 2].set_title("Velocity Profile")
-        else:
-            axes[1, 2].plot(x, rho, "g-", linewidth=2)
-            axes[1, 2].set_xlabel("x")
-            axes[1, 2].set_ylabel("Density")
-            axes[1, 2].set_title("Final Density Profile")
-
-        axes[1, 2].grid(True, alpha=0.3)
-
-        plt.tight_layout()
-        plt.savefig(
-            os.path.join(self.outdir, "wave_packet_analysis.png"),
-            dpi=150,
-            bbox_inches="tight",
-        )
-        plt.close()
-
     def get_solver_class(self):
         """Get 1D solver class."""
         return SpectralSolver1D
@@ -498,11 +368,9 @@ class GaussianWave1DProblem(BaseProblem):
         p0 = float(ic_config.get("p0", 1.0))
         amplitude = float(ic_config.get("amplitude", 0.1))
         sigma = float(ic_config.get("sigma", 0.1))
-        x0 = float(ic_config.get("x0", 0.0))
-        wave_type = ic_config.get("wave_type", "traveling")
-
-        # Get domain length from grid config
         Lx = float(self.config["grid"]["Lx"])
+        x0 = float(ic_config.get("x0", 0.5 * Lx))
+        wave_type = ic_config.get("wave_type", "traveling")
 
         # Calculate derived parameters
         c_s = np.sqrt(self.gamma * p0 / rho0)  # Sound speed

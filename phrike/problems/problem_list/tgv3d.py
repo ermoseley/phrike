@@ -1,6 +1,7 @@
 """3D Taylor-Green vortex problem."""
 
 import os
+import warnings
 from typing import Optional
 
 import matplotlib.pyplot as plt
@@ -23,13 +24,16 @@ def taylor_green_vortex_3d(
     k: int = 1,
     gamma: float = 1.4,
 ) -> np.ndarray:
-    """3D Taylor-Green vortex initial condition (compressible variant).
+    """3D Taylor-Green vortex initial condition.
 
-    Velocity field:
+    Velocity field (Brachet et al. 1983):
         u =  U0 * sin(k x) cos(k y) cos(k z)
         v = -U0 * cos(k x) sin(k y) cos(k z)
         w =  0
-    Constant density rho0 and pressure p0.
+    The pressure that cancels the divergent part of the initial advection is
+        p = p0 + (rho0 * U0**2 / 16) * (cos(2kx) + cos(2ky)) * (cos(2kz) + 2)
+    ``p0`` is the mean pressure. The Mach number is
+    ``Ma = U0 / sqrt(gamma * p0 / rho0)``.
     """
     # Torch interop if needed
     try:
@@ -44,19 +48,28 @@ def taylor_green_vortex_3d(
         isinstance(a, (torch.Tensor,)) for a in (X, Y, Z)
     )
 
+    def _pressure(cos):
+        # Mean p0 plus the Brachet fluctuation. The fluctuation averages to 0.
+        return (
+            float(p0)
+            + (float(rho0) * float(U0) ** 2 / 16.0)
+            * (cos(2.0 * k * X) + cos(2.0 * k * Y))
+            * (cos(2.0 * k * Z) + 2.0)
+        )
+
     if is_torch:
         assert torch is not None
         ux = U0 * torch.sin(k * X) * torch.cos(k * Y) * torch.cos(k * Z)
         uy = -U0 * torch.cos(k * X) * torch.sin(k * Y) * torch.cos(k * Z)
         uz = torch.zeros_like(X)
         rho = torch.full_like(X, float(rho0))
-        p = torch.full_like(X, float(p0))
+        p = _pressure(torch.cos)
     else:
         ux = U0 * np.sin(k * X) * np.cos(k * Y) * np.cos(k * Z)
         uy = -U0 * np.cos(k * X) * np.sin(k * Y) * np.cos(k * Z)
         uz = np.zeros_like(X)
         rho = rho0 * np.ones_like(X)
-        p = p0 * np.ones_like(X)
+        p = _pressure(np.cos)
 
     eqs = EulerEquations3D(gamma=gamma)
     return eqs.conservative(rho, ux, uy, uz, p)
@@ -102,9 +115,25 @@ class TGV3DProblem(BaseProblem):
         icfg = self.config["initial_conditions"]
 
         rho0 = float(icfg.get("rho0", 1.0))
-        p0 = float(icfg.get("p0", 100.0))
         U0 = float(icfg.get("U0", 1.0))
-        k = int(icfg.get("k", 2))
+        k = int(icfg.get("k", 1))
+        # mach, when set, fixes the mean pressure so Ma = U0/c0 holds.
+        if "mach" in icfg:
+            mach = float(icfg["mach"])
+            if mach <= 0.0:
+                raise ValueError("initial_conditions.mach must be positive")
+            p0 = rho0 * U0 * U0 / (self.gamma * mach * mach)
+            if "p0" in icfg:
+                stated = float(icfg["p0"])
+                if abs(stated - p0) > 1e-8 * max(1.0, abs(p0)):
+                    warnings.warn(
+                        "initial_conditions.p0 does not match mach; "
+                        f"using p0={p0:.8g} from Ma={mach:g}",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+        else:
+            p0 = float(icfg.get("p0", 100.0))
 
         return taylor_green_vortex_3d(
             X, Y, Z, rho0=rho0, p0=p0, U0=U0, k=k, gamma=self.gamma

@@ -1,11 +1,7 @@
 # 2D Gaussian Wave Packet Configuration - Angled wave (Fourier basis)
 # Tests 2D Fourier basis with a low-amplitude wave traveling at an angle
 
-problem:
-  name: "gaussian_wave2d"
-  description: "2D Gaussian wave packet traveling at an angle - Fourier basis (low amplitude)"
-
-# Grid configuration
+problem: gaussian_wave2d
 grid:
   Nx: 64                    # More modes for better resolution
   Ny: 64                    # More modes for better resolution
@@ -13,7 +9,7 @@ grid:
   Ly: 1.0                   # Domain length in y
   basis_x: "fourier"        # Use Fourier basis in x
   basis_y: "fourier"        # Use Fourier basis in y
-  bc: "periodic"            # Periodic boundary conditions
+  # Periodic by basis. Grid2D rejects bc: periodic.
   dealias: true             # Enable dealiasing for Fourier
   precision: "double"       # Use double precision
 
@@ -32,21 +28,16 @@ initial_conditions:
 # Physics
 physics:
   gamma: 1.4                # Adiabatic index
-  gravity:
-    enabled: false          # No gravity for this test
-
-# Integration
 integration:
   t0: 0.0                   # Start time
   t_end: 2.0                # End time (longer to see full propagation)
-  dt: 1e-4                  # Initial time step
   scheme: "rk4"             # 4th order Runge-Kutta
   cfl: 0.5                  # CFL number
-  adaptive_dt: true         # Use adaptive time stepping
   spectral_dissipation:
     enabled: false
 
 # Artificial viscosity (small amount for stability)
+  output_interval: 0.05
 artificial_viscosity:
   enabled: true
   nu_max: 1e-5              # Lower viscosity for linear regime
@@ -65,17 +56,5 @@ artificial_viscosity:
 # Output
 io:
   outdir: "outputs/gaussian_wave2d_angled_fourier"
-  output_interval: 0.05     # Output every 0.05 time units
-  save_frames: true         # Save frames for video generation
-  frames_dir: "frames"      # Subdirectory for frames
-
-# Monitoring
 monitoring:
   step_interval: 10         # Print status every 10 steps
-  verbose: true             # Verbose output
-
-# Visualization
-visualization:
-  create_plots: true        # Create analysis plots
-  plot_interval: 0.05       # Plot every 0.05 time units
-  save_plots: true          # Save plots to disk
