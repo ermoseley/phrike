@@ -7,11 +7,14 @@ from phrike.equations import MHDEquations1D, MHDEquations2D, MHDEquations3D
 from phrike.grid import Grid1D, Grid2D, Grid3D
 from phrike.io import load_checkpoint, save_solution_snapshot
 from phrike.nonideal import Hall
+from phrike.problems.problem_list.adsi_shear import (
+    ADSIShearProblem, adsi_incompressible_roots, adsi_shear_matrix, adsi_shear_mode, adsi_shear_vector,
+)
 from phrike.problems.problem_list.hall_mri1d import (
-    HallMRI1DProblem, hall_mri_fastest, hall_mri_mode,
+    HallMRI1DProblem, hall_mri_fastest, hall_mri_matrix, hall_mri_mode,
 )
 from phrike.problems.problem_list.orszag_tang2d import orszag_tang_2d
-from phrike.solver import SpectralSolverMHD1D, SpectralSolverMHD2D
+from phrike.solver import SpectralSolverMHD1D, SpectralSolverMHD2D, SpectralSolverMHD3D
 
 
 def grid1d(**kwargs):
@@ -27,6 +30,11 @@ def state(grid, B, rho=None):
 def solver(grid, **blocks):
     grid.mhd_config = blocks
     return SpectralSolverMHD1D(grid=grid, equations=MHDEquations1D())
+
+
+def solver2d(grid, **blocks):
+    grid.mhd_config = blocks
+    return SpectralSolverMHD2D(grid=grid, equations=MHDEquations2D())
 
 
 @pytest.mark.parametrize("method,eta", [("reference", 0.2), ("reference", -0.2),
@@ -325,10 +333,46 @@ def test_shearing_sheet_defaults_and_validation():
                 dict(omega=float("nan"))):
         with pytest.raises(ValueError):
             solver(g, shearing_sheet=bad)
+    # 2D: vertical x and radial y are the grid axes, azimuthal z is ignorable.
     g2 = Grid2D(Nx=8, Ny=8, Lx=1.0, Ly=1.0, backend="numpy")
-    g2.mhd_config = dict(shearing_sheet=dict(omega=1.0))
+    sheet = solver2d(g2, shearing_sheet=dict(omega=1.0)).shearing_sheet
+    assert (sheet["radial"], sheet["azimuthal"], sheet["sign"]) == (1, 2, 1)
+    for bad in (dict(omega=1.0, vertical_axis=1), dict(omega=1.0, radial_axis=2)):
+        with pytest.raises(ValueError):
+            solver2d(g2, shearing_sheet=bad)
+    g3 = Grid3D(Nx=8, Ny=8, Nz=8, Lx=1.0, Ly=1.0, Lz=1.0, backend="numpy")
+    g3.mhd_config = dict(shearing_sheet=dict(omega=1.0))
     with pytest.raises(NotImplementedError):
-        SpectralSolverMHD2D(grid=g2, equations=MHDEquations2D())
+        SpectralSolverMHD3D(grid=g3, equations=MHDEquations3D())
+
+
+def test_shearing_sheet_2d_sources_match_1d_and_are_local():
+    g1 = grid1d()
+    g2 = Grid2D(Nx=24, Ny=8, Lx=2*np.pi, Ly=1.0, backend="numpy")
+    sheet = dict(omega=0.8, shear=1.1)
+    x = g1.x
+    U1 = MHDEquations1D().conservative(1.3+0.1*np.cos(x), 0.2+0.05*np.sin(x), 0.4*np.ones_like(x),
+                                       -0.7+0.1*np.cos(2*x), 2.0+0*x, 0.9+0*x, 0.3*np.cos(x),
+                                       -0.2+0.1*np.sin(x))
+    d1 = solver(g1, shearing_sheet=sheet)._compute_rhs(U1)-solver(g1)._compute_rhs(U1)
+    # A state independent of r: every row of the 2D sources is the 1D source.
+    U2 = np.repeat(U1[:, None, :], g2.Ny, axis=1)
+    d2 = solver2d(g2, shearing_sheet=sheet)._compute_rhs(U2)-solver2d(g2)._compute_rhs(U2)
+    for j in range(g2.Ny):
+        np.testing.assert_allclose(d2[:, j, :], d1, atol=1e-13)
+    # A state that depends on r and x: the sources stay pointwise (vertical x, radial y, phi = +z).
+    X, Y = np.meshgrid(g2.x, g2.y)
+    one = np.ones_like(X)
+    V = MHDEquations2D().conservative(1.3+0.1*np.cos(X+Y), 0.2*one, 0.4+0.1*np.sin(Y), -0.7+0.1*np.cos(X),
+                                      2.0*one, 0.9*one, 0.3*np.cos(Y), -0.2+0.1*np.sin(X-Y))
+    d = solver2d(g2, shearing_sheet=sheet)._compute_rhs(V)-solver2d(g2)._compute_rhs(V)
+    omega, shear = sheet["omega"], sheet["shear"]
+    expected = np.zeros_like(V)
+    expected[2] = 2*omega*V[3]
+    expected[3] = -(2*omega-shear)*V[2]
+    expected[7] = -shear*V[6]
+    expected[4] = shear*(V[2]*V[3]/V[0]-V[6]*V[7])
+    np.testing.assert_allclose(d, expected, atol=1e-13)
 
 
 def test_ideal_mri_growth_and_hall_neutral_curves():
@@ -462,3 +506,68 @@ def test_hall_mri_restart_rebuilds_mode_metadata_and_history(tmp_path):
     assert restarted.linear_mode == fresh.linear_mode
     (t, amplitude), = restarted.amplitude_history
     assert t == 0.1 and amplitude == pytest.approx(fresh._amplitude(U), rel=1e-14)
+
+
+def test_adsi_shear_ideal_mri_and_hall_limits():
+    s, _ = adsi_shear_mode(np.sqrt(15.0)/4.0, 0.0, 1.0, 1.5, 1.0, 0.0, p0=100.0)
+    assert abs(s.real-0.75) < 1e-10 and abs(s.imag) < 1e-10
+    # For k along B0 the transverse block is hall_mri_matrix (also with the inertia length).
+    for eta, length in ((0.5, 0.0), (-0.25, 0.0), (0.5, 0.3)):
+        k = 0.8
+        hall = np.linalg.eigvals(hall_mri_matrix(k, 1.0, 1.5, 1.0, eta_h=eta, length=length))
+        full = np.linalg.eigvals(adsi_shear_matrix(k, 0.0, 1.0, 1.5, 1.0, 0.0, p0=100.0,
+                                                   eta_h=eta, length=length))
+        assert max(min(abs(h-f) for f in full) for h in hall) < 1e-10
+
+
+def test_adsi_shear_incompressible_quartic_and_destabilization_rule():
+    # Kunz and Balbus (2004) quartic for B_R = 0 against the compressible matrix at huge sound speed.
+    for omega, shear, bphi, eta, kv, kr in ((0.0, 1.0, 1.0, 2.0, 0.7, -1.4), (0.0, 1.0, 0.3, 3.0, 0.5, -3.0),
+                                            (1.0, 1.5, 1.0, 1.0, 0.6, 0.3), (1.0, 1.5, 1.0, 1.0, 0.6, -0.3)):
+        roots = adsi_incompressible_roots(kv, kr, omega, shear, 1.0, bphi, eta=eta)
+        eigen = np.linalg.eigvals(adsi_shear_matrix(kv, kr, omega, shear, 1.0, bphi, p0=1e6, eta=eta))
+        assert max(min(abs(r-e) for e in eigen) for r in roots) < 1e-4
+    # Pure shear, Am = 1/(rho eta S) = 0.5: unstable iff S k_r k_v B_v B_phi < 0 and |k_r B_phi/(k_v B_v)| > Am.
+    growth = lambda kr, bphi, eta: np.linalg.eigvals(
+        adsi_shear_matrix(1.0, kr, 0.0, 1.0, 1.0, bphi, p0=1e6, eta=eta)).real.max()
+    for bphi in (1.0, -1.0):
+        assert 0.01 < growth(-2.0*bphi, bphi, 2.0) <= 0.5+1e-9
+        assert growth(2.0*bphi, bphi, 2.0) < 1e-6
+        assert growth(-0.25*bphi, bphi, 2.0) < 1e-6
+        assert growth(-2.0*bphi, bphi, 0.0) < 1e-6
+    # k along the vertical axis decouples (u_r, b_r) from the shear-driven rows: stable at any eta.
+    assert max(growth(0.0, bphi, eta) for bphi in (0.3, 1.0, -1.0) for eta in (0.0, 0.5, 5.0)) < 1e-6
+
+
+def test_adsi_shear_growth_never_exceeds_half_the_shear():
+    rng = np.random.default_rng(7)
+    for _ in range(60):
+        omega, shear = rng.choice([0.0, 1.0]), rng.choice([1.0, 1.5, -0.7])
+        s, _ = adsi_shear_mode(rng.uniform(0.2, 3.0), rng.uniform(-3.0, 3.0), omega, shear, 1.0,
+                               rng.uniform(-2.0, 2.0), p0=rng.uniform(0.5, 50.0), eta=rng.uniform(0.0, 5.0),
+                               eta_h=rng.uniform(-2.0, 2.0), length=rng.choice([0.0, 0.3]))
+        assert s.real <= 0.5*abs(shear)+1e-9
+    # Ideal pure shear is stable for oblique k as well.
+    for kv, kr, bphi in ((0.7, 1.1, 0.8), (1.0, -2.0, 0.3), (0.4, 0.9, 1.5)):
+        assert np.linalg.eigvals(adsi_shear_matrix(kv, kr, 0.0, 1.0, 1.0, bphi, p0=5.0)).real.max() < 1e-6
+
+
+def test_adsi_shear_seed_roundtrip_and_box(tmp_path):
+    problem = ADSIShearProblem(config=dict(
+        problem="adsi_shear", grid=dict(Nx=16, Ny=16, Lx="auto", Ly="auto", precision="double"),
+        physics=dict(gamma=5.0/3.0, mhd=dict(enabled=True, shearing_sheet=dict(omega=0.0, shear=1.0),
+                                              ambipolar=dict(enabled=True, eta=2.0))),
+        integration=dict(t0=0.0, t_end=1.0, cfl=0.3, scheme="rk4"),
+        initial_conditions=dict(rho0=1.0, Bv=1.0, Bphi=1.0, beta=10.0, mode_v=1, mode_r=1,
+                                amplitude=1e-6),
+        io=dict(outdir=str(tmp_path))))
+    g = problem.create_grid("numpy")
+    mode = problem.linear_mode
+    assert mode["growth"] > 0.01 and mode["k_r"]*mode["k_v"] < 0.0  # S B_v B_phi > 0 needs k_r k_v < 0
+    assert g.Lx == pytest.approx(2.0*np.pi/mode["k_v"]) and g.Ly == pytest.approx(2.0*np.pi/abs(mode["k_r"]))
+    U = problem.create_initial_conditions(g)
+    assert problem.amplitude_history[0][1] == pytest.approx(1e-6*np.sqrt(2.0), rel=1e-6)
+    rho, ux, uy, uz, p, bx, by, bz = problem.create_equations().primitive(U)
+    c = adsi_shear_vector(np.array([rho, ux, uy, uz, bx, by, bz, p]), mode["k_v"], mode["k_r"],
+                          problem._mode_v, problem._mode_r)
+    np.testing.assert_allclose(c, 1e-6*np.sqrt(2.0)*problem._vector, rtol=1e-5, atol=1e-12)

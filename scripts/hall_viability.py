@@ -1,8 +1,9 @@
 """Hall-term viability measurements. Run ONLY on a cluster; no output files.
 
-1D: NumPy CPU. 2D: NumPy CPU or torch CUDA. The `mri` suite is always 1D NumPy. Only `waves`
-also runs in 3D. `ot`, `stability` and `precision` are 2D torch CUDA suites and are not part of
-`--suite all`. All numerical work, including the small analytic eigenproblems, happens at run time.
+1D: NumPy CPU. 2D: NumPy CPU or torch CUDA. The `mri` suite is always 1D NumPy and the `adsi`
+suite always 2D NumPy (shearing-sheet ambipolar diffusion). Only `waves` also runs in 3D. `ot`,
+`stability` and `precision` are 2D torch CUDA suites; they and `adsi` are not part of `--suite all`.
+All numerical work, including the small analytic eigenproblems, happens at run time.
 """
 from __future__ import annotations
 
@@ -22,6 +23,9 @@ from phrike.equations import MHDEquations1D, MHDEquations2D, MHDEquations3D
 from phrike.grid import Grid1D, Grid2D, Grid3D
 from phrike.io import load_config
 from phrike.nonideal import Hall
+from phrike.problems.problem_list.adsi_shear import (
+    adsi_incompressible_roots, adsi_shear_box, adsi_shear_fastest, adsi_shear_fields, adsi_shear_left,
+    adsi_shear_matrix, adsi_shear_mode, adsi_shear_vector)
 from phrike.problems.problem_list.hall_mri1d import hall_mri_fastest, hall_mri_matrix, hall_mri_mode
 from phrike.problems.problem_list.orszag_tang2d import orszag_tang_2d
 from phrike.solver import SpectralSolverMHD1D, SpectralSolverMHD2D, SpectralSolverMHD3D
@@ -865,6 +869,184 @@ def mri(args, out):
             mri_marginal(args, out, label, omega, shear_rate, field, rho0, eta, k)
 
 
+def adsi_params(args, omega, shear, bphi, am):
+    """Background of an ADSI case: B0 = (1, 0, bphi), rho0 = 1 and eta = 1/(rho0 Am |S|) (zero for Am = inf)."""
+    return dict(omega=omega, shear=shear, bv=1., bphi=bphi, rho0=1., p0=0.5*args.adsi_beta*(1+bphi**2),
+                gamma=5./3., eta=0. if math.isinf(am) else 1./(am*abs(shear)))
+
+
+def adsi_grid(args, kv, kr):
+    Lx, Ly, mv, mr = adsi_shear_box(kv, kr)
+    return Grid2D(Nx=args.adsi_n, Ny=args.adsi_n, Lx=Lx, Ly=Ly, dealias=True, backend='numpy',
+                  precision='double', fft_workers=1), mv, mr
+
+
+def adsi_state(g, par, kv, kr, vec, amp):
+    """Uniform state plus the real wave amp |B0| Re(fields exp(i (kv x + kr y))) of a mode vector."""
+    X, Y = coords(g)
+    wave = amp*math.hypot(par['bv'], par['bphi'])*np.real(
+        adsi_shear_fields(vec, kv, kr)[:, None, None]*np.exp(1j*(kv*X+kr*Y))[None])
+    one = np.ones_like(X)
+    return state(g, MHDEquations2D(), np.array([par['bv']*one+wave[4], wave[5], par['bphi']*one+wave[6]]),
+                 rho=par['rho0']*one+wave[0], u=wave[1:4], p=par['p0']*one+wave[7])
+
+
+def adsi_vector(V, kv, kr, mv, mr):
+    """Complex amplitudes of the seven mode variables at box mode (mv, mr)."""
+    rho, ux, uy, uz, p, bx, by, bz = [host(a).astype(np.float64) for a in MHDEquations2D().primitive(V)]
+    return adsi_shear_vector(np.array([rho, ux, uy, uz, bx, by, bz, p]), kv, kr, mv, mr)
+
+
+def adsi_solver(args, par, g):
+    blocks = dict(shearing_sheet=dict(omega=par['omega'], shear=par['shear'], vertical_axis=0, radial_axis=1))
+    if par['eta'] > 0:
+        blocks['ambipolar'] = dict(eta=par['eta'], method='midpoint_resolvent', midpoint_tol=1e-11)
+    return build(g, cfl=args.adsi_cfl, **blocks)
+
+
+def adsi_dt(args, par, kv, kr, vec):
+    g, _, _ = adsi_grid(args, kv, kr)
+    return adsi_solver(args, par, g).compute_dt(adsi_state(g, par, kv, kr, vec, 0.))
+
+
+def adsi_run(args, par, kv, kr, vec, end, dt):
+    """Evolve a seed under shearing sheet + ambipolar diffusion; returns times, amplitudes, stats."""
+    g, mv, mr = adsi_grid(args, kv, kr)
+    ts, cs = [], []
+
+    def sample(t, V):
+        ts.append(t)
+        cs.append(adsi_vector(V, kv, kr, mv, mr))
+
+    _, stats = advance(g, adsi_solver(args, par, g).step, adsi_state(g, par, kv, kr, vec, args.adsi_amp),
+                       end, dt, sample=sample)
+    return np.array(ts), np.array(cs), stats
+
+
+def adsi_marginal(args, out, label, par, rate, k, psi_fast):
+    """Growth near the neutral angles at fixed |k| and at half the fastest |k|, vs the eigenproblem."""
+    angles = np.radians(np.linspace(-85., 85., 681))
+    growth = lambda a: np.linalg.eigvals(adsi_shear_matrix(k*math.cos(a), k*math.sin(a), **par)).real.max()
+    curve = np.array([growth(a) for a in angles])
+    threshold = 1e-3*rate
+    neutral = []
+    for i in np.nonzero((curve[:-1] > threshold) != (curve[1:] > threshold))[0]:
+        lo, hi = angles[i], angles[i+1]
+        for _ in range(40):
+            mid = 0.5*(lo+hi)
+            lo, hi = (mid, hi) if (growth(mid) > threshold) == (curve[i] > threshold) else (lo, mid)
+        neutral.append(0.5*(lo+hi))
+    tests = [(0.5*k, psi_fast)] + [(k, a+d) for a in neutral[:2] for d in (-0.05, 0.05)]
+    for q, a in tests:
+        kv, kr = q*math.cos(a), q*math.sin(a)
+        s, v = adsi_shear_mode(kv, kr, **par)
+        dt = adsi_dt(args, par, kv, kr, v)
+        end = mri_duration(s, rate, args.adsi_efolds, dt, cap=args.adsi_tmax)
+        ts, cs, stats = adsi_run(args, par, kv, kr, v, end, 0.5*dt)
+        measured, frequency = complex_rate(ts, cs @ adsi_shear_left(kv, kr, **par))
+        reference = max(abs(s), 0.1*rate)
+        ok = abs(measured-s.real) < 1e-2*reference and abs(frequency-s.imag) < args.adsi_tol*reference
+        out.check(f'adsi marginal {label} k={q:.4g} psi={math.degrees(a):.3f}deg', ok, growth=measured,
+                  linear=s.real, frequency=frequency, linear_frequency=s.imag,
+                  neutral_psi_deg=listing(np.degrees(neutral)),
+                  growth_error_over_scale=(measured-s.real)/reference, **stats)
+
+
+def adsi(args, out):
+    """Shearing-sheet ADSI (2D NumPy, vertical x, radial y, azimuthal z) vs the compressible eigenproblem."""
+    tol, rng = args.adsi_tol, np.random.default_rng(20241007)
+    s, _ = adsi_shear_mode(math.sqrt(15.)/4., 0., 1., 1.5, 1., 0., p0=100.)
+    out.check('adsi linear ideal MRI limit', abs(s.real-0.75) < 1e-10 and abs(s.imag) < 1e-10,
+              growth=s.real, frequency=s.imag)
+    for omega, shear, bphi, eta, kv, kr in [(0., 1., 1., 2., 0.7, -1.4), (0., 1., 0.3, 3., 0.5, -3.),
+                                            (1., 1.5, 1., 1., 0.6, 0.3), (1., 1.5, 1., 1., 0.6, -0.3)]:
+        roots = adsi_incompressible_roots(kv, kr, omega, shear, 1., bphi, eta=eta)
+        eigen = np.linalg.eigvals(adsi_shear_matrix(kv, kr, omega, shear, 1., bphi, p0=1e6, eta=eta))
+        match = max(min(abs(r-e) for e in eigen) for r in roots)
+        out.check(f'adsi linear incompressible quartic Omega={omega:g} tan={bphi:g} k=({kv:g},{kr:g})',
+                  match < 1e-4, root_mismatch=match, growth=max(roots.real))
+    worst = max(np.linalg.eigvals(adsi_shear_matrix(kv, 0., 0., 1., 1., 0.7, p0=5., eta=eta)).real.max()
+                for kv in (0.3, 1., 3.) for eta in (0., 0.5, 5.))
+    out.check('adsi linear pure shear with k along the vertical axis is stable', worst < 1e-9, max_growth=worst)
+    cases = [(f'Omega=0 S=1 tan={t:g} sign(S Bphi Bz)={sign:+d} Am={am:g}', 0., 1., sign*t, am, sign > 0 and t == 1. and am < 2)
+             for sign in (1, -1) for t in (1., 0.3) for am in (math.inf, 1., 0.3)]
+    cases += [(f'Keplerian tan=1 Am={am:g}', 1., 1.5, 1., am, am == 1.) for am in (math.inf, 1., 0.3)]
+    for label, omega, shear, bphi, am, marginal in cases:
+        par = adsi_params(args, omega, shear, bphi, am)
+        rate, k0 = max(abs(omega), abs(shear)), max(abs(omega), abs(shear))/math.hypot(1., bphi)
+        k, psi, s, v = adsi_shear_fastest(**par)
+        edge = not (0.1*k0*1.02 < k < 6*k0/1.02 and abs(psi) < math.radians(84.9))
+        stable = s.real < 1e-3*rate
+        if stable:
+            # No growth anywhere in the scan: a representative mode on the favorable side of k_r.
+            k, psi = 2*k0, -math.copysign(math.radians(40.), shear*bphi)
+            s, v = adsi_shear_mode(k*math.cos(psi), k*math.sin(psi), **par)
+        kv, kr = k*math.cos(psi), k*math.sin(psi)
+        out.check(f'adsi linear {label}', np.isfinite(s) and s.real <= 0.5*abs(shear)*(1+1e-9),
+                  k=k, psi_deg=math.degrees(psi), growth=s.real, frequency=s.imag, growth_bound=0.5*abs(shear),
+                  scan_edge=edge, stable=stable)
+        if stable and args.adsi_quick:
+            print(f'MEASURE adsi {label}: stable in the scanned range (max growth {s.real:.3g})', flush=True)
+            continue
+        dt = adsi_dt(args, par, kv, kr, v)
+        scale = max(abs(s), 0.1*rate)
+        left = adsi_shear_left(kv, kr, **par)
+        end = mri_duration(s, rate, args.adsi_efolds, dt, cap=args.adsi_tmax)
+        if stable and s.real < -1e-9:
+            end = min(end, math.ceil(8./abs(s.real)/dt)*dt)
+        fits = {}
+        for division in (1, 2):
+            ts, cs, stats = adsi_run(args, par, kv, kr, v, end, dt/division)
+            fits[division] = (*complex_rate(ts, cs @ left), ts, cs, stats)
+        growth, frequency, ts, cs, stats = fits[2]
+        errors = [fits[d][0]-s.real for d in (1, 2)]
+        window = ts >= 0.4*end
+        t_w, half = ts[window], window.sum()//2
+        polarization = max(mri_polarization(c, v) for c in cs[window])
+        compressive = [0, 1, 6]
+        pol_compressive = (max(mri_polarization(c[compressive], v[compressive]) for c in cs[window])
+                           if np.linalg.norm(v[compressive]) > 1e-3*np.linalg.norm(v) else 0.)
+        ref = int(np.argmax(np.abs(v)))
+        big = np.abs(v) > 0.05*np.abs(v).max()
+        relative = (cs[-1]/cs[-1][ref])/(v/v[ref])
+        numbers = dict(growth=growth, linear=s.real, frequency=frequency, linear_frequency=s.imag,
+                       growth_error_over_scale=(growth-s.real)/scale, polarization_error=polarization,
+                       compressive_polarization_error=pol_compressive,
+                       phase_error=np.max(np.abs(np.angle(relative[big]))),
+                       ratio_error=np.max(np.abs(np.abs(relative[big])-1)), k=k, psi_deg=math.degrees(psi),
+                       dt=dt/2, **stats)
+        ok = (abs(growth-s.real) < tol*scale and abs(frequency-s.imag) < tol*scale
+              and polarization < tol and pol_compressive < 3*tol)
+        if not stable:
+            logs = np.log(np.hypot(np.abs(cs[:, 4]), np.abs(cs[:, 5])))[window]
+            first, last = np.polyfit(t_w[:half], logs[:half], 1)[0], np.polyfit(t_w[half:], logs[half:], 1)[0]
+            ok = ok and abs(first-last) < tol*scale
+            out.check(f'adsi {label}', ok, half_fits=f'{first:.6g}/{last:.6g}', **numbers)
+        else:
+            norms = np.linalg.norm(cs, axis=1)
+            ok = ok and norms.max()/norms[0]-1 < tol
+            name = 'adsi ideal control stays neutral' if am == math.inf else 'adsi stable'
+            out.check(f'{name} {label}', ok and (am != math.inf or abs(s.real) < 1e-8*rate),
+                      amplitude_growth=norms.max()/norms[0]-1, **numbers)
+        # Strang splitting is second order in dt: the error at dt must be about four times that at dt/2.
+        order = math.log2(abs(errors[0]/errors[1])) if min(abs(e) for e in errors) > 1e-12*scale else float('nan')
+        out.check(f'adsi timestep convergence {label}',
+                  abs(errors[1]) < tol*scale and (abs(errors[0]) < 0.02*tol*scale or 1.5 < order < 2.6),
+                  growth_error_dt=errors[0]/scale, growth_error_half_dt=errors[1]/scale, observed_order=order,
+                  extrapolated_error=(errors[1]-(errors[0]-errors[1])/3.)/scale)
+        if stable or args.adsi_quick:
+            continue
+        # Generic seed: the projection onto the left eigenvector of the leading mode evolves as exp(s t).
+        seed = rng.standard_normal(7)+1j*rng.standard_normal(7)
+        ts, cs, stats = adsi_run(args, par, kv, kr, seed, end, dt/2)
+        measured, frequency = complex_rate(ts, cs @ left)
+        out.check(f'adsi generic seed {label}', abs(measured-s.real) < tol*scale and abs(frequency-s.imag) < tol*scale,
+                  growth=measured, linear=s.real, frequency=frequency, linear_frequency=s.imag,
+                  growth_error_over_scale=(measured-s.real)/scale, **stats)
+        if marginal:
+            adsi_marginal(args, out, label, par, rate, k, psi)
+
+
 def truncate(a, n):
     """Spectrally truncate fields on an m x m grid (last two axes) to n x n, keeping the mean."""
     m = a.shape[-1]
@@ -1281,10 +1463,10 @@ def precision_mri(args, out):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--suite', default='all', choices=['waves', 'invariants', 'convergence', 'energy',
-                                                           'cost', 'shear', 'mri', 'ot', 'stability',
-                                                           'precision', 'all'],
-                        help='`all` runs the first seven; ot, stability and precision (2D, torch CUDA) '
-                             'must be named')
+                                                           'cost', 'shear', 'mri', 'adsi', 'ot',
+                                                           'stability', 'precision', 'all'],
+                        help='`all` runs the first seven; adsi (2D NumPy) and ot, stability and precision '
+                             '(2D, torch CUDA) must be named')
     parser.add_argument('--dim', type=int, choices=[1, 2, 3], default=1, help='3 is only for the waves suite')
     parser.add_argument('--n', type=int, default=None,
                         help='grid points per axis (default 128; 256 for ot; 16 for --dim 3)')
@@ -1309,6 +1491,18 @@ def main():
                              'or marginal-curve scan)')
     parser.add_argument('--mri-tol', type=float, default=1e-3,
                         help='mri: tolerance of the polarization and frequency (relative to |s|) gates')
+    parser.add_argument('--adsi-n', type=int, default=16, help='grid points per axis of the adsi box (one wavelength)')
+    parser.add_argument('--adsi-beta', type=float, default=10., help='plasma beta 2p/|B0|^2 of the adsi box')
+    parser.add_argument('--adsi-amp', type=float, default=1e-7, help='adsi seed amplitude |b|/|B0|')
+    parser.add_argument('--adsi-efolds', type=float, default=8., help='adsi run length in e-foldings')
+    parser.add_argument('--adsi-tmax', type=float, default=200., help='adsi cap on the run length')
+    parser.add_argument('--adsi-cfl', type=float, default=0.3)
+    parser.add_argument('--adsi-tol', type=float, default=1e-3,
+                        help='adsi: relative tolerance of the growth, frequency and polarization gates, '
+                             'applied at half the CFL step (the Strang splitting is second order)')
+    parser.add_argument('--adsi-quick', action='store_true',
+                        help='adsi: only the unstable-eigenmode runs with their timestep check (no stable '
+                             'evolution, generic seeds or marginal points)')
     parser.add_argument('--ot-di', type=float, default=0.05, help='ot: d_i = eta_H/v_A at the mean state')
     parser.add_argument('--stab-lh-dx', type=float, default=20., help='stability: l_H/dx at the mean state')
     parser.add_argument('--stab-steps', type=int, default=200, help='stability: ideal-CFL steps per case')
@@ -1349,6 +1543,9 @@ def main():
         parser.error('The torch comparison targets --device cuda.')
     if not (args.mri_n >= 24 and args.mri_beta > 0 and args.mri_amp > 0 and args.mri_efolds >= 5):
         parser.error('Invalid mri grid, beta, amplitude or e-folding count')
+    if not (args.adsi_n >= 12 and args.adsi_beta > 0 and args.adsi_amp > 0 and args.adsi_efolds >= 4
+            and args.adsi_tmax > 0 and args.adsi_cfl > 0 and args.adsi_tol > 0):
+        parser.error('Invalid adsi grid, beta, amplitude, length, cfl or tolerance')
     for variant in args.mri_variants.split(','):
         if variant not in ('reference', 'auto') and not float(variant) > 0:
             parser.error('--mri-variants entries must be reference, auto or a positive k*l')
@@ -1365,7 +1562,8 @@ def main():
           f'dim={args.dim} N={args.n} precision={"double and single" if args.suite == "precision" else "double"} '
           f'numpy={np.__version__}', flush=True)
     for name in ('phrike/nonideal.py', 'phrike/solver.py', 'phrike/grid.py', 'phrike/equations.py',
-                 'phrike/problems/problem_list/hall_mri1d.py', 'phrike/problems/problem_list/orszag_tang2d.py',
+                 'phrike/problems/problem_list/hall_mri1d.py', 'phrike/problems/problem_list/adsi_shear.py',
+                 'phrike/problems/problem_list/orszag_tang2d.py',
                  'configs/orszag_tang2d.yaml', 'scripts/hall_viability.py'):
         print(f'SOURCE {name} sha256={hashlib.sha256((ROOT/name).read_bytes()).hexdigest()}', flush=True)
     if args.backend == 'torch':
@@ -1374,8 +1572,8 @@ def main():
     result = Results()
     for name, run in [('waves', waves), ('invariants', invariants), ('shear', shear), ('cost', cost),
                       ('convergence', convergence), ('energy', energy), ('mri', mri),
-                      ('ot', ot), ('stability', stability), ('precision', precision)]:
-        if name in ('ot', 'stability', 'precision'):
+                      ('adsi', adsi), ('ot', ot), ('stability', stability), ('precision', precision)]:
+        if name in ('adsi', 'ot', 'stability', 'precision'):
             if args.suite == name:
                 run(args, result)
             continue

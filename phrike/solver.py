@@ -1509,12 +1509,17 @@ class SpectralSolverMHD:
             radial = int(shear_config.get("radial_axis", 1))
             if not (np.isfinite(omega) and np.isfinite(shear)):
                 raise ValueError("Shearing-sheet omega and shear must be finite")
-            if self.dim > 1:
+            if self.dim > 2:
                 raise NotImplementedError(
-                    "Shearing-sheet sources assume fields independent of the radial axis "
-                    "and are implemented for 1D grids only")
-            if vertical != 0 or radial not in (1, 2):
+                    "Shearing-sheet sources are implemented for 1D and 2D (axisymmetric) grids only")
+            # In 2D the vertical and radial coordinates are the grid axes and phi is ignorable, so
+            # d/dphi = 0 holds by construction. The sources are local, hence exact for r-dependent
+            # fields (1D grids assume fields independent of r).
+            if self.dim == 1 and (vertical != 0 or radial not in (1, 2)):
                 raise ValueError("1D shearing sheet requires vertical_axis 0 and radial_axis 1 or 2")
+            if self.dim == 2 and (vertical, radial) != (0, 1):
+                raise ValueError("2D shearing sheet requires vertical_axis 0 and radial_axis 1 "
+                                 "(the azimuthal axis z is ignorable)")
             azimuthal, sign = shearing_sheet_axes(vertical, radial)
             self.shearing_sheet = dict(omega=omega, shear=shear, radial=radial,
                                        azimuthal=azimuthal, sign=sign)

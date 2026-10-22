@@ -21,6 +21,7 @@ from .problem_list.orszag_tang2d import OrszagTang2DProblem
 from .problem_list.alfven3d import Alfven3DProblem
 from .problem_list.mhd_turb3d import MHDTurb3DProblem
 from .problem_list.hall_mri1d import HallMRI1DProblem
+from .problem_list.adsi_shear import ADSIShearProblem
 
 
 # Register all problems
@@ -44,3 +45,4 @@ ProblemRegistry.register("orszag_tang2d", OrszagTang2DProblem)
 ProblemRegistry.register("alfven3d", Alfven3DProblem)
 ProblemRegistry.register("mhd_turb3d", MHDTurb3DProblem)
 ProblemRegistry.register("hall_mri1d", HallMRI1DProblem)
+ProblemRegistry.register("adsi_shear", ADSIShearProblem)
