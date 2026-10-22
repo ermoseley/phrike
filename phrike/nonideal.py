@@ -1,6 +1,7 @@
 """Non-ideal MHD operators: midpoint-resolvent ambipolar diffusion in 2D and Hall induction."""
 
 import math
+import warnings
 
 import numpy as np
 
@@ -64,6 +65,10 @@ def _max(a):
 
 def _min(a):
     return float(a.min().item()) if _tensor(a) else float(np.min(a))
+
+
+def _cross(a, b):
+    return _stack([a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]])
 
 
 def _fft(V, dim):
@@ -311,6 +316,24 @@ class Hall:
     uses an exact Fourier inverse; l(x) uses preconditioned CG, with a tolerance
     floored at 10 eps (float64) or 100 eps (float32) and raises if it does not converge. Density, momentum and internal energy are held fixed, so
     total energy changes only by the change of 0.5|B|^2.
+
+    ``hyper`` C (reference only) adds E_hyp = -C |eta_H(x)| dx^2 laplacian(J) (Iwasaki and Tomida
+    2025), dB/dt = -nu k^4 B per mode with nu = C |eta_H| dx^2 for the smallest spacing dx. Its work
+    E_hyp.J is deposited in the total energy, i.e. as internal energy, so the call conserves total
+    energy; its rate C |eta_H| dx^2 kmax^4 is added to the substep rate.
+
+    ``xmhd`` is a reduced-speed extended-MHD Hall subflow with persistent fields E and J (velocity
+    frozen):  dB/dt = -curl E,  (1/c^2) dE/dt = curl B - J,  l^2 dJ/dt = E - eta_H (J x b),
+    b = B/|B|. Its steady state is J = curl B, E = eta_H J x b, and it conserves
+    0.5|B|^2 + |E|^2/(2 c^2) + 0.5 l^2 |J|^2 (``xmhd_energy``). Linear whistler, k along B:
+    l^2 w^3 + eta w^2 - c^2 (1 + k^2 l^2) w - c^2 k^2 eta = 0; w -> -eta k^2/(1 + k^2 l^2) as c -> inf.
+    The speed is ``c_tilde`` or ``c_factor`` dx/dt, and l is ``length`` or the automatic ``inertia``
+    value (a call whose automatic l^2 is at most 1/kmax^2 uses the reference substeps instead).
+    The unsplit RK4 substep rate bounds the eigenfrequencies of the system, which are at most
+    c sqrt(kmax^2 + 1/l^2) + max|eta_H|/l^2 (light waves and plasma oscillation, plus the local
+    cyclotron rotation, which is integrated explicitly so that equilibria stay exact).
+    E and J live on the object between calls, start at their steady values for the first B (and
+    after ``reset_fields``) and are not saved in checkpoints: a restart re-initialises them.
     """
 
     def __init__(self, grid, config):
@@ -337,11 +360,12 @@ class Hall:
         if self.form not in ("constant", "proportional_to_b_over_rho"):
             raise ValueError("Hall eta_h_form must be constant or proportional_to_B_over_rho")
         self.method = str(cfg.get("method", "reference")).lower()
-        if self.method not in ("reference", "inertia"):
-            raise ValueError("Hall method must be reference or inertia")
+        if self.method not in ("reference", "inertia", "xmhd"):
+            raise ValueError("Hall method must be reference, inertia or xmhd")
+        # RK4 is stable for imaginary rates up to 2 sqrt(2); 2 is kept for the damped regularized modes.
         self.safety = float(cfg.get("safety", 0.5))
-        if not 0.0 < self.safety <= 1.0:
-            raise ValueError("Hall safety must lie in (0, 1]")
+        if not 0.0 < self.safety <= 2.0:
+            raise ValueError("Hall safety must lie in (0, 2]")
         self.length_mode = str(cfg.get("length_mode", "constant")).lower()
         if self.length_mode not in ("constant", "local"):
             raise ValueError("Hall length_mode must be constant or local")
@@ -356,6 +380,25 @@ class Hall:
         self.cg_maxiter = int(cfg.get("cg_maxiter", 200))
         if (self.cg_tol is not None and not self.cg_tol > 0) or self.cg_maxiter < 1:
             raise ValueError("Hall CG tolerance and iteration limit must be positive")
+        self.hyper = float(cfg.get("hyper", 0.0))
+        if not (np.isfinite(self.hyper) and self.hyper >= 0.0):
+            raise ValueError("Hall hyper must be finite and nonnegative")
+        if self.hyper > 0.0 and self.method != "reference":
+            raise ValueError("Hall hyper requires method reference")
+        self.c_tilde = None if cfg.get("c_tilde") is None else float(cfg["c_tilde"])
+        self.c_factor = float(cfg.get("c_factor", 2.0))
+        if not ((self.c_tilde is None or (np.isfinite(self.c_tilde) and self.c_tilde > 0.0))
+                and np.isfinite(self.c_factor) and self.c_factor > 0.0):
+            raise ValueError("Hall c_tilde and c_factor must be finite and positive")
+        self.E = self.J = None
+        self.last_c = self.last_length2 = None
+        self._work = 0.0
+        if self.method == "xmhd":
+            if self.length_mode != "constant":
+                raise ValueError("Hall xmhd requires length_mode constant")
+            warnings.warn("Hall xmhd keeps E and J between calls and does not save them in checkpoints: "
+                          "a restart re-initialises them to the steady values for B",
+                          RuntimeWarning, stacklevel=2)
         self._k = self._k_key = self._kmax2 = None
         self.last_stats = None
         self.reset_stats()
@@ -421,15 +464,41 @@ class Hall:
             eta = self.eta*_sqrt((B*B).sum(axis=0))/self.b0*self.rho0/_floor(rho, 1e-30)
         return eta if self.eta_max is None else _clip(eta, self.eta_max)
 
-    def electric_field(self, B, rho):
-        """E_H = eta_H J x B/|B|; |B| cancels analytically in the proportional form unless eta_max is set."""
-        J = self.curl(B)
-        cross = _stack([J[1]*B[2]-J[2]*B[1], J[2]*B[0]-J[0]*B[2], J[0]*B[1]-J[1]*B[0]])
+    def hall_coupling(self, B, rho):
+        """eta_H/|B|; |B| cancels analytically in the proportional form unless eta_max is set."""
         if self.eta_max is not None:
-            return (self.eta_field(B, rho)/_floor(_sqrt((B*B).sum(axis=0)), 1e-30))*cross
+            return self.eta_field(B, rho)/_floor(_sqrt((B*B).sum(axis=0)), 1e-30)
         if self.form == "constant":
-            return (self.eta/_floor(_sqrt((B*B).sum(axis=0)), 1e-30))*cross
-        return (self.eta*self.rho0/self.b0/_floor(rho, 1e-30))*cross
+            return self.eta/_floor(_sqrt((B*B).sum(axis=0)), 1e-30)
+        return self.eta*self.rho0/self.b0/_floor(rho, 1e-30)
+
+    def spacing(self):
+        """Smallest grid spacing."""
+        return min(float(getattr(self.grid, name)) for name in ("dx", "dy", "dz")[:self.dim])
+
+    def hyper_field(self, B, rho, J):
+        """E_hyp = -C |eta_H(x)| dx^2 laplacian(J) with the masked symbols, so that E_hyp.J integrates to >= 0."""
+        kx, ky, kz = self._wavevectors(J)
+        nu = self.hyper*self.spacing()**2*_abs(self.eta_field(B, rho))
+        return nu*_ifft((kx*kx+ky*ky+kz*kz)*_fft(J, self.dim), self.dim, J)
+
+    def electric_field(self, B, rho):
+        """E_H = eta_H J x B/|B| (plus E_hyp, whose work E_hyp.J is left in ``_work``)."""
+        J = self.curl(B)
+        E = self.hall_coupling(B, rho)*_cross(J, B)
+        if self.hyper > 0.0:
+            hyper = self.hyper_field(B, rho, J)
+            self._work = (hyper*J).sum(axis=0)
+            E = E+hyper
+        return E
+
+    def steady_fields(self, B, rho):
+        """Steady values (E, J) = (E_H, curl B) of the xmhd subflow for the field B."""
+        return self.electric_field(B, rho), self.curl(B)
+
+    def reset_fields(self):
+        """Forget E and J; the next xmhd call sets them to their steady values for its B."""
+        self.E = self.J = None
 
     def length_squared(self, U, dt):
         """Inertia metric l^2 frozen for one call; an explicit length wins over the automatic one.
@@ -523,8 +592,81 @@ class Hall:
         """Volume mean 0.5(|B|^2 + l^2 |curl B|^2), conserved by the Hall subflow at fixed l(x)."""
         return _number((0.5*(B*B).sum(axis=0)).mean())+self.reservoir_energy(B, length2)
 
+    def xmhd_energy(self, B, c_tilde=None, length2=None):
+        """Volume mean 0.5|B|^2 + |E|^2/(2 c^2) + 0.5 l^2 |J|^2 of B and the stored E, J; conserved by xmhd.
+
+        c and l^2 default to the values of the last xmhd call.
+        """
+        c = self.last_c if c_tilde is None else c_tilde
+        length2 = self.last_length2 if length2 is None else length2
+        mean = lambda a: _number((0.5*(a*a).sum(axis=0)).mean())
+        return mean(B)+mean(self.E)/(c*c)+length2*mean(self.J)
+
+    def _peak(self, B, rho):
+        """max|eta_H|, the sign-free Hall coefficient of the rate."""
+        if self.form == "constant":
+            return abs(self.eta) if self.eta_max is None else min(abs(self.eta), self.eta_max)
+        return _max(_abs(self.eta_field(B, rho)))
+
+    def _finish(self, U, B, stats, heat=None):
+        """Result state: B replaced, total energy changed by the magnetic energy (and the hyper heat)."""
+        if not np.isfinite(_max(_abs(B))):
+            raise RuntimeError("Nonfinite Hall magnetic field")
+        B0 = U[5:8]
+        result = _copy(U)
+        result[5:8] = B
+        result[4] = U[4]+0.5*((B*B).sum(axis=0)-(B0*B0).sum(axis=0))
+        if heat is not None:
+            result[4] = result[4]+heat
+        self._record(stats)
+        return result
+
+    def _xmhd(self, U, h, stats):
+        """RK4 substeps of (B, E, J); returns B, or None when the reference substeps should be used."""
+        B0, rho = U[5:8], U[0]
+        length2 = self.length_squared(U, h)
+        kmax2 = self.kmax2(B0)
+        # l = 0 is the reference flow; an automatic l below the grid scale would cost more than it.
+        if length2 == 0.0 or (self.length is None and length2 <= 1.0/kmax2):
+            self.reset_fields()
+            return None
+        stats["initialised"] = self.E is None or self.E.shape != B0.shape
+        if stats["initialised"]:
+            self.E, self.J = self.steady_fields(B0, rho)
+        c = self.c_tilde if self.c_tilde is not None else self.c_factor*self.spacing()/h
+        self.last_c, self.last_length2 = c, length2
+        stats.update(length2_min=length2, length2_max=length2, c_tilde=c)
+
+        def rhs(X):
+            B, E, J = X
+            return _stack([-self.curl(E), c*c*(self.curl(B)-J),
+                           (E-self.hall_coupling(B, rho)*_cross(J, B))/length2])
+
+        X, elapsed = _stack([B0, self.E, self.J]), 0.0
+        while True:
+            # Skew in the energy norm: |w| <= c sqrt(kmax^2 + 1/l^2) (light, plasma) + max|eta_H|/l^2 (cyclotron).
+            rate = c*math.sqrt(kmax2+1.0/length2)+self._peak(X[0], rho)/length2
+            if not np.isfinite(rate):
+                raise RuntimeError("Nonfinite Hall rate")
+            remaining = h-elapsed
+            n = max(1, math.ceil(remaining*rate/self.safety-1e-9))
+            hs = remaining/n
+            if elapsed+hs == elapsed:
+                raise RuntimeError("Hall substep underflow")
+            k1 = rhs(X)
+            k2 = rhs(X+0.5*hs*k1)
+            k3 = rhs(X+0.5*hs*k2)
+            k4 = rhs(X+hs*k3)
+            X = X+(hs/6.0)*(k1+2*k2+2*k3+k4)
+            elapsed += hs
+            stats["substeps"] += 1
+            if n == 1:
+                break
+        self.E, self.J = X[1], X[2]
+        return X[0]
+
     def step(self, U, equations, dt):
-        """Advance B by the Hall subflow; density, momentum and internal energy are preserved."""
+        """Advance B by the Hall subflow; density, momentum and internal energy are preserved (except hyper heat)."""
         h = float(dt)
         if not np.isfinite(h) or h < 0.0:
             raise ValueError("Hall timestep must be finite and nonnegative")
@@ -535,6 +677,10 @@ class Hall:
         if h == 0 or self.eta == 0:
             self._record(stats)
             return _copy(U)
+        if self.method == "xmhd":
+            B = self._xmhd(U, h, stats)
+            if B is not None:
+                return self._finish(U, B, stats)
         B0, rho = U[5:8], U[0]
         inertia = self.method == "inertia"
         length2 = self.length_squared(U, h) if inertia else 0.0
@@ -543,9 +689,14 @@ class Hall:
             stats["length2_min"] = length2 if not iterative else _min(length2)
             stats["length2_max"] = length2 if not iterative else _max(length2)
         kmax2 = self.kmax2(B0)
+        # The hyper rate nu_max kmax^4 = C |eta_H| dx^2 kmax^4 adds to the Hall rate |eta_H| kmax^2.
+        hyper_factor = 1.0+self.hyper*self.spacing()**2*kmax2
+        works = []
 
         def rhs(B):
             value = -self.curl(self.electric_field(B, rho))
+            if self.hyper > 0.0:
+                works.append(self._work)
             if inertia:
                 value, iterations, residual = self.inertia_solve(value, length2)
                 if iterative:
@@ -555,14 +706,10 @@ class Hall:
                     stats["cg_residual"] = max(stats["cg_residual"], residual)
             return value
 
-        B, elapsed = _copy(B0), 0.0
+        B, elapsed, heat = _copy(B0), 0.0, 0.0
         while True:
             # Reevaluate nonlinear eta_H each substep; the smallest l bounds the rate.
-            if self.form == "constant":
-                peak = abs(self.eta) if self.eta_max is None else min(abs(self.eta), self.eta_max)
-            else:
-                peak = _max(_abs(self.eta_field(B, rho)))
-            rate = peak*kmax2
+            rate = self._peak(B, rho)*kmax2*hyper_factor
             if inertia:
                 rate /= 1.0+stats["length2_min"]*kmax2
             if not np.isfinite(rate):
@@ -577,14 +724,12 @@ class Hall:
             k3 = rhs(B+0.5*hs*k2)
             k4 = rhs(B+hs*k3)
             B = B+(hs/6.0)*(k1+2*k2+2*k3+k4)
+            if works:
+                # Heat E_hyp.J of this substep, with the RK4 weights of the stages.
+                heat = heat+(hs/6.0)*(works[0]+2*works[1]+2*works[2]+works[3])
+                works.clear()
             elapsed += hs
             stats["substeps"] += 1
             if n == 1:
                 break
-        if not np.isfinite(_max(_abs(B))):
-            raise RuntimeError("Nonfinite Hall magnetic field")
-        result = _copy(U)
-        result[5:8] = B
-        result[4] = U[4]+0.5*((B*B).sum(axis=0)-(B0*B0).sum(axis=0))
-        self._record(stats)
-        return result
+        return self._finish(U, B, stats, heat if self.hyper > 0.0 else None)

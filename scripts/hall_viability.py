@@ -2,7 +2,9 @@
 
 1D: NumPy CPU. 2D: NumPy CPU or torch CUDA. The `mri` suite is always 1D NumPy and the `adsi`
 suite always 2D NumPy (shearing-sheet ambipolar diffusion). Only `waves` also runs in 3D. `ot`,
-`stability` and `precision` are 2D torch CUDA suites; they and `adsi` are not part of `--suite all`.
+`stability` and `precision` are 2D torch CUDA suites; they, `adsi` and `h2h` (head-to-head of Hall
+time-integration strategies: 1D NumPy waves and mri, 2D shear on the chosen backend) are not part
+of `--suite all`.
 All numerical work, including the small analytic eigenproblems, happens at run time.
 """
 from __future__ import annotations
@@ -684,7 +686,7 @@ def mri_state(g, eq, k, vec, amp, field, rho0, beta):
                  u=np.array([0*one, wave[0], wave[1]]), p=0.5*beta*field**2*one)
 
 
-def mri_run(args, g, eq, k, params, cfg, vec, amp, end, dt):
+def mri_run(args, g, eq, k, params, cfg, vec, amp, end, dt, tick=None):
     """Evolve a seed under shearing sheet + Hall block cfg; returns times, complex amplitudes, stats."""
     omega, shear_rate, field, rho0 = params
     sheet = dict(omega=omega, shear=shear_rate, vertical_axis=0, radial_axis=1)
@@ -694,6 +696,8 @@ def mri_run(args, g, eq, k, params, cfg, vec, amp, end, dt):
     def sample(t, V):
         ts.append(t)
         cs.append(mri_vector(V, eq, g.N))
+        if tick:
+            tick(t, V)
 
     _, stats = advance(g, solver.step, mri_state(g, eq, k, vec, amp, field, rho0, args.mri_beta),
                        end, dt, hall=solver.hall, sample=sample)
@@ -1830,13 +1834,242 @@ def precision_mri(args, out):
         out.check('precision mri', False, error=f'{type(error).__name__}: {str(error)[:160]}')
 
 
+H2H_TESTS = ('waves', 'mri', 'shear')
+H2H_METHODS = ('reference', 'hyper', 'inertia-auto', 'inertia-fixed', 'xmhd-auto', 'xmhd-fixed')
+H2H_THRESHOLDS = (0.01, 0.001)
+
+
+def float_list(text):
+    return [float(v) for v in text.split(',') if v]
+
+
+def h2h_selected(tokens, method):
+    return any(t == 'all' or method == t or method.startswith(t+'-') for t in tokens)
+
+
+def h2h_points(args, k):
+    """(method, knob label, Hall block) for every accuracy-knob value; a fixed k*l becomes l = k*l/k."""
+    xl = args.h2h_xmhd_kl
+    points = [('reference', f'safety={s:g}', dict(method='reference', safety=s)) for s in args.h2h_ref_safety]
+    points += [('hyper', f'C={c:g}', dict(method='reference', hyper=c, safety=0.5)) for c in args.h2h_hyper]
+    points += [('inertia-auto', f'safety={s:g}', dict(method='inertia', safety=s)) for s in args.h2h_safety]
+    points += [('inertia-fixed', f'kl={q:g}', dict(method='inertia', length=q/k, safety=0.5)) for q in args.h2h_kl]
+    points += [('xmhd-auto', f'c={c:g}', dict(method='xmhd', c_factor=c, safety=0.5)) for c in args.h2h_cfactor]
+    points += [('xmhd-fixed', f'c={c:g},kl={xl:g}', dict(method='xmhd', c_factor=c, length=xl/k, safety=0.5))
+               for c in args.h2h_cfactor]
+    return [p for p in points if h2h_selected(args.h2h_method_tokens, p[0])]
+
+
+def h2h_ticker(label, end, every):
+    """Sample callback that prints a PROGRESS line every `every` wall seconds."""
+    start = last = time.perf_counter()
+
+    def tick(t, V):
+        nonlocal last
+        now = time.perf_counter()
+        if now-last >= every:
+            last = now
+            done = t/end
+            print(f'PROGRESS {label}: t={t:.5g}/{end:g} wall={hms(now-start)} '
+                  f'eta={hms((now-start)*(1-done)/done if done > 0 else math.nan)}', flush=True)
+    return tick
+
+
+def h2h_waves_cases(args):
+    """Linear whistler and ion-cyclotron eigenmodes at l_H/dx in --h2h-lh-dx (1D NumPy, coupled ideal+Hall).
+
+    Error: relative L2 error of B - B0 against the exact true-Hall linear solution at T = --h2h-periods
+    whistler periods, at the ideal CFL step.
+    """
+    wargs = argparse.Namespace(**dict(vars(args), dim=1, backend='numpy'))
+    g = make_grid(wargs)
+    amp, cases = 1e-6, []
+    for ratio in args.h2h_lh_dx:
+        eta = ratio*g.dx  # |B0| = rho0 = 1, so v_A = 1 and l_H = eta
+        T = args.h2h_periods*2*np.pi/abs(WaveMode(wargs, g, 'whistler', eta).omega)
+        for branch in ('whistler', 'ion-cyclotron'):
+            mode = WaveMode(wargs, g, branch, eta)
+            exact = mode.fields(amp, T)[1]
+            scale = np.linalg.norm(exact-mode.background)
+            ideal = build(g, cfl=args.h2h_cfl)
+            dt = ideal.compute_dt(mode.initial(g, ideal.equations, amp))
+
+            def run(cfg, tick, mode=mode, exact=exact, scale=scale, dt=dt, T=T, eta=eta):
+                s = build(g, cfl=args.h2h_cfl, hall=dict(cfg, eta_h=eta))
+                V, info = advance(g, s.step, mode.initial(g, s.equations, amp), T, dt, hall=s.hall, sample=tick)
+                return float(np.linalg.norm(host(V[5:8])-exact)/scale), info
+
+            cases.append(dict(label=f'{branch} l_H/dx={ratio:g}', k=1., run=run, end=T,
+                              notes=f'N={g.N} eta={eta:.4g} T={T:.4g} dt={dt:.4g} omega={mode.omega:.4g} '
+                                    f'periods={args.h2h_periods:g}'))
+    return cases
+
+
+def h2h_mri_cases(args):
+    """Hall-dominated MRI eigenmodes (1D shearing sheet, one fastest-growing wavelength on N points).
+
+    N is chosen so that l_H/dx = |eta_H|/(v_A dx) >= --h2h-mri-lh-dx. Error: |growth - s|/s for the
+    fitted growth rate of |b| against the true-Hall eigenvalue s. Cases with no growing mode are skipped.
+    """
+    field, rho0 = 1.0, 1.0
+    margs = argparse.Namespace(**dict(vars(args), mri_beta=args.h2h_mri_beta))
+    cases = []
+    for label, omega, shear_rate, eta in [('Keplerian X=1 sign=-1', 1.0, 1.5, -field**2/1.0),
+                                          ('Hall-shear X=0.5 sign=-1', 0.0, 1.0, -field**2/0.5),
+                                          ('Hall-shear X=0.5 sign=+1', 0.0, 1.0, field**2/0.5)]:
+        k, s, v = hall_mri_fastest(omega, shear_rate, field, rho0, eta)
+        rate = max(abs(omega), abs(shear_rate))
+        if s.real < 1e-3*rate:
+            print(f'MEASURE h2h mri {label}: stable in the scanned range (max growth {s.real:.3g}), skipped',
+                  flush=True)
+            continue
+        n = max(args.mri_n, 8*math.ceil(args.h2h_mri_lh_dx*2*np.pi/(k*abs(eta))/8))
+        g = Grid1D(N=n, Lx=2*np.pi/k, dealias=True, backend='numpy', precision='double', fft_workers=1)
+        eq = MHDEquations1D()
+        sheet = dict(omega=omega, shear=shear_rate, vertical_axis=0, radial_axis=1)
+        dt = build(g, cfl=args.mri_cfl, shearing_sheet=sheet).compute_dt(
+            mri_state(g, eq, k, v, 0., field, rho0, margs.mri_beta))
+        end = mri_duration(s, rate, args.h2h_efolds, dt)
+        stiffness = abs(eta)*Hall(g, dict(eta_h=eta)).kmax2(np.zeros((3, n)))*0.5*dt
+
+        def run(cfg, tick, g=g, eq=eq, k=k, s=s, v=v, end=end, dt=dt, eta=eta, omega=omega, shear_rate=shear_rate):
+            ts, cs, stats = mri_run(margs, g, eq, k, (omega, shear_rate, field, rho0), dict(cfg, eta_h=eta), v,
+                                    args.mri_amp, end, dt, tick=tick)
+            window = ts >= 0.4*end
+            logs = np.log(np.hypot(np.abs(cs[:, 2]), np.abs(cs[:, 3])))
+            growth = np.polyfit(ts[window], logs[window], 1)[0]
+            return abs(growth-s.real)/s.real, dict(stats, growth=growth, linear=s.real)
+
+        cases.append(dict(label=label, k=k, run=run, end=end,
+                          notes=f'N={n} k={k:.4g} eta={eta:.4g} l_H/dx={abs(eta)/g.dx:.4g} growth={s.real:.4g} '
+                                f'dt={dt:.4g} end={end:.4g} beta={margs.mri_beta:g} '
+                                f'hall_rate_x_half_dt={stiffness:.4g}'))
+    return cases
+
+
+def h2h_shear_cases(args):
+    """Density-shear instability under Hall steps of --shear-dt (2D): growth against the floored eigenvalue."""
+    L = 2*np.pi*args.shear_box_periods
+    g = make_grid(args, L=L)
+    eq = MHDEquations2D()
+    X, Y = coords(g)
+    Y = Y-L/2
+    f = np.exp(-Y**2)+args.shear_floor
+    target, by, dby, _ = shear_mode(args.n, L, args.shear_floor)
+    if args.shear_seed == 'eigenmode':
+        B = np.array([f-1e-7*dby[:, None]*np.sin(X), 1e-7*by[:, None]*np.cos(X),
+                      -1e-7*target*by[:, None]*np.cos(X)])
+    else:
+        B = np.array([f, 1e-7*np.cos(X), 0*X])
+
+    def run(cfg, tick):
+        hall = Hall(g, dict(cfg, eta_h=1., eta_h_form='proportional_to_B_over_rho', cg_tol=args.cg_tol))
+        U = state(g, eq, B, rho=f, p=0.55*(1+args.shear_floor)**2-0.5*f**2)
+        step = lambda W, h: hall.step(W, eq, h)
+        step(U, args.shear_dt)  # warm kernels without changing the initial state
+        hall.reset_fields()
+        ts, logs = [], []
+
+        def sample(t, V):
+            if args.shear_fit_start-1e-12 <= t <= args.shear_fit_end+1e-12:
+                ts.append(t)
+                logs.append(np.log(np.sqrt(np.mean(host(V[6])**2))))
+            tick(t, V)
+
+        V, info = advance(g, step, U, args.shear_end, args.shear_dt, hall=hall, sample=sample)
+        growth = np.polyfit(ts, logs, 1)[0]
+        return abs(growth/target-1), dict(info, growth=growth, linear=target)
+
+    return [dict(label=f'density shear N={args.n}', k=1., run=run, end=args.shear_end,
+                 notes=f'N={args.n} box={L:.4g} dx={g.dx:.4g} sigma={target:.6g} floor={args.shear_floor:g} '
+                       f'dt={args.shear_dt:g} seed={args.shear_seed} backend={args.backend}')]
+
+
+def h2h_pareto(points):
+    """Per (test, case, method): the cheapest point reaching each error threshold, plus the fastest method."""
+    cheapest, summary = {}, []
+    for p in points:
+        cheapest.setdefault((p['test'], p['case']), {}).setdefault(p['method'], []).append(p)
+    cell = lambda best, ref: ('not reached' if best is None else f'{best["seconds"]:.4g}s [{best["knob"]}]'
+                              + (f' x{ref["seconds"]/best["seconds"]:.3g}' if ref and ref is not best else ''))
+    for (test, case), methods in cheapest.items():
+        best = {}
+        for method in H2H_METHODS:
+            for thr in H2H_THRESHOLDS:
+                good = [p for p in methods.get(method, []) if p['error'] is not None and p['error'] <= thr]
+                best[method, thr] = min(good, key=lambda p: p['seconds']) if good else None
+        for method in H2H_METHODS:
+            if method not in methods:
+                continue
+            errors = [p['error'] for p in methods[method] if p['error'] is not None]
+            cells = [cell(best[method, thr], best['reference', thr]) for thr in H2H_THRESHOLDS]
+            print(f'MEASURE h2h pareto {test}/{case} {method}: min wall at error<=1%: {cells[0]}; '
+                  f'at error<=0.1%: {cells[1]}; best_error={min(errors) if errors else math.nan:.4g}', flush=True)
+            summary += [dict(test=test, case=case, method=method, threshold=thr,
+                             seconds=None if best[method, thr] is None else best[method, thr]['seconds'],
+                             knob=None if best[method, thr] is None else best[method, thr]['knob'])
+                        for thr in H2H_THRESHOLDS]
+        for thr in H2H_THRESHOLDS:
+            reached = [(best[m, thr]['seconds'], m) for m in H2H_METHODS if best[m, thr] is not None]
+            print(f'MEASURE h2h pareto {test}/{case} FASTEST at error<={thr:.1%}: '
+                  f'{min(reached)[1] if reached else "none reached"}', flush=True)
+    return summary
+
+
+def h2h(args, out):
+    """Head-to-head of Hall integration strategies: error vs exact against wall time, per test and case."""
+    builders = dict(waves=h2h_waves_cases, mri=h2h_mri_cases, shear=h2h_shear_cases)
+    records = {}
+    for path in args.h2h_in:
+        for p in json.loads(Path(path).read_text())['points']:
+            records[p['test'], p['case'], p['method'], p['knob']] = p
+    print(f'NOTE h2h: tests={",".join(args.h2h_tests)} methods={",".join(args.h2h_method_tokens)} '
+          f'loaded_points={len(records)}', flush=True)
+
+    def write():
+        if args.h2h_out:
+            save_json(args.h2h_out, dict(revision=REVISION, args={k: v for k, v in vars(args).items()
+                                                                   if k != 'h2h_method_tokens'},
+                                         points=list(records.values())))
+
+    for test in args.h2h_tests:
+        cases = [c for c in builders[test](args)
+                 if not args.h2h_cases or any(t.lower() in c['label'].lower() for t in args.h2h_cases)]
+        for case in cases:
+            print(f'NOTE h2h {test}/{case["label"]}: {case["notes"]}', flush=True)
+            plan = h2h_points(args, case['k'])
+            for i, (method, knob, cfg) in enumerate(plan, 1):
+                label = f'h2h {test}/{case["label"]} {method} {knob}'
+                print(f'START {label}: point={i}/{len(plan)} hall={cfg}', flush=True)
+                start = time.perf_counter()
+                error, info, status = math.nan, {}, 'ok'
+                try:
+                    error, info = case['run'](cfg, h2h_ticker(label, case['end'], args.progress_every))
+                except (RuntimeError, ArithmeticError, np.linalg.LinAlgError) as exc:
+                    status = f'error: {str(exc)[:80]}'
+                if status == 'ok' and not math.isfinite(error):
+                    status = 'nonfinite'
+                record = dict(test=test, case=case['label'], method=method, knob=knob, hall=cfg, status=status,
+                              error=float(error) if math.isfinite(error) else None,
+                              seconds=float(info['seconds']) if info else None,
+                              substeps=info.get('substeps'), steps=info.get('steps'),
+                              growth=info.get('growth'), linear=info.get('linear'))
+                records[test, case['label'], method, knob] = record
+                write()
+                print(f'DONE {label}: wall={hms(time.perf_counter()-start)}', flush=True)
+                print(f'MEASURE {label}: error={error:.4g} seconds={record["seconds"] or math.nan:.4g} '
+                      f'substeps={record["substeps"]} steps={record["steps"]} status={status}', flush=True)
+        h2h_pareto([p for p in records.values() if p['test'] == test])
+    write()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--suite', default='all', choices=['waves', 'invariants', 'convergence', 'energy',
                                                            'cost', 'shear', 'mri', 'adsi', 'ot',
-                                                           'stability', 'precision', 'all'],
-                        help='`all` runs the first seven; adsi (2D NumPy) and ot, stability and precision '
-                             '(2D, torch CUDA) must be named')
+                                                           'stability', 'precision', 'h2h', 'all'],
+                        help='`all` runs the first seven; adsi (2D NumPy), ot, stability and precision '
+                             '(2D, torch CUDA) and h2h (see --h2h-*) must be named')
     parser.add_argument('--dim', type=int, choices=[1, 2, 3], default=1, help='3 is only for the waves suite')
     parser.add_argument('--n', type=int, default=None,
                         help='grid points per axis (default 128; 256 for ot; 16 for --dim 3)')
@@ -1906,7 +2139,30 @@ def main():
                         help='ot and stability: a reference run needing more Hall substeps than this per ideal '
                              'step is stopped, reported as a cost MEASURE and recorded as too expensive')
     parser.add_argument('--progress-every', type=float, default=60.,
-                        help='ot and stability: wall seconds between progress lines')
+                        help='ot, stability and h2h: wall seconds between progress lines')
+    parser.add_argument('--h2h-tests', default=None,
+                        help='h2h: comma list of waves, mri, shear (default waves,mri, plus shear with --dim 2); '
+                             'waves and mri are 1D NumPy whatever --dim says, shear uses --dim 2 and --backend')
+    parser.add_argument('--h2h-methods', default='all',
+                        help='h2h: comma list of reference, hyper, inertia-auto, inertia-fixed, xmhd-auto, '
+                             'xmhd-fixed, the families inertia and xmhd, all, or none (summary only)')
+    parser.add_argument('--h2h-cases', default=None, help='h2h: comma list of case-label substrings to keep')
+    parser.add_argument('--h2h-out', default=None, help='h2h: JSON of every point, rewritten after each point')
+    parser.add_argument('--h2h-in', default='', help='h2h: comma list of earlier --h2h-out files added to the summary')
+    parser.add_argument('--h2h-lh-dx', type=float_list, default=[10., 100.], help='h2h waves: l_H/dx values')
+    parser.add_argument('--h2h-periods', type=float, default=3., help='h2h waves: whistler periods to run')
+    parser.add_argument('--h2h-cfl', type=float, default=0.3, help='h2h waves: ideal CFL number of the outer step')
+    parser.add_argument('--h2h-mri-lh-dx', type=float, default=20., help='h2h mri: minimum l_H/dx, which sets N')
+    parser.add_argument('--h2h-mri-beta', type=float, default=2.,
+                        help='h2h mri: plasma beta; low so that the ideal step does not hide the Hall stiffness')
+    parser.add_argument('--h2h-efolds', type=float, default=6., help='h2h mri: run length in e-foldings')
+    parser.add_argument('--h2h-ref-safety', type=float_list, default=[0.5, 1.], help='h2h reference: safety values')
+    parser.add_argument('--h2h-hyper', type=float_list, default=[0.02, 0.05], help='h2h hyper: C values')
+    parser.add_argument('--h2h-safety', type=float_list, default=[0.25, 0.5, 1., 2.],
+                        help='h2h inertia-auto: safety values (l^2 ~ 1/safety)')
+    parser.add_argument('--h2h-kl', type=float_list, default=[0.05, 0.1, 0.2], help='h2h inertia-fixed: k*l values')
+    parser.add_argument('--h2h-cfactor', type=float_list, default=[1., 2., 4.], help='h2h xmhd: c_factor values')
+    parser.add_argument('--h2h-xmhd-kl', type=float, default=0.1, help='h2h xmhd-fixed: k*l')
     args = parser.parse_args()
     if args.n is None:
         args.n = 256 if args.suite == 'ot' else 16 if args.dim == 3 else 128
@@ -1937,6 +2193,26 @@ def main():
         parser.error('The 3D waves check runs on NumPy.')
     if args.suite == 'shear' and args.dim != 2:
         parser.error('Density shear requires --dim 2')
+    args.h2h_tests = ([t for t in args.h2h_tests.split(',') if t] if args.h2h_tests
+                      else ['waves', 'mri'] + (['shear'] if args.dim == 2 else []))
+    args.h2h_method_tokens = [t for t in args.h2h_methods.split(',') if t]
+    args.h2h_cases = [t for t in (args.h2h_cases or '').split(',') if t]
+    args.h2h_in = [t for t in args.h2h_in.split(',') if t]
+    if args.suite == 'h2h':
+        if any(t not in H2H_TESTS for t in args.h2h_tests) or not args.h2h_tests:
+            parser.error(f'--h2h-tests entries must be among {", ".join(H2H_TESTS)}')
+        if 'shear' in args.h2h_tests and args.dim != 2:
+            parser.error('h2h shear requires --dim 2')
+        if not args.h2h_method_tokens or any(
+                t not in H2H_METHODS+('inertia', 'xmhd', 'all', 'none') for t in args.h2h_method_tokens):
+            parser.error(f'--h2h-methods entries must be among {", ".join(H2H_METHODS)}, inertia, xmhd, all, none')
+        lists = (args.h2h_lh_dx, args.h2h_ref_safety, args.h2h_hyper, args.h2h_safety, args.h2h_kl,
+                 args.h2h_cfactor)
+        if not (all(all(np.isfinite(v) and v > 0 for v in values) for values in lists)
+                and all(0 < s <= 2 for s in args.h2h_ref_safety+args.h2h_safety)
+                and args.h2h_periods > 0 and args.h2h_cfl > 0 and args.h2h_mri_lh_dx > 0
+                and args.h2h_mri_beta > 0 and args.h2h_efolds >= 5 and args.h2h_xmhd_kl > 0):
+            parser.error('Invalid h2h knob lists (positive, safety at most 2), periods, cfl, mri parameters')
     if not (np.isfinite(args.conv_dt0) and args.conv_dt0 > 0):
         parser.error('--conv-dt0 must be finite and positive')
     if args.backend == 'torch' and args.device != 'cuda':
@@ -1995,8 +2271,9 @@ def main():
     result = Results()
     for name, run in [('waves', waves), ('invariants', invariants), ('shear', shear), ('cost', cost),
                       ('convergence', convergence), ('energy', energy), ('mri', mri),
-                      ('adsi', adsi), ('ot', ot), ('stability', stability), ('precision', precision)]:
-        if name in ('adsi', 'ot', 'stability', 'precision'):
+                      ('adsi', adsi), ('ot', ot), ('stability', stability), ('precision', precision),
+                      ('h2h', h2h)]:
+        if name in ('adsi', 'ot', 'stability', 'precision', 'h2h'):
             if args.suite == name:
                 run(args, result)
             continue
