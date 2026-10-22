@@ -126,6 +126,14 @@ class Results:
         print(f'{"PASS" if ok else "FAIL"} {name}: {fields}', flush=True)
 
 
+def transverse_basis(k):
+    """Orthonormal (e1, e2) with e1 x e2 = k/|k|; e1 is horizontal, so cross(z, k) is renormalized."""
+    n = k/np.linalg.norm(k)
+    e1 = np.cross([0., 0., 1.], n)
+    e1 = e1/np.linalg.norm(e1)
+    return e1, np.cross(n, e1)
+
+
 def linear_modes(k, B0, eta, length):
     """Independent six-variable compressible Hall-MHD Fourier symbol.
 
@@ -134,9 +142,7 @@ def linear_modes(k, B0, eta, length):
     eta in the usual Hall-MHD polynomial; ideal induction and momentum are unchanged.
     """
     kn = np.linalg.norm(k)
-    e1 = np.cross([0., 0., 1.], k/kn)
-    e2 = np.cross(k/kn, e1)
-    P = np.array([e1, e2]).T
+    P = np.array(transverse_basis(k)).T
     effective = eta/(1+length**2*kn**2)
     M = np.zeros((6, 6), complex)
     for j in range(6):
@@ -197,8 +203,7 @@ def waves(args, out):
             hall = Hall(g, cfg)
             # Pure induction has only the whistler pair, not ion cyclotron.
             kn = np.linalg.norm(k)
-            e1 = np.cross([0., 0., 1.], k/kn)
-            e2 = np.cross(k/kn, e1)
+            e1, e2 = transverse_basis(k)
             amp = 1e-6
             B = B0.reshape(3, *([1]*args.dim)) + amp*(
                 e1.reshape(3, *([1]*args.dim))*np.cos(phase)
@@ -1165,7 +1170,7 @@ def precision(args, out):
     is32 = lambda a: '32' in str(a.dtype)
     eps32 = float(np.finfo(np.float32).eps)
     out.check('precision grids', is32(g32.x) and not is32(g64.x), grid_dtype=str(g32.x.dtype),
-              cg_tol_effective=max(args.cg_tol, 10*eps32))
+              cg_tol_effective=max(args.cg_tol, 100*eps32))
     ic = orszag_tang_2d(*g32.xy_mesh())
     out.check('precision main orszag_tang_2d initial state is float32 on a single grid', is32(ic),
               dtype=str(ic.dtype))

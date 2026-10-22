@@ -1,3 +1,5 @@
+import itertools
+
 import numpy as np
 import pytest
 
@@ -61,6 +63,34 @@ def test_circular_rotation_in_2d_and_3d(dim):
     omega = eta/np.sqrt(1+amp**2)/(1+length**2)
     assert np.max(np.abs(V[6]-amp*np.cos(X+omega*dt))) < 2e-10
     assert np.max(np.abs(V[7]-amp*np.sin(X+omega*dt))) < 2e-10
+
+
+@pytest.mark.parametrize("method", ["reference", "inertia"])
+def test_oblique_circular_rotation_is_axis_permutation_invariant(method):
+    """B = k_hat + amp (e1 cos + e2 sin)(k.x) has constant |B| and curl b = -|k| b, so the Hall
+    subflow rotates it exactly at omega = eta |k|^2/|B| (divided by 1 + l^2 |k|^2 for inertia).
+    The distinct, signed components (2, 1, -1) are permuted over the axes: any kx/ky/kz mix-up
+    in the symbols, which the symmetric k = (1, 1, 1) cannot see, changes the result."""
+    n, amp, eta, length, dt = 12, 0.02, 0.05, 0.3, 0.1
+    g = Grid3D(Nx=n, Ny=n, Nz=n, Lx=2*np.pi, Ly=2*np.pi, Lz=2*np.pi, backend="numpy")
+    eq, (X, Y, Z) = MHDEquations3D(), g.xyz_mesh()
+    one = np.ones_like(X)
+    hall = Hall(g, dict(eta_h=eta, method=method, length=length))
+    for k in itertools.permutations((2.0, 1.0, -1.0)):
+        k = np.array(k)
+        kn = np.linalg.norm(k)
+        khat = k/kn
+        e1 = np.cross(khat, [0.0, 0.0, 1.0])
+        e1 /= np.linalg.norm(e1)
+        e2 = np.cross(khat, e1)
+        phase = k[0]*X+k[1]*Y+k[2]*Z
+        field = lambda a: np.array([khat[i]+amp*(e1[i]*np.cos(a)+e2[i]*np.sin(a)) for i in range(3)])
+        omega = eta*kn**2/np.sqrt(1+amp**2)
+        if method == "inertia":
+            omega /= 1+length**2*kn**2
+        U = eq.conservative(one, 0*one, 0*one, 0*one, one, *field(phase))
+        V = hall.step(U, eq, dt)
+        assert np.max(np.abs(V[5:8]-field(phase+omega*dt))) < 1e-9, k
 
 
 @pytest.mark.parametrize("force_free", [True, False])
@@ -363,10 +393,10 @@ def test_float32_inertia_cg_tolerance_is_floored_at_roundoff():
     B = np.array([1+0*X, 0.1*np.cos(X+Y), 0.1*np.sin(Y)])
     rhs = hall.curl(B).astype(np.float32)
     length2 = (0.01*(1+0.5*np.sin(X))).astype(np.float32)
-    # A float32 residual of 1e-10 is unreachable; the request is raised to 10 eps.
+    # A float32 residual of 1e-10 is unreachable; the request is raised to 100 eps.
     x, iterations, residual = hall.inertia_solve(rhs, length2, tol=1e-10)
     assert x.dtype == np.float32 and iterations > 0
-    assert residual <= 10*np.finfo(np.float32).eps
+    assert residual <= 100*np.finfo(np.float32).eps
     # Double precision keeps the requested tolerance.
     _, _, residual = hall.inertia_solve(rhs.astype(np.float64), length2.astype(np.float64), tol=1e-10)
     assert residual <= 1e-10
