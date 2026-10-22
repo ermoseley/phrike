@@ -45,6 +45,13 @@ def _to_np(x: Any) -> np.ndarray:
     return np.asarray(x)
 
 
+def _as_grid_array(grid: Any, x: Any) -> Any:
+    """Convert an array to the backend, dtype and device of ``grid.x``."""
+    if getattr(grid, "_use_torch", False):
+        return torch.as_tensor(_to_np(x)).to(dtype=grid.x.dtype, device=grid.x.device)
+    return np.array(_to_np(x), dtype=np.asarray(grid.x).dtype)
+
+
 def _periodic_linear_1d(f: Any, xp: Any, length: float) -> Any:
     """Linearly interpolate a periodic 1-D grid without changing backends."""
     n = int(f.shape[-1])
@@ -644,6 +651,7 @@ class Grid1D:
         self._bc_boundary_map: dict[str, dict[str, str]] | None = None  # {boundary: {var: bc}}
         self._dirichlet_values_map: dict[str, tuple[float, float]] | None = None
         self._boundary_reference = None
+        self._restored_boundary_reference = None
         
         if isinstance(self.bc, dict):
             # Check if this is a per-boundary configuration
@@ -1143,9 +1151,18 @@ class Grid1D:
 
     # --- Boundary conditions (1D) ---
     def initialize_boundary_conditions(self, U, equations) -> np.ndarray:
-        """Capture fixed endpoints once at the start of a run."""
-        self._boundary_reference = None
+        """Capture the boundary reference once at the start of a run.
+
+        A reference restored from a checkpoint (see
+        :meth:`restore_boundary_reference`) is used instead of the endpoints
+        of ``U``, so a restart keeps the original far field.
+        """
+        self._boundary_reference = self._restored_boundary_reference
         return self.apply_boundary_conditions(U, equations)
+
+    def restore_boundary_reference(self, reference) -> None:
+        """Use a checkpointed boundary reference for the next run."""
+        self._restored_boundary_reference = _as_grid_array(self, reference)
 
     def _boundary_layout(self, U):
         """Conservative rows of the boundary variables and the energy row."""
@@ -1242,10 +1259,12 @@ class Grid1D:
         ``wall`` it is the mirror state with the normal momentum reversed, so
         the mass flux through the wall is exactly zero. ``fixed`` variables
         take their fixed values in ``g`` and are also imposed strongly by
-        :meth:`apply_boundary_conditions`. ``boundary_flux`` is the endpoint
-        flux consistent with the volume derivative (see
-        :meth:`flux_derivative`); it defaults to the flux of the endpoint
-        states. Copying endpoint values instead is not a characteristic
+        :meth:`apply_boundary_conditions`. The Rusanov flux is built from the
+        physical fluxes of the endpoint and exterior states. ``boundary_flux``
+        is the endpoint trace of the volume flux (see :meth:`flux_derivative`),
+        which differs from the physical endpoint flux under overintegration;
+        it is the term the correction removes, and it defaults to the physical
+        flux. Copying endpoint values instead is not a characteristic
         closure for the global polynomial derivative and lets the endpoint
         states drift.
         """
@@ -1295,13 +1314,14 @@ class Grid1D:
             kinetic = sum(g[row, 0] ** 2 for row in range(1, energy)) / (2.0 * g[0, 0])
             magnetic = 0.5 * sum(g[row, 0] ** 2 for row in (5, 6, 7)) if mhd else 0.0
             g[energy, 0] = values["pressure"] / (gamma - 1.0) + kinetic + magnetic
-            flux_b = (equations.flux(u_b)[:, 0] if boundary_flux is None
-                      else boundary_flux[:, side])
+            flux_b = equations.flux(u_b)[:, 0]
+            trace = flux_b if boundary_flux is None else boundary_flux[:, side]
             flux_g = equations.flux(g)[:, 0]
             signal = max(float(speed(u_b)[0]), float(speed(g)[0]))
-            outward = normal * flux_b
-            numerical = 0.5 * (outward + normal * flux_g) - 0.5 * signal * (g[:, 0] - u_b[:, 0])
-            rhs[:, endpoint] = rhs[:, endpoint] - (numerical - outward) / float(weights[endpoint])
+            numerical = (0.5 * normal * (flux_b + flux_g)
+                         - 0.5 * signal * (g[:, 0] - u_b[:, 0]))
+            rhs[:, endpoint] = (rhs[:, endpoint]
+                                - (numerical - normal * trace) / float(weights[endpoint]))
         return rhs
 
 
@@ -1534,6 +1554,7 @@ class Grid2D:
         self.wy[-4:] = self.wy[:4][::-1]
         self._sbp_backend_cache = {}
         self._boundary_reference = None
+        self._restored_boundary_reference = None
 
     def _sbp_arrays(self, ref):
         is_torch = _TORCH_AVAILABLE and isinstance(ref, torch.Tensor)
@@ -1741,12 +1762,22 @@ class Grid2D:
                 )
 
     def initialize_boundary_conditions(self, U, equations):
-        """Store the initial ambient exterior for the mixed-grid open faces."""
+        """Store the initial ambient exterior for the mixed-grid open faces.
+
+        A reference restored from a checkpoint (see
+        :meth:`restore_boundary_reference`) takes precedence over ``U``.
+        """
         if self._mixed_open_y:
-            boundary = U[:, [0, -1], :]
+            boundary = (self._restored_boundary_reference
+                        if self._restored_boundary_reference is not None
+                        else U[:, [0, -1], :])
             self._boundary_reference = (boundary.clone() if _TORCH_AVAILABLE
-                                        and isinstance(U, torch.Tensor) else boundary.copy())
+                                        and isinstance(boundary, torch.Tensor) else boundary.copy())
         return self.apply_boundary_conditions(U, equations)
+
+    def restore_boundary_reference(self, reference) -> None:
+        """Use a checkpointed open-face exterior for the next run."""
+        self._restored_boundary_reference = _as_grid_array(self, reference)
 
     def apply_split_advection(self, rhs, U):
         """Conservative y-advection split with SBP kinetic-energy balance.
