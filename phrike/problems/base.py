@@ -16,6 +16,7 @@ from phrike.io import (
     load_config,
     save_solution_snapshot,
 )
+from phrike.solver import conserved_diagnostics, nodal_quadrature_weights
 from phrike.tracers import FourierTracers1D, FourierTracers2D, FourierTracers3D
 
 # ffmpeg image sequence. Frames are renamed to this pattern before encoding.
@@ -724,6 +725,13 @@ class BaseProblem(ABC):
         """Create initial conditions."""
         pass
 
+    def on_output(self, solver, t: float, U) -> None:
+        """Hook called at every output time, before the snapshot is written.
+
+        The default does nothing. Problems override it to record diagnostics
+        that need every output rather than only the final state.
+        """
+
     @abstractmethod
     def create_visualization(self, solver, t: float, U):
         """Create visualization for current state."""
@@ -964,12 +972,21 @@ class BaseProblem(ABC):
             return arrays
 
     def compute_conservation_errors(self, solver, U):
-        """Compute conservation errors relative to initial values."""
+        """Compute conservation errors relative to initial values.
+
+        Fourier grids use plain grid sums. Chebyshev and Legendre 1D grids use
+        quadrature-weighted integrals, matching the solver history.
+        """
         if self.monitoring_initial_values is None:
             return {}
 
+        initial_values = self.monitoring_initial_values
+        scales = getattr(self, "monitoring_momentum_scales", None) or {}
+
         # Get current conserved quantities
-        if getattr(solver.grid, "_mixed_open_y", False):
+        if nodal_quadrature_weights(solver.grid, U) is not None:
+            current_cons = conserved_diagnostics(solver.grid, solver.equations, U)
+        elif getattr(solver.grid, "_mixed_open_y", False):
             current_cons = solver.grid.conserved_quantities(U, solver.equations)
         elif hasattr(solver.equations, "conserved_quantities"):
             current_cons = solver.equations.conserved_quantities(U)
@@ -1134,9 +1151,8 @@ class BaseProblem(ABC):
         # Mass and energy stay relative to their initial values. Momentum is
         # normalized by a physical scale: a signed initial momentum is often
         # only round-off, and dividing by it reports a meaningless ratio.
-        scales = getattr(self, "monitoring_momentum_scales", None) or {}
         errors = {}
-        for key, initial_val in self.monitoring_initial_values.items():
+        for key, initial_val in initial_values.items():
             if key not in current_cons:
                 continue
             change = current_cons[key] - initial_val
@@ -1162,8 +1178,9 @@ class BaseProblem(ABC):
         """Scale for each momentum component.
 
         The scale is ``max(sum(|rho u_i|), mass * c_s)`` using the same
-        summation as the conservation diagnostic (quadrature weights on the
-        mixed Fourier/SBP grid, otherwise a plain sum). ``c_s`` is the rms
+        summation as the conservation diagnostic (quadrature weights on 1D
+        Chebyshev/Legendre grids and on the mixed Fourier/SBP grid, otherwise a
+        plain sum). ``c_s`` is the rms
         sound speed ``sqrt(gamma p / rho)``.
         """
         primitive_vars = solver.equations.primitive(U)
@@ -1185,8 +1202,8 @@ class BaseProblem(ABC):
             velocities = [primitive_vars[1], primitive_vars[2], primitive_vars[3]]
             names = ["momentum_x", "momentum_y", "momentum_z"]
 
-        weight = None
-        if getattr(solver.grid, "_mixed_open_y", False):
+        weight = nodal_quadrature_weights(solver.grid, U)
+        if weight is None and getattr(solver.grid, "_mixed_open_y", False):
             try:
                 _, weights = solver.grid._sbp_arrays(U)
                 weight = solver.grid.dx * np.asarray(weights)[:, None]
@@ -1197,7 +1214,7 @@ class BaseProblem(ABC):
                     stacklevel=2,
                 )
                 weight = None
-        if weight is not None and is_torch:
+        if weight is not None and is_torch and not isinstance(weight, torch.Tensor):
             weight = torch.as_tensor(weight, dtype=rho.dtype, device=rho.device)
 
         def total(values: Any, absolute: bool = False) -> float:
@@ -1512,7 +1529,11 @@ class BaseProblem(ABC):
             return
 
         # Store initial conserved quantities for error computation
-        if getattr(solver.grid, "_mixed_open_y", False):
+        if nodal_quadrature_weights(solver.grid, U) is not None:
+            self.monitoring_initial_values = conserved_diagnostics(
+                solver.grid, solver.equations, U
+            )
+        elif getattr(solver.grid, "_mixed_open_y", False):
             self.monitoring_initial_values = solver.grid.conserved_quantities(U, solver.equations)
         elif hasattr(solver.equations, "conserved_quantities"):
             self.monitoring_initial_values = solver.equations.conserved_quantities(U)
@@ -1886,6 +1907,7 @@ class BaseProblem(ABC):
             on_output_callbacks.append(snapshot_callback)
             
             def combined_output_callback(t, U):
+                self.on_output(solver, t, U)
                 for callback in on_output_callbacks:
                     callback(t, U)
 

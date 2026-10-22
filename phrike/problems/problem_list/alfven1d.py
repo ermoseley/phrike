@@ -8,7 +8,9 @@ Alfven speed c_A = B0 / sqrt(rho0). It validates:
 - the magnetic pressure / pressure recovery (E -= 1/2 |B|^2),
 - the induction flux rows (dB/dt = curl(u x B)),
 - the solenoidal constraint (div B = dBx/dx = 0 to machine precision),
-- spectral spatial convergence and RK temporal order,
+- RK temporal order (the wave is one Fourier mode, so its spatial error is
+  at round-off once the grid retains it; scripts/validate_alfven1d.py
+  measures the two separately at fixed dt and fixed N),
 - the phase speed (= c_A).
 
 For a wave travelling in +x the eigenmode relation is  du_perp = -dB_perp/sqrt(rho0).

@@ -1,6 +1,14 @@
 # 2D Orszag-Tang vortex (MHD) at 1024^2 on Metal (MPS):
 #   python -m phrike orszag_tang2d --config configs/orszag_tang2d.yaml \
 #       --backend torch --device mps --video
+#
+# The run is ideal MHD. Without dissipation the 2/3 Fourier truncation rings
+# density and pressure below zero in the current sheets near t ~ 0.19. The
+# solver floors them, the Alfven speed in the floored cells becomes huge, and
+# the run stops with a "Time step collapsed" error. The
+# integration.spectral_dissipation block below prevents this; it was verified
+# at 64^2, 128^2 and 256^2 (double, t_end = 0.5). A few cells still reach the
+# pressure floor, and the solver warns once per run when the floor is used.
 problem: orszag_tang2d
 
 grid:
@@ -14,9 +22,8 @@ grid:
 physics:
   gamma: 1.6666666666666667   # 5/3
   mhd:
-    enabled: true
-    resistivity: 0.0          # eta — raise to a small value (e.g. 1e-4) if unstable
-    viscosity: 0.0            # nu  — raise to a small value (e.g. 1e-4) if unstable
+    resistivity: 0.0          # eta. Explicit, so it tightens the time step (dt <~ 1/(eta k_max^2)).
+    viscosity: 0.0            # nu, explicit like eta
     divergence_clean: projection
     project_each_substage: true
 
@@ -28,7 +35,10 @@ integration:
   output_interval: 0.05
   checkpoint_interval: 0.0
   spectral_dissipation:
-    enabled: false
+    enabled: true
+    order: 8
+    rate: 300.0               # damping rate of the cutoff mode, 1/time
+    onset_fraction: 0.5       # modes below half the cutoff are untouched
 
 initial_conditions: {}        # standard Stone/Athena OT normalization
 

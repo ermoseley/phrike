@@ -3,6 +3,11 @@
 Reuses the turbulent velocity generator from turb3d for u, builds a band-limited
 random magnetic field, projects it to be exactly divergence-free, adds a uniform
 mean field b0, and normalizes the fluctuations to a target b_rms.
+
+All band limits (``kmin``, ``kmax``, ``b_kmin``, ``b_kmax``) are integer Fourier
+mode magnitudes, i.e. cycles per box, as in ``turb3d``. They are not physical
+wavenumbers: mode n has k = 2*pi*n/L, so the same band covers the same number
+of box-sized wavelengths for any domain length.
 """
 
 import os
@@ -26,18 +31,24 @@ def banded_random_b_3d(grid: Grid3D, b_rms=0.1, kmin=1.0, kmax=5.0,
                        b0=(0.0, 0.0, 1.0), seed=123):
     """Band-limited, divergence-free random B with mean field b0, target b_rms.
 
+    ``kmin`` and ``kmax`` are integer mode magnitudes (cycles per box), not
+    physical wavenumbers; they select the same modes for any ``Lx, Ly, Lz``.
+
     Returns numpy arrays (Bx, By, Bz) of shape (Nz, Ny, Nx).
     """
     Nz, Ny, Nx = grid.Nz, grid.Ny, grid.Nx
     rng = np.random.default_rng(seed)
-    # FFT-grid integer wavenumbers (cycles per box). The Leray projection is
-    # scale-invariant so integer k (vs physical 2*pi/L * k) is fine here.
-    kx = np.fft.fftfreq(Nx, d=1.0 / Nx).reshape(1, 1, Nx)
-    ky = np.fft.fftfreq(Ny, d=1.0 / Ny).reshape(1, Ny, 1)
-    kz = np.fft.fftfreq(Nz, d=1.0 / Nz).reshape(Nz, 1, 1)
-    kmag = np.sqrt(kx * kx + ky * ky + kz * kz)
-    band = (kmag >= kmin) & (kmag <= kmax)
-    envelope = np.where(band, 1.0, 0.0)
+    # Integer FFT mode numbers (cycles per box) select the band. The Leray
+    # projection uses physical wavenumbers 2*pi*n/L so that B is divergence-free
+    # for anisotropic boxes too; for a cube it is the same as using n.
+    nx = np.fft.fftfreq(Nx, d=1.0 / Nx).reshape(1, 1, Nx)
+    ny = np.fft.fftfreq(Ny, d=1.0 / Ny).reshape(1, Ny, 1)
+    nz = np.fft.fftfreq(Nz, d=1.0 / Nz).reshape(Nz, 1, 1)
+    nmag = np.sqrt(nx * nx + ny * ny + nz * nz)
+    envelope = np.where((nmag >= kmin) & (nmag <= kmax), 1.0, 0.0)
+    kx = 2.0 * np.pi * nx / grid.Lx
+    ky = 2.0 * np.pi * ny / grid.Ly
+    kz = 2.0 * np.pi * nz / grid.Lz
     k2 = kx * kx + ky * ky + kz * kz
     k2_safe = np.where(k2 == 0.0, 1.0, k2)
 

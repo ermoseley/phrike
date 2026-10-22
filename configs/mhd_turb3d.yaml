@@ -1,5 +1,5 @@
 # 3D compressible MHD turbulence (turbulent u + banded solenoidal B).
-#   python -m phrike mhd_turb3d --config configs/mhd_turb3d.yaml --backend torch --device mps
+#   python -m phrike mhd_turb3d --config configs/mhd_turb3d.yaml --backend numpy
 problem: mhd_turb3d
 
 grid:
@@ -15,7 +15,6 @@ grid:
 physics:
   gamma: 1.6666666666666667
   mhd:
-    enabled: true
     resistivity: 0.0
     viscosity: 0.0
     divergence_clean: projection

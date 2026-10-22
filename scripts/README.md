@@ -40,7 +40,10 @@ python -m scripts.benchmark_tracers --backend numpy --grid 64 --steps 20
 # Validate tracer density against a smooth compressive flow on Apple Metal.
 python -m scripts.validate_tracers --backend torch --device mps --grid 32
 
-# Run the full 1-D circularly polarized Alfvén-wave diagnostic.
+# Run the full 1-D circularly polarized Alfvén-wave diagnostic on CPU/double.
+# It reports the spatial error at a fixed dt and the RK4 temporal order at
+# fixed N separately. Add --mps for an optional Metal float32 run; --help
+# lists the other options.
 python -m scripts.validate_alfven1d
 ```
 
