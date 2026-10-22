@@ -11,8 +11,7 @@ Run a CPU acoustic-wave smoke test from the repository root:
 The command writes its outputs to the chosen directory. The command-line
 interface leaves video off unless ``--video`` is supplied or
 ``video.enabled`` is true. ``run_simulation`` and ``BaseProblem.run``
-default ``generate_video`` to true, so a direct Python call renders
-frames unless that argument is false.
+also default ``generate_video`` to false.
 
 List the available problem names and options with:
 
