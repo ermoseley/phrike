@@ -737,3 +737,108 @@ def test_resistivity_max_clamps_rhs_and_timestep():
     assert np.array_equal(capped._compute_rhs(U), reference._compute_rhs(U))
     assert not np.array_equal(capped._compute_rhs(U), plain._compute_rhs(U))
     assert capped.compute_dt(U) == reference.compute_dt(U) > plain.compute_dt(U)
+
+
+@pytest.mark.parametrize("force_free", [True, False])
+def test_xmhd_steady_state_is_stationary(force_free):
+    g = grid1d()
+    zero = g.x*0
+    B = np.array([zero, np.cos(g.x), np.sin(g.x)] if force_free
+                 else [zero, 1+0.1*np.cos(g.x), zero])
+    U = state(g, B)
+    with pytest.warns(RuntimeWarning, match="restart"):
+        hall = Hall(g, dict(eta_h=1.0, method="xmhd", length=0.3, c_tilde=5.0))
+    E, J = hall.steady_fields(B, U[0])
+    if not force_free:
+        assert np.max(np.abs(E)) > 0.05
+    for _ in range(3):
+        V = hall.step(U, None, 0.03)
+    assert hall.last_stats["substeps"] > 1
+    assert np.max(np.abs(V-U)) < 2e-13
+    assert np.max(np.abs(hall.E-E)) < 2e-13 and np.max(np.abs(hall.J-J)) < 2e-13
+
+
+def test_xmhd_conserves_its_quadratic_energy():
+    g = grid1d()
+    B = np.array([1+0*g.x, 0.1*np.cos(g.x)+0.03*np.sin(2*g.x), 0.1*np.sin(g.x)+0.02*np.cos(3*g.x)])
+    rho = 1+0.2*np.cos(g.x)
+    U = state(g, B, rho)
+    c, length = 5.0, 0.3
+    hall = Hall(g, dict(eta_h=0.2, eta_h_form="proportional_to_B_over_rho", method="xmhd",
+                        length=length, c_tilde=c, safety=0.25))
+    hall.E, hall.J = hall.steady_fields(B, rho)
+    W0 = hall.xmhd_energy(B, c, length**2)
+    V = hall.step(U, None, 0.05)
+    assert np.max(np.abs(V[5:8]-B)) > 1e-5
+    assert abs(hall.xmhd_energy(V[5:8])/W0-1) < 1e-8
+    eq = MHDEquations1D()
+    assert np.max(np.abs(eq.primitive(V)[4]-eq.primitive(U)[4])) < 1e-14
+    assert hall.last_stats["initialised"] is False and hall.last_stats["c_tilde"] == c
+    assert np.array_equal(V[:4], U[:4]) and np.array_equal(V[5], U[5])  # B_x untouched: div B exact
+
+
+@pytest.mark.parametrize("eta", [0.5, -0.5])
+def test_xmhd_linear_whistler_matches_its_dispersion_relation(eta):
+    """k = 1 along B0 = x. With psi = V_y + i V_z ~ exp(i(x - w t)) the curl is -k, J x x = -i J, and
+    l^2 w^3 + eta w^2 - c^2 (1 + l^2) w - c^2 eta = 0 with the eigenvector e = -i w b, j = w b/(w l^2 + eta)."""
+    g = grid1d()
+    amp, c, length, T = 1e-6, 5.0, 0.3, 1.0
+    l2 = length**2
+    roots = np.roots([l2, eta, -c*c*(1+l2), -c*c*eta]).real
+    omega = roots[np.argmin(np.abs(roots))]
+    cs, sn = amp*np.cos(g.x), amp*np.sin(g.x)
+    U = state(g, [1+0*g.x, cs, sn])
+    hall = Hall(g, dict(eta_h=eta, method="xmhd", length=length, c_tilde=c, safety=0.1))
+    q = omega/(omega*l2+eta)
+    hall.E = np.array([0*g.x, omega*sn, -omega*cs])
+    hall.J = np.array([0*g.x, q*cs, q*sn])
+    V = hall.step(U, None, T)
+    z = np.mean((V[6]+1j*V[7])*np.exp(-1j*g.x))/amp
+    assert abs(z-np.exp(-1j*omega*T)) < 1e-4
+    # The displacement current matters: the c -> infinity (inertia) frequency is off by ~ 4e-3.
+    assert abs(np.exp(-1j*omega*T)-np.exp(1j*eta/(1+l2)*T)) > 1e-3
+
+
+def test_xmhd_falls_back_to_reference_and_validates():
+    g = grid1d()
+    B = np.array([1+0*g.x, 0.1*np.cos(g.x), 0.1*np.sin(g.x)])
+    U = state(g, B)
+    with pytest.warns(RuntimeWarning):
+        hall = Hall(g, dict(eta_h=0.2, method="xmhd", length=0.0))
+        auto = Hall(g, dict(eta_h=0.2, method="xmhd"))
+    reference = Hall(g, dict(eta_h=0.2, method="reference")).step(U, None, 0.01)
+    for h in (hall, auto):  # l = 0, and an automatic l^2 below 1/kmax^2 at this dt
+        assert np.array_equal(h.step(U, None, 0.01), reference)
+        assert h.E is None
+    assert hall.step(U, None, 0.0) is not U
+    V = Hall(g, dict(eta_h=0.2, method="xmhd", c_tilde=3.0, length=0.3)).step(U, None, 0.05)
+    assert np.all(np.isfinite(V))
+    with pytest.raises(ValueError, match="length_mode"):
+        Hall(g, dict(eta_h=0.2, method="xmhd", length_mode="local"))
+    for bad in (dict(hyper=-1.0), dict(hyper=0.1, method="inertia"), dict(c_tilde=0.0),
+                dict(c_factor=np.inf), dict(safety=2.5)):
+        with pytest.raises(ValueError):
+            Hall(g, dict(eta_h=0.2, **bad))
+
+
+def test_hyper_resistive_reference_deposits_its_work_as_heat():
+    g = grid1d()
+    amp, eta, C, dt, safety = 0.3, 0.2, 0.2, 0.1, 0.1
+    U = state(g, [1+0*g.x, amp*np.cos(g.x), amp*np.sin(g.x)])
+    hall = Hall(g, dict(eta_h=eta, method="reference", hyper=C, safety=safety))
+    V = hall.step(U, None, dt)
+    eq = MHDEquations1D()
+    nu = C*eta*g.dx**2
+    # |J|^2 = amp^2 for this circular mode and E_hyp.J = nu |J|^2 (k = 1), decaying by exp(-2 nu t).
+    heat = (eq.primitive(V)[4]-eq.primitive(U)[4]).mean()/(eq.gamma-1)
+    assert abs(heat/(nu*amp**2*dt)-1) < 2e-3
+    assert abs(V[4].mean()-U[4].mean()) < 1e-3*heat
+    magnetic = lambda W: (0.5*(W[5:8]**2).sum(axis=0)).mean()
+    assert abs((magnetic(U)-magnetic(V))/heat-1) < 1e-3
+    # The hyper rate nu kmax^4 adds to the Hall rate in the substep count.
+    k2 = hall.kmax2(U[5:8])
+    assert hall.last_stats["substeps"] == int(np.ceil(dt*eta*k2*(1+C*g.dx**2*k2)/safety-1e-9))
+    plain = Hall(g, dict(eta_h=eta, method="reference", safety=safety))
+    W = plain.step(U, None, dt)
+    assert plain.last_stats["substeps"] < hall.last_stats["substeps"]
+    assert abs(W[4].mean()-U[4].mean()) < 1e-12

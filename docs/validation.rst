@@ -575,11 +575,13 @@ Hall/2, which is palindromic; without a ``hall`` block it is unchanged.
          eta_h: 0.03             # signed
          eta_h_form: constant    # or proportional_to_B_over_rho (uses b0, rho0)
          eta_max: 0.5            # optional cap on |eta_H(x)|; omit for none
-         method: inertia         # reference | inertia
-         length: 0.05            # inertia only; omit for the automatic length
+         method: inertia         # reference | inertia | xmhd
+         hyper: 0.05             # reference only: hyper-resistive coefficient C; omit for none
+         c_factor: 2.0           # xmhd only: c = c_factor dx/dt (or c_tilde: c)
+         length: 0.05            # inertia and xmhd; omit for the automatic length
          length_mode: constant   # constant | local
          length_ratio: 4.0       # local only: raise l so max(l)/min(l) <= ratio
-         safety: 0.5
+         safety: 0.5             # at most 2 (RK4 limit 2.8)
          cg_tol: 1.0e-10
 
 ``eta_max`` replaces ``eta_H(x)`` by ``sign(eta_H) min(|eta_H(x)|, eta_max)`` in the
@@ -614,13 +616,30 @@ over fixed ``k l`` reports the drift per unit perturbation energy, its fitted or
 contributions separately; the stabilization filters the total energy field, which leaves
 its volume mean unchanged). The outer step keeps the ideal CFL limit.
 ``scripts/hall_viability.py`` reports these pieces
-(``--suite waves|invariants|convergence|energy|cost|shear|mri|adsi|ot|stability|precision``)
+(``--suite waves|invariants|convergence|energy|cost|shear|mri|adsi|ot|stability|precision|h2h``)
 and must be run on a cluster. The ``cost`` suite times Hall-only steps under a shared
 phase-error ceiling; it is not an equal-error comparison of coupled runs. The ``ot``
 suite is the coupled comparison: inertia runs against the reference at ``N`` with
 the reference's own ``2N -> N`` resolution error as the accuracy gate. ``waves`` also
 runs on a 3D grid (``--dim 3``), and ``mri --mri-quick`` keeps only the unstable
 eigenmode runs.
+
+Two comparators and the head-to-head suite
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``hyper: C`` on ``reference`` adds ``E_hyp = -C |eta_H(x)| dx**2 laplacian(J)`` (Iwasaki and
+Tomida 2025, arXiv:2503.14842), ``dB/dt = -nu k**4 B`` with ``dx`` the smallest spacing. Its
+work ``E_hyp.J`` goes into the total energy (the gas heats, total energy is conserved) and its
+rate ``C |eta_H| dx**2 kmax**4`` adds to the substep rate. ``method: xmhd`` is a reduced-speed
+extended-MHD Hall subflow with persistent ``E`` and ``J``: ``dB/dt = -curl E``,
+``(1/c**2) dE/dt = curl B - J``, ``l**2 dJ/dt = E - eta_H J x b``. It rests at ``J = curl B``,
+``E = E_H``, conserves ``0.5|B|**2 + |E|**2/(2c**2) + 0.5 l**2 |J|**2`` and, for ``k`` along ``B0``,
+has ``l**2 w**3 + eta w**2 - c**2 (1 + k**2 l**2) w - c**2 k**2 eta = 0``, which tends to the inertia
+frequency as ``c -> infinity``. Its RK4 substeps resolve ``c sqrt(kmax**2 + 1/l**2) + max|eta_H|/l**2``.
+``E`` and ``J`` are not checkpointed: a restart re-initialises them (with a warning). ``--suite h2h``
+sweeps each method's accuracy knob on the whistler and ion-cyclotron eigenmodes (1D), the Hall-MRI
+growth (1D, ``l_H/dx >= 20``) and the density-shear growth (2D), and prints the least wall time that
+reaches 1% and 0.1% error per test (``--h2h-tests``, ``--h2h-methods``, ``--h2h-out``).
 
 Shearing sheet and Hall-MRI
 ---------------------------
