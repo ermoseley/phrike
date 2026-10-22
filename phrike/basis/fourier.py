@@ -53,6 +53,12 @@ class FourierBasis1D(Basis1D):
         dx = self.Lx / self.N
         return np.full(self.N, dx, dtype=float)
 
+    def _spectral_filter_eta(self) -> np.ndarray:
+        """``|k| / k_Nyquist`` in FFT order, so the filter follows wavenumber."""
+        wavenumber = np.abs(np.rint(np.fft.fftfreq(self.N) * self.N))
+        nyquist = max(self.N // 2, 1)
+        return wavenumber / float(nyquist)
+
     # Transforms
     def forward(self, f: np.ndarray) -> np.ndarray:
         try:

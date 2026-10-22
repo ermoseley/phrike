@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Dict, Optional, Any
 
@@ -183,14 +184,22 @@ def _periodic_linear_3d(
     return (1.0 - wz) * c0 + wz * c1
 
 
+def _integer_wavenumbers(n: int) -> np.ndarray:
+    """FFT wavenumbers in ``fftfreq`` order, as exact integers.
+
+    ``fftfreq(n) * n`` is not an integer for every ``n``. A float comparison
+    with ``(n - 1) // 3`` drops that cutoff mode for some resolutions.
+    """
+    return np.rint(np.fft.fftfreq(n) * n).astype(np.int64)
+
+
 def _build_filter_mask(N: int, dealias: bool) -> np.ndarray:
     if not dealias:
         return np.ones(N, dtype=float)
-    # Exact quadratic 2/3 rule: retain |k| < N/3.
-    k = np.fft.fftfreq(N) * N
+    # Quadratic 2/3 rule on integer modes: retain |k| < N/3.
+    k = _integer_wavenumbers(N)
     cutoff = (N - 1) // 3
-    mask = (np.abs(k) <= cutoff).astype(float)
-    return mask
+    return (np.abs(k) <= cutoff).astype(float)
 
 
 def _stabilization_params(
@@ -407,27 +416,61 @@ def resolve_backend(
     return "torch", resolved_device
 
 
+_mps_double_warned = False
+_numpy_fourier_single_warned = False
+
+
 def _torch_dtypes(precision: str, device: str) -> tuple[Any, Any, str]:
     """Return real/complex Torch dtypes and the effective precision."""
+    global _mps_double_warned
     normalized = str(precision).strip().lower()
     if normalized not in {"single", "double"}:
         raise ValueError(
             f"Unknown precision {precision!r}; expected 'single' or 'double'."
         )
-    # PyTorch MPS does not support float64. Metal is preferred for automatic
-    # acceleration, so normalize its effective precision instead of failing.
-    if device == "mps":
+    # PyTorch MPS does not support float64. Keep Metal as the automatic
+    # accelerator, but do not drop to float32 without saying so.
+    if device == "mps" and normalized == "double":
+        if not _mps_double_warned:
+            _mps_double_warned = True
+            warnings.warn(
+                "MPS does not support float64; using float32 instead of "
+                "the requested double precision.",
+                UserWarning,
+                stacklevel=2,
+            )
         normalized = "single"
     if normalized == "single":
         return torch.float32, torch.complex64, normalized
     return torch.float64, torch.complex128, normalized
 
 
+def _note_numpy_fourier_single() -> None:
+    """Warn once that NumPy Fourier operators stay in float64."""
+    global _numpy_fourier_single_warned
+    if _numpy_fourier_single_warned:
+        return
+    _numpy_fourier_single_warned = True
+    warnings.warn(
+        "NumPy Fourier operators always compute in float64; "
+        "precision='single' is not applied to them.",
+        UserWarning,
+        stacklevel=2,
+    )
+
+
 def _build_filter_mask_2d(Nx: int, Ny: int, dealias: bool) -> np.ndarray:
+    """Tensor-product 2/3 mask of shape (Ny, Nx).
+
+    A mode is kept only when both ``|kx| <= (Nx - 1) // 3`` and
+    ``|ky| <= (Ny - 1) // 3``. Differentiating in one direction therefore
+    also removes modes that are resolved along that direction but sit
+    outside the cutoff on the other axis.
+    """
     if not dealias:
         return np.ones((Ny, Nx), dtype=float)
-    kx = (np.fft.fftfreq(Nx) * Nx).astype(float)
-    ky = (np.fft.fftfreq(Ny) * Ny).astype(float)
+    kx = _integer_wavenumbers(Nx)
+    ky = _integer_wavenumbers(Ny)
     cutoff_x = (Nx - 1) // 3
     cutoff_y = (Ny - 1) // 3
     mask_x = (np.abs(kx) <= cutoff_x).astype(float)
@@ -443,6 +486,13 @@ def _build_exponential_filter_rate_2d(
     dealias: bool,
     onset_fraction: float = 0.0,
 ) -> np.ndarray:
+    """Per-mode decay rate ``lambda = rate * (ramp(|ky|) + ramp(|kx|))``.
+
+    The ramps are added. A mode at the cutoff on both axes has
+    ``lambda = 2 * rate``, so its e-folding time is ``tau / 2`` when
+    ``rate = 1 / tau`` and ``tau`` is ``e_folding_time_at_cutoff``.
+    That setting is the e-folding time of one axis, not of the corner mode.
+    """
     kx = (np.fft.fftfreq(Nx) * Nx).astype(float)
     ky = (np.fft.fftfreq(Ny) * Ny).astype(float)
     scale_x = (Nx - 1) // 3 if dealias else int(np.max(np.abs(kx)))
@@ -456,11 +506,17 @@ def _build_exponential_filter_rate_2d(
 
 
 def _build_filter_mask_3d(Nx: int, Ny: int, Nz: int, dealias: bool) -> np.ndarray:
+    """Tensor-product 2/3 mask of shape (Nz, Ny, Nx).
+
+    A mode is kept only when it is inside the cutoff on every axis, so a
+    derivative in one direction also removes modes resolved on that axis
+    but outside the cutoff on another.
+    """
     if not dealias:
         return np.ones((Nz, Ny, Nx), dtype=float)
-    kx = (np.fft.fftfreq(Nx) * Nx).astype(float)
-    ky = (np.fft.fftfreq(Ny) * Ny).astype(float)
-    kz = (np.fft.fftfreq(Nz) * Nz).astype(float)
+    kx = _integer_wavenumbers(Nx)
+    ky = _integer_wavenumbers(Ny)
+    kz = _integer_wavenumbers(Nz)
     cutoff_x = (Nx - 1) // 3
     cutoff_y = (Ny - 1) // 3
     cutoff_z = (Nz - 1) // 3
@@ -479,6 +535,12 @@ def _build_exponential_filter_rate_3d(
     dealias: bool,
     onset_fraction: float = 0.0,
 ) -> np.ndarray:
+    """Per-mode decay rate, summed over the three axis ramps.
+
+    A mode at the cutoff on every axis has ``lambda = 3 * rate`` and an
+    e-folding time ``tau / 3``, where ``tau`` is
+    ``e_folding_time_at_cutoff`` for a single axis.
+    """
     kx = (np.fft.fftfreq(Nx) * Nx).astype(float)
     ky = (np.fft.fftfreq(Ny) * Ny).astype(float)
     kz = (np.fft.fftfreq(Nz) * Nz).astype(float)
@@ -744,8 +806,11 @@ class Grid1D:
                 self.filter_rate = torch.from_numpy(self.filter_rate).to(
                     dtype=torch_dtype, device=self.torch_device
                 )
+        elif self.precision == "single" and self._basis_name == "fourier":
+            # Coordinates stay float64 so they match the FFT operators.
+            _note_numpy_fourier_single()
         elif self.precision == "single":
-            self.x = self.x.astype(np.float32)
+            self.x = np.asarray(self.x).astype(np.float32, copy=False)
 
     def set_dirichlet_bc_values(self, values: dict[str, tuple[float, float]]) -> None:
         """Set fixed endpoint density, momenta, thermal pressure, and B values.
@@ -799,8 +864,19 @@ class Grid1D:
 
     # (Chebyshev-specific DCT helpers removed)
 
-    # Spectral derivative
     def dx1(self, f: np.ndarray) -> np.ndarray:
+        """Derivative along the last axis.
+
+        Fourier spectra are multiplied by the 2/3-rule dealias mask
+        (integer modes ``|k| <= (N - 1) // 3`` when ``dealias`` is true)
+        and then by ``i k``. The mask is part of this operator, not only
+        of a separate product step. The stepper projects the conserved
+        state onto that retained band after every accepted step and
+        differentiates the nonlinear flux with this method, so the mask
+        belongs on that flux path. Linear callers — sensors, resistive
+        and viscous Laplacians, and divergence diagnostics — drop the
+        same modes. Polynomial bases have no Fourier mask.
+        """
         # Supports f with shape (..., N)
         if self._basis_name == "fourier":
             F = self.rfft(f)
@@ -924,7 +1000,11 @@ class Grid1D:
 
     # --- MHD solenoidal helpers (1D) ---
     def divergence_x(self, Bx: np.ndarray) -> np.ndarray:
-        """1D spectral divergence d(Bx)/dx using the masked derivative operator."""
+        """1D divergence ``d(Bx)/dx``.
+
+        This is :meth:`dx1`, so a Fourier result includes the 2/3 dealias
+        mask described there.
+        """
         return self.dx1(Bx)
 
     def project_solenoidal_x(self, Bx: np.ndarray) -> np.ndarray:
@@ -946,7 +1026,12 @@ class Grid1D:
         return np.full_like(Bx, float(Bx.mean()))
 
     def laplacian(self, f: np.ndarray) -> np.ndarray:
-        """1D spectral Laplacian d^2/dx^2 (for explicit resistivity/viscosity)."""
+        """Second derivative along the last axis.
+
+        The Fourier result uses the same 2/3 dealias mask as :meth:`dx1`,
+        including when the Laplacian is a linear diffusion operator.
+        Polynomial bases use the unmasked second-derivative matrix.
+        """
         if self._basis_name != "fourier":
             return self._basis.d2x(f)
         F = self.rfft(f)
@@ -968,17 +1053,23 @@ class Grid1D:
         return _periodic_linear_1d(f, xp, self.Lx)
 
     def evaluate_fourier_at_points_1d(self, f: np.ndarray, xp: np.ndarray) -> np.ndarray:
-        """Evaluate a Fourier-represented field at arbitrary points (Fourier basis only).
+        """Evaluate a Fourier field at arbitrary points.
 
-        f(x) = (1/N) * Re( sum_k F_k exp(i*k*x) ) on retained modes.
-        Supports NumPy and PyTorch (including MPS/CUDA); keeps tensors on same device.
+        ``f(x) = (1/N) * Re(sum_k F_k exp(i*k*x))`` on the retained band.
+        The same 2/3-rule dealias mask used by :meth:`dx1` is applied
+        before the sum. The stepper projects the conserved state onto
+        that band after every accepted step. A derived field such as
+        velocity ``= momentum / density`` can still contain modes with
+        ``|k| > (N - 1) // 3``, and those modes are discarded here.
+        Supports NumPy and PyTorch (including MPS/CUDA); tensors stay
+        on their device.
 
         Args:
-            f: Field on grid, shape (..., N); last axis is spatial.
-            xp: Query points, shape (P,).
+            f: Field on the grid, shape ``(N,)``. Batches are rejected.
+            xp: Query points, shape ``(P,)``.
 
         Returns:
-            Values at xp, shape (P,). Same dtype/device as f (real).
+            Values at ``xp``, shape ``(P,)``. Same dtype/device as ``f``.
         """
         if self._basis_name != "fourier":
             raise ValueError("evaluate_fourier_at_points_1d requires Fourier basis")
@@ -990,6 +1081,11 @@ class Grid1D:
         else:
             f_np = np.asarray(f)
             xp_np = np.asarray(xp, dtype=np.float64)
+        if np.ndim(f_np) != 1:
+            raise ValueError(
+                "evaluate_fourier_at_points_1d expects one field of shape "
+                f"(N,); got shape {np.shape(f_np)}"
+            )
         dealias = _to_np(self.dealias_mask)
         f_flat = np.reshape(f_np, (-1, self.N))
         F = np.fft.fft(f_flat, axis=-1)
@@ -1080,43 +1176,6 @@ class Grid1D:
         return result
 
 
-def _build_legendre_diff_matrix_1d(x: np.ndarray, L: float) -> np.ndarray:
-    """Build Legendre differentiation matrix for 1D.
-    
-    Args:
-        x: Legendre-Gauss-Lobatto points
-        L: Domain length
-        
-    Returns:
-        Differentiation matrix D with shape (N, N)
-    """
-    N = len(x)
-    D = np.zeros((N, N))
-    
-    # Map x from [0, L] to [-1, 1]
-    xi = 2.0 * x / L - 1.0
-    
-    # Legendre differentiation matrix on [-1, 1]
-    for i in range(N):
-        for j in range(N):
-            if i != j:
-                # Standard Legendre differentiation formula
-                D[i, j] = (1.0 / (xi[i] - xi[j])) * np.sqrt((1 - xi[j]**2) / (1 - xi[i]**2))
-            else:
-                # Diagonal elements
-                if i == 0:
-                    D[i, i] = -N * (N - 1) / 4.0
-                elif i == N - 1:
-                    D[i, i] = N * (N - 1) / 4.0
-                else:
-                    D[i, i] = 0.0
-    
-    # Scale by 2/L to account for mapping from [-1,1] to [0,L]
-    D *= 2.0 / L
-    
-    return D
-
-
 @dataclass
 class Grid2D:
     """Uniform periodic 2D grid and spectral operators.
@@ -1198,54 +1257,30 @@ class Grid2D:
             except Exception as e:
                 raise RuntimeError(f"2D Legendre basis initialization failed: {e}")
         else:
-            # Hybrid or pure Fourier basis
+            # Pure Fourier, or Fourier in x with SBP in y.
             self._legendre_basis = None
-            
-            # Set up x-direction (Fourier or Legendre)
+            if self.basis_x == "legendre" or self.basis_y == "legendre":
+                raise NotImplementedError(
+                    "Mixed Fourier/Legendre grids are not implemented. "
+                    "Use Legendre on both axes, Fourier on both axes, or "
+                    "Fourier in x with SBP in y."
+                )
+
             if self.basis_x == "fourier":
                 self.x = np.linspace(0.0, self.Lx, num=self.Nx, endpoint=False)
                 kx_index = np.fft.fftfreq(self.Nx, d=self.dx)
                 self.kx = 2.0 * np.pi * kx_index  # shape (Nx,)
                 self.ikx = 1j * self.kx[None, :]  # shape (1, Nx)
                 self.Dx = None  # Will use FFT for derivatives
-            elif self.basis_x == "legendre":
-                # Legendre-Gauss-Lobatto points
-                from scipy.special import roots_legendre
-                xi, _ = roots_legendre(self.Nx)
-                self.x = 0.5 * self.Lx * (xi + 1.0)  # Map [-1,1] to [0, Lx]
-                # Legendre differentiation matrix
-                self.Dx = _build_legendre_diff_matrix_1d(self.x, self.Lx)
-                self.kx = None
-                self.ikx = None
-                try:
-                    import numpy as _np
-                    self.dx_min = float(_np.min(_np.diff(self.x))) if len(self.x) > 1 else self.dx
-                except Exception:
-                    self.dx_min = self.dx
             else:
                 raise ValueError(f"Unknown basis_x: {self.basis_x}")
-            
-            # Set up y-direction (Fourier or Legendre)
+
             if self.basis_y == "fourier":
                 self.y = np.linspace(0.0, self.Ly, num=self.Ny, endpoint=False)
                 ky_index = np.fft.fftfreq(self.Ny, d=self.dy)
                 self.ky = 2.0 * np.pi * ky_index  # shape (Ny,)
                 self.iky = 1j * self.ky[:, None]  # shape (Ny, 1)
                 self.Dy = None  # Will use FFT for derivatives
-            elif self.basis_y == "legendre":
-                # Legendre-Gauss-Lobatto points
-                from scipy.special import roots_legendre
-                xi, _ = roots_legendre(self.Ny)
-                self.y = 0.5 * self.Ly * (xi + 1.0)  # Map [-1,1] to [0, Ly]
-                # Legendre differentiation matrix
-                self.Dy = _build_legendre_diff_matrix_1d(self.y, self.Ly)
-                self.ky = None
-                self.iky = None
-                try:
-                    import numpy as _np
-                    self.dy_min = float(_np.min(_np.diff(self.y))) if len(self.y) > 1 else self.dy
-                except Exception:
-                    self.dy_min = self.dy
             elif self._mixed_open_y:
                 if self.Ny < 9:
                     raise ValueError("The open SBP direction requires Ny >= 9")
@@ -1354,6 +1389,8 @@ class Grid2D:
                 self.k2_safe = torch.from_numpy(np.asarray(self.k2_safe)).to(
                     dtype=torch_dtype, device=self.torch_device
                 )
+        elif self.precision == "single" and self.basis_x == "fourier":
+            _note_numpy_fourier_single()
 
     def _setup_sbp_y(self) -> None:
         """Fourth-order interior, second-order boundary diagonal-norm SBP."""
@@ -1453,8 +1490,21 @@ class Grid2D:
         return scipy_fft.ifft(f, axis=-1, workers=self.fft_workers).real
 
     def _parse_boundary_conditions(self) -> None:
-        """Parse boundary condition configuration for 2D grid."""
-        # Initialize boundary condition maps
+        """Parse boundary conditions for a 2D grid.
+
+        With no ``bc_config``, ``bc`` selects one treatment for every side.
+        ``dirichlet``, ``wall``, and ``reflective`` are kinematic walls:
+        normal momentum is zero, and density, tangential momentum, and the
+        total-energy component are copied from the adjacent node. ``neumann``
+        copies density, both momenta, and total energy. A Neumann entry
+        named ``pressure`` copies that total-energy component. It is not a
+        zero gradient of thermal pressure.
+
+        ``bc_config`` must name ``left``, ``right``, ``bottom``, and ``top``.
+        Each value is ``neumann`` or a mapping with finite ``density``,
+        ``momentum_x``, ``momentum_y``, and thermal ``pressure``. Unknown
+        names and incomplete mappings raise ``ValueError``.
+        """
         self._bc_boundary_map = {}
         self._dirichlet_values_map = {}
         if self._mixed_open_y:
@@ -1469,78 +1519,97 @@ class Grid2D:
                     raise ValueError("Fourier/SBP grids require periodic x and open y")
                 self._bc_boundary_map[side] = kind
             return
-        
+
+        names = ("density", "momentum_x", "momentum_y", "pressure")
+        sides = ("left", "right", "bottom", "top")
+
+        def _fill_neumann(boundary: str) -> None:
+            self._bc_boundary_map[boundary] = {name: "neumann" for name in names}
+
+        def _fill_wall(boundary: str) -> None:
+            normal = "momentum_x" if boundary in ("left", "right") else "momentum_y"
+            spec = {name: "neumann" for name in names}
+            spec[normal] = "dirichlet"
+            self._bc_boundary_map[boundary] = spec
+            self._dirichlet_values_map[f"{boundary}_{normal}"] = 0.0
+
+        def _finite_value(boundary: str, key: str, value: Any) -> float:
+            try:
+                number = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Boundary value {boundary}.{key} must be a real number"
+                ) from exc
+            if not np.isfinite(number):
+                raise ValueError(
+                    f"Boundary value {boundary}.{key} must be finite"
+                )
+            return number
+
         if not self.bc_config:
-            # Default all boundaries to global bc if provided
-            # Accept strings: "dirichlet" (treated as reflective wall) or "neumann"
-            if isinstance(self.bc, str) and self.bc in ("dirichlet", "neumann", "wall", "reflective"):
-                default = self.bc
-                if default in ("neumann",):
-                    for boundary in ["left", "right", "top", "bottom"]:
-                        self._bc_boundary_map[boundary] = {
-                            "density": "neumann",
-                            "momentum_x": "neumann",
-                            "momentum_y": "neumann",
-                            "pressure": "neumann",
-                        }
-                else:
-                    # Treat "dirichlet"/"wall"/"reflective" as solid reflective walls:
-                    # - zero normal momentum (Dirichlet u_n=0)
-                    # - zero-gradient for tangential momentum, density, and pressure (Neumann)
-                    # Left/right: normal is x
-                    for boundary in ["left", "right"]:
-                        self._bc_boundary_map[boundary] = {
-                            "density": "neumann",
-                            "momentum_x": "dirichlet",  # u_n = 0
-                            "momentum_y": "neumann",    # tangential
-                            "pressure": "neumann",
-                        }
-                        # Provide Dirichlet value for momentum_x → 0
-                        self._dirichlet_values_map[f"{boundary}_momentum_x"] = 0.0
-                    # Bottom/top: normal is y
-                    for boundary in ["bottom", "top"]:
-                        self._bc_boundary_map[boundary] = {
-                            "density": "neumann",
-                            "momentum_x": "neumann",    # tangential
-                            "momentum_y": "dirichlet",  # u_n = 0
-                            "pressure": "neumann",
-                        }
-                        # Provide Dirichlet value for momentum_y → 0
-                        self._dirichlet_values_map[f"{boundary}_momentum_y"] = 0.0
-            return
-            
-        # Parse boundary-specific configurations
-        for boundary, config in self.bc_config.items():
-            if boundary in ["left", "right", "top", "bottom"]:
-                if isinstance(config, dict):
-                    # Dirichlet boundary with specific values
-                    self._bc_boundary_map[boundary] = {}
-                    self._dirichlet_values_map[f"{boundary}_density"] = config.get("density", 1.0)
-                    self._dirichlet_values_map[f"{boundary}_momentum_x"] = config.get("momentum_x", 0.0)
-                    self._dirichlet_values_map[f"{boundary}_momentum_y"] = config.get("momentum_y", 0.0)
-                    self._dirichlet_values_map[f"{boundary}_pressure"] = config.get("pressure", 1.0)
-                    
-                    # Set boundary conditions for each variable
-                    self._bc_boundary_map[boundary]["density"] = "dirichlet"
-                    self._bc_boundary_map[boundary]["momentum_x"] = "dirichlet"
-                    self._bc_boundary_map[boundary]["momentum_y"] = "dirichlet"
-                    self._bc_boundary_map[boundary]["pressure"] = "dirichlet"
-                elif config == "neumann":
-                    # Neumann boundary
-                    self._bc_boundary_map[boundary] = {
-                        "density": "neumann",
-                        "momentum_x": "neumann", 
-                        "momentum_y": "neumann",
-                        "pressure": "neumann"
-                    }
-                elif config == "dirichlet":
-                    # Default Dirichlet boundary
-                    self._bc_boundary_map[boundary] = {
-                        "density": "dirichlet",
-                        "momentum_x": "dirichlet",
-                        "momentum_y": "dirichlet", 
-                        "pressure": "dirichlet"
-                    }
+            if not isinstance(self.bc, str) or not str(self.bc).strip():
+                raise ValueError(
+                    f"Unknown 2D boundary condition {self.bc!r}. "
+                    "Expected 'dirichlet', 'wall', 'reflective', or 'neumann'."
+                )
+            default = str(self.bc).strip().lower()
+            if default in ("dirichlet", "wall", "reflective"):
+                for boundary in sides:
+                    _fill_wall(boundary)
+                return
+            if default == "neumann":
+                for boundary in sides:
+                    _fill_neumann(boundary)
+                return
+            raise ValueError(
+                f"Unknown 2D boundary condition {self.bc!r}. "
+                "Expected 'dirichlet', 'wall', 'reflective', or 'neumann'."
+            )
+
+        if not isinstance(self.bc_config, dict):
+            raise TypeError("bc_config must be a mapping of boundary names")
+        unknown = [name for name in self.bc_config if name not in sides]
+        if unknown:
+            raise ValueError(f"Unknown 2D boundary {unknown[0]!r} in bc_config")
+        missing = [name for name in sides if name not in self.bc_config]
+        if missing:
+            raise ValueError(
+                "bc_config must specify left, right, bottom, and top; "
+                f"missing {', '.join(missing)}"
+            )
+        for boundary in sides:
+            config = self.bc_config[boundary]
+            if isinstance(config, dict):
+                missing_keys = [key for key in names if key not in config]
+                if missing_keys:
+                    raise ValueError(
+                        f"Dirichlet boundary {boundary!r} is missing "
+                        f"{', '.join(missing_keys)}. density, momentum_x, "
+                        "momentum_y, and pressure are required and are not defaulted."
+                    )
+                extra = [key for key in config if key not in names]
+                if extra:
+                    raise ValueError(
+                        f"Unknown Dirichlet value {extra[0]!r} for boundary {boundary!r}"
+                    )
+                self._bc_boundary_map[boundary] = {key: "dirichlet" for key in names}
+                for key in names:
+                    self._dirichlet_values_map[f"{boundary}_{key}"] = _finite_value(
+                        boundary, key, config[key]
+                    )
+            elif isinstance(config, str) and config.strip().lower() == "neumann":
+                _fill_neumann(boundary)
+            elif isinstance(config, str) and config.strip().lower() == "dirichlet":
+                raise ValueError(
+                    f"Boundary {boundary!r} is 'dirichlet' without values. "
+                    "Pass density, momentum_x, momentum_y, and pressure."
+                )
+            else:
+                raise ValueError(
+                    f"Unknown 2D boundary condition {config!r} for {boundary}. "
+                    "Use 'neumann', or a mapping of density, momentum_x, "
+                    "momentum_y, and pressure."
+                )
 
     def initialize_boundary_conditions(self, U, equations):
         """Store the initial ambient exterior for the mixed-grid open faces."""
@@ -1602,14 +1671,17 @@ class Grid2D:
         return rhs
 
     def apply_boundary_conditions(self, U: np.ndarray, equations) -> np.ndarray:
-        """Apply boundary conditions to conservative variables U in-place for 2D grid.
-        
-        Args:
-            U: Conservative variables array with shape (4, Ny, Nx)
-            equations: Equations object for variable interpretation
-            
-        Returns:
-            U with boundary conditions applied
+        """Return a 2D state with boundary conditions applied.
+
+        The input array is not modified. Fourier and Fourier/SBP grids
+        return it unchanged; open SBP faces are enforced by the boundary
+        flux. On a Legendre grid the returned array is a copy.
+
+        A Neumann ``pressure`` entry copies the total-energy component
+        from the adjacent node. It does not impose a zero gradient of
+        thermal pressure. A Dirichlet ``pressure`` value is thermal
+        pressure and is stored as
+        ``E = p / (gamma - 1) + (m_x^2 + m_y^2) / (2 rho)``.
         """
         if self._mixed_open_y:
             if U.shape[0] not in (4, 8) or U.shape[-2:] != (self.Ny, self.Nx):
@@ -1618,78 +1690,106 @@ class Grid2D:
                 self.initialize_boundary_conditions(U, equations)
             return U
         if self._legendre_basis is None:
-            # Only apply BCs for Legendre basis
             return U
-            
+
         if U.shape[-2:] != (self.Ny, self.Nx):
             return U
         if U.shape[0] < 4:
             return U
 
-        # Helper function to apply zero-gradient (Neumann)
-        def _apply_neumann(comp_idx: int, boundary: str) -> None:
+        is_torch = _TORCH_AVAILABLE and torch is not None and isinstance(U, torch.Tensor)
+        work = U.clone() if is_torch else U.copy()
+
+        def _edge(boundary: str) -> tuple:
             if boundary == "left":
-                if self.Nx >= 2:
-                    U[comp_idx, :, 0] = U[comp_idx, :, 1]
-            elif boundary == "right":
-                if self.Nx >= 2:
-                    U[comp_idx, :, -1] = U[comp_idx, :, -2]
-            elif boundary == "bottom":
-                if self.Ny >= 2:
-                    U[comp_idx, 0, :] = U[comp_idx, 1, :]
-            elif boundary == "top":
-                if self.Ny >= 2:
-                    U[comp_idx, -1, :] = U[comp_idx, -2, :]
+                return (slice(None), 0)
+            if boundary == "right":
+                return (slice(None), -1)
+            if boundary == "bottom":
+                return (0, slice(None))
+            return (-1, slice(None))
 
-        # Helper function to apply Dirichlet values
-        def _apply_dirichlet(comp_idx: int, var_key: str, boundary: str) -> None:
-            value_key = f"{boundary}_{var_key}"
-            if value_key in self._dirichlet_values_map:
-                value = self._dirichlet_values_map[value_key]
-                if boundary == "left":
-                    U[comp_idx, :, 0] = value
-                elif boundary == "right":
-                    U[comp_idx, :, -1] = value
-                elif boundary == "bottom":
-                    U[comp_idx, 0, :] = value
-                elif boundary == "top":
-                    U[comp_idx, -1, :] = value
-            else:
-                # Fallback to Neumann
-                _apply_neumann(comp_idx, boundary)
+        def _interior(boundary: str) -> tuple:
+            if boundary == "left":
+                return (slice(None), 1)
+            if boundary == "right":
+                return (slice(None), -2)
+            if boundary == "bottom":
+                return (1, slice(None))
+            return (-2, slice(None))
 
-        # Apply boundary conditions for each boundary
-        for boundary in ["left", "right", "top", "bottom"]:
-            if boundary not in self._bc_boundary_map:
+        def _has_neighbor(boundary: str) -> bool:
+            if boundary in ("left", "right"):
+                return self.Nx >= 2
+            return self.Ny >= 2
+
+        def _write(comp: int, boundary: str, values) -> None:
+            work[(comp,) + _edge(boundary)] = values
+
+        def _read_interior(comp: int, boundary: str):
+            return work[(comp,) + _interior(boundary)]
+
+        def _gamma() -> float:
+            if equations is not None and hasattr(equations, "gamma"):
+                gamma = float(equations.gamma)
+                if not np.isfinite(gamma) or gamma <= 1.0:
+                    raise ValueError("equations.gamma must be finite and greater than 1")
+                self._boundary_gamma = gamma
+                return gamma
+            gamma = getattr(self, "_boundary_gamma", None)
+            if gamma is None:
+                raise ValueError(
+                    "Dirichlet pressure requires equations so thermal "
+                    "pressure can be converted to total energy"
+                )
+            return float(gamma)
+
+        for boundary in ("left", "right", "top", "bottom"):
+            bc_config = self._bc_boundary_map.get(boundary)
+            if not bc_config:
                 continue
-                
-            bc_config = self._bc_boundary_map[boundary]
-            
-            # Density (component 0)
-            if bc_config.get("density") == "neumann":
-                _apply_neumann(0, boundary)
-            elif bc_config.get("density") == "dirichlet":
-                _apply_dirichlet(0, "density", boundary)
-                
-            # Momentum x (component 1)
-            if bc_config.get("momentum_x") == "neumann":
-                _apply_neumann(1, boundary)
-            elif bc_config.get("momentum_x") == "dirichlet":
-                _apply_dirichlet(1, "momentum_x", boundary)
-                
-            # Momentum y (component 2)
-            if bc_config.get("momentum_y") == "neumann":
-                _apply_neumann(2, boundary)
-            elif bc_config.get("momentum_y") == "dirichlet":
-                _apply_dirichlet(2, "momentum_y", boundary)
-                
-            # Pressure (component 3 - energy)
-            if bc_config.get("pressure") == "neumann":
-                _apply_neumann(3, boundary)
-            elif bc_config.get("pressure") == "dirichlet":
-                _apply_dirichlet(3, "pressure", boundary)
-
-        return U
+            for comp, name in ((0, "density"), (1, "momentum_x"), (2, "momentum_y")):
+                kind = bc_config.get(name)
+                if kind == "neumann":
+                    if _has_neighbor(boundary):
+                        _write(comp, boundary, _read_interior(comp, boundary))
+                elif kind == "dirichlet":
+                    value_key = f"{boundary}_{name}"
+                    if value_key not in self._dirichlet_values_map:
+                        raise ValueError(
+                            f"Dirichlet boundary {boundary}.{name} has no value"
+                        )
+                    _write(comp, boundary, self._dirichlet_values_map[value_key])
+            kind = bc_config.get("pressure")
+            if kind == "neumann":
+                # Copies total energy, not thermal pressure.
+                if _has_neighbor(boundary):
+                    _write(3, boundary, _read_interior(3, boundary))
+            elif kind == "dirichlet":
+                if work.shape[0] != 4:
+                    raise ValueError(
+                        "Dirichlet thermal pressure is implemented for a "
+                        "4-component hydro state"
+                    )
+                value_key = f"{boundary}_pressure"
+                if value_key not in self._dirichlet_values_map:
+                    raise ValueError(
+                        f"Dirichlet boundary {boundary}.pressure has no value"
+                    )
+                pressure = self._dirichlet_values_map[value_key]
+                gamma = _gamma()
+                rho = work[(0,) + _edge(boundary)]
+                mx = work[(1,) + _edge(boundary)]
+                my = work[(2,) + _edge(boundary)]
+                if is_torch:
+                    bad_density = bool(torch.any(rho <= 0).item())
+                else:
+                    bad_density = bool(np.any(np.asarray(rho) <= 0.0))
+                if bad_density or not pressure > 0.0:
+                    raise ValueError("Boundary density and pressure must be positive")
+                kinetic = 0.5 * (mx ** 2 + my ** 2) / rho
+                _write(3, boundary, pressure / (gamma - 1.0) + kinetic)
+        return work
 
     # 2D FFT wrappers
     def fft2(self, f: np.ndarray) -> np.ndarray:
@@ -1732,7 +1832,11 @@ class Grid2D:
         """Evaluate a Fourier-represented 2D field at arbitrary points (Fourier x and y only).
 
         f(x,y) = (1/(Nx*Ny)) * Re( sum_{kx,ky} F exp(i*kx*x + i*ky*y) )
-        on the retained 2/3-dealiased modes.
+        on the retained 2/3-dealiased modes. The same tensor-product mask
+        used by :meth:`dx1` is applied first. The stepper projects the
+        conserved state onto that band after every accepted step. A derived
+        field such as velocity can still carry modes outside the box, and
+        those modes are discarded here.
         Supports NumPy and PyTorch (including MPS/CUDA); keeps tensors on same device.
 
         Args:
@@ -1784,7 +1888,11 @@ class Grid2D:
         xp: np.ndarray,
         yp: np.ndarray,
     ) -> tuple:
-        """Evaluate two Fourier fields at one shared set of 2-D points."""
+        """Evaluate two Fourier fields at one shared set of 2-D points.
+
+        Both fields are restricted to the retained 2/3-rule band before
+        evaluation, as in :meth:`evaluate_fourier_at_points`.
+        """
         if self.basis_x != "fourier" or self.basis_y != "fourier":
             raise ValueError(
                 "evaluate_fourier_at_points_batched_2d requires Fourier basis"
@@ -1859,43 +1967,47 @@ class Grid2D:
         return vx.astype(fx_np.dtype), vy.astype(fy_np.dtype)
 
     def dx1(self, f: np.ndarray) -> np.ndarray:
-        # derivative along x on last spatial axis
+        """Derivative along x, the last axis.
+
+        On a periodic grid the spectrum is multiplied by the tensor-product
+        2/3 mask before differentiation. A mode is removed when
+        ``|kx| > (Nx - 1) // 3`` or ``|ky| > (Ny - 1) // 3``, so this
+        derivative also drops modes that are resolved in x but lie outside
+        the y cutoff. The mask is inside the operator. The stepper projects
+        the state onto that box after every accepted step and uses this
+        method for nonlinear fluxes. A Fourier/SBP grid masks only the
+        periodic x wavenumbers. A pure Legendre grid has no Fourier mask.
+        """
         if self._mixed_open_y:
             F = self._mixed_fft_x(f)
             return self._mixed_ifft_x(F * self.dealias_mask * self.ikx)
         if self._legendre_basis is not None:
-            # Use 2D Legendre basis directly (supports NumPy and Torch)
             return self._legendre_basis.dx(f)
-        elif self.basis_x == "fourier":
+        if self.basis_x == "fourier":
             F = self.fft2(f)
             F = self._apply_dealias_mask(F)
             dF = F * self.ikx  # broadcast over (Ny, Nx)
             return self.ifft2(dF)
-        elif self.basis_x == "legendre":
-            # Use Legendre differentiation matrix
-            # f has shape (..., Ny, Nx), we need to apply Dx to the last axis
-            return np.tensordot(f, self.Dx, axes=([-1], [1]))
-        else:
-            raise ValueError(f"Unknown basis_x: {self.basis_x}")
+        raise ValueError(f"Unknown basis_x: {self.basis_x}")
 
     def dy1(self, f: np.ndarray) -> np.ndarray:
-        # derivative along y on second-to-last spatial axis
+        """Derivative along y, the second-to-last axis.
+
+        The periodic path uses the same tensor-product 2/3 mask as
+        :meth:`dx1`, so a y derivative also drops modes outside the x
+        cutoff. A Fourier/SBP grid uses the unmasked SBP operator in y.
+        A pure Legendre grid has no Fourier mask.
+        """
         if self._mixed_open_y:
             return self._sbp_dy(f)
         if self._legendre_basis is not None:
-            # Use 2D Legendre basis directly (supports NumPy and Torch)
             return self._legendre_basis.dy(f)
-        elif self.basis_y == "fourier":
+        if self.basis_y == "fourier":
             F = self.fft2(f)
             F = self._apply_dealias_mask(F)
             dF = F * self.iky
             return self.ifft2(dF)
-        elif self.basis_y == "legendre":
-            # Use Legendre differentiation matrix
-            # f has shape (..., Ny, Nx), we need to apply Dy to the second-to-last axis
-            return np.tensordot(f, self.Dy, axes=([-2], [1]))
-        else:
-            raise ValueError(f"Unknown basis_y: {self.basis_y}")
+        raise ValueError(f"Unknown basis_y: {self.basis_y}")
 
     def project_dealiased(self, f: np.ndarray) -> np.ndarray:
         """Project Fourier directions onto the retained 2/3 modal subspace."""
@@ -1914,7 +2026,13 @@ class Grid2D:
     def apply_spectral_dissipation(
         self, f: np.ndarray, dt: float, *, project: bool = False
     ) -> np.ndarray:
-        """Apply exp(-dt*lambda(k)); optionally combine dealias projection."""
+        """Apply ``exp(-dt * lambda)`` and, if requested, the dealias mask.
+
+        ``lambda`` is ``rate`` times the sum of the x and y power-law ramps.
+        A mode at the cutoff on both axes has ``lambda = 2 * rate`` and an
+        e-folding time ``tau / 2``, where ``tau`` is
+        ``e_folding_time_at_cutoff``. That name is the single-axis time.
+        """
         if dt < 0.0:
             raise ValueError("spectral dissipation dt must be non-negative")
         if self._mixed_open_y:
@@ -1975,7 +2093,13 @@ class Grid2D:
         return result
 
     def divergence(self, Bx: np.ndarray, By: np.ndarray) -> np.ndarray:
-        """2D spectral divergence dxBx + dyBy using the masked derivative operator."""
+        """Divergence of an in-plane vector.
+
+        The periodic implementation multiplies both spectra by the
+        tensor-product 2/3 mask, the same box used by :meth:`dx1` and
+        :meth:`dy1`. A Fourier/SBP grid adds those derivative methods, so
+        only the periodic x factor of the mask is applied.
+        """
         if self._mixed_open_y:
             return self.dx1(Bx) + self.dy1(By)
         Fx = self._apply_dealias_mask(self.fft2(Bx))
@@ -2058,7 +2182,14 @@ class Grid2D:
                 self._mixed_ifft_x(Fy - self.dy_adjoint(phi)))
 
     def laplacian(self, f: np.ndarray) -> np.ndarray:
-        """2D spectral Laplacian (for explicit resistivity/viscosity)."""
+        """Scalar Laplacian.
+
+        The periodic result multiplies the spectrum by the tensor-product
+        2/3 mask (see :meth:`dx1`) before applying ``-(kx^2 + ky^2)``.
+        A Fourier/SBP grid uses ``dx1(dx1(f)) - dy_adjoint(dy1(f))``,
+        which masks only x. The mask is applied for linear diffusion as
+        well as for any other caller.
+        """
         if self._mixed_open_y:
             return self.dx1(self.dx1(f)) - self.dy_adjoint(self.dy1(f))
         if self.kx is None or self.ky is None:
@@ -2214,6 +2345,8 @@ class Grid3D:
             self.filter_rate = torch.from_numpy(np.asarray(self.filter_rate)).to(
                 dtype=torch_dtype, device=self.torch_device
             )
+        elif self.precision == "single":
+            _note_numpy_fourier_single()
 
     # 3D FFT wrappers
     def fftn(self, f: np.ndarray) -> np.ndarray:
@@ -2275,7 +2408,11 @@ class Grid3D:
         """Evaluate a Fourier-represented 3D field at arbitrary points.
 
         f(x,y,z) = (1/(Nx*Ny*Nz)) * Re( sum F exp(i*kx*x + i*ky*y + i*kz*z) )
-        on the retained 2/3-dealiased modes.
+        on the retained 2/3-dealiased modes. The same tensor-product mask
+        used by :meth:`dx1` is applied first. The stepper projects the
+        conserved state onto that band after every accepted step. A derived
+        field such as velocity can still carry modes outside the box, and
+        those modes are discarded here.
         Supports NumPy and PyTorch (including MPS/CUDA); keeps tensors on same device.
 
         Args:
@@ -2334,7 +2471,8 @@ class Grid3D:
 
         Same as calling evaluate_fourier_at_points for fx, fy, fz separately but
         reuses chunk loop and exp(E) matrices, reducing overhead (especially for
-        tracer velocity interpolation).
+        tracer velocity interpolation). Each field is restricted to the
+        retained 2/3-rule band before evaluation.
         """
         is_torch_input = _TORCH_AVAILABLE and torch is not None and getattr(self, "_use_torch", False) and isinstance(fx, torch.Tensor)
         if is_torch_input:
@@ -2396,11 +2534,16 @@ class Grid3D:
 
     # --- MHD solenoidal helpers (3D) ---
     def divergence(self, Vx: np.ndarray, Vy: np.ndarray, Vz: np.ndarray) -> np.ndarray:
-        """3D spectral divergence dxVx + dyVy + dzVz (masked derivative operator).
+        """3D divergence ``dx Vx + dy Vy + dz Vz``.
 
-        Used as the div(B) diagnostic. After project_solenoidal this is zero to
-        machine precision because k.V_hat = 0 on every retained mode and the
-        mask only zeroes high modes.
+        Each spectrum is multiplied by the tensor-product 2/3 mask before
+        the derivatives. A mode is removed if it exceeds the cutoff on any
+        axis, including an axis other than the one being differentiated.
+        The mask is inside this operator. The stepper projects the conserved
+        state onto that box after every accepted step; linear diagnostics
+        that call this method drop the same modes. After
+        ``project_solenoidal`` the result is zero to machine precision on
+        the retained modes because ``k·V_hat = 0`` there.
         """
         Fx = self._apply_dealias_mask(self.fftn(Vx))
         Fy = self._apply_dealias_mask(self.fftn(Vy))
@@ -2447,7 +2590,12 @@ class Grid3D:
         return self.ifftn(Fx), self.ifftn(Fy), self.ifftn(Fz)
 
     def curl(self, Vx: np.ndarray, Vy: np.ndarray, Vz: np.ndarray):
-        """3D spectral curl (masked derivative operator). Returns (Cx, Cy, Cz)."""
+        """3D curl. Returns ``(Cx, Cy, Cz)``.
+
+        Each spectrum is multiplied by the tensor-product 2/3 mask before
+        the derivatives, the same box described on :meth:`divergence`. The
+        mask is applied for every caller, not only for nonlinear products.
+        """
         Fx = self._apply_dealias_mask(self.fftn(Vx))
         Fy = self._apply_dealias_mask(self.fftn(Vy))
         Fz = self._apply_dealias_mask(self.fftn(Vz))
@@ -2457,7 +2605,12 @@ class Grid3D:
         return Cx, Cy, Cz
 
     def laplacian(self, f: np.ndarray) -> np.ndarray:
-        """3D spectral Laplacian (used for explicit resistivity/viscosity)."""
+        """Scalar Laplacian used for explicit resistivity and viscosity.
+
+        The spectrum is multiplied by the tensor-product 2/3 mask (see
+        :meth:`dx1`) before ``-(kx^2 + ky^2 + kz^2)`` is applied. Linear
+        diffusion therefore drops every mode outside that box.
+        """
         F = self._apply_dealias_mask(self.fftn(f))
         if getattr(self, "_use_torch", False) and torch is not None and isinstance(F, torch.Tensor):
             k2 = self.k2.to(F.dtype)
@@ -2466,18 +2619,30 @@ class Grid3D:
         return self.ifftn(-k2 * F)
 
     def dx1(self, f: np.ndarray) -> np.ndarray:
+        """Derivative along x, the last axis.
+
+        The spectrum is multiplied by the tensor-product 2/3 mask before
+        differentiation. A mode is removed when it exceeds
+        ``(N - 1) // 3`` on x, y, or z, so this derivative also drops modes
+        that are resolved in x. The mask is inside the operator. The
+        stepper projects the state onto that box after every accepted step
+        and uses this method for nonlinear fluxes. Linear callers drop the
+        same modes.
+        """
         F = self.fftn(f)
         F = self._apply_dealias_mask(F)
         dF = F * self.ikx
         return self.ifftn(dF)
 
     def dy1(self, f: np.ndarray) -> np.ndarray:
+        """Derivative along y. Uses the same tensor-product 2/3 mask as :meth:`dx1`."""
         F = self.fftn(f)
         F = self._apply_dealias_mask(F)
         dF = F * self.iky
         return self.ifftn(dF)
 
     def dz1(self, f: np.ndarray) -> np.ndarray:
+        """Derivative along z. Uses the same tensor-product 2/3 mask as :meth:`dx1`."""
         F = self.fftn(f)
         F = self._apply_dealias_mask(F)
         dF = F * self.ikz
@@ -2492,7 +2657,14 @@ class Grid3D:
     def apply_spectral_dissipation(
         self, f: np.ndarray, dt: float, *, project: bool = False
     ) -> np.ndarray:
-        """Apply exp(-dt*lambda(k)); optionally combine dealias projection."""
+        """Apply ``exp(-dt * lambda)`` and, if requested, the dealias mask.
+
+        ``lambda`` is ``rate`` times the sum of the x, y, and z power-law
+        ramps. A mode at the cutoff on all three axes has
+        ``lambda = 3 * rate`` and an e-folding time ``tau / 3``, where
+        ``tau`` is ``e_folding_time_at_cutoff``. That name is the
+        single-axis time.
+        """
         if dt < 0.0:
             raise ValueError("spectral dissipation dt must be non-negative")
         if not self.spectral_dissipation_enabled:
@@ -2525,10 +2697,9 @@ class Grid3D:
             z_np = self.z.detach().cpu().numpy()
             # Return arrays with shape (Nz, Ny, Nx) to align with solver axes (-3,-2,-1)
             Z_np, Y_np, X_np = np.meshgrid(z_np, y_np, x_np, indexing="ij")
-            torch_dtype = torch.float32 if self.torch_device == "mps" else torch.float64
-            X = torch.from_numpy(X_np).to(dtype=torch_dtype, device=self.torch_device)
-            Y = torch.from_numpy(Y_np).to(dtype=torch_dtype, device=self.torch_device)
-            Z = torch.from_numpy(Z_np).to(dtype=torch_dtype, device=self.torch_device)
+            X = torch.from_numpy(X_np).to(dtype=self.x.dtype, device=self.torch_device)
+            Y = torch.from_numpy(Y_np).to(dtype=self.y.dtype, device=self.torch_device)
+            Z = torch.from_numpy(Z_np).to(dtype=self.z.dtype, device=self.torch_device)
             return X, Y, Z
         else:
             # Return arrays with shape (Nz, Ny, Nx)

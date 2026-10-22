@@ -85,7 +85,9 @@ def test_metal_uses_single_precision(monkeypatch):
     )
 
 
-def test_grid_default_uses_numpy_when_no_accelerator_is_installed():
+def test_grid_default_uses_numpy_when_no_accelerator_is_installed(monkeypatch):
+    monkeypatch.setattr(grid_module, "_mps_available", lambda: False)
+    monkeypatch.setattr(grid_module, "_cuda_available", lambda: False)
     grid = Grid1D(N=8, Lx=1.0)
     assert grid.backend == "numpy"
     assert grid.torch_device is None
