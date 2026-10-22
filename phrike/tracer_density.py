@@ -18,7 +18,7 @@ try:
         if isinstance(a, torch.Tensor):
             return a.detach().cpu().numpy().flatten()
         return np.asarray(a, dtype=np.float64).flatten()
-except Exception:
+except ImportError:
     def _arr_from_tracers(a: Any) -> np.ndarray:
         return np.asarray(a, dtype=np.float64).flatten()
 
@@ -219,7 +219,11 @@ def _plot_tracer_density_3d_simple(
     vmax: Optional[float] = None,
     percentile: Optional[Tuple[float, float]] = (2.0, 98.0),
 ) -> None:
-    """6-panel figure: slices (mid) and projections. extent = (xmin, xmax, ymin, ymax, zmin, zmax).
+    """6-panel figure: mid-plane slices and mean projections.
+
+    The lower row is the mean of the density along the collapsed axis, in the
+    same units as the slices, not a column integral.
+    extent = (xmin, xmax, ymin, ymax, zmin, zmax).
 
     If vmin/vmax are None, they are set from percentile of valid values (default 2–98%)
     so the color range is not dominated by a few extreme voxels.
@@ -273,7 +277,7 @@ def _plot_tracer_density_3d_simple(
         axes[0, ax_idx].set_title(f"Slice ({labels[ax_idx]}=mid)")
         axes[1, ax_idx].set_xlabel(labels[ax_idx])
     axes[0, 0].set_ylabel("Slice")
-    axes[1, 0].set_ylabel("Projection")
+    axes[1, 0].set_ylabel("Mean")
     im = axes[0, 0].images[0] if axes[0, 0].images else None
     if im is not None:
         plt.colorbar(im, cax=axcb, label="log10(density)" if log else "density")
@@ -295,7 +299,7 @@ def plot_tracer_density_3d(
     vmax: Optional[float] = None,
     percentile: Optional[Tuple[float, float]] = (2.0, 98.0),
 ) -> None:
-    """Plot 3D tracer density: slices and projections.
+    """Plot 3D tracer density: mid-plane slices and mean projections.
 
     When outpath is set, save the figure and do not block. Color range defaults
     to the 2–98% percentile so extreme cells do not dominate; pass vmin/vmax

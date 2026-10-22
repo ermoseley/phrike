@@ -16,7 +16,7 @@ try:
     import torch  # type: ignore
 
     _TORCH_AVAILABLE = True
-except Exception:  # pragma: no cover - Torch is optional
+except ImportError:  # pragma: no cover - Torch is optional
     _TORCH_AVAILABLE = False
     torch = None  # type: ignore
 
@@ -27,8 +27,19 @@ def _is_torch(value: Any) -> bool:
     )
 
 
+def _to_float64(value: Any) -> np.ndarray:
+    """Return particle coordinates as a float64 NumPy array.
+
+    Positions are integrated in float64. The field dtype is used only for
+    the temporary sample passed to the Fourier evaluator.
+    """
+    if _is_torch(value):
+        value = value.detach().cpu().numpy()
+    return np.asarray(value, dtype=np.float64)
+
+
 def _as_backend(value: Any, template: Any) -> Any:
-    """Move a position array to the field backend, device, and dtype."""
+    """Move a sample coordinate to the field backend, device, and dtype."""
     if _is_torch(template):
         assert torch is not None
         if isinstance(value, torch.Tensor):
@@ -67,8 +78,14 @@ class FourierTracers1D:
         self.lattice_shape: Optional[Tuple[int, ...]] = None
 
     def _ensure_backend(self, template: Any) -> None:
-        self.x = _as_backend(self.x, template)
-        self.x_unwrapped = _as_backend(self.x_unwrapped, template)
+        """Keep stored coordinates in float64.
+
+        ``template`` is accepted so callers can pass the velocity field.
+        Sampling casts a copy; the stored positions are not downcast.
+        """
+        del template
+        self.x = _to_float64(self.x).reshape(-1)
+        self.x_unwrapped = _to_float64(self.x_unwrapped).reshape(-1)
 
     @staticmethod
     def _sample(grid: Any, velocity: Any, x: Any) -> Any:
@@ -88,15 +105,17 @@ class FourierTracers1D:
         if dt < 0.0 or not np.isfinite(dt):
             raise ValueError("Tracer timestep must be finite and non-negative")
         u0 = _velocities(equations, U, 1)[0]
-        self._ensure_backend(u0)
-        v0 = self._sample(grid, u0, self.x_unwrapped)
-        midpoint = self.x_unwrapped + 0.5 * dt * v0
+        x_unwrapped = _to_float64(self.x_unwrapped).reshape(-1)
+        v0 = _to_float64(self._sample(grid, u0, _as_backend(x_unwrapped, u0))).reshape(-1)
+        midpoint = x_unwrapped + 0.5 * float(dt) * v0
         end_state = U if U_new is None else U_new
         midpoint_state = 0.5 * (U + end_state)
         u_midpoint = _velocities(equations, midpoint_state, 1)[0]
-        v_midpoint = self._sample(grid, u_midpoint, midpoint)
-        self.x_unwrapped = self.x_unwrapped + dt * v_midpoint
-        self.x = _wrap(self.x_unwrapped, grid.Lx)
+        v_midpoint = _to_float64(
+            self._sample(grid, u_midpoint, _as_backend(midpoint, u_midpoint))
+        ).reshape(-1)
+        self.x_unwrapped = x_unwrapped + float(dt) * v_midpoint
+        self.x = _wrap(self.x_unwrapped, float(grid.Lx))
 
 
 class FourierTracers2D:
@@ -119,8 +138,10 @@ class FourierTracers2D:
         self.lattice_shape = lattice_shape
 
     def _ensure_backend(self, template: Any) -> None:
+        """Keep stored coordinates in float64. See ``FourierTracers1D``."""
+        del template
         for name in ("x", "y", "x_unwrapped", "y_unwrapped"):
-            setattr(self, name, _as_backend(getattr(self, name), template))
+            setattr(self, name, _to_float64(getattr(self, name)).reshape(-1))
 
     @staticmethod
     def _sample(
@@ -151,23 +172,31 @@ class FourierTracers2D:
         if dt < 0.0 or not np.isfinite(dt):
             raise ValueError("Tracer timestep must be finite and non-negative")
         velocity0 = _velocities(equations, U, 2)
-        ux0 = velocity0[0]
-        self._ensure_backend(ux0)
+        x_unwrapped = _to_float64(self.x_unwrapped).reshape(-1)
+        y_unwrapped = _to_float64(self.y_unwrapped).reshape(-1)
         vx0, vy0 = self._sample(
-            grid, velocity0, self.x_unwrapped, self.y_unwrapped
+            grid,
+            velocity0,
+            _as_backend(x_unwrapped, velocity0[0]),
+            _as_backend(y_unwrapped, velocity0[0]),
         )
-        x_midpoint = self.x_unwrapped + 0.5 * dt * vx0
-        y_midpoint = self.y_unwrapped + 0.5 * dt * vy0
+        vx0 = _to_float64(vx0).reshape(-1)
+        vy0 = _to_float64(vy0).reshape(-1)
+        x_midpoint = x_unwrapped + 0.5 * float(dt) * vx0
+        y_midpoint = y_unwrapped + 0.5 * float(dt) * vy0
         end_state = U if U_new is None else U_new
         midpoint_state = 0.5 * (U + end_state)
         velocity_midpoint = _velocities(equations, midpoint_state, 2)
         vx_midpoint, vy_midpoint = self._sample(
-            grid, velocity_midpoint, x_midpoint, y_midpoint
+            grid,
+            velocity_midpoint,
+            _as_backend(x_midpoint, velocity_midpoint[0]),
+            _as_backend(y_midpoint, velocity_midpoint[0]),
         )
-        self.x_unwrapped = self.x_unwrapped + dt * vx_midpoint
-        self.y_unwrapped = self.y_unwrapped + dt * vy_midpoint
-        self.x = _wrap(self.x_unwrapped, grid.Lx)
-        self.y = _wrap(self.y_unwrapped, grid.Ly)
+        self.x_unwrapped = x_unwrapped + float(dt) * _to_float64(vx_midpoint).reshape(-1)
+        self.y_unwrapped = y_unwrapped + float(dt) * _to_float64(vy_midpoint).reshape(-1)
+        self.x = _wrap(self.x_unwrapped, float(grid.Lx))
+        self.y = _wrap(self.y_unwrapped, float(grid.Ly))
 
 
 class FourierTracers3D:
@@ -193,6 +222,8 @@ class FourierTracers3D:
         self.lattice_shape = lattice_shape
 
     def _ensure_backend(self, template: Any) -> None:
+        """Keep stored coordinates in float64. See ``FourierTracers1D``."""
+        del template
         for name in (
             "x",
             "y",
@@ -201,7 +232,7 @@ class FourierTracers3D:
             "y_unwrapped",
             "z_unwrapped",
         ):
-            setattr(self, name, _as_backend(getattr(self, name), template))
+            setattr(self, name, _to_float64(getattr(self, name)).reshape(-1))
 
     @staticmethod
     def _sample(
@@ -228,29 +259,47 @@ class FourierTracers3D:
         U_new: Optional[Any] = None,
     ) -> None:
         """Advance one accepted gas step with two-evaluation explicit midpoint."""
+        basis = getattr(grid, "basis", None)
+        if basis is not None and str(basis).lower() != "fourier":
+            raise ValueError("FourierTracers3D requires a Fourier grid")
+        for axis in ("x", "y", "z"):
+            axis_basis = getattr(grid, f"basis_{axis}", None)
+            if axis_basis is not None and str(axis_basis).lower() != "fourier":
+                raise ValueError("FourierTracers3D requires a Fourier grid")
         if dt < 0.0 or not np.isfinite(dt):
             raise ValueError("Tracer timestep must be finite and non-negative")
         velocity0 = _velocities(equations, U, 3)
-        self._ensure_backend(velocity0[0])
+        x_unwrapped = _to_float64(self.x_unwrapped).reshape(-1)
+        y_unwrapped = _to_float64(self.y_unwrapped).reshape(-1)
+        z_unwrapped = _to_float64(self.z_unwrapped).reshape(-1)
+        template = velocity0[0]
         vx0, vy0, vz0 = self._sample(
             grid,
             velocity0,
-            self.x_unwrapped,
-            self.y_unwrapped,
-            self.z_unwrapped,
+            _as_backend(x_unwrapped, template),
+            _as_backend(y_unwrapped, template),
+            _as_backend(z_unwrapped, template),
         )
-        x_midpoint = self.x_unwrapped + 0.5 * dt * vx0
-        y_midpoint = self.y_unwrapped + 0.5 * dt * vy0
-        z_midpoint = self.z_unwrapped + 0.5 * dt * vz0
+        vx0 = _to_float64(vx0).reshape(-1)
+        vy0 = _to_float64(vy0).reshape(-1)
+        vz0 = _to_float64(vz0).reshape(-1)
+        x_midpoint = x_unwrapped + 0.5 * float(dt) * vx0
+        y_midpoint = y_unwrapped + 0.5 * float(dt) * vy0
+        z_midpoint = z_unwrapped + 0.5 * float(dt) * vz0
         end_state = U if U_new is None else U_new
         midpoint_state = 0.5 * (U + end_state)
         velocity_midpoint = _velocities(equations, midpoint_state, 3)
+        midpoint_template = velocity_midpoint[0]
         vx_midpoint, vy_midpoint, vz_midpoint = self._sample(
-            grid, velocity_midpoint, x_midpoint, y_midpoint, z_midpoint
+            grid,
+            velocity_midpoint,
+            _as_backend(x_midpoint, midpoint_template),
+            _as_backend(y_midpoint, midpoint_template),
+            _as_backend(z_midpoint, midpoint_template),
         )
-        self.x_unwrapped = self.x_unwrapped + dt * vx_midpoint
-        self.y_unwrapped = self.y_unwrapped + dt * vy_midpoint
-        self.z_unwrapped = self.z_unwrapped + dt * vz_midpoint
-        self.x = _wrap(self.x_unwrapped, grid.Lx)
-        self.y = _wrap(self.y_unwrapped, grid.Ly)
-        self.z = _wrap(self.z_unwrapped, grid.Lz)
+        self.x_unwrapped = x_unwrapped + float(dt) * _to_float64(vx_midpoint).reshape(-1)
+        self.y_unwrapped = y_unwrapped + float(dt) * _to_float64(vy_midpoint).reshape(-1)
+        self.z_unwrapped = z_unwrapped + float(dt) * _to_float64(vz_midpoint).reshape(-1)
+        self.x = _wrap(self.x_unwrapped, float(grid.Lx))
+        self.y = _wrap(self.y_unwrapped, float(grid.Ly))
+        self.z = _wrap(self.z_unwrapped, float(grid.Lz))
