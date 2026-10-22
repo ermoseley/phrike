@@ -1,4 +1,4 @@
-"""Hall-term viability measurements. Run ONLY on a cluster; no output files.
+"""Hall-term viability measurements. Run ONLY on a cluster; no output files except --ot-cache and --stab-cache.
 
 1D: NumPy CPU. 2D: NumPy CPU or torch CUDA. The `mri` suite is always 1D NumPy and the `adsi`
 suite always 2D NumPy (shearing-sheet ambipolar diffusion). Only `waves` also runs in 3D. `ot`,
@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import math
+import os
+import re
 import subprocess
 import sys
 import time
@@ -1100,10 +1103,118 @@ def ot_setup(args, n, hall):
     return g, s, g.project_dealiased(s._project_B(U))
 
 
-def ot_evolve(g, s, U, marks):
+REVISION = 'unknown'  # set by main; stored with every cached result
+
+
+class TooExpensive(Exception):
+    """A reference Hall run needs more substeps per ideal step than --max-hall-substeps-per-step."""
+
+
+def hms(seconds):
+    if not math.isfinite(seconds):
+        return 'n/a'
+    hours, rest = divmod(int(seconds), 3600)
+    return f'{hours}h{rest//60:02d}m{rest % 60:02d}s'
+
+
+class Probe:
+    """Live cost of one run with a Hall block, for progress lines and the substep cap.
+
+    Wraps hall.electric_field (called once per RK4 stage, so four times per Hall substep) and
+    hall.inertia_solve (CG iterations), which lets a progress line appear even while a single ideal
+    step is still inside its Hall substeps. cap is the largest number of Hall substeps one ideal
+    step (both Hall half-steps) may take before TooExpensive is raised.
+    """
+
+    def __init__(self, label, hall, end=None, every=60., cap=None, total_steps=None, note=''):
+        self.label, self.end, self.every, self.cap, self.total_steps = label, end, every, cap, total_steps
+        self.t = self.dt = 0.
+        self.steps = self.evals = self.cg = self.step_evals = 0
+        self.max_step_substeps = 0.
+        self.start = self.last = time.perf_counter()
+        field, solve = hall.electric_field, hall.inertia_solve
+
+        def counted_field(B, rho):
+            self.evals += 1
+            if self.cap is not None and (self.evals-self.step_evals)/4 > self.cap:
+                raise TooExpensive(self.label)
+            self.tick()
+            return field(B, rho)
+
+        def counted_solve(*a, **kw):
+            result = solve(*a, **kw)
+            self.cg += result[1]
+            return result
+
+        hall.electric_field, hall.inertia_solve = counted_field, counted_solve
+        print(f'START {label}: end={end if end is not None else total_steps} cap={cap} {note}'.rstrip(), flush=True)
+
+    def begin_step(self, dt):
+        self.step_evals, self.dt = self.evals, dt
+
+    def end_step(self, dt, advance=True):
+        """Close an ideal step; the warm-up step passes advance=False so t and steps exclude it."""
+        self.max_step_substeps = max(self.max_step_substeps, (self.evals-self.step_evals)/4)
+        if advance:
+            self.t += dt
+            self.steps += 1
+        self.tick()
+
+    def tick(self):
+        now = time.perf_counter()
+        if now-self.last >= self.every:
+            self.last = now
+            self.report()
+
+    def report(self, tag='PROGRESS'):
+        wall = time.perf_counter()-self.start
+        done = self.steps/self.total_steps if self.total_steps else self.t/self.end
+        eta = wall*(1-done)/done if done > 0 else math.nan
+        of = f'/{self.end:g}' if self.end is not None else f'/{self.total_steps}'
+        now = f't={self.t:.5g}' if self.end is not None else f'step={self.steps}'
+        print(f'{tag} {self.label}: {now}{of} steps={self.steps} substeps={self.evals//4} cg_iterations={self.cg} '
+              f'step_substeps={(self.evals-self.step_evals)//4} wall={hms(wall)} eta={hms(eta)}', flush=True)
+
+    def projection(self):
+        """Projected total cost from the substeps per ideal step seen so far (a lower bound as B grows)."""
+        wall = time.perf_counter()-self.start
+        per_step = max((self.evals-self.step_evals)/4, self.max_step_substeps)
+        if self.total_steps:
+            steps_total = float(self.total_steps)
+        elif self.steps and self.t > 0:
+            steps_total = self.end*self.steps/self.t
+        else:
+            steps_total = self.end/self.dt if self.dt else math.nan
+        substeps = self.evals/4
+        total = per_step*steps_total
+        return dict(per_step_substeps=per_step, steps_total=steps_total, substeps_so_far=substeps,
+                    projected_substeps=total, wall_so_far_s=wall,
+                    projected_hours=wall/max(substeps, 1.)*total/3600.)
+
+
+def too_expensive_line(what, cap, p):
+    return (f'MEASURE {what} TOO_EXPENSIVE (stopped, not a failure): cap={cap} '
+            f'per_step_substeps>={p["per_step_substeps"]:.6g} projected_steps={p["steps_total"]:.6g} '
+            f'projected_substeps={p["projected_substeps"]:.6g} projected_wall_hours={p["projected_hours"]:.6g} '
+            f'substeps_so_far={p["substeps_so_far"]:.6g} wall_so_far={hms(p["wall_so_far_s"])}')
+
+
+def save_json(path, record):
+    """Atomic write, so a preempted job never leaves a partial cache file."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name+'.tmp')
+    tmp.write_text(json.dumps(record, indent=1, default=lambda o: o.item() if isinstance(o, np.generic) else str(o)))
+    os.replace(tmp, path)
+
+
+def ot_evolve(g, s, U, marks, probe):
     """Ideal-CFL loop to each mark. Seconds include compute_dt and the CUDA sync, and exclude the
     warm-up step and the host snapshots. Returns per-mark (host state, max|div B|), steps, seconds."""
-    s.step(U, s.compute_dt(U))
+    dt = s.compute_dt(U)
+    probe.begin_step(dt)
+    s.step(U, dt)
+    probe.end_step(dt, advance=False)
     if s.hall is not None:
         s.hall.reset_stats()
     t, steps, seconds, snaps = 0., 0, 0., []
@@ -1112,7 +1223,9 @@ def ot_evolve(g, s, U, marks):
         start = time.perf_counter()
         while t < mark-1e-12:
             dt = min(s.compute_dt(U), mark-t)
+            probe.begin_step(dt)
             U = s.step(U, dt)
+            probe.end_step(dt)
             t += dt
             steps += 1
         sync(g)
@@ -1121,102 +1234,211 @@ def ot_evolve(g, s, U, marks):
     return snaps, U, steps, seconds
 
 
-def ot(args, out):
-    """Hall Orszag-Tang: reference at N and 2N against inertia runs, with an accuracy gate."""
+OT_VARIANTS = ('ref_N', 'ref_2N', 'inertia_const', 'inertia_local4', 'inertia_fixed')
+
+
+def ot_hall(args):
+    """Hall block of the ot suite and the Alfven speed of the mean state."""
     b0, rho0 = 1/np.sqrt(4*np.pi), 25/(36*np.pi)  # main's orszag_tang_2d amplitude and density
     v_a = b0/np.sqrt(rho0)
-    hall = dict(eta_h=args.ot_di*v_a, eta_h_form='proportional_to_B_over_rho', b0=b0, rho0=rho0,
-                cg_tol=args.cg_tol)
-    marks = (0.25, 0.5)
+    return dict(eta_h=args.ot_di*v_a, eta_h_form='proportional_to_B_over_rho', b0=b0, rho0=rho0,
+                cg_tol=args.cg_tol), v_a
+
+
+def ot_table(args):
+    """variant -> (label, grid points, Hall overrides); labels are the check names of the original suite."""
     n = args.n
     k_ref = 2*np.pi*4  # energy-containing band of the box L = 1
-    runs = [('reference', n, dict(method='reference')),
-            ('reference 2N', 2*n, dict(method='reference')),
-            ('inertia constant automatic l', n, dict(method='inertia', length_mode='constant')),
-            ('inertia local automatic l ratio=4', n,
-             dict(method='inertia', length_mode='local', length_ratio=4.)),
-            ('inertia fixed l k_ref*l=0.2', n, dict(method='inertia', length_mode='constant',
-                                                     length=0.2/k_ref))]
-    print(f'NOTE ot: eta_h={hall["eta_h"]:.6g} gives d_i = eta_H/v_A = {args.ot_di:g} at the mean state '
-          f'(v_A={v_a:.4g}); fixed l={0.2/k_ref:.4g}; times {marks}', flush=True)
-    data, grids = {}, {}
-    for name, size, cfg in runs:
-        g, s, U0 = ot_setup(args, size, dict(hall, **cfg))
-        initial = host(U0).copy()
-        try:
-            snaps, U, steps, seconds = ot_evolve(g, s, U0, marks)
-        except RuntimeError as error:
-            out.check(f'ot {name} N={size}', False, error=str(error)[:120])
-            continue
-        total = s.hall.total
-        gamma = s.equations.gamma
-        l_eff = float('nan')
-        if cfg['method'] == 'inertia':
-            B_end = snaps[-1][0][5:8]
-            l2 = s.hall.length_squared(U, 0.5*s.compute_dt(U))
-            J2 = current_magnitude(g, B_end)**2
-            l_eff = (math.sqrt(l2) if isinstance(l2, float)
-                     else math.sqrt(float(np.sum(host(l2)*J2)/np.sum(J2))))
-        info = dict(N=size, seconds=seconds, steps=steps, substeps=total['substeps'],
-                    cg_mean=total['cg_iterations']/max(total['cg_calls'], 1), cg_max=total['cg_max_iterations'],
-                    cg_worst_residual=total['cg_residual'],
-                    l_min=math.sqrt(total['length2_min']) if math.isfinite(total['length2_min']) else 0.,
-                    l_max=math.sqrt(total['length2_max']), l_current_weighted=l_eff)
-        results = []
-        for state_h, divb in snaps:
-            rho, m, E, B = state_h[0], state_h[1:4], state_h[4], state_h[5:8]
-            p = (gamma-1)*(E-0.5*(m*m).sum(axis=0)/rho-0.5*(B*B).sum(axis=0))
-            results.append(dict(
-                B=B, rho=rho, J=float(current_magnitude(g, B).max()), spectrum=magnetic_spectrum(B),
-                divb=divb, rho_min=float(rho.min()), p_min=float(p.min()),
-                dE_total=float(E.mean()/initial[4].mean()-1),
-                dE_mag=float(0.5*(B*B).sum(axis=0).mean()/(0.5*(initial[5:8]**2).sum(axis=0).mean())-1)))
-        data[name] = (info, results)
-        grids[name] = g
-        finite = all(np.isfinite(r['B']).all() for r in results)
-        out.check(f'ot {name} N={size}', finite and all(r['rho_min'] > 0 and r['p_min'] > 0 for r in results),
-                  max_divB=max(r['divb'] for r in results), min_rho=results[-1]['rho_min'],
-                  min_p=results[-1]['p_min'], dE_total_050=results[-1]['dE_total'],
-                  dE_mag_050=results[-1]['dE_mag'], **info)
-    if 'reference' not in data or 'reference 2N' not in data:
-        out.check('ot reference runs complete', False)
+    return {'ref_N': ('reference', n, dict(method='reference')),
+            'ref_2N': ('reference 2N', 2*n, dict(method='reference')),
+            'inertia_const': ('inertia constant automatic l', n, dict(method='inertia', length_mode='constant')),
+            'inertia_local4': ('inertia local automatic l ratio=4', n,
+                               dict(method='inertia', length_mode='local', length_ratio=4.)),
+            'inertia_fixed': ('inertia fixed l k_ref*l=0.2', n,
+                              dict(method='inertia', length_mode='constant', length=0.2/k_ref))}
+
+
+def ot_tag(mark):
+    return f'{round(mark*100):03d}'
+
+
+def ot_base(args, key, size):
+    """Cache path stem (no extension). Keyed by variant, N and the parameters that change the numbers;
+    not by revision (the revision is stored inside) and not by --ot-tend (the marks are stored inside)."""
+    return str(Path(args.ot_cache)/f'ot_{key}_N{size}_di{args.ot_di:g}_cg{args.cg_tol:g}')
+
+
+def ot_save(args, record):
+    """<base>.npz holds B and rho per mark; <base>.json holds the statistics and is written last."""
+    if not args.ot_cache:
         return
-    ref = data['reference'][1]
-    fine = data['reference 2N'][1]
+    base = ot_base(args, record['key'], record['size'])
+    meta = {k: v for k, v in record.items() if k != 'results'}
+    meta.update(revision=REVISION, ot_di=args.ot_di, cg_tol=args.cg_tol)
+    if record['status'] == 'ok':
+        Path(base).parent.mkdir(parents=True, exist_ok=True)
+        arrays, meta['scalars'] = {}, []
+        for tag, r in zip(record['tags'], record['results']):
+            arrays[f'B_{tag}'], arrays[f'rho_{tag}'] = r['B'], r['rho']
+            meta['scalars'].append({k: v for k, v in r.items() if k not in ('B', 'rho', 'spectrum')})
+        np.savez(base+'.tmp.npz', **arrays)
+        os.replace(base+'.tmp.npz', base+'.npz')
+    save_json(base+'.json', meta)
+    print(f'CACHE ot {record["key"]} N={record["size"]} status={record["status"]}: {base}.json', flush=True)
+
+
+def ot_load(args, key, size):
+    """Cached record of a variant, or None if absent."""
+    if not args.ot_cache:
+        return None
+    base = ot_base(args, key, size)
+    if not Path(base+'.json').exists():
+        return None
+    record = json.loads(Path(base+'.json').read_text())
+    if record['status'] == 'ok':
+        if not Path(base+'.npz').exists():
+            return None
+        with np.load(base+'.npz') as z:
+            record['results'] = [dict(scalars, B=z[f'B_{tag}'], rho=z[f'rho_{tag}'],
+                                      spectrum=magnetic_spectrum(z[f'B_{tag}']))
+                                 for tag, scalars in zip(record['tags'], record['scalars'])]
+    return record
+
+
+def ot_run(args, out, key, label, size, cfg, hall, marks):
+    """One variant: run, check, return its record (status ok, too_expensive or error)."""
+    g, s, U0 = ot_setup(args, size, dict(hall, **cfg))
+    initial = host(U0).copy()
+    reference = cfg['method'] == 'reference'
+    cap = args.max_hall_substeps_per_step if reference else None
+    probe = Probe(f'ot {key} N={size}', s.hall, end=marks[-1], every=args.progress_every, cap=cap)
+    record = dict(key=key, label=label, size=size, marks=list(marks), tags=[ot_tag(m) for m in marks])
+    try:
+        snaps, U, steps, seconds = ot_evolve(g, s, U0, marks, probe)
+    except RuntimeError as error:
+        out.check(f'ot {label} N={size}', False, error=str(error)[:120])
+        return dict(record, status='error', error=str(error)[:120])
+    except TooExpensive:
+        projection = probe.projection()
+        print(too_expensive_line(f'ot {label} N={size}', cap, projection), flush=True)
+        return dict(record, status='too_expensive', cap=cap, projection=projection)
+    probe.report('DONE')
+    total = s.hall.total
+    gamma = s.equations.gamma
+    l_eff = float('nan')
+    if cfg['method'] == 'inertia':
+        B_end = snaps[-1][0][5:8]
+        l2 = s.hall.length_squared(U, 0.5*s.compute_dt(U))
+        J2 = current_magnitude(g, B_end)**2
+        l_eff = (math.sqrt(l2) if isinstance(l2, float)
+                 else math.sqrt(float(np.sum(host(l2)*J2)/np.sum(J2))))
+    info = dict(N=size, seconds=seconds, steps=steps, substeps=total['substeps'],
+                cg_mean=total['cg_iterations']/max(total['cg_calls'], 1), cg_max=total['cg_max_iterations'],
+                cg_worst_residual=total['cg_residual'],
+                l_min=math.sqrt(total['length2_min']) if math.isfinite(total['length2_min']) else 0.,
+                l_max=math.sqrt(total['length2_max']), l_current_weighted=l_eff)
+    results = []
+    for state_h, divb in snaps:
+        rho, m, E, B = state_h[0], state_h[1:4], state_h[4], state_h[5:8]
+        p = (gamma-1)*(E-0.5*(m*m).sum(axis=0)/rho-0.5*(B*B).sum(axis=0))
+        results.append(dict(
+            B=B, rho=rho, J=float(current_magnitude(g, B).max()), spectrum=magnetic_spectrum(B),
+            divb=divb, rho_min=float(rho.min()), p_min=float(p.min()),
+            dE_total=float(E.mean()/initial[4].mean()-1),
+            dE_mag=float(0.5*(B*B).sum(axis=0).mean()/(0.5*(initial[5:8]**2).sum(axis=0).mean())-1)))
+    finite = all(np.isfinite(r['B']).all() for r in results)
+    last = record['tags'][-1]
+    out.check(f'ot {label} N={size}', finite and all(r['rho_min'] > 0 and r['p_min'] > 0 for r in results),
+              max_divB=max(r['divb'] for r in results), min_rho=results[-1]['rho_min'],
+              min_p=results[-1]['p_min'], **{f'dE_total_{last}': results[-1]['dE_total'],
+                                              f'dE_mag_{last}': results[-1]['dE_mag']}, **info)
+    return dict(record, status='ok', info=info, results=results)
+
+
+def ot_compare(args, out, records, table, hall):
+    """Gate and speedups from the records in memory, else from --ot-cache."""
+    n = args.n
+    recs = {}
+    for key, (label, size, cfg) in table.items():
+        recs[key] = records.get(key) or ot_load(args, key, size)
+    revisions = sorted({str(r.get('revision', REVISION)) for r in recs.values() if r})
+    print(f'NOTE ot compare: revisions of the records: {revisions}', flush=True)
+    missing = [k for k in ('ref_N', 'ref_2N') if recs[k] is None or recs[k]['status'] not in ('ok', 'too_expensive')]
+    expensive = [k for k in ('ref_N', 'ref_2N') if k not in missing and recs[k]['status'] == 'too_expensive']
+    if missing:
+        out.check('ot reference runs complete', False, unavailable=','.join(missing))
+        return
+    if expensive:
+        print(f'SKIP ot accuracy gates: reference {",".join(expensive)} was too expensive (see its MEASURE line)',
+              flush=True)
+        return
+    ref, fine = ({r['tags'][i]: r['results'][i] for i in range(len(r['tags']))} for r in (recs['ref_N'], recs['ref_2N']))
+    tags = [t for t in recs['ref_N']['tags'] if t in fine]
+    if '025' not in tags:
+        out.check('ot compare has t=0.25 snapshots of both references', False)
+        return
     kmax = n//6
+    g = ot_setup(args, n, dict(hall, method='reference'))[0]
 
     # Resolution-error yardstick: reference at 2N truncated to N against reference at N.
     yardstick = {}
-    for i, tag in enumerate(('025', '050')):
-        B = truncate(fine[i]['B'], n)
-        yardstick[tag] = relative_l2(B, ref[i]['B'])
-        es, er = magnetic_spectrum(B), ref[i]['spectrum']
+    for tag in tags:
+        B = truncate(fine[tag]['B'], n)
+        yardstick[tag] = relative_l2(B, ref[tag]['B'])
+        es, er = magnetic_spectrum(B), ref[tag]['spectrum']
         out.check(f'ot resolution error reference 2N->N vs N t={tag}', True, dB=yardstick[tag],
-                  drho=relative_l2(truncate(fine[i]['rho'], n), ref[i]['rho']),
-                  Jmax_ratio_2N_over_N=float(current_magnitude(grids['reference'], B).max())/ref[i]['J'],
+                  drho=relative_l2(truncate(fine[tag]['rho'], n), ref[tag]['rho']),
+                  Jmax_ratio_2N_over_N=float(current_magnitude(g, B).max())/ref[tag]['J'],
                   spectrum_max=float(np.max(np.abs(es[1:kmax+1]-er[1:kmax+1])/er[1:kmax+1])))
-    seconds_ref = data['reference'][0]['seconds']
-    for name, size, cfg in runs[2:]:
-        if name not in data:
+    seconds_ref = recs['ref_N']['info']['seconds']
+    for key in ('inertia_const', 'inertia_local4', 'inertia_fixed'):
+        label, size, cfg = table[key]
+        rec = recs[key]
+        if rec is None or rec['status'] != 'ok' or '025' not in rec['tags']:
+            print(f'SKIP ot accuracy gate {label}: no complete record', flush=True)
             continue
-        info, results = data[name]
+        info = rec['info']
+        by_tag = dict(zip(rec['tags'], rec['results']))
         numbers = {}
         ratios = {}
-        for i, tag in enumerate(('025', '050')):
-            B = results[i]['B']
-            numbers[f'dB_{tag}'] = relative_l2(B, ref[i]['B'])
-            numbers[f'drho_{tag}'] = relative_l2(results[i]['rho'], ref[i]['rho'])
-            numbers[f'Jmax_ratio_{tag}'] = results[i]['J']/ref[i]['J']
-            es, er = results[i]['spectrum'], ref[i]['spectrum']
+        for tag in (t for t in tags if t in by_tag):
+            B = by_tag[tag]['B']
+            numbers[f'dB_{tag}'] = relative_l2(B, ref[tag]['B'])
+            numbers[f'drho_{tag}'] = relative_l2(by_tag[tag]['rho'], ref[tag]['rho'])
+            numbers[f'Jmax_ratio_{tag}'] = by_tag[tag]['J']/ref[tag]['J']
+            es, er = by_tag[tag]['spectrum'], ref[tag]['spectrum']
             numbers[f'spectrum_max_{tag}'] = float(np.max(np.abs(es[1:kmax+1]-er[1:kmax+1])/er[1:kmax+1]))
             ratios[tag] = numbers[f'dB_{tag}']/yardstick[tag]
-        out.check(f'ot accuracy gate {name}: regularization error <= resolution error at t=0.25',
-                  ratios['025'] <= 1, ratio_025=ratios['025'], ratio_050_informational=ratios['050'],
+        out.check(f'ot accuracy gate {label}: regularization error <= resolution error at t=0.25',
+                  ratios['025'] <= 1, ratio_025=ratios['025'],
+                  **{f'ratio_{t}_informational': r for t, r in ratios.items() if t != '025'},
                   resolution_error_025=yardstick['025'], **numbers)
-        print(f'MEASURE ot speedup {name}: A_over_B={seconds_ref/info["seconds"]:.6g} '
+        print(f'MEASURE ot speedup {label}: A_over_B={seconds_ref/info["seconds"]:.6g} '
               f'(reference-N seconds / run seconds) accuracy_ratio_025={ratios["025"]:.6g} '
-              f'substeps_reference={data["reference"][0]["substeps"]} substeps_run={info["substeps"]}',
+              f'substeps_reference={recs["ref_N"]["info"]["substeps"]} substeps_run={info["substeps"]}',
               flush=True)
+
+
+def ot(args, out):
+    """Hall Orszag-Tang: reference at N and 2N against inertia runs, with an accuracy gate.
+
+    Each selected variant is run and cached (--ot-cache); the comparison reads the records of this
+    process and, for the others, the cache.
+    """
+    hall, v_a = ot_hall(args)
+    table = ot_table(args)
+    marks = (0.25,) if args.ot_tend <= 0.25+1e-12 else (0.25, args.ot_tend)
+    print(f'NOTE ot: eta_h={hall["eta_h"]:.6g} gives d_i = eta_H/v_A = {args.ot_di:g} at the mean state '
+          f'(v_A={v_a:.4g}); fixed l={table["inertia_fixed"][2]["length"]:.4g}; times {marks}', flush=True)
+    if args.ot_run and not args.ot_cache and len(args.ot_run) < len(OT_VARIANTS):
+        print('NOTE ot: no --ot-cache, so these results are not saved for a later compare', flush=True)
+    records = {}
+    for key in args.ot_run:
+        label, size, cfg = table[key]
+        records[key] = ot_run(args, out, key, label, size, cfg, hall, marks)
+        ot_save(args, records[key])
+    if args.ot_compare:
+        ot_compare(args, out, records, table, hall)
 
 
 def stability_fields(n, seed):
@@ -1238,10 +1460,12 @@ def stability_fields(n, seed):
     return dB/rms(dB), du/rms(du), f/np.max(np.abs(f))
 
 
-def stability_run(g, cfg, B, u, rho, steps, cfl):
-    """steps ideal-CFL solver steps from the given state; diagnostics after every step."""
+def stability_run(g, cfg, B, u, rho, steps, cfl, label='stability', every=60., cap=None):
+    """steps ideal-CFL solver steps from the given state; diagnostics after every step. With a cap
+    (Hall substeps per ideal step) a run that exceeds it is stopped and returns too_expensive=projection."""
     s = build(g, cfl=cfl, hall=cfg)
     eq = s.equations
+    probe = Probe(label, s.hall, every=every, cap=cap, total_steps=steps)
     U = state(g, eq, B, rho=rho, u=u, p=0.5*np.ones_like(rho))
     emag = lambda V: 0.5*(V[5:8]**2).sum(axis=0).mean()
     V = host(U)
@@ -1251,7 +1475,10 @@ def stability_run(g, cfg, B, u, rho, steps, cfl):
     result = dict(finite=True, error='', steps=0)
     try:
         for _ in range(steps):
-            U = s.step(U, s.compute_dt(U))
+            dt = s.compute_dt(U)
+            probe.begin_step(dt)
+            U = s.step(U, dt)
+            probe.end_step(dt)
             V = host(U)
             result['steps'] += 1
             if not np.isfinite(V).all():
@@ -1267,6 +1494,9 @@ def stability_run(g, cfg, B, u, rho, steps, cfl):
             history['divb'].append(s.max_div_b(U))
     except RuntimeError as error:
         result['error'] = str(error)[:120]
+    except TooExpensive:
+        return dict(result, too_expensive=probe.projection(), cap=cap)
+    probe.report('DONE')
     total = s.hall.total
     h = {key: np.array(value) for key, value in history.items()}
     result.update(
@@ -1285,47 +1515,171 @@ def stability_run(g, cfg, B, u, rho, steps, cfl):
     return result
 
 
+STAB_FORMS = ('proportional_to_B_over_rho', 'constant')
+
+
+def stability_cases():
+    """All 8 reference then 16 inertia cases in the original order, with an index and label words.
+
+    Words (selected by --stab-cases): ref|inertia, dB=, contrast=, form=prop|const and, for inertia,
+    mode= and safety=. The half-fraction design sets safety 0.5 or 1.0 by the parity of the four level indices.
+    """
+    cases = []
+    for amp in (0.1, 1.0):
+        for contrast in (1., 100.):
+            for form in STAB_FORMS:
+                cases.append(dict(kind='ref', amp=amp, contrast=contrast, form=form, mode=None, safety=None))
+    for amp in (0.1, 1.0):
+        for contrast in (1., 100.):
+            for form in STAB_FORMS:
+                for mode in ('constant', 'local'):
+                    bits = (amp > 0.5)+(contrast > 1.)+(form == 'constant')+(mode == 'local')
+                    cases.append(dict(kind='inertia', amp=amp, contrast=contrast, form=form, mode=mode,
+                                      safety=0.5 if bits % 2 == 0 else 1.0))
+    for index, c in enumerate(cases):
+        c['index'] = index
+        c['words'] = [c['kind'], f'dB={c["amp"]:g}', f'contrast={c["contrast"]:g}',
+                      'form='+('const' if c['form'] == 'constant' else 'prop')]
+        c['text'] = (f'reference dB={c["amp"]:g} contrast={c["contrast"]:g} form={c["form"]}' if c['kind'] == 'ref'
+                     else f'inertia dB={c["amp"]:g} contrast={c["contrast"]:g} form={c["form"]} '
+                          f'mode={c["mode"]} safety={c["safety"]:g}')
+        if c['kind'] == 'inertia':
+            c['words'] += [f'mode={c["mode"]}', f'safety={c["safety"]:g}']
+        c['label'] = ' '.join(c['words'])
+    return cases
+
+
+def stability_select(args, cases):
+    """--stab-cases: comma list of an index, an a-b index range, or space-separated label words that
+    must all be present (e.g. "ref dB=1 contrast=100"); --stab-ref-only / --stab-inertia-only filter the kind."""
+    keep = set(c['index'] for c in cases)
+    if args.stab_cases:
+        keep = set()
+        for token in (t.strip() for t in args.stab_cases.split(',') if t.strip()):
+            m = re.fullmatch(r'(\d+)(?:-(\d+))?', token)
+            if m:
+                lo, hi = int(m[1]), int(m[2] or m[1])
+                picked = [c['index'] for c in cases if lo <= c['index'] <= hi]
+            else:
+                picked = [c['index'] for c in cases if all(w in c['words'] for w in token.split())]
+            if not picked:
+                raise ValueError(f'--stab-cases entry {token!r} matches no case')
+            keep.update(picked)
+    selected = [c for c in cases if c['index'] in keep and not (args.stab_ref_only and c['kind'] != 'ref')
+                and not (args.stab_inertia_only and c['kind'] != 'inertia')]
+    if not selected:
+        raise ValueError('the stability case filters select no case')
+    return selected
+
+
+def stability_path(args, case):
+    return Path(args.stab_cache)/(f'stability_{"_".join(case["words"])}_N{args.n}_lh{args.stab_lh_dx:g}'
+                                  f'_steps{args.stab_steps}_cfl{args.stab_cfl:g}_cg{args.cg_tol:g}.json')
+
+
+def stability_load(args, case, records):
+    """Record of a case from this process, else from --stab-cache, else None."""
+    if case['index'] in records:
+        return records[case['index']]
+    if args.stab_cache and stability_path(args, case).exists():
+        return json.loads(stability_path(args, case).read_text())
+    return None
+
+
+def stability_reference(args, case, records):
+    """(state, peak magnetic energy) of the matched reference: state is ok, too_expensive or missing;
+    the peak is None when the reference blew up or raised (the energy gate then passes, as before)."""
+    ref = next(c for c in stability_cases() if c['kind'] == 'ref' and (c['amp'], c['contrast'], c['form'])
+               == (case['amp'], case['contrast'], case['form']))
+    record = stability_load(args, ref, records)
+    if record is None:
+        return 'missing', None
+    if record['status'] == 'too_expensive':
+        return 'too_expensive', None
+    r = record['result']
+    return 'ok', (r['emag_peak'] if r['finite'] and not r['error'] else None)
+
+
+def stability_measure(case, record):
+    if record['status'] == 'too_expensive':
+        print(too_expensive_line(f'stability {case["text"]}', record['cap'], record['too_expensive']), flush=True)
+    else:
+        print(f'MEASURE stability {case["text"]}: ' + ' '.join(
+            f'{k}={v:.6g}' if isinstance(v, float) else f'{k}={v}' for k, v in record['result'].items()), flush=True)
+
+
+def stability_gate(args, out, case, record, records):
+    r = record['result']
+    state_, reference = stability_reference(args, case, records)
+    basic = (r['finite'] and not r['error'] and r['divB_max'] < 1e-10
+             and r['rho_min'] > 10*r['rho_floor'] and r['p_min'] > 10*r['p_floor']
+             and r['cg_worst_residual'] <= max(args.cg_tol, 10*np.finfo(float).eps))
+    energy_ok = reference is None or r['emag_peak'] <= 1.1*reference
+    energy = 'skipped' if state_ != 'ok' else 'pass' if energy_ok else 'fail'
+    out.check(f'stability {case["text"]}', basic and energy != 'fail',
+              energy_gate=energy,
+              emag_peak_over_reference=(r['emag_peak']/reference if reference else float('nan')), **r)
+    if energy == 'skipped':
+        print(f'SKIP stability energy gate {case["text"]}: matched reference is {state_} '
+              f'(run the reference case, then --stab-report)', flush=True)
+
+
 def stability(args, out):
-    """Nonlinear robustness of the inertia method at large l_H/dx against the reference method."""
-    g = make_grid(args)
-    dB, du, f = stability_fields(args.n, seed=20240611)
-    eta = args.stab_lh_dx*g.dx  # b0 = rho0 = 1 and v_A = 1 at the mean state, so l_H = eta_h
-    forms = ('proportional_to_B_over_rho', 'constant')
-    base = lambda form: dict(eta_h=eta, eta_h_form=form, cg_tol=args.cg_tol)
-    fields = lambda amp, contrast: (np.array([1., 0., 0.])[:, None, None]+amp*dB, 0.5*amp*du,
-                                    np.exp(0.5*math.log(contrast)*f))
+    """Nonlinear robustness of the inertia method at large l_H/dx against the reference method.
+
+    Each selected case is run and cached (--stab-cache); the inertia energy gate reads the matched
+    reference from this process or the cache. --stab-report gates the cached results without running.
+    """
+    cases = stability_cases()
+    selected = stability_select(args, cases)
+    eta = args.stab_lh_dx*2*np.pi/args.n  # b0 = rho0 = 1 and v_A = 1 at the mean state, so l_H = eta_h
     print(f'NOTE stability: l_H/dx={args.stab_lh_dx:g} (eta_h={eta:.4g}), N={args.n}, {args.stab_steps} ideal-CFL '
           f'steps at cfl={args.stab_cfl:g}; B0=1, rms dB/B0 in (0.1, 1), u_rms = 0.5 dB, p=0.5', flush=True)
-    peaks = {}
-    for amp in (0.1, 1.0):
-        for contrast in (1., 100.):
-            for form in forms:
-                B, u, rho = fields(amp, contrast)
-                r = stability_run(g, dict(base(form), method='reference'), B, u, rho, args.stab_steps, args.stab_cfl)
-                peaks[amp, contrast, form] = r['emag_peak'] if r['finite'] and not r['error'] else None
-                print(f'MEASURE stability reference dB={amp:g} contrast={contrast:g} form={form}: ' + ' '.join(
-                    f'{k}={v:.6g}' if isinstance(v, float) else f'{k}={v}' for k, v in r.items()), flush=True)
-    for amp in (0.1, 1.0):
-        for contrast in (1., 100.):
-            for form in forms:
-                for mode in ('constant', 'local'):
-                    # Half-fraction design: safety 0.5 or 1.0 by the parity of the four level indices.
-                    bits = (amp > 0.5)+(contrast > 1.)+(form == 'constant')+(mode == 'local')
-                    safety = 0.5 if bits % 2 == 0 else 1.0
-                    cfg = dict(base(form), method='inertia', length_mode=mode, safety=safety)
-                    if mode == 'local':
-                        cfg['length_ratio'] = 4.
-                    B, u, rho = fields(amp, contrast)
-                    r = stability_run(g, cfg, B, u, rho, args.stab_steps, args.stab_cfl)
-                    reference = peaks[amp, contrast, form]
-                    energy_ok = reference is None or r['emag_peak'] <= 1.1*reference
-                    ok = (r['finite'] and not r['error'] and r['divB_max'] < 1e-10
-                          and r['rho_min'] > 10*r['rho_floor'] and r['p_min'] > 10*r['p_floor']
-                          and r['cg_worst_residual'] <= max(args.cg_tol, 10*np.finfo(float).eps) and energy_ok)
-                    out.check(f'stability inertia dB={amp:g} contrast={contrast:g} form={form} mode={mode} '
-                              f'safety={safety:g}', ok,
-                              emag_peak_over_reference=(r['emag_peak']/reference if reference else float('nan')),
-                              **r)
+    print('NOTE stability cases: ' + '; '.join(f'{c["index"]}={c["label"]}' for c in selected), flush=True)
+    records = {}
+    if not args.stab_report:
+        g = make_grid(args)
+        dB, du, f = stability_fields(args.n, seed=20240611)
+        base = lambda form: dict(eta_h=eta, eta_h_form=form, cg_tol=args.cg_tol)
+        fields = lambda amp, contrast: (np.array([1., 0., 0.])[:, None, None]+amp*dB, 0.5*amp*du,
+                                        np.exp(0.5*math.log(contrast)*f))
+        for case in selected:
+            reference = case['kind'] == 'ref'
+            cfg = dict(base(case['form']), method='reference' if reference else 'inertia')
+            if not reference:
+                cfg.update(length_mode=case['mode'], safety=case['safety'])
+                if case['mode'] == 'local':
+                    cfg['length_ratio'] = 4.
+            B, u, rho = fields(case['amp'], case['contrast'])
+            r = stability_run(g, cfg, B, u, rho, args.stab_steps, args.stab_cfl, label=f'stability {case["label"]}',
+                              every=args.progress_every, cap=args.max_hall_substeps_per_step if reference else None)
+            record = dict(index=case['index'], label=case['label'], status='ok', revision=REVISION)
+            if 'too_expensive' in r:
+                record.update(status='too_expensive', cap=r['cap'], too_expensive=r['too_expensive'])
+            else:
+                record['result'] = r
+            records[case['index']] = record
+            if args.stab_cache:
+                save_json(stability_path(args, case), record)
+                print(f'CACHE stability {case["label"]} status={record["status"]}: {stability_path(args, case)}',
+                      flush=True)
+            if reference:
+                stability_measure(case, record)
+            else:
+                stability_gate(args, out, case, record, records)
+        return
+    for case in selected:
+        record = stability_load(args, case, records)
+        if record is None:
+            print(f'SKIP stability {case["text"]}: no cached result', flush=True)
+            continue
+        records[case['index']] = record
+        if case['kind'] == 'ref':
+            stability_measure(case, record)
+        else:
+            stability_gate(args, out, case, record, records)
+    print(f'NOTE stability report: revisions of the records: '
+          f'{sorted({str(r.get("revision")) for r in records.values()})}', flush=True)
 
 
 def induction_phase_error(g, eq, X, method, length, amp, eta=3.):
@@ -1509,6 +1863,29 @@ def main():
     parser.add_argument('--stab-cfl', type=float, default=0.25)
     parser.add_argument('--mri-variants', default='reference,auto,0.05,0.2,0.5',
                         help='comma list: reference, auto, or fixed k*l values for inertia')
+    parser.add_argument('--ot-variants', default='all',
+                        help='ot: comma list of ref_N, ref_2N, inertia_const, inertia_local4, inertia_fixed to run '
+                             '(each is cached), plus `compare` for the gates and speedups from this process and '
+                             '--ot-cache; `all` (default) is the five variants and compare')
+    parser.add_argument('--ot-compare-only', action='store_true',
+                        help='ot: run nothing, gate and compare the variants cached in --ot-cache')
+    parser.add_argument('--ot-cache', default=None, help='ot: directory of the per-variant npz and json results')
+    parser.add_argument('--ot-tend', type=float, default=0.5,
+                        help='ot: end time (snapshots at 0.25 and this time; 0.25 runs the gate alone)')
+    parser.add_argument('--stab-cases', default=None,
+                        help='stability: comma list of case indices, index ranges a-b, or space-separated label '
+                             'words that must all match (e.g. "ref dB=1 contrast=100"); default all. The case '
+                             'indices and labels are printed in the NOTE line')
+    parser.add_argument('--stab-ref-only', action='store_true', help='stability: only the reference cases')
+    parser.add_argument('--stab-inertia-only', action='store_true', help='stability: only the inertia cases')
+    parser.add_argument('--stab-cache', default=None, help='stability: directory of the per-case json results')
+    parser.add_argument('--stab-report', action='store_true',
+                        help='stability: run nothing, gate the cases cached in --stab-cache')
+    parser.add_argument('--max-hall-substeps-per-step', type=float, default=None,
+                        help='ot and stability: a reference run needing more Hall substeps than this per ideal '
+                             'step is stopped, reported as a cost MEASURE and recorded as too expensive')
+    parser.add_argument('--progress-every', type=float, default=60.,
+                        help='ot and stability: wall seconds between progress lines')
     args = parser.parse_args()
     if args.n is None:
         args.n = 256 if args.suite == 'ot' else 16 if args.dim == 3 else 128
@@ -1549,6 +1926,27 @@ def main():
     for variant in args.mri_variants.split(','):
         if variant not in ('reference', 'auto') and not float(variant) > 0:
             parser.error('--mri-variants entries must be reference, auto or a positive k*l')
+    if not (np.isfinite(args.ot_tend) and args.ot_tend >= 0.25 and args.progress_every > 0
+            and (args.max_hall_substeps_per_step is None or args.max_hall_substeps_per_step > 0)):
+        parser.error('--ot-tend must be at least 0.25; --progress-every and --max-hall-substeps-per-step positive')
+    tokens = [t for t in args.ot_variants.split(',') if t]
+    if args.ot_compare_only:
+        tokens = ['compare']
+    if not tokens or any(t not in OT_VARIANTS+('all', 'compare') for t in tokens):
+        parser.error(f'--ot-variants entries must be among {", ".join(OT_VARIANTS)}, compare, all')
+    args.ot_compare = 'all' in tokens or 'compare' in tokens
+    args.ot_run = list(OT_VARIANTS) if 'all' in tokens else [v for v in OT_VARIANTS if v in tokens]
+    if args.suite == 'ot' and not args.ot_cache and args.ot_compare and len(args.ot_run) < len(OT_VARIANTS):
+        parser.error('ot compare of a partial run needs --ot-cache')
+    if args.stab_ref_only and args.stab_inertia_only:
+        parser.error('--stab-ref-only and --stab-inertia-only are exclusive')
+    if args.stab_report and not args.stab_cache:
+        parser.error('--stab-report needs --stab-cache')
+    if args.suite == 'stability':
+        try:
+            stability_select(args, stability_cases())
+        except ValueError as error:
+            parser.error(str(error))
     try:
         revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True,
                                            stderr=subprocess.DEVNULL).strip()
@@ -1557,6 +1955,8 @@ def main():
             revision += '+dirty'
     except (OSError, subprocess.CalledProcessError):
         revision = 'unknown (no git)'
+    global REVISION
+    REVISION = revision
     print(f'Hall viability REVISION={revision} backend={args.backend} '
           f'device={args.device if args.backend == "torch" else "cpu"} '
           f'dim={args.dim} N={args.n} precision={"double and single" if args.suite == "precision" else "double"} '
