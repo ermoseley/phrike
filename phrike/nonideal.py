@@ -50,6 +50,14 @@ def _floor(a, value):
     return torch.clamp(a, min=value) if _tensor(a) else np.maximum(a, value)
 
 
+def _cap(a, value):
+    return torch.clamp(a, max=value) if _tensor(a) else np.minimum(a, value)
+
+
+def _clip(a, bound):
+    return torch.clamp(a, -bound, bound) if _tensor(a) else np.clip(a, -bound, bound)
+
+
 def _max(a):
     return float(a.max().item()) if _tensor(a) else float(np.max(a))
 
@@ -77,6 +85,11 @@ class MidpointAmbipolar:
     natural flux closure, separate from the ideal-MHD outflow condition. The
     boundary tensor is R K R, so endpoint constitutive accuracy can be lower
     than the interior stencil accuracy when the normal field is nonzero.
+
+    The electric field E = eta (|B|^2 J - B (B.J)) is a diffusion of J_perp with
+    effective diffusivity eta_eff = eta |B|^2. ``eta_max`` caps it by the factor
+    c(x) = min(1, eta_max/(eta |B_ref|^2)) on the frozen reference field, which
+    keeps the tensor eta c (|B|^2 I - B B^T) symmetric positive semidefinite.
     """
 
     def __init__(self, grid, config):
@@ -91,6 +104,9 @@ class MidpointAmbipolar:
                                          config.get("preconditioner", "fourier_tensor"))
         if self.preconditioner not in ("fourier_tensor", "none", "identity"):
             raise ValueError("Unknown ambipolar preconditioner")
+        self.eta_max = None if config.get("eta_max") is None else float(config["eta_max"])
+        if self.eta_max is not None and not (np.isfinite(self.eta_max) and self.eta_max > 0.0):
+            raise ValueError("Ambipolar eta_max must be finite and positive")
         self.last_iterations = 0
         self.last_residual = 0.0
         self.total_iterations = 0
@@ -121,12 +137,19 @@ class MidpointAmbipolar:
         dx, dy = self.grid.dx1(B), self.grid.dy1(B)
         return _stack([dy[2], -dx[2], dx[1]-dy[0]])
 
+    def _coupling(self, b2):
+        """c(x) = min(1, eta_max/(eta b2)) of the frozen reference, so that eta c b2 <= eta_max."""
+        ratio = self.eta_max/self.eta if self.eta > 0 else math.inf
+        return _cap(ratio/_floor(b2, 1e-30), 1.0)
+
     def _electric(self, B, reference):
         B = self.grid.project_dealiased(B)
         J = self._mask(self._curl(B))
         b2 = (reference * reference).sum(axis=0)
         dot = (reference * J).sum(axis=0)
         E = self.eta * (b2 * J - reference * dot)
+        if self.eta_max is not None:
+            E = E * self._coupling(b2)
         return self.grid.project_dealiased(self._mask(E))
 
     def _operator(self, B, reference):
@@ -166,8 +189,15 @@ class MidpointAmbipolar:
         else:
             ik2 = np.divide(1, k2, out=np.zeros_like(k2), where=k2 > 0)
             ia2 = np.divide(1, a2, out=np.zeros_like(a2), where=a2 > 0)
-        small = h*self.eta*((k*b).sum(axis=0))**2
-        large = h*self.eta*(mean*mean).sum()*k2
+        eta = self.eta
+        if self.eta_max is not None:
+            # The |B|^2-weighted mean of the cap factor scales the mean-field tensor eta |b|^2.
+            b2 = (reference*reference).sum(axis=0)
+            total = _number(_sum(w*b2))
+            if total > 0:
+                eta = eta*_number(_sum(w*self._coupling(b2)*b2))/total
+        small = h*eta*((k*b).sum(axis=0))**2
+        large = h*eta*(mean*mean).sum()*k2
         fs = 1/(1+small+0.5*small*small)
         fl = 1/(1+large+0.5*large*large)
 
@@ -274,7 +304,8 @@ class Hall:
     """Hall induction dB/dt = -curl(eta_H J x B/|B|) on periodic Fourier grids.
 
     ``reference`` integrates the nonlinear equation with RK4 substeps limited by
-    the Hall rate max|eta_H| kmax^2 of the masked curl. ``inertia`` solves
+    the Hall rate max|eta_H| kmax^2 of the masked curl. An optional ``eta_max`` caps
+    |eta_H(x)| (sign kept) in the field, the rate and the automatic l^2. ``inertia`` solves
     (I + curl l^2 curl) dB/dt = -curl E_H with l frozen over the call: solenoidal
     modes see eta_H/(1 + l^2 k^2) and curl-free parts are untouched. A uniform l
     uses an exact Fourier inverse; l(x) uses preconditioned CG, with a tolerance
@@ -299,6 +330,9 @@ class Hall:
             raise ValueError("Hall eta_h must be finite")
         if not (np.isfinite(self.b0) and np.isfinite(self.rho0) and self.b0 > 0 and self.rho0 > 0):
             raise ValueError("Hall b0 and rho0 must be positive and finite")
+        self.eta_max = None if cfg.get("eta_max") is None else float(cfg["eta_max"])
+        if self.eta_max is not None and not (np.isfinite(self.eta_max) and self.eta_max > 0.0):
+            raise ValueError("Hall eta_max must be finite and positive")
         self.form = str(cfg.get("eta_h_form", "constant")).lower()
         if self.form not in ("constant", "proportional_to_b_over_rho"):
             raise ValueError("Hall eta_h_form must be constant or proportional_to_B_over_rho")
@@ -380,15 +414,19 @@ class Hall:
         return _ifft(1j*C, self.dim, V)
 
     def eta_field(self, B, rho):
-        """eta_H(x): constant, or eta_h (|B|/b0)(rho0/rho)."""
+        """eta_H(x): constant, or eta_h (|B|/b0)(rho0/rho); eta_max caps |eta_H(x)| keeping the sign."""
         if self.form == "constant":
-            return self.eta+0*rho
-        return self.eta*_sqrt((B*B).sum(axis=0))/self.b0*self.rho0/_floor(rho, 1e-30)
+            eta = self.eta+0*rho
+        else:
+            eta = self.eta*_sqrt((B*B).sum(axis=0))/self.b0*self.rho0/_floor(rho, 1e-30)
+        return eta if self.eta_max is None else _clip(eta, self.eta_max)
 
     def electric_field(self, B, rho):
-        """E_H = eta_H J x B/|B|; |B| cancels analytically in the proportional form."""
+        """E_H = eta_H J x B/|B|; |B| cancels analytically in the proportional form unless eta_max is set."""
         J = self.curl(B)
         cross = _stack([J[1]*B[2]-J[2]*B[1], J[2]*B[0]-J[0]*B[2], J[0]*B[1]-J[1]*B[0]])
+        if self.eta_max is not None:
+            return (self.eta_field(B, rho)/_floor(_sqrt((B*B).sum(axis=0)), 1e-30))*cross
         if self.form == "constant":
             return (self.eta/_floor(_sqrt((B*B).sum(axis=0)), 1e-30))*cross
         return (self.eta*self.rho0/self.b0/_floor(rho, 1e-30))*cross
@@ -520,8 +558,11 @@ class Hall:
         B, elapsed = _copy(B0), 0.0
         while True:
             # Reevaluate nonlinear eta_H each substep; the smallest l bounds the rate.
-            rate = (abs(self.eta) if self.form == "constant"
-                    else _max(_abs(self.eta_field(B, rho))))*kmax2
+            if self.form == "constant":
+                peak = abs(self.eta) if self.eta_max is None else min(abs(self.eta), self.eta_max)
+            else:
+                peak = _max(_abs(self.eta_field(B, rho)))
+            rate = peak*kmax2
             if inertia:
                 rate /= 1.0+stats["length2_min"]*kmax2
             if not np.isfinite(rate):
