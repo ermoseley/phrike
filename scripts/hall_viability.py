@@ -945,11 +945,17 @@ def adsi_marginal(args, out, label, par, rate, k, psi_fast):
         s, v = adsi_shear_mode(kv, kr, **par)
         dt = adsi_dt(args, par, kv, kr, v)
         end = mri_duration(s, rate, args.adsi_efolds, dt, cap=args.adsi_tmax)
+        left = adsi_shear_left(kv, kr, **par)
+        ts_coarse, cs_coarse, _ = adsi_run(args, par, kv, kr, v, end, dt)
+        coarse, _ = complex_rate(ts_coarse, cs_coarse @ left)
         ts, cs, stats = adsi_run(args, par, kv, kr, v, end, 0.5*dt)
-        measured, frequency = complex_rate(ts, cs @ adsi_shear_left(kv, kr, **par))
+        measured, frequency = complex_rate(ts, cs @ left)
+        # Second-order splitting: judge the Richardson-extrapolated growth, as in the main adsi gate.
+        extrapolated = measured+(measured-coarse)/3.
         reference = max(abs(s), 0.1*rate)
-        ok = abs(measured-s.real) < 1e-2*reference and abs(frequency-s.imag) < args.adsi_tol*reference
+        ok = abs(extrapolated-s.real) < 1e-2*reference and abs(frequency-s.imag) < args.adsi_tol*reference
         out.check(f'adsi marginal {label} k={q:.4g} psi={math.degrees(a):.3f}deg', ok, growth=measured,
+                  extrapolated_growth=extrapolated,
                   linear=s.real, frequency=frequency, linear_frequency=s.imag,
                   neutral_psi_deg=listing(np.degrees(neutral)),
                   growth_error_over_scale=(measured-s.real)/reference, **stats)
@@ -1247,7 +1253,7 @@ def ot_hall(args):
     """Hall block of the ot suite and the Alfven speed of the mean state."""
     b0, rho0 = 1/np.sqrt(4*np.pi), 25/(36*np.pi)  # main's orszag_tang_2d amplitude and density
     v_a = b0/np.sqrt(rho0)
-    return dict(eta_h=args.ot_di*v_a, eta_h_form='proportional_to_B_over_rho', b0=b0, rho0=rho0,
+    return dict(eta_h=args.ot_di*v_a, eta_h_form=args.ot_form, b0=b0, rho0=rho0,
                 cg_tol=args.cg_tol), v_a
 
 
@@ -1271,7 +1277,8 @@ def ot_tag(mark):
 def ot_base(args, key, size):
     """Cache path stem (no extension). Keyed by variant, N and the parameters that change the numbers;
     not by revision (the revision is stored inside) and not by --ot-tend (the marks are stored inside)."""
-    return str(Path(args.ot_cache)/f'ot_{key}_N{size}_di{args.ot_di:g}_cg{args.cg_tol:g}')
+    form = '' if args.ot_form == 'proportional_to_B_over_rho' else f'_{args.ot_form}'
+    return str(Path(args.ot_cache)/f'ot_{key}_N{size}_di{args.ot_di:g}{form}_cg{args.cg_tol:g}')
 
 
 def ot_save(args, record):
@@ -1864,6 +1871,9 @@ def main():
                         help='adsi: only the unstable-eigenmode runs with their timestep check (no stable '
                              'evolution, generic seeds or marginal points)')
     parser.add_argument('--ot-di', type=float, default=0.05, help='ot: d_i = eta_H/v_A at the mean state')
+    parser.add_argument('--ot-form', choices=['proportional_to_B_over_rho', 'constant'],
+                        default='proportional_to_B_over_rho',
+                        help='ot: eta_H form; constant avoids eta_H ~ 1/rho at the near-vacuum shocks of OT')
     parser.add_argument('--stab-lh-dx', type=float, default=20., help='stability: l_H/dx at the mean state')
     parser.add_argument('--stab-steps', type=int, default=200, help='stability: ideal-CFL steps per case')
     parser.add_argument('--stab-cfl', type=float, default=0.25)
