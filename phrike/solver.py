@@ -1476,6 +1476,11 @@ class SpectralSolverMHD:
         # MHD runtime options (from grid.mhd_config, with safe defaults)
         cfg = getattr(grid, "mhd_config", None) or {}
         self.resistivity = float(cfg.get("resistivity", 0.0))   # eta
+        if cfg.get("resistivity_max") is not None:
+            resistivity_max = float(cfg["resistivity_max"])
+            if not (np.isfinite(resistivity_max) and resistivity_max > 0.0):
+                raise ValueError("MHD resistivity_max must be finite and positive")
+            self.resistivity = min(self.resistivity, resistivity_max)
         self.viscosity = float(cfg.get("viscosity", 0.0))       # nu
         self.project_each_substage = bool(cfg.get("project_each_substage", True))
         self.divergence_clean = str(cfg.get("divergence_clean", "projection"))

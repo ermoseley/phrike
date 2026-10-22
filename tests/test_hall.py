@@ -6,7 +6,7 @@ import pytest
 from phrike.equations import MHDEquations1D, MHDEquations2D, MHDEquations3D
 from phrike.grid import Grid1D, Grid2D, Grid3D
 from phrike.io import load_checkpoint, save_solution_snapshot
-from phrike.nonideal import Hall
+from phrike.nonideal import Hall, MidpointAmbipolar
 from phrike.problems.problem_list.adsi_shear import (
     ADSIShearProblem, adsi_incompressible_roots, adsi_shear_matrix, adsi_shear_mode, adsi_shear_vector,
 )
@@ -571,3 +571,169 @@ def test_adsi_shear_seed_roundtrip_and_box(tmp_path):
     c = adsi_shear_vector(np.array([rho, ux, uy, uz, bx, by, bz, p]), mode["k_v"], mode["k_r"],
                           problem._mode_v, problem._mode_r)
     np.testing.assert_allclose(c, 1e-6*np.sqrt(2.0)*problem._vector, rtol=1e-5, atol=1e-12)
+
+
+def hall_cap_state(g):
+    """1D state with a low-density spot at x = pi, where eta_H ~ |B|/rho is large."""
+    B = np.array([1+0*g.x, 0.3*np.cos(g.x), 0.3*np.sin(g.x)])
+    rho = 0.02+0.98*(1-np.exp(-(g.x-np.pi)**2))
+    return B, rho, state(g, B, rho)
+
+
+@pytest.mark.parametrize("form", ["constant", "proportional_to_B_over_rho"])
+@pytest.mark.parametrize("eta", [0.2, -0.2])
+@pytest.mark.parametrize("cap", [0.1, 1.0, 50.0])
+def test_hall_eta_max_clamps_magnitude_and_keeps_sign(form, eta, cap):
+    g = grid1d()
+    B, rho, _ = hall_cap_state(g)
+    cfg = dict(eta_h=eta, eta_h_form=form)
+    free = Hall(g, cfg).eta_field(B, rho)
+    capped = Hall(g, dict(cfg, eta_max=cap)).eta_field(B, rho)
+    below = np.abs(free) < cap
+    assert np.array_equal(capped[below], free[below])
+    assert np.array_equal(capped, np.sign(free)*np.minimum(np.abs(free), cap))
+    assert np.all(np.sign(capped) == np.sign(eta)) and np.max(np.abs(capped)) <= cap
+    if form == "proportional_to_B_over_rho" and cap == 1.0:
+        assert below.any() and not below.all()
+
+
+@pytest.mark.parametrize("form", ["constant", "proportional_to_B_over_rho"])
+def test_hall_eta_max_electric_field_uses_the_capped_coefficient(form):
+    g = grid1d()
+    B, rho, _ = hall_cap_state(g)
+    cfg = dict(eta_h=-0.2, eta_h_form=form)
+    free = Hall(g, cfg)
+    # Without a cap the expressions are unchanged, including the analytic |B| cancellation.
+    J = free.curl(B)
+    cross = np.stack([J[1]*B[2]-J[2]*B[1], J[2]*B[0]-J[0]*B[2], J[0]*B[1]-J[1]*B[0]])
+    modulus = np.sqrt((B*B).sum(axis=0))
+    original = ((free.eta/np.maximum(modulus, 1e-30))*cross if form == "constant"
+                else (free.eta*free.rho0/free.b0/np.maximum(rho, 1e-30))*cross)
+    assert np.array_equal(free.electric_field(B, rho), original)
+    for cap in (0.5, 50.0):
+        hall = Hall(g, dict(cfg, eta_max=cap))
+        expected = hall.eta_field(B, rho)*np.cross(hall.curl(B), B, axis=0)/modulus
+        np.testing.assert_allclose(hall.electric_field(B, rho), expected, rtol=1e-13, atol=1e-15)
+    # A cap above every |eta_H| reproduces the uncapped field.
+    np.testing.assert_allclose(Hall(g, dict(cfg, eta_max=1e6)).electric_field(B, rho),
+                               free.electric_field(B, rho), rtol=1e-13, atol=1e-15)
+
+
+def test_hall_eta_max_reduces_substeps_and_automatic_length():
+    g = grid1d()
+    B, rho, U = hall_cap_state(g)
+    cfg = dict(eta_h=0.2, eta_h_form="proportional_to_B_over_rho", method="reference")
+    free, capped = Hall(g, cfg), Hall(g, dict(cfg, eta_max=0.5))
+    free.step(U, None, 0.05)
+    capped.step(U, None, 0.05)
+    assert 0 < capped.last_stats["substeps"] < free.last_stats["substeps"]
+    inertia = dict(cfg, method="inertia", safety=0.5)
+    dt = 0.05
+    l2_free = Hall(g, inertia).length_squared(U, dt)
+    hall = Hall(g, dict(inertia, eta_max=0.5))
+    l2_capped = hall.length_squared(U, dt)
+    assert l2_capped < l2_free
+    assert l2_capped == pytest.approx(max(0.0, 0.5*dt/0.5-1.0/hall.kmax2(B)))
+    # Constant form: the rate uses min(|eta_h|, eta_max).
+    const = Hall(g, dict(eta_h=2.0, method="reference", eta_max=0.5))
+    const.step(U, None, 0.05)
+    plain = Hall(g, dict(eta_h=0.5, method="reference"))
+    plain.step(U, None, 0.05)
+    assert const.last_stats["substeps"] == plain.last_stats["substeps"]
+
+
+def test_hall_eta_max_absent_or_inactive_leaves_step_unchanged():
+    g = grid1d()
+    B, rho, U = hall_cap_state(g)
+    cfg = dict(eta_h=0.2, eta_h_form="proportional_to_B_over_rho", method="inertia", length=0.1)
+    expected = Hall(g, cfg).step(U, None, 0.05)
+    assert np.array_equal(Hall(g, dict(cfg, eta_max=None)).step(U, None, 0.05), expected)
+    np.testing.assert_allclose(Hall(g, dict(cfg, eta_max=1e6)).step(U, None, 0.05), expected,
+                               rtol=1e-9, atol=1e-11)
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, np.nan, np.inf])
+def test_hall_ambipolar_and_resistivity_caps_are_validated(bad):
+    g = grid1d()
+    with pytest.raises(ValueError, match="eta_max"):
+        Hall(g, dict(eta_h=1.0, eta_max=bad))
+    g2 = Grid2D(Nx=12, Ny=12, Lx=2*np.pi, Ly=2*np.pi, backend="numpy")
+    with pytest.raises(ValueError, match="eta_max"):
+        MidpointAmbipolar(g2, dict(eta=1.0, eta_max=bad))
+    with pytest.raises(ValueError, match="resistivity_max"):
+        solver(g, resistivity=1.0, resistivity_max=bad)
+
+
+def ambipolar_state(g):
+    X, Y = np.meshgrid(g.x, g.y)
+    U = np.zeros((8, g.Ny, g.Nx))
+    U[0] = 1
+    U[5], U[6], U[7] = 1+0.3*np.sin(Y), 0.2*np.cos(X), 0.3*np.sin(X+Y)
+    U[4] = 2.0+0.5*(U[5:8]**2).sum(axis=0)
+    return U
+
+
+def test_ambipolar_eta_max_below_everywhere_is_the_uniform_coefficient_operator():
+    g = Grid2D(Nx=12, Ny=12, Lx=2*np.pi, Ly=2*np.pi, backend="numpy")
+    X, Y = np.meshgrid(g.x, g.y)
+    b = 1.2  # |reference| is uniform, so eta c |B|^2 = eta_max everywhere
+    reference = b*np.array([np.cos(X), np.sin(X)*np.cos(Y), np.sin(X)*np.sin(Y)])
+    cap, rng = 0.3, np.random.default_rng(5)
+    B = rng.normal(size=(3, g.Ny, g.Nx))
+    capped = MidpointAmbipolar(g, dict(eta=5.0, eta_max=cap))
+    uniform = MidpointAmbipolar(g, dict(eta=cap/b**2))
+    np.testing.assert_allclose(capped._operator(B, reference), uniform._operator(B, reference),
+                               rtol=1e-10, atol=1e-10)
+    V = rng.normal(size=B.shape)
+    np.testing.assert_allclose(capped._precondition(reference, 0.2)(V),
+                               uniform._precondition(reference, 0.2)(V), rtol=1e-10, atol=1e-10)
+
+
+def test_ambipolar_eta_max_absent_or_inactive_leaves_step_unchanged():
+    g = Grid2D(Nx=12, Ny=12, Lx=2*np.pi, Ly=2*np.pi, backend="numpy")
+    U = ambipolar_state(g)
+    cfg = dict(eta=0.4, midpoint_tol=1e-12)
+    expected = MidpointAmbipolar(g, cfg).step(U, None, 0.05)
+    assert np.array_equal(MidpointAmbipolar(g, dict(cfg, eta_max=None)).step(U, None, 0.05), expected)
+    reference = U[5:8]
+    big = MidpointAmbipolar(g, dict(cfg, eta_max=1e9))
+    assert np.array_equal(big._operator(U[5:8]*0.9, reference),
+                          MidpointAmbipolar(g, cfg)._operator(U[5:8]*0.9, reference))
+    np.testing.assert_allclose(big.step(U, None, 0.05), expected, rtol=1e-9, atol=1e-10)
+
+
+def test_ambipolar_eta_max_keeps_the_operator_spd_and_cg_convergent():
+    mixed = Grid2D(Nx=12, Ny=12, Lx=2*np.pi, Ly=2*np.pi, basis_y="sbp", backend="numpy")
+    rng = np.random.default_rng(3)
+    a, b, reference = rng.normal(size=(3, 3, mixed.Ny, mixed.Nx))
+    b2 = (reference*reference).sum(axis=0)
+    ad = MidpointAmbipolar(mixed, dict(eta=1.0, eta_max=float(np.median(b2))))
+    assert 0 < np.count_nonzero(ad._coupling(b2) < 1) < b2.size
+    La, Lb = ad._operator(a, reference), ad._operator(b, reference)
+    w = mixed.wy[:, None]
+    np.testing.assert_allclose((a*Lb*w).sum(), (b*La*w).sum(), atol=2e-11)
+    assert (a*La*w).sum() <= 0
+    precondition = ad._precondition(reference, 0.2)
+    np.testing.assert_allclose((a*precondition(b)).sum(), (b*precondition(a)).sum(), atol=1e-12)
+    assert (a*precondition(a)).sum() > 0
+    g = Grid2D(Nx=12, Ny=12, Lx=2*np.pi, Ly=2*np.pi, backend="numpy")
+    U = ambipolar_state(g)
+    cfg = dict(eta=2.0, midpoint_tol=1e-12)
+    free, limited = MidpointAmbipolar(g, cfg), MidpointAmbipolar(g, dict(cfg, eta_max=0.8))
+    V0, V1 = free.step(U, None, 0.05), limited.step(U, None, 0.05)
+    assert limited.last_residual <= 1e-12 and limited.total_solves == 2
+    magnetic = lambda V: (V[5:8]**2).sum()
+    assert magnetic(V1) < magnetic(U) and magnetic(V0) < magnetic(V1)
+
+
+def test_resistivity_max_clamps_rhs_and_timestep():
+    g = grid1d()
+    U = state(g, [1+0*g.x, 0.3*np.cos(g.x), 0.3*np.sin(g.x)])
+    plain = solver(g, resistivity=50.0)
+    capped = solver(g, resistivity=50.0, resistivity_max=20.0)
+    reference = solver(g, resistivity=20.0)
+    inactive = solver(g, resistivity=0.1, resistivity_max=20.0)
+    assert capped.resistivity == 20.0 and inactive.resistivity == 0.1 and plain.resistivity == 50.0
+    assert np.array_equal(capped._compute_rhs(U), reference._compute_rhs(U))
+    assert not np.array_equal(capped._compute_rhs(U), plain._compute_rhs(U))
+    assert capped.compute_dt(U) == reference.compute_dt(U) > plain.compute_dt(U)

@@ -366,6 +366,13 @@ supported. Set ``method: midpoint_resolvent``; optional solver controls are
 is enabled. Explicit resistivity and viscosity retain separate diffusion CFL
 limits, including the SBP derivative bound on mixed grids.
 
+The optional ``eta_max`` in the ``ambipolar`` block caps the effective perpendicular
+diffusivity ``eta |B|**2`` by scaling the tensor with ``min(1, eta_max/(eta |B_ref|**2))``
+on the frozen reference field. The optional ``resistivity_max`` in ``physics.mhd`` clamps
+the constant ``resistivity`` (and so its diffusion CFL limit). Each cap is a physical
+approximation that alters the physics where it is active, used to keep near-vacuum
+regions affordable; absent, nothing changes.
+
 The ambipolar step predicts the coefficient field at half time, then applies
 ``(I - h L + h**2 L**2 / 2)**(-1)`` with that field frozen. An H-weighted
 increment CG solve uses a checked true relative residual and raises on failure.
@@ -567,12 +574,18 @@ Hall/2, which is palindromic; without a ``hall`` block it is unchanged.
          enabled: true
          eta_h: 0.03             # signed
          eta_h_form: constant    # or proportional_to_B_over_rho (uses b0, rho0)
+         eta_max: 0.5            # optional cap on |eta_H(x)|; omit for none
          method: inertia         # reference | inertia
          length: 0.05            # inertia only; omit for the automatic length
          length_mode: constant   # constant | local
          length_ratio: 4.0       # local only: raise l so max(l)/min(l) <= ratio
          safety: 0.5
          cg_tol: 1.0e-10
+
+``eta_max`` replaces ``eta_H(x)`` by ``sign(eta_H) min(|eta_H(x)|, eta_max)`` in the
+electric field, the substep rate and the automatic ``l``. It is a physical approximation
+that alters the Hall physics where it is active (for example where ``eta_H ~ |B|/rho`` is
+large in near-vacuum regions) and keeps those regions affordable; absent, nothing changes.
 
 ``reference`` is nonlinear RK4 subcycled to ``h <= safety/(max|eta_H| kmax**2)``
 of the masked curl. ``inertia`` solves ``(I + curl l**2 curl) dB/dt = -curl E_H``

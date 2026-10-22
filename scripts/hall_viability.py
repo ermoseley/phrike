@@ -1253,8 +1253,10 @@ def ot_hall(args):
     """Hall block of the ot suite and the Alfven speed of the mean state."""
     b0, rho0 = 1/np.sqrt(4*np.pi), 25/(36*np.pi)  # main's orszag_tang_2d amplitude and density
     v_a = b0/np.sqrt(rho0)
-    return dict(eta_h=args.ot_di*v_a, eta_h_form=args.ot_form, b0=b0, rho0=rho0,
-                cg_tol=args.cg_tol), v_a
+    hall = dict(eta_h=args.ot_di*v_a, eta_h_form=args.ot_form, b0=b0, rho0=rho0, cg_tol=args.cg_tol)
+    if args.ot_eta_max is not None:
+        hall['eta_max'] = args.ot_eta_max
+    return hall, v_a
 
 
 def ot_table(args):
@@ -1278,7 +1280,8 @@ def ot_base(args, key, size):
     """Cache path stem (no extension). Keyed by variant, N and the parameters that change the numbers;
     not by revision (the revision is stored inside) and not by --ot-tend (the marks are stored inside)."""
     form = '' if args.ot_form == 'proportional_to_B_over_rho' else f'_{args.ot_form}'
-    return str(Path(args.ot_cache)/f'ot_{key}_N{size}_di{args.ot_di:g}{form}_cg{args.cg_tol:g}')
+    cap = '' if args.ot_eta_max is None else f'_etamax{args.ot_eta_max:g}'
+    return str(Path(args.ot_cache)/f'ot_{key}_N{size}_di{args.ot_di:g}{form}{cap}_cg{args.cg_tol:g}')
 
 
 def ot_save(args, record):
@@ -1287,7 +1290,7 @@ def ot_save(args, record):
         return
     base = ot_base(args, record['key'], record['size'])
     meta = {k: v for k, v in record.items() if k != 'results'}
-    meta.update(revision=REVISION, ot_di=args.ot_di, cg_tol=args.cg_tol)
+    meta.update(revision=REVISION, ot_di=args.ot_di, cg_tol=args.cg_tol, ot_eta_max=args.ot_eta_max)
     if record['status'] == 'ok':
         Path(base).parent.mkdir(parents=True, exist_ok=True)
         arrays, meta['scalars'] = {}, []
@@ -1874,6 +1877,8 @@ def main():
     parser.add_argument('--ot-form', choices=['proportional_to_B_over_rho', 'constant'],
                         default='proportional_to_B_over_rho',
                         help='ot: eta_H form; constant avoids eta_H ~ 1/rho at the near-vacuum shocks of OT')
+    parser.add_argument('--ot-eta-max', type=float, default=None,
+                        help='ot: cap |eta_H(x)| at this value (a physical approximation); default no cap')
     parser.add_argument('--stab-lh-dx', type=float, default=20., help='stability: l_H/dx at the mean state')
     parser.add_argument('--stab-steps', type=int, default=200, help='stability: ideal-CFL steps per case')
     parser.add_argument('--stab-cfl', type=float, default=0.25)
@@ -1918,6 +1923,8 @@ def main():
         parser.error('Invalid ot/stability/mri-tol parameters')
     if not (np.isfinite(args.cg_tol) and args.cg_tol > 0):
         parser.error('--cg-tol must be finite and positive')
+    if args.ot_eta_max is not None and not (np.isfinite(args.ot_eta_max) and args.ot_eta_max > 0):
+        parser.error('--ot-eta-max must be finite and positive')
     if not (np.isfinite(args.shear_floor) and args.shear_floor > 0 and args.shear_box_periods >= 2
             and all(np.isfinite(t) for t in (args.shear_dt, args.shear_fit_start,
                                            args.shear_fit_end, args.shear_end)) and args.shear_dt > 0
