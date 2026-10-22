@@ -51,11 +51,16 @@ class ArtificialViscosityConfig:
         mode: Viscosity mode - "sensor" for gradient-based or "constant" for uniform
         nu_constant: Constant viscosity coefficient (used when mode="constant")
         nu_max: Maximum viscosity coefficient (used when mode="sensor")
-        s_ref: Reference smoothness threshold (used when mode="sensor")
-        s_min: Minimum smoothness for applying viscosity (used when mode="sensor")
+        s_ref: Reference sensor value. Viscosity uses ``clip(s / s_ref, 0, 1) ** p``
+            once, in ``ArtificialViscosityCoefficient``. The sensor itself is not
+            divided by ``s_ref``.
+        s_min: Raw-sensor threshold. Cells with ``s <= s_min`` get zero viscosity.
+            The comparison is made before dividing by ``s_ref``.
         p: Exponent for smoothness scaling (used when mode="sensor")
         epsilon: Small number to avoid division by zero (used when mode="sensor")
-        variable_weights: Weights for different conserved variables
+        variable_weights: Per-variable multipliers. Missing magnetic names default
+            to 1, so Bx, By and Bz are diffused unless the user sets their weight
+            to 0.
         sensor_variable: Which variable to use for smoothness sensing (used when mode="sensor")
         diagnostic_output: Whether to output diagnostic information
     """
@@ -72,27 +77,37 @@ class ArtificialViscosityConfig:
     diagnostic_output: bool = False
     
     def __post_init__(self):
+        if not isinstance(self.mode, str):
+            raise TypeError(
+                "artificial viscosity mode must be a string, 'sensor' or "
+                f"'constant' (got {type(self.mode).__name__}: {self.mode!r})"
+            )
+        self.mode = self.mode.lower().strip()
+        if self.mode not in ("sensor", "constant"):
+            raise ValueError(
+                f"Invalid mode '{self.mode}'. Must be 'sensor' or 'constant'"
+            )
+        if self.mode == "constant" and self.nu_constant < 0:
+            raise ValueError("nu_constant must be non-negative")
+
+        # bx/by/bz are explicit so magnetic diffusion is not a silent fallback.
+        # Weight 1 diffuses that component; weight 0 leaves it undiffused.
         if self.variable_weights is None:
             self.variable_weights = {
                 "density": 1.0,
                 "momentum_x": 1.0,
                 "momentum_y": 1.0,
                 "momentum_z": 1.0,
-                "energy": 1.0
+                "energy": 1.0,
+                "bx": 1.0,
+                "by": 1.0,
+                "bz": 1.0,
             }
-        # Normalize mode value
-        if isinstance(self.mode, str):
-            self.mode = self.mode.lower().strip()
         else:
-            self.mode = "sensor"
-        
-        # Validate mode
-        if self.mode not in ["sensor", "constant"]:
-            raise ValueError(f"Invalid mode '{self.mode}'. Must be 'sensor' or 'constant'")
-        
-        # Validate nu_constant for constant mode
-        if self.mode == "constant" and self.nu_constant < 0:
-            raise ValueError("nu_constant must be non-negative")
+            weights = dict(self.variable_weights)
+            for name in ("bx", "by", "bz"):
+                weights.setdefault(name, 1.0)
+            self.variable_weights = weights
 
 
 class SmoothnessSensor(ABC):
@@ -113,61 +128,140 @@ class SmoothnessSensor(ABC):
         pass
 
 
+# Conserved-state layouts. 2D Euler is four components (energy, not momentum_z).
+_STATE_VARIABLE_NAMES = {
+    3: ("density", "momentum_x", "energy"),
+    4: ("density", "momentum_x", "momentum_y", "energy"),
+    5: ("density", "momentum_x", "momentum_y", "momentum_z", "energy"),
+    8: ("density", "momentum_x", "momentum_y", "momentum_z", "energy", "bx", "by", "bz"),
+}
+
+
+def _is_torch(value) -> bool:
+    return _TORCH_AVAILABLE and isinstance(value, torch.Tensor)
+
+
+def _state_variable_names(n_conserved: int) -> Tuple[str, ...]:
+    try:
+        return _STATE_VARIABLE_NAMES[n_conserved]
+    except KeyError as exc:
+        raise ValueError(
+            "artificial viscosity has no variable-name map for a state with "
+            f"{n_conserved} components"
+        ) from exc
+
+
+def _pressure(primitives, n_conserved: int):
+    """Thermal pressure from ``equations.primitive``.
+
+    MHD primitives are ``(rho, ux, uy, uz, p, Bx, By, Bz)``, so pressure is
+    index 4. 1D Euler is ``(rho, u, p, a)``, so pressure is index 2 rather
+    than the last entry. 2D and 3D Euler put pressure last.
+    """
+    if n_conserved == 8:
+        return primitives[4]
+    if n_conserved == 3:
+        return primitives[2]
+    if n_conserved in (4, 5):
+        return primitives[-1]
+    raise ValueError(
+        f"cannot locate pressure in a state with {n_conserved} components"
+    )
+
+
+def _velocity_components(primitives, n_conserved: int):
+    """Velocity components only, in x, y, z order."""
+    if n_conserved == 3:
+        return (primitives[1],)
+    if n_conserved == 4:
+        return (primitives[1], primitives[2])
+    if n_conserved in (5, 8):
+        return (primitives[1], primitives[2], primitives[3])
+    raise ValueError(
+        f"cannot locate velocity in a state with {n_conserved} components"
+    )
+
+
 class GradientBasedSensor(SmoothnessSensor):
     """Gradient-based smoothness sensor using spectral derivatives.
-    
-    Computes smoothness as s = |∇q| / (|q| + ε) where q is the sensor variable.
+
+    Density and pressure use ``s = |∇q| / (|q| + ε)``. The velocity sensor
+    does not divide by the local speed. It uses the velocity-gradient
+    magnitude normalised by the RMS peculiar speed, which is unchanged by a
+    uniform boost and stays finite at a stagnation point. ``s_ref`` is not
+    applied here.
     """
     
     def __init__(self, config: ArtificialViscosityConfig):
         self.config = config
     
     def compute_sensor(self, U: np.ndarray, grid, equations) -> np.ndarray:
-        """Compute gradient-based smoothness sensor."""
-        # Get the sensor variable
+        """Compute the raw smoothness sensor. ``s_ref`` is applied later, once."""
+        n_conserved = len(U)
         if self.config.sensor_variable == "density":
-            q = U[0]  # density
-        elif self.config.sensor_variable == "pressure":
-            primitives = equations.primitive(U)
-            q = primitives[4] if len(U) == 8 else primitives[2]
-        elif self.config.sensor_variable == "velocity_magnitude":
-            primitives = equations.primitive(U)
-            u = primitives[1]
-            if len(U) == 8:
-                q = sum(v ** 2 for v in primitives[1:4]) ** 0.5
-            elif len(u.shape) == 1:  # 1D
-                q = np.abs(u)
-            elif len(u.shape) == 2:  # 2D
-                q = np.sqrt(u[0]**2 + u[1]**2)
-            else:  # 3D
-                q = np.sqrt(u[0]**2 + u[1]**2 + u[2]**2)
-        else:
-            raise ValueError(f"Unknown sensor variable: {self.config.sensor_variable}")
-        
-        # Compute gradient magnitude
-        grad_magnitude = self._compute_gradient_magnitude(q, grid)
-        
-        # Torch-aware math to avoid implicit numpy conversions on device tensors
-        is_torch = False
-        try:
-            import torch  # type: ignore
-            is_torch = isinstance(q, torch.Tensor)
-        except Exception:
-            torch = None  # type: ignore
-            is_torch = False
+            q = U[0]
+            grad = self._compute_gradient_magnitude(q, grid)
+            return self._normalize_by_local_scale(grad, q)
+        if self.config.sensor_variable == "pressure":
+            q = _pressure(equations.primitive(U), n_conserved)
+            grad = self._compute_gradient_magnitude(q, grid)
+            return self._normalize_by_local_scale(grad, q)
+        if self.config.sensor_variable == "velocity_magnitude":
+            components = _velocity_components(equations.primitive(U), n_conserved)
+            return self._velocity_sensor(components, grid)
+        raise ValueError(f"Unknown sensor variable: {self.config.sensor_variable}")
 
-        if is_torch:
+    def _normalize_by_local_scale(self, grad, q):
+        """``|∇q| / (|q| + ε)``. Not divided by ``s_ref``."""
+        if _is_torch(q):
             eps = torch.tensor(float(self.config.epsilon), dtype=q.dtype, device=q.device)
-            sensor = grad_magnitude / (torch.abs(q) + eps)
-            if self.config.s_ref > 0:
-                sref = torch.tensor(float(self.config.s_ref), dtype=q.dtype, device=q.device)
-                sensor = torch.clamp(sensor / sref, 0.0, 1.0)
-            return sensor
-        else:
-            sensor = grad_magnitude / (np.abs(q) + self.config.epsilon)
-            if self.config.s_ref > 0:
-                sensor = np.clip(sensor / self.config.s_ref, 0.0, 1.0)
-            return sensor
+            return grad / (torch.abs(q) + eps)
+        return grad / (np.abs(q) + self.config.epsilon)
+
+    def _velocity_sensor(self, components, grid):
+        """``|∇u| / u_ref`` with ``u_ref`` the RMS peculiar speed.
+
+        ``|∇u| = sqrt(sum_i |∇u_i|^2)`` and
+        ``u_ref = sqrt(mean(|u - <u>|^2))``. Both are unchanged by adding a
+        constant velocity, so the sensor does not divide by the local speed
+        and does not blow up where ``u = 0``. A uniform flow has sensor 0.
+        The result has units of 1/length, like the density and pressure sensors.
+        """
+        grad = self._velocity_gradient_magnitude(components, grid)
+        u_ref = self._rms_peculiar_speed(components)
+        eps = float(self.config.epsilon)
+        if not np.isfinite(u_ref):
+            if _is_torch(grad):
+                return torch.full_like(grad, float("nan"))
+            return np.full_like(grad, np.nan)
+        if u_ref <= eps:
+            if _is_torch(grad):
+                return torch.zeros_like(grad)
+            return np.zeros_like(grad)
+        return grad / u_ref
+
+    def _velocity_gradient_magnitude(self, components, grid):
+        acc = None
+        for velocity in components:
+            slope = self._compute_gradient_magnitude(velocity, grid)
+            term = slope * slope
+            acc = term if acc is None else acc + term
+        if _is_torch(acc):
+            return torch.sqrt(acc)
+        return np.sqrt(acc)
+
+    def _rms_peculiar_speed(self, components) -> float:
+        torch_path = _is_torch(components[0])
+        acc = None
+        for velocity in components:
+            mean = torch.mean(velocity) if torch_path else np.mean(velocity)
+            fluctuation = velocity - mean
+            term = fluctuation * fluctuation
+            acc = term if acc is None else acc + term
+        mean_square = torch.mean(acc) if torch_path else np.mean(acc)
+        if torch_path:
+            return float(torch.sqrt(mean_square).item())
+        return float(np.sqrt(mean_square))
     
     def _compute_gradient_magnitude(self, q: np.ndarray, grid) -> np.ndarray:
         """Compute |∇q| using spectral differentiation."""
@@ -227,6 +321,8 @@ class ArtificialViscosityCoefficient:
             torch = None  # type: ignore
             is_torch = False
 
+        # Single s_ref normalisation: nu = nu_max * clip(s / s_ref, 0, 1)^p.
+        # s_min is compared with the raw sensor, before that division.
         if is_torch:
             s_min = torch.tensor(float(self.config.s_min), dtype=sensor.dtype, device=sensor.device)
             active_sensor = torch.where(sensor > s_min, sensor, torch.zeros((), dtype=sensor.dtype, device=sensor.device))
@@ -309,15 +405,9 @@ class SpectralArtificialViscosity:
             sensor = self.sensor.compute_sensor(U, grid, equations)
             viscosity = self.viscosity_coeff.compute_viscosity(sensor)
         
-        # Compute viscosity terms for each conserved variable
-        viscosity_terms = []
-        if len(U) == 8:
-            variable_names = ["density", "momentum_x", "momentum_y", "momentum_z", "energy", "bx", "by", "bz"]
-        elif len(U) == 3:
-            variable_names = ["density", "momentum_x", "energy"]
-        else:
-            variable_names = ["density", "momentum_x", "momentum_y", "momentum_z", "energy"]
-        
+        # Names follow the state layout. 2D Euler energy is component 3, not momentum_z.
+        variable_names = _state_variable_names(len(U))
+
         if (self.config.mode == "constant" and not hasattr(grid, "dy1")
                 and getattr(grid, "_basis_name", "fourier") != "fourier"):
             laplacian = grid.laplacian(U)
@@ -326,6 +416,7 @@ class SpectralArtificialViscosity:
                 for i, name in enumerate(variable_names[:len(U)])
             ]
         else:
+            viscosity_terms = []
             for i, var_name in enumerate(variable_names[:len(U)]):
                 weight = self.config.variable_weights.get(var_name, 1.0)
                 viscosity_term = self._compute_viscosity_term(U[i], viscosity * weight, grid)

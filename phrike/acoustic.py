@@ -24,10 +24,35 @@ class AcousticParams:
     gamma: float = 1.4
 
 
+def _sound_speed(params: AcousticParams) -> float:
+    return float(np.sqrt(params.gamma * params.p0 / params.rho0))
+
+
+def _wave_sign(params: AcousticParams) -> float:
+    """+1 for a right-going wave, -1 for a left-going wave."""
+    if params.direction == "right":
+        return 1.0
+    if params.direction == "left":
+        return -1.0
+    raise ValueError(
+        f"direction must be 'right' or 'left', got {params.direction!r}"
+    )
+
+
+def _phase_speed(params: AcousticParams) -> float:
+    """Linear acoustic phase speed u0 ± c."""
+    return params.u0 + _wave_sign(params) * _sound_speed(params)
+
+
 def _fields_from_phase(
     phase: np.ndarray, params: AcousticParams
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    c = np.sqrt(params.gamma * params.p0 / params.rho0)
+    """Linear acoustic eigenmode on a uniform background (rho0, u0, p0).
+
+    The velocity perturbation has the sign of the propagation direction:
+    u' = ± c rho' / rho0, and p' = c^2 rho'.
+    """
+    c = _sound_speed(params)
 
     if params.fractional:
         drho_amp = params.amplitude * params.rho0
@@ -36,12 +61,18 @@ def _fields_from_phase(
 
     s = np.sin(phase)
     rho = params.rho0 + drho_amp * s
-    u = params.u0 + c * (drho_amp / params.rho0) * s
-    p = params.p0 + (c * c) * (drho_amp) * s
+    u = params.u0 + _wave_sign(params) * c * (drho_amp / params.rho0) * s
+    p = params.p0 + (c * c) * drho_amp * s
     return rho, u, p
 
 
 def acoustic_ic(x: np.ndarray, params: AcousticParams) -> np.ndarray:
+    """Conservative initial state of the linear eigenmode at t = 0.
+
+    The phase is k x for either direction. ``direction`` sets the sign of
+    the velocity perturbation, so a left-going wave is not initialised as a
+    right-going one.
+    """
     k = 2.0 * np.pi * params.mode_m / params.Lx
     phase = k * x
     rho, u, p = _fields_from_phase(phase, params)
@@ -52,10 +83,12 @@ def acoustic_ic(x: np.ndarray, params: AcousticParams) -> np.ndarray:
 def acoustic_exact(
     x: np.ndarray, t: float, params: AcousticParams
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    c = np.sqrt(params.gamma * params.p0 / params.rho0)
+    """Exact linear acoustic wave, advected at u0 ± c.
+
+    ``direction='right'`` propagates at u0 + c and ``'left'`` at u0 - c.
+    """
     k = 2.0 * np.pi * params.mode_m / params.Lx
-    shift = -c * t if params.direction == "right" else c * t
-    phase = k * (x + shift)
+    phase = k * (x - _phase_speed(params) * t)
     return _fields_from_phase(phase, params)
 
 
