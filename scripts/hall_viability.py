@@ -1002,6 +1002,9 @@ def adsi(args, out):
             ts, cs, stats = adsi_run(args, par, kv, kr, v, end, dt/division)
             fits[division] = (*complex_rate(ts, cs @ left), ts, cs, stats)
         growth, frequency, ts, cs, stats = fits[2]
+        # Strang + midpoint AD is second order in dt: gate the Richardson-extrapolated growth,
+        # so stiff AD cases are judged on convergence to the eigenvalue, not on the dt/2 error.
+        extrapolated = growth+(growth-fits[1][0])/3.
         errors = [fits[d][0]-s.real for d in (1, 2)]
         window = ts >= 0.4*end
         t_w, half = ts[window], window.sum()//2
@@ -1013,12 +1016,13 @@ def adsi(args, out):
         big = np.abs(v) > 0.05*np.abs(v).max()
         relative = (cs[-1]/cs[-1][ref])/(v/v[ref])
         numbers = dict(growth=growth, linear=s.real, frequency=frequency, linear_frequency=s.imag,
-                       growth_error_over_scale=(growth-s.real)/scale, polarization_error=polarization,
+                       growth_error_over_scale=(growth-s.real)/scale,
+                       extrapolated_error_over_scale=(extrapolated-s.real)/scale, polarization_error=polarization,
                        compressive_polarization_error=pol_compressive,
                        phase_error=np.max(np.abs(np.angle(relative[big]))),
                        ratio_error=np.max(np.abs(np.abs(relative[big])-1)), k=k, psi_deg=math.degrees(psi),
                        dt=dt/2, **stats)
-        ok = (abs(growth-s.real) < tol*scale and abs(frequency-s.imag) < tol*scale
+        ok = (abs(extrapolated-s.real) < tol*scale and abs(frequency-s.imag) < tol*scale
               and polarization < tol and pol_compressive < 3*tol)
         if not stable:
             logs = np.log(np.hypot(np.abs(cs[:, 4]), np.abs(cs[:, 5])))[window]
@@ -1034,7 +1038,7 @@ def adsi(args, out):
         # Strang splitting is second order in dt: the error at dt must be about four times that at dt/2.
         order = math.log2(abs(errors[0]/errors[1])) if min(abs(e) for e in errors) > 1e-12*scale else float('nan')
         out.check(f'adsi timestep convergence {label}',
-                  abs(errors[1]) < tol*scale and (abs(errors[0]) < 0.02*tol*scale or 1.5 < order < 2.6),
+                  abs(extrapolated-s.real) < tol*scale and (abs(errors[0]) < 0.02*tol*scale or 1.5 < order < 2.6),
                   growth_error_dt=errors[0]/scale, growth_error_half_dt=errors[1]/scale, observed_order=order,
                   extrapolated_error=(errors[1]-(errors[0]-errors[1])/3.)/scale)
         if stable or args.adsi_quick:
@@ -1043,8 +1047,10 @@ def adsi(args, out):
         seed = rng.standard_normal(7)+1j*rng.standard_normal(7)
         ts, cs, stats = adsi_run(args, par, kv, kr, seed, end, dt/2)
         measured, frequency = complex_rate(ts, cs @ left)
-        out.check(f'adsi generic seed {label}', abs(measured-s.real) < tol*scale and abs(frequency-s.imag) < tol*scale,
-                  growth=measured, linear=s.real, frequency=frequency, linear_frequency=s.imag,
+        # Same dt as the eigenmode run: the projection must reproduce its growth, whatever the dt error.
+        out.check(f'adsi generic seed {label}', abs(measured-growth) < tol*scale and abs(frequency-s.imag) < tol*scale,
+                  growth=measured, eigenmode_growth_same_dt=growth, linear=s.real, frequency=frequency,
+                  linear_frequency=s.imag,
                   growth_error_over_scale=(measured-s.real)/scale, **stats)
         if marginal:
             adsi_marginal(args, out, label, par, rate, k, psi)
