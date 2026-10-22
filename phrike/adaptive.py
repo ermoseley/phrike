@@ -7,8 +7,9 @@ automatic error estimation and step size adjustment.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
-from typing import Any, Tuple
+from typing import Any, Optional, Tuple
 
 import numpy as np
 
@@ -41,7 +42,27 @@ class AdaptiveStepController:
         safety_factor: Safety factor for step size adjustment (typically 0.9)
         min_dt_factor: Minimum allowed step size reduction factor
         max_dt_factor: Maximum allowed step size increase factor
-        max_rejections: Maximum number of consecutive step rejections
+        max_rejections: Maximum number of consecutive step rejections.
+            Must be an integer >= 1. There is no "accept on the first try
+            regardless of error" setting.
+        dt_min: Absolute floor on the attempted step. ``None`` uses ``1e-14``
+            until a driver installs a run-specific floor (the spectral solvers
+            use ``1e-12 * (t_end - t0)`` when this is left unset). A rejected
+            step that would shrink below the floor raises ``RuntimeError``.
+            A non-finite error estimate that cannot shrink below the floor
+            raises ``FloatingPointError``.
+
+    Rejection policy:
+        A non-finite (or negative) error estimate is always rejected and the
+        next step is shrunk by ``min_dt_factor`` when that factor is in
+        ``(0, 1)``, otherwise by ``0.1``. It never grows the step and it does
+        not repeat the same step. ``AdaptiveTimeStepper`` raises
+        ``FloatingPointError`` after ``max_rejections`` such attempts.
+
+        A finite error above the tolerance is rejected and the step is
+        adjusted with the standard controller. After ``max_rejections`` the
+        stepper emits ``RuntimeWarning``, accepts that step, and sets
+        ``AdaptiveStepResult.forced``. That path is only for a finite error.
     """
 
     rtol: float = 1e-6
@@ -50,6 +71,57 @@ class AdaptiveStepController:
     min_dt_factor: float = 0.1
     max_dt_factor: float = 5.0
     max_rejections: int = 10
+    dt_min: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        value = self.max_rejections
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+            raise ValueError(
+                f"max_rejections must be an integer >= 1, got {value!r}"
+            )
+        if int(value) < 1:
+            raise ValueError(
+                f"max_rejections must be an integer >= 1, got {value!r}"
+            )
+        self.max_rejections = int(value)
+        if self.dt_min is not None:
+            dt_min = float(self.dt_min)
+            if not np.isfinite(dt_min) or dt_min <= 0.0:
+                raise ValueError(
+                    f"dt_min must be a finite number > 0, got {self.dt_min!r}"
+                )
+            self.dt_min = dt_min
+
+    def effective_dt_min(self) -> float:
+        """Floor used when ``dt_min`` has not been set for a run."""
+        if self.dt_min is None:
+            return 1e-14
+        return float(self.dt_min)
+
+    def _shrink_dt(self, dt_current: float) -> float:
+        """Shrink ``dt_current`` without ever increasing it."""
+        try:
+            shrink = float(self.min_dt_factor)
+        except (TypeError, ValueError):
+            shrink = 0.1
+        if not np.isfinite(shrink) or shrink <= 0.0 or shrink >= 1.0:
+            shrink = 0.1
+        return float(dt_current) * shrink
+
+    def _raise_if_rejected_below_floor(
+        self, dt_current: float, dt_new: float, error: float, *, nonfinite: bool
+    ) -> None:
+        dt_min = self.effective_dt_min()
+        if dt_new < dt_min or float(dt_current) <= dt_min:
+            message = (
+                f"Adaptive time step reached the floor dt_min={dt_min:.3e} "
+                f"(current dt={float(dt_current):.3e}, proposed dt={dt_new:.3e}, "
+                f"error={error}). The tolerance was not met and the step cannot "
+                "shrink further."
+            )
+            if nonfinite:
+                raise FloatingPointError(message)
+            raise RuntimeError(message)
 
     def compute_new_dt(
         self, dt_current: float, error: float, solution_scale: float, order: int
@@ -66,27 +138,46 @@ class AdaptiveStepController:
             Tuple of (new_dt, accept) where:
             - new_dt: Recommended new time step
             - accept: Whether to accept current step
+
+        A non-finite error is rejected and the recommendation is a smaller
+        step. The finite-error formula is unchanged:
+        ``dt * clip(safety * (tol/err)**(1/order), min_factor, max_factor)``.
         """
-        # Compute tolerance
+        dt_current = float(dt_current)
         tolerance = self.atol + self.rtol * solution_scale
+        invalid = (not np.isfinite(error)) or error < 0.0 or (not np.isfinite(tolerance))
+        if invalid:
+            dt_new = self._shrink_dt(dt_current)
+            self._raise_if_rejected_below_floor(
+                dt_current, dt_new, error, nonfinite=True
+            )
+            return dt_new, False
 
         # Accept/reject decision
-        accept = error <= tolerance
+        accept = bool(error <= tolerance)
 
-        if error > 0:
+        if error > 0.0:
             # Compute optimal step size using the order of the method
             dt_optimal = dt_current * (tolerance / error) ** (1.0 / order)
             dt_optimal *= self.safety_factor
 
             # Limit step size changes
-            dt_new = dt_current * np.clip(
+            dt_new = dt_current * float(np.clip(
                 dt_optimal / dt_current, self.min_dt_factor, self.max_dt_factor
-            )
+            ))
         else:
             # If error is zero (unlikely but possible), increase step size
-            dt_new = dt_current * self.max_dt_factor
+            dt_new = dt_current * float(self.max_dt_factor)
 
-        return dt_new, accept
+        if not accept:
+            self._raise_if_rejected_below_floor(
+                dt_current, dt_new, error, nonfinite=False
+            )
+        elif dt_new < self.effective_dt_min():
+            # An accepted step may not propose an illegal next attempt.
+            dt_new = self.effective_dt_min()
+
+        return float(dt_new), accept
 
 
 class EmbeddedRungeKutta:
@@ -130,13 +221,23 @@ class EmbeddedRungeKutta:
         if not np.isclose(np.sum(self.b_low), 1.0, rtol=0.0, atol=5e-14):
             raise ValueError(f"{self.name} embedded weights do not sum to one")
 
-    def step(self, rhs_func, U: Any, dt: float) -> Tuple[Any, Any, float]:
+    def step(self, rhs_func, U: Any, dt: float, limit_state=None) -> Tuple[Any, Any, float]:
         """Perform one embedded RK step.
+
+        The right-hand side is autonomous: ``rhs_func`` is called as
+        ``rhs_func(U)`` with no explicit time, and the Butcher nodes ``c``
+        are not forwarded. No current spectral RHS depends on time. A
+        time-dependent forcing would be integrated incorrectly until this
+        interface grows a ``t`` argument.
 
         Args:
             rhs_func: Function that computes dU/dt = f(U)
             U: Current solution vector
             dt: Time step
+            limit_state: Optional map applied to every stage after the first
+                and to both embedded solutions. It is not applied to ``U``
+                before the first evaluation. When it returns its input
+                unchanged, the step is the unmodified embedded method.
 
         Returns:
             Tuple of (U_high, U_low, error) where:
@@ -144,6 +245,11 @@ class EmbeddedRungeKutta:
             - U_low: Lower-order solution (for error estimation)
             - error: Local truncation error estimate
         """
+        def _limit(state):
+            if limit_state is None:
+                return state
+            return limit_state(state)
+
         stages = len(self.c)
         k = [None] * stages
         k[0] = rhs_func(U)
@@ -154,6 +260,7 @@ class EmbeddedRungeKutta:
                 coefficient = self.a[i, j]
                 if coefficient != 0.0:
                     U_stage = U_stage + dt * coefficient * k[j]
+            U_stage = _limit(U_stage)
             k[i] = rhs_func(U_stage)
 
         U_high = _copy_state(U)
@@ -164,6 +271,8 @@ class EmbeddedRungeKutta:
             if self.b_low[i] != 0.0:
                 U_low = U_low + dt * self.b_low[i] * k[i]
 
+        U_high = _limit(U_high)
+        U_low = _limit(U_low)
         return U_high, U_low, self.compute_error(U_high, U_low)
 
     def compute_error(self, U_high: np.ndarray, U_low: np.ndarray) -> float:
@@ -584,6 +693,9 @@ class AdaptiveStepResult:
         accepted: Whether the step was accepted
         error: Local truncation error estimate
         rejections: Number of consecutive rejections
+        forced: True when a finite but over-tolerance step was accepted
+            because ``max_rejections`` was reached. Non-finite errors are
+            never forced through; those raise ``FloatingPointError``.
     """
 
     U_new: np.ndarray
@@ -592,6 +704,7 @@ class AdaptiveStepResult:
     accepted: bool
     error: float
     rejections: int
+    forced: bool = False
 
 
 class AdaptiveTimeStepper:
@@ -611,9 +724,11 @@ class AdaptiveTimeStepper:
         self.method = method
         self.controller = controller
         self.consecutive_rejections = 0
+        self.forced_acceptances = 0
 
     def step(
-        self, rhs_func, U: np.ndarray, dt: float, solution_scale: float
+        self, rhs_func, U: np.ndarray, dt: float, solution_scale: float,
+        limit_state=None,
     ) -> AdaptiveStepResult:
         """Perform one adaptive time step.
 
@@ -622,19 +737,30 @@ class AdaptiveTimeStepper:
             U: Current solution vector
             dt: Proposed time step
             solution_scale: Scale of the solution (for relative error)
+            limit_state: Optional stage limiter forwarded to the embedded method.
 
         Returns:
-            AdaptiveStepResult containing step outcome and recommendations
+            AdaptiveStepResult containing step outcome and recommendations.
+
+        A non-finite error estimate rejects the step and shrinks ``dt``.
+        After ``max_rejections`` non-finite attempts this raises
+        ``FloatingPointError`` and does not return the non-finite state.
+        A finite error that is still too large after ``max_rejections``
+        accepts the high-order state, warns, and sets ``forced``.
         """
         # Perform embedded RK step
-        U_high, U_low, error = self.method.step(rhs_func, U, dt)
+        U_high, U_low, error = self.method.step(
+            rhs_func, U, dt, limit_state=limit_state
+        )
 
-        # Check if we should accept or reject the step
+        # Check if we should accept or reject the step. A non-finite estimate
+        # comes back as a rejection with a smaller dt, or raises at the floor.
         dt_next, accept = self.controller.compute_new_dt(
             dt, error, solution_scale, self.method.error_estimator_order
         )
+        nonfinite = not np.isfinite(error)
 
-        if accept:
+        if accept and not nonfinite:
             # Step accepted
             self.consecutive_rejections = 0
             return AdaptiveStepResult(
@@ -644,32 +770,49 @@ class AdaptiveTimeStepper:
                 accepted=True,
                 error=error,
                 rejections=0,
+                forced=False,
             )
-        else:
-            # Step rejected
-            self.consecutive_rejections += 1
 
-            if self.consecutive_rejections >= self.controller.max_rejections:
-                # Too many rejections, accept the step anyway to avoid infinite loop
-                self.consecutive_rejections = 0
-                return AdaptiveStepResult(
-                    U_new=U_high,
-                    dt_used=dt,
-                    dt_next=dt_next,
-                    accepted=True,
-                    error=error,
-                    rejections=self.controller.max_rejections,
+        # Step rejected. Keep the previous state; do not publish U_high.
+        self.consecutive_rejections += 1
+        if self.consecutive_rejections >= self.controller.max_rejections:
+            if nonfinite:
+                raise FloatingPointError(
+                    "Adaptive step produced a non-finite error estimate after "
+                    f"{self.consecutive_rejections} rejections "
+                    f"(dt={float(dt):.3e}, error={error})."
                 )
-            else:
-                # Reject and try again with smaller step
-                return AdaptiveStepResult(
-                    U_new=U,
-                    dt_used=dt,
-                    dt_next=dt_next,
-                    accepted=False,
-                    error=error,
-                    rejections=self.consecutive_rejections,
-                )
+            # Finite but over tolerance. Accept so the driver cannot spin,
+            # and say so. The next attempt is still subject to the dt floor.
+            self.forced_acceptances += 1
+            rejections = self.consecutive_rejections
+            self.consecutive_rejections = 0
+            warnings.warn(
+                "Accepting an adaptive step that exceeds the tolerance after "
+                f"{rejections} rejections (error={error}, dt={float(dt):.3e}). "
+                "AdaptiveStepResult.forced is True for this step.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return AdaptiveStepResult(
+                U_new=U_high,
+                dt_used=dt,
+                dt_next=dt_next,
+                accepted=True,
+                error=error,
+                rejections=rejections,
+                forced=True,
+            )
+
+        return AdaptiveStepResult(
+            U_new=U,
+            dt_used=dt,
+            dt_next=dt_next,
+            accepted=False,
+            error=error,
+            rejections=self.consecutive_rejections,
+            forced=False,
+        )
 
     def reset_rejections(self):
         """Reset the consecutive rejection counter."""

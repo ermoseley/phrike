@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
@@ -28,35 +30,487 @@ from .artificial_viscosity import SpectralArtificialViscosity, ArtificialViscosi
 
 Array = np.ndarray
 
+# Fixed-step schemes and embedded pairs. An unknown name is an error.
+# rk23/rk45/rk78 are not silent aliases of RK4.
+_FIXED_SCHEMES = frozenset({"rk2", "rk4"})
+_EMBEDDED_SCHEMES = frozenset({"rk23", "rk45", "rk78"})
+_KNOWN_SCHEMES = _FIXED_SCHEMES | _EMBEDDED_SCHEMES
+_UNUSED_FALLBACK_WARNED = False
 
-def _positivity_clamp(U: Array, eqs: EulerEquations1D, rho_min: float = 1e-10, p_min: float = 1e-12) -> Array:
-    """Clamp density and pressure to be positive (lightweight limiter).
+# Historical positivity floors. 2D is looser than 1D; 3D follows 1D.
+# Changing the 2D numbers would move any shock that actually hits the floor.
+_RHO_FLOOR_1D = 1e-10
+_P_FLOOR_1D = 1e-12
+_RHO_FLOOR_2D = 1e-8
+_P_FLOOR_2D = 1e-10
 
-    Args:
-        U: Conservative variables (3, N)
-        eqs: Euler equations object
-        rho_min: Minimum allowed density
-        p_min: Minimum allowed pressure
-    Returns:
-        Clamped conservative variables of same shape.
+
+class UnboundedTimeStep(RuntimeError):
+    """The step is not bounded by a wave speed, a parabolic limit, or a horizon."""
+
+
+class PositivityMonitor:
+    """Count positivity-floor hits and warn once per run.
+
+    ``events`` is the number of clamp calls that raised at least one value.
+    ``cells`` sums the density and pressure values that were below the floor.
+    """
+
+    def __init__(self) -> None:
+        self.events = 0
+        self.cells = 0
+        self._warned = False
+
+    def reset_run(self) -> None:
+        self.events = 0
+        self.cells = 0
+        self._warned = False
+
+    def note(self, n_values: int) -> None:
+        if n_values <= 0:
+            return
+        self.events += 1
+        self.cells += int(n_values)
+        if self._warned:
+            return
+        self._warned = True
+        warnings.warn(
+            "Positivity clamp raised density or pressure to the floor "
+            f"({int(n_values)} values on the first event this run).",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+
+def _init_monitors(solver, rho_floor: float, p_floor: float) -> None:
+    solver.positivity = PositivityMonitor()
+    solver.rho_floor = float(rho_floor)
+    solver.p_floor = float(p_floor)
+    solver._accepted_steps = 0
+
+
+def _is_torch_array(value) -> bool:
+    return bool(_TORCH_AVAILABLE and isinstance(value, torch.Tensor))
+
+
+def _array_all_finite(U) -> bool:
+    if _is_torch_array(U):
+        return bool(torch.isfinite(U).all().item())
+    return bool(np.isfinite(np.asarray(U)).all())
+
+
+def _require_finite_state(solver, where: str, U=None) -> None:
+    """Raise if the conserved state contains NaN or Inf.
+
+    The check looks at the state itself. It does not trust ``max_wave_speed``,
+    which can report 0 when every cell is non-finite.
+    """
+    state = solver.U if U is None else U
+    if state is None or _array_all_finite(state):
+        return
+    step = int(getattr(solver, "_accepted_steps", 0))
+    raise FloatingPointError(
+        f"Non-finite solution {where} at step {step}, t={solver.t}"
+    )
+
+
+def _count_below(values, floor: float) -> int:
+    if _is_torch_array(values):
+        return int(torch.count_nonzero(values < float(floor)).item())
+    return int(np.count_nonzero(np.asarray(values) < float(floor)))
+
+
+def _floor_values(values, floor: float):
+    if _is_torch_array(values):
+        return torch.clamp(values, min=float(floor))
+    return np.maximum(values, floor)
+
+
+def _clamp_conserved(
+    U,
+    equations,
+    rho_min: float,
+    p_min: float,
+    monitor: Optional[PositivityMonitor] = None,
+    *,
+    rebuild_always: bool = False,
+):
+    """Floor density and pressure.
+
+    ``rebuild_always`` reproduces the historical 1D/2D fixed-step clamp, which
+    rebuilds the conservative state at every stage. Adaptive steps and the 3D
+    fixed stages leave a positive state untouched, so a smooth update stays
+    bit-for-bit the embedded or classical Runge-Kutta step.
+
+    MHD (8 components) is not handled here. Fixed MHD substages use
+    ``SpectralSolverMHD._clamp``; embedded MHD stages are not limited.
+    """
+    primitive = equations.primitive(U)
+    ncomp = int(U.shape[0])
+    if ncomp == 3:
+        rho, velocity, pressure = primitive[0], primitive[1], primitive[2]
+        below = _count_below(rho, rho_min) + _count_below(pressure, p_min)
+        if monitor is not None:
+            monitor.note(below)
+        if below == 0 and not rebuild_always:
+            return U
+        return equations.conservative(
+            _floor_values(rho, rho_min), velocity, _floor_values(pressure, p_min)
+        )
+    if ncomp == 4:
+        rho, ux, uy, pressure = primitive
+        below = _count_below(rho, rho_min) + _count_below(pressure, p_min)
+        if monitor is not None:
+            monitor.note(below)
+        if below == 0 and not rebuild_always:
+            return U
+        return equations.conservative(
+            _floor_values(rho, rho_min), ux, uy, _floor_values(pressure, p_min)
+        )
+    if ncomp == 5:
+        rho, ux, uy, uz, pressure = primitive
+        below = _count_below(rho, rho_min) + _count_below(pressure, p_min)
+        if monitor is not None:
+            monitor.note(below)
+        if below == 0 and not rebuild_always:
+            return U
+        return equations.conservative(
+            _floor_values(rho, rho_min),
+            ux,
+            uy,
+            uz,
+            _floor_values(pressure, p_min),
+        )
+    raise ValueError(
+        f"Positivity clamp expected a 1D, 2D, or 3D Euler state, got {ncomp} components"
+    )
+
+
+def _limit_euler_stage(solver, U):
+    return _clamp_conserved(
+        U,
+        solver.equations,
+        solver.rho_floor,
+        solver.p_floor,
+        solver.positivity,
+        rebuild_always=False,
+    )
+
+
+def _call_adaptive_step(solver, stepper, rhs, state, dt, scale, limit_state=None):
+    """Step, and attach the solver step and time to a non-finite failure.
+
+    ``limit_state`` is forwarded only when ``stepper.step`` accepts it. Tests
+    replace the stepper with a duck-typed ``(rhs, state, dt, scale)`` callable.
     """
     try:
-        import torch  # type: ignore
-        is_torch = isinstance(U, torch.Tensor)
-    except Exception:
-        is_torch = False
-        torch = None  # type: ignore
+        parameters = inspect.signature(stepper.step).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    accepts_limit = limit_state is not None and (
+        "limit_state" in parameters
+        or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+    )
+    try:
+        if accepts_limit:
+            return stepper.step(rhs, state, dt, scale, limit_state=limit_state)
+        return stepper.step(rhs, state, dt, scale)
+    except FloatingPointError as exc:
+        message = str(exc)
+        if "t=" in message:
+            raise
+        raise FloatingPointError(
+            f"{message} At step {int(getattr(solver, '_accepted_steps', 0))}, "
+            f"t={solver.t}."
+        ) from exc
 
-    rho, u, p, _ = eqs.primitive(U)
-    if is_torch:  # type: ignore[truthy-bool]
-        rho_clamped = torch.clamp(rho, min=float(rho_min))
-        p_clamped = torch.clamp(p, min=float(p_min))
-        Uc = eqs.conservative(rho_clamped, u, p_clamped)
+
+def _positivity_clamp(U: Array, eqs: EulerEquations1D, rho_min: float = _RHO_FLOOR_1D,
+                      p_min: float = _P_FLOOR_1D, monitor: Optional[PositivityMonitor] = None) -> Array:
+    """Clamp 1D density and pressure, always rebuilding the conservative state.
+
+    Floors default to rho_min=1e-10 and p_min=1e-12. The 2D fixed stages use
+    looser historical floors (1e-8 and 1e-10). 3D uses these 1D floors.
+    Rebuilding even when the floor does not bind matches the previous 1D
+    fixed-step update.
+    """
+    return _clamp_conserved(
+        U, eqs, rho_min, p_min, monitor, rebuild_always=True
+    )
+
+
+def _parse_scheme(value, label: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a scheme name, got {value!r}")
+    name = value.strip().lower()
+    if name not in _KNOWN_SCHEMES:
+        raise ValueError(
+            f"Unknown {label} {value!r}. "
+            "Supported schemes: rk2, rk4, rk23, rk45, rk78."
+        )
+    return name
+
+
+def _warn_unused_fallback(fallback_name: str) -> None:
+    """``fallback_scheme`` does not run while an embedded method is active."""
+    global _UNUSED_FALLBACK_WARNED
+    if _UNUSED_FALLBACK_WARNED:
+        return
+    _UNUSED_FALLBACK_WARNED = True
+    warnings.warn(
+        "fallback_scheme is unused while adaptive.scheme is an embedded method "
+        f"(rk23, rk45, or rk78); ignoring fallback_scheme={fallback_name!r}. "
+        "It is applied only when adaptive stepping is requested with rk2 or rk4.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
+def _configure_time_integration(scheme, adaptive_config):
+    """Resolve the fixed or embedded scheme shared by every solver class.
+
+    Policy:
+    * ``rk2`` and ``rk4`` are the fixed schemes. ``rk23``, ``rk45``, and
+      ``rk78`` are embedded methods and require adaptive stepping.
+    * An unknown name raises ``ValueError`` instead of running RK4.
+    * When adaptive stepping is on and both ``scheme`` and
+      ``adaptive.scheme`` name embedded methods, they must be the same
+      method. The adaptive block wins only when ``scheme`` is a fixed
+      method (the historical ``scheme: rk4`` plus ``adaptive.scheme: rk45``
+      combination). If ``adaptive.scheme`` is omitted, an embedded
+      ``scheme`` is used; otherwise the default embedded method is ``rk45``.
+    * ``fallback_scheme`` must be ``rk2`` or ``rk4``. It is the fixed method
+      used when adaptive stepping is requested with a non-embedded scheme.
+      It is not a recovery path after rejected steps, and a process-wide
+      warning says so when an embedded method is selected anyway.
+    """
+    scheme_name = _parse_scheme(scheme if scheme is not None else "rk4", "integration scheme")
+    enabled = bool(adaptive_config and adaptive_config.get("enabled", False))
+    if not enabled:
+        if scheme_name not in _FIXED_SCHEMES:
+            raise ValueError(
+                f"Integration scheme {scheme_name!r} is an embedded method. "
+                "Enable adaptive time stepping, or choose rk2 or rk4."
+            )
+        return scheme_name, False, None
+
+    if adaptive_config.get("scheme") is None:
+        adaptive_method = scheme_name if scheme_name in _EMBEDDED_SCHEMES else "rk45"
     else:
-        rho_clamped = np.maximum(rho, rho_min)
-        p_clamped = np.maximum(p, p_min)
-        Uc = eqs.conservative(rho_clamped, u, p_clamped)
-    return Uc
+        adaptive_method = _parse_scheme(adaptive_config.get("scheme"), "adaptive scheme")
+
+    if (
+        scheme_name in _EMBEDDED_SCHEMES
+        and adaptive_method in _EMBEDDED_SCHEMES
+        and scheme_name != adaptive_method
+    ):
+        raise ValueError(
+            f"integration scheme {scheme_name!r} and adaptive scheme "
+            f"{adaptive_method!r} name different embedded methods. "
+            "Set them to the same method."
+        )
+
+    fallback_raw = adaptive_config.get("fallback_scheme", None)
+    if fallback_raw is None:
+        fallback_name = "rk4"
+    else:
+        fallback_name = _parse_scheme(fallback_raw, "fallback_scheme")
+        if fallback_name not in _FIXED_SCHEMES:
+            raise ValueError(
+                f"fallback_scheme must be rk2 or rk4, got {fallback_raw!r}"
+            )
+
+    if adaptive_method in _EMBEDDED_SCHEMES:
+        if fallback_raw is not None:
+            _warn_unused_fallback(fallback_name)
+        stepper = create_adaptive_stepper(
+            adaptive_method,
+            rtol=float(adaptive_config.get("rtol", 1e-6)),
+            atol=float(adaptive_config.get("atol", 1e-8)),
+            safety_factor=float(adaptive_config.get("safety_factor", 0.9)),
+            min_dt_factor=float(adaptive_config.get("min_dt_factor", 0.1)),
+            max_dt_factor=float(adaptive_config.get("max_dt_factor", 5.0)),
+            max_rejections=adaptive_config.get("max_rejections", 10),
+            dt_min=adaptive_config.get("dt_min", None),
+        )
+        return adaptive_method, True, stepper
+
+    warnings.warn(
+        f"Adaptive scheme {adaptive_method!r} is not an embedded Runge-Kutta "
+        f"method; using fixed-step {fallback_name!r} from fallback_scheme.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+    return fallback_name, False, None
+
+
+def _reject_unsupported_artificial_viscosity(config, solver_name: str) -> None:
+    if config and config.get("enabled", False):
+        raise NotImplementedError(
+            f"Artificial viscosity is enabled but {solver_name} does not apply it. "
+            "Disable artificial_viscosity.enabled."
+        )
+
+
+def _install_adaptive_floor(solver, t0: float, t_end: float) -> None:
+    stepper = getattr(solver, "adaptive_stepper", None)
+    controller = getattr(stepper, "controller", None)
+    if controller is None or getattr(controller, "dt_min", None) is not None:
+        return
+    span = abs(float(t_end) - float(t0))
+    controller.dt_min = 1e-12 * span if span > 0.0 else 1e-14
+
+
+def _begin_run(solver, t0: float, t_end: float) -> None:
+    solver.t = float(t0)
+    solver._accepted_steps = 0
+    monitor = getattr(solver, "positivity", None)
+    if monitor is not None:
+        monitor.reset_run()
+    _install_adaptive_floor(solver, t0, t_end)
+    _require_finite_state(solver, "before time integration")
+
+
+def _checked_wave_speed(solver, U) -> float:
+    _require_finite_state(solver, "while computing the time step", U)
+    speed = solver.equations.max_wave_speed(U)
+    try:
+        speed = float(speed)
+    except (TypeError, ValueError) as exc:
+        raise FloatingPointError(
+            f"Maximum wave speed is not a real number ({speed!r}) at "
+            f"step {solver._accepted_steps}, t={solver.t}"
+        ) from exc
+    if not np.isfinite(speed):
+        raise FloatingPointError(
+            f"Non-finite maximum wave speed ({speed}) at "
+            f"step {solver._accepted_steps}, t={solver.t}"
+        )
+    if speed < 0.0:
+        raise FloatingPointError(
+            f"Negative maximum wave speed ({speed}) at "
+            f"step {solver._accepted_steps}, t={solver.t}"
+        )
+    return speed
+
+
+def _min_spacing(grid) -> float:
+    """Smallest positive node spacing on the axes the grid actually has."""
+    values = []
+    for fallback, primary in (("dx", "dx_min"), ("dy", "dy_min"), ("dz", "dz_min")):
+        if not hasattr(grid, fallback):
+            continue
+        value = getattr(grid, primary, None)
+        if value is None:
+            value = getattr(grid, fallback)
+        value = float(value)
+        if not np.isfinite(value) or value <= 0.0:
+            raise RuntimeError(f"Grid {fallback} spacing is not positive ({value}).")
+        values.append(value)
+    if not values:
+        raise RuntimeError("Cannot form a CFL length: the grid has no dx, dy, or dz.")
+    return min(values)
+
+
+def _hyperbolic_dt(cfl: float, length: float, speed: float) -> float:
+    if speed == 0.0:
+        return float("inf")
+    return float(cfl) * float(length) / float(speed)
+
+
+def _smallest_finite(bounds) -> float:
+    """Minimum finite positive bound, or inf when every bound is absent."""
+    finite = []
+    for bound in bounds:
+        if bound is None:
+            continue
+        bound = float(bound)
+        if not np.isfinite(bound):
+            if bound == float("inf"):
+                continue
+            raise FloatingPointError(f"Non-finite time-step bound ({bound})")
+        if bound <= 0.0:
+            raise RuntimeError(f"Non-positive time-step bound ({bound})")
+        finite.append(bound)
+    if not finite:
+        return float("inf")
+    return min(finite)
+
+
+def _event_horizon(t, t_end, next_output, next_checkpoint) -> float:
+    horizon = float(t_end) - float(t)
+    for event in (next_output, next_checkpoint):
+        if event is None:
+            continue
+        event = float(event)
+        if np.isfinite(event) and event > float(t):
+            horizon = min(horizon, event - float(t))
+    return horizon
+
+
+def _cap_proposal(solver, proposal, t_end, next_output, next_checkpoint) -> float:
+    """Cap a proposed step by the stability limit and the next output time.
+
+    A genuinely zero wave speed contributes no hyperbolic bound. The step is
+    then the viscous/diffusive limit, or the time remaining until the next
+    output, checkpoint, or ``t_end``. If none of those is finite and positive,
+    raise rather than inventing a ``1e-6`` step.
+    """
+    limit = solver._stability_limit(solver.U)
+    horizon = _event_horizon(solver.t, t_end, next_output, next_checkpoint)
+    finite = [
+        float(value)
+        for value in (proposal, limit, horizon)
+        if np.isfinite(float(value))
+    ]
+    if not finite:
+        raise UnboundedTimeStep(
+            "No finite time step at "
+            f"step {solver._accepted_steps}, t={solver.t}: the maximum wave "
+            "speed is zero and no viscous, diffusive, output, checkpoint, or "
+            "end-time limit applies."
+        )
+    dt = min(finite)
+    if dt <= 0.0:
+        raise UnboundedTimeStep(
+            f"No positive time step at step {solver._accepted_steps}, t={solver.t}."
+        )
+    return dt
+
+
+def _public_dt(solver, U) -> float:
+    dt = solver._stability_limit(U)
+    if not np.isfinite(dt):
+        raise UnboundedTimeStep(
+            "No finite time-step bound at "
+            f"step {solver._accepted_steps}, t={solver.t}: the maximum wave "
+            "speed is zero and no viscous or diffusive stability limit applies."
+        )
+    return dt
+
+
+def _emit_final_output(history, t, record, on_output, U) -> None:
+    """Record the end state once. Skip when the last step already landed on it."""
+    times = history.get("time") or []
+    if times and abs(float(times[-1]) - float(t)) <= 1e-12:
+        return
+    record()
+    if on_output is not None:
+        on_output(t, U)
+
+
+def _note_accepted(solver) -> None:
+    solver._accepted_steps = int(getattr(solver, "_accepted_steps", 0)) + 1
+    _require_finite_state(solver, "after accepted step")
+
+
+def _copy_initial_state(U0):
+    if _TORCH_AVAILABLE and isinstance(U0, torch.Tensor):
+        return U0.clone()
+    return U0.copy()
 
 
 def _compute_rhs(grid: Grid1D, eqs: EulerEquations1D, U: Array, 
@@ -93,27 +547,29 @@ def _compute_rhs(grid: Grid1D, eqs: EulerEquations1D, U: Array,
 
 def _rk2_step(grid: Grid1D, eqs: EulerEquations1D, U: Array, dt: float, 
               artificial_viscosity: Optional[SpectralArtificialViscosity] = None,
-              gravity_config: Optional[Dict] = None) -> Array:
+              gravity_config: Optional[Dict] = None,
+              monitor: Optional[PositivityMonitor] = None) -> Array:
     k1 = _compute_rhs(grid, eqs, U, artificial_viscosity, gravity_config)
     U1 = U + dt * 0.5 * k1
-    U1 = _positivity_clamp(U1, eqs)
+    U1 = _positivity_clamp(U1, eqs, monitor=monitor)
     k2 = _compute_rhs(grid, eqs, U1, artificial_viscosity, gravity_config)
     Unew = U + dt * k2
-    return _positivity_clamp(Unew, eqs)
+    return _positivity_clamp(Unew, eqs, monitor=monitor)
 
 
 def _rk4_step(grid: Grid1D, eqs: EulerEquations1D, U: Array, dt: float,
               artificial_viscosity: Optional[SpectralArtificialViscosity] = None,
-              gravity_config: Optional[Dict] = None) -> Array:
+              gravity_config: Optional[Dict] = None,
+              monitor: Optional[PositivityMonitor] = None) -> Array:
     k1 = _compute_rhs(grid, eqs, U, artificial_viscosity, gravity_config)
-    U2 = _positivity_clamp(U + 0.5 * dt * k1, eqs)
+    U2 = _positivity_clamp(U + 0.5 * dt * k1, eqs, monitor=monitor)
     k2 = _compute_rhs(grid, eqs, U2, artificial_viscosity, gravity_config)
-    U3 = _positivity_clamp(U + 0.5 * dt * k2, eqs)
+    U3 = _positivity_clamp(U + 0.5 * dt * k2, eqs, monitor=monitor)
     k3 = _compute_rhs(grid, eqs, U3, artificial_viscosity, gravity_config)
-    U4 = _positivity_clamp(U + dt * k3, eqs)
+    U4 = _positivity_clamp(U + dt * k3, eqs, monitor=monitor)
     k4 = _compute_rhs(grid, eqs, U4, artificial_viscosity, gravity_config)
     Unew = U + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
-    return _positivity_clamp(Unew, eqs)
+    return _positivity_clamp(Unew, eqs, monitor=monitor)
 
 
 def _apply_accepted_state_stabilization(
@@ -138,14 +594,39 @@ def _artificial_viscosity_dt(grid, viscosity) -> float:
     weight = max([1.0, *config.variable_weights.values()])
     if nu <= 0.0:
         return float("inf")
-    if (config.mode == "constant" and grid._basis_name != "fourier"
-            and grid._bc_global == "fixed" and grid.N > 2):
+    # 1D fixed-endpoint diffusion matrix. Multi-D grids have no `_basis`.
+    basis = getattr(grid, "_basis_name", None)
+    if (config.mode == "constant" and basis not in (None, "fourier")
+            and getattr(grid, "_bc_global", None) == "fixed"
+            and getattr(grid, "N", 0) > 2
+            and hasattr(grid, "_basis")):
         if not hasattr(grid, "_fixed_diffusion_bound"):
             laplacian = grid._basis.d2x(np.eye(grid.N)).T
             grid._fixed_diffusion_bound = float(np.max(np.sum(np.abs(laplacian[1:-1, 1:-1]), axis=1)))
         # Bound the fixed-endpoint diffusion matrix, with a unit RK stability margin.
         return 1.0 / (nu * weight * grid._fixed_diffusion_bound)
-    return 0.2 * grid.dx ** 2 / (nu * weight)
+    dx = _min_spacing(grid)
+    return 0.2 * dx ** 2 / (nu * weight)
+
+
+def _spacing_wavenumber_bound(grid) -> float:
+    """Conservative explicit-diffusion bound ``sum_i 4 / dx_i**2``."""
+    terms = []
+    for fallback, primary in (("dx", "dx_min"), ("dy", "dy_min"), ("dz", "dz_min")):
+        if not hasattr(grid, fallback):
+            continue
+        value = getattr(grid, primary, None)
+        if value is None:
+            value = getattr(grid, fallback)
+        value = float(value)
+        if not np.isfinite(value) or value <= 0.0:
+            raise RuntimeError(f"Grid {fallback} spacing is not positive ({value}).")
+        terms.append(4.0 / (value * value))
+    if not terms:
+        raise RuntimeError(
+            "Cannot bound the diffusive CFL: grid wavenumbers and spacings are unavailable."
+        )
+    return float(sum(terms))
 
 
 class SpectralSolver1D:
@@ -183,38 +664,13 @@ class SpectralSolver1D:
         """
         self.grid = grid
         self.equations = equations
-        self.scheme = scheme
         self.cfl = cfl
         self.t = 0.0
         self.U = U0
-        
-        # Setup adaptive time-stepping if configured
-        self.adaptive_enabled = False
-        self.adaptive_stepper = None
-        
-        if adaptive_config and adaptive_config.get("enabled", False):
-            adaptive_method = adaptive_config.get("scheme", "rk45")
-            rtol = adaptive_config.get("rtol", 1e-6)
-            atol = adaptive_config.get("atol", 1e-8)
-            
-            # Extract controller parameters
-            controller_kwargs = {
-                "safety_factor": adaptive_config.get("safety_factor", 0.9),
-                "min_dt_factor": adaptive_config.get("min_dt_factor", 0.1),
-                "max_dt_factor": adaptive_config.get("max_dt_factor", 5.0),
-                "max_rejections": adaptive_config.get("max_rejections", 10)
-            }
-            
-            # Check if scheme is adaptive
-            if adaptive_method in ["rk23", "rk45", "rk78"]:
-                self.adaptive_stepper = create_adaptive_stepper(
-                    adaptive_method, rtol=rtol, atol=atol, **controller_kwargs
-                )
-                self.adaptive_enabled = True
-                self.scheme = adaptive_method
-            else:
-                # Fall back to non-adaptive scheme
-                self.scheme = adaptive_config.get("fallback_scheme", "rk4")
+        self.scheme, self.adaptive_enabled, self.adaptive_stepper = (
+            _configure_time_integration(scheme, adaptive_config)
+        )
+        _init_monitors(self, _RHO_FLOOR_1D, _P_FLOOR_1D)
         
         # Setup artificial viscosity if configured
         self.artificial_viscosity = None
@@ -226,13 +682,19 @@ class SpectralSolver1D:
         self.gravity_config = gravity_config
 
 
+    def _stability_limit(self, U: Array) -> float:
+        speed = _checked_wave_speed(self, U)
+        # CFL for spectral (heuristic): dt <= cfl * dx / max_speed.
+        # A zero wave speed is unbounded here. Artificial viscosity can still
+        # supply a finite limit. A uniform state at rest with p > 0 is not a
+        # zero-speed state: the sound speed remains.
+        return _smallest_finite((
+            _hyperbolic_dt(self.cfl, _min_spacing(self.grid), speed),
+            _artificial_viscosity_dt(self.grid, self.artificial_viscosity),
+        ))
+
     def compute_dt(self, U: Array) -> float:
-        max_speed = self.equations.max_wave_speed(U)
-        # CFL for spectral (heuristic): dt <= cfl * dx / max_speed
-        if max_speed <= 0.0:
-            return 1e-6
-        return min(self.cfl * self.grid.dx / max_speed,
-                   _artificial_viscosity_dt(self.grid, self.artificial_viscosity))
+        return _public_dt(self, U)
 
     def step(self, U: Array, dt: float) -> Array:
         """Perform one time step using the configured scheme.
@@ -255,9 +717,9 @@ class SpectralSolver1D:
         """Perform one fixed time step."""
         U_split = self.grid.apply_spectral_dissipation(U, 0.5 * dt)
         if self.scheme.lower() == "rk2":
-            Un = _rk2_step(self.grid, self.equations, U_split, dt, self.artificial_viscosity, self.gravity_config)
+            Un = _rk2_step(self.grid, self.equations, U_split, dt, self.artificial_viscosity, self.gravity_config, self.positivity)
         else:
-            Un = _rk4_step(self.grid, self.equations, U_split, dt, self.artificial_viscosity, self.gravity_config)
+            Un = _rk4_step(self.grid, self.equations, U_split, dt, self.artificial_viscosity, self.gravity_config, self.positivity)
         return _apply_accepted_state_stabilization(
             self.grid, Un, self.equations, dt=0.5 * dt
         )
@@ -276,8 +738,11 @@ class SpectralSolver1D:
         else:
             solution_scale = float(np.max(np.abs(U_split)))
         
-        # Perform adaptive step
-        result = self.adaptive_stepper.step(rhs_func, U_split, dt, solution_scale)
+        # Perform adaptive step. Stages after the first are positivity limited.
+        result = _call_adaptive_step(
+            self, self.adaptive_stepper, rhs_func, U_split, dt, solution_scale,
+            limit_state=lambda state: _limit_euler_stage(self, state),
+        )
         
         # Complete the split dissipation and projection for an accepted solution.
         if result.accepted:
@@ -304,8 +769,11 @@ class SpectralSolver1D:
         else:
             solution_scale = float(np.max(np.abs(U_split)))
         
-        # Perform adaptive step
-        result = self.adaptive_stepper.step(rhs_func, U_split, dt, solution_scale)
+        # Perform adaptive step. Stages after the first are positivity limited.
+        result = _call_adaptive_step(
+            self, self.adaptive_stepper, rhs_func, U_split, dt, solution_scale,
+            limit_state=lambda state: _limit_euler_stage(self, state),
+        )
         
         if result.accepted:
             # Step accepted - update solution and time
@@ -313,6 +781,7 @@ class SpectralSolver1D:
                 self.grid, result.U_new, self.equations, dt=0.5 * dt
             )
             self.t += dt
+            _note_accepted(self)
             
             # Call monitoring callback
             if on_step is not None:
@@ -329,13 +798,13 @@ class SpectralSolver1D:
         """Perform one step in fixed run loop."""
         self.U = self.step(self.U, dt)
         self.t += dt
+        _note_accepted(self)
         
         # Call monitoring callback
         if on_step is not None:
             on_step(step_count, dt, self.U)
         
-        # Return next CFL-based step size
-        return min(self.compute_dt(self.U), 1e-6 if self.equations.max_wave_speed(self.U) <= 0.0 else float('inf'))
+        return self._stability_limit(self.U)
 
     def run(
         self,
@@ -358,7 +827,7 @@ class SpectralSolver1D:
         # Start Fourier runs in the same retained subspace enforced after steps.
         self.U = self.grid.project_dealiased(self.U)
         self.U = self.grid.initialize_boundary_conditions(self.U, self.equations)
-        self.t = float(t0)
+        _begin_run(self, t0, t_end)
         next_output = self.t + output_interval
         next_checkpoint = (
             self.t + checkpoint_interval
@@ -385,12 +854,10 @@ class SpectralSolver1D:
         if on_output is not None:
             on_output(self.t, self.U)
 
-        # Initialize time step
-        dt = self.compute_dt(self.U) if self.U is not None else 1e-6
+        dt = float("inf")
         
         while self.t < t_end - 1e-12:
-            # Ensure we don't overshoot the end time
-            dt = min(dt, self.compute_dt(self.U), t_end - self.t)
+            dt = _cap_proposal(self, dt, t_end, next_output, next_checkpoint)
             dt_used = dt
             state_before = self.U
             time_before = self.t
@@ -429,9 +896,7 @@ class SpectralSolver1D:
                 )
                 next_checkpoint += checkpoint_interval
 
-        record()
-        if on_output is not None:
-            on_output(self.t, self.U)
+        _emit_final_output(history, self.t, record, on_output, self.U)
         return history
 
 
@@ -441,12 +906,9 @@ class SpectralSolver1D:
 def _compute_rhs_2d(grid: Grid2D, eqs: EulerEquations2D, U: Array, 
                    artificial_viscosity: Optional[SpectralArtificialViscosity] = None,
                    gravity_config: Optional[Dict] = None) -> Array:
-    # Mirror 1D: pre-apply BCs via grid if available (Fourier or hybrid). 2D Legendre disabled.
+    # Mirror 1D: pre-apply BCs via grid if available (Fourier or hybrid).
     if hasattr(grid, "apply_boundary_conditions"):
-        try:
-            U = grid.apply_boundary_conditions(U, eqs)
-        except Exception:
-            pass
+        U = grid.apply_boundary_conditions(U, eqs)
     # Fluxes in x and y
     Fx, Fy = eqs.flux(U)
     dFdx = grid.dx1(Fx)
@@ -482,65 +944,56 @@ def _compute_rhs_2d(grid: Grid2D, eqs: EulerEquations2D, U: Array,
         rhs[3] += rho * (gx * ux + gy * uy)
     
     return rhs
-def _positivity_clamp_2d(U: Array, eqs: EulerEquations2D, rho_min: float = 1e-8, p_min: float = 1e-10) -> Array:
-    """Clamp density and pressure to small positive bounds in 2D.
 
-    Rebuilds conservative state from clamped (rho, ux, uy, p) to avoid negative pressure blow-ups.
+
+def _positivity_clamp_2d(U: Array, eqs: EulerEquations2D, rho_min: float = _RHO_FLOOR_2D,
+                         p_min: float = _P_FLOOR_2D,
+                         monitor: Optional[PositivityMonitor] = None) -> Array:
+    """Clamp 2D density and pressure, always rebuilding the conservative state.
+
+    Floors stay at the historical 2D values rho_min=1e-8 and p_min=1e-10.
     """
-    try:
-        import torch  # type: ignore
-        is_torch = isinstance(U, torch.Tensor)
-    except Exception:
-        is_torch = False
-        torch = None  # type: ignore
-
-    rho, ux, uy, p = eqs.primitive(U)
-    if is_torch:  # type: ignore[truthy-bool]
-        rho_c = torch.clamp(rho, min=float(rho_min))
-        p_c = torch.clamp(p, min=float(p_min))
-        Uc = eqs.conservative(rho_c, ux, uy, p_c)
-    else:
-        rho_c = np.maximum(rho, rho_min)
-        p_c = np.maximum(p, p_min)
-        Uc = eqs.conservative(rho_c, ux, uy, p_c)
-    return Uc
+    return _clamp_conserved(
+        U, eqs, rho_min, p_min, monitor, rebuild_always=True
+    )
 
 
 
 def _rk2_step_2d(grid: Grid2D, eqs: EulerEquations2D, U: Array, dt: float,
                  artificial_viscosity: Optional[SpectralArtificialViscosity] = None,
-                 gravity_config: Optional[Dict] = None) -> Array:
+                 gravity_config: Optional[Dict] = None,
+                 monitor: Optional[PositivityMonitor] = None) -> Array:
     k1 = _compute_rhs_2d(grid, eqs, U, artificial_viscosity, gravity_config)
-    U1 = _positivity_clamp_2d(U + dt * 0.5 * k1, eqs)
+    U1 = _positivity_clamp_2d(U + dt * 0.5 * k1, eqs, monitor=monitor)
     k2 = _compute_rhs_2d(grid, eqs, U1, artificial_viscosity, gravity_config)
-    Unew = _positivity_clamp_2d(U + dt * k2, eqs)
+    Unew = _positivity_clamp_2d(U + dt * k2, eqs, monitor=monitor)
     return Unew
 
 
 def _rk4_step_2d(grid: Grid2D, eqs: EulerEquations2D, U: Array, dt: float,
                  artificial_viscosity: Optional[SpectralArtificialViscosity] = None,
-                 gravity_config: Optional[Dict] = None) -> Array:
+                 gravity_config: Optional[Dict] = None,
+                 monitor: Optional[PositivityMonitor] = None) -> Array:
     k1 = _compute_rhs_2d(grid, eqs, U, artificial_viscosity, gravity_config)
-    U2 = _positivity_clamp_2d(U + 0.5 * dt * k1, eqs)
+    U2 = _positivity_clamp_2d(U + 0.5 * dt * k1, eqs, monitor=monitor)
     k2 = _compute_rhs_2d(grid, eqs, U2, artificial_viscosity, gravity_config)
-    U3 = _positivity_clamp_2d(U + 0.5 * dt * k2, eqs)
+    U3 = _positivity_clamp_2d(U + 0.5 * dt * k2, eqs, monitor=monitor)
     k3 = _compute_rhs_2d(grid, eqs, U3, artificial_viscosity, gravity_config)
-    U4 = _positivity_clamp_2d(U + dt * k3, eqs)
+    U4 = _positivity_clamp_2d(U + dt * k3, eqs, monitor=monitor)
     k4 = _compute_rhs_2d(grid, eqs, U4, artificial_viscosity, gravity_config)
     Unew = U + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
-    return _positivity_clamp_2d(Unew, eqs)
+    return _positivity_clamp_2d(Unew, eqs, monitor=monitor)
 
 
 def _apply_accepted_state_stabilization_2d(
-    grid: Grid2D, U: Array, dt: float = 0.0
+    grid: Grid2D,
+    U: Array,
+    equations: Optional[EulerEquations2D] = None,
+    dt: float = 0.0,
 ) -> Array:
     U_filtered = grid.apply_accepted_state_stabilization(U, dt)
-    # Re-apply BCs after filtering if available
-    try:
-        if hasattr(grid, "apply_boundary_conditions"):
-            return grid.apply_boundary_conditions(U_filtered, None)
-    except Exception:
-        pass
+    if equations is not None and hasattr(grid, "apply_boundary_conditions"):
+        return grid.apply_boundary_conditions(U_filtered, equations)
     return U_filtered
 
 
@@ -579,38 +1032,13 @@ class SpectralSolver2D:
         """
         self.grid = grid
         self.equations = equations
-        self.scheme = scheme
         self.cfl = cfl
         self.t = 0.0
         self.U = U0
-        
-        # Setup adaptive time-stepping if configured
-        self.adaptive_enabled = False
-        self.adaptive_stepper = None
-        
-        if adaptive_config and adaptive_config.get("enabled", False):
-            adaptive_method = adaptive_config.get("scheme", "rk45")
-            rtol = adaptive_config.get("rtol", 1e-6)
-            atol = adaptive_config.get("atol", 1e-8)
-            
-            # Extract controller parameters
-            controller_kwargs = {
-                "safety_factor": adaptive_config.get("safety_factor", 0.9),
-                "min_dt_factor": adaptive_config.get("min_dt_factor", 0.1),
-                "max_dt_factor": adaptive_config.get("max_dt_factor", 5.0),
-                "max_rejections": adaptive_config.get("max_rejections", 10)
-            }
-            
-            # Check if scheme is adaptive
-            if adaptive_method in ["rk23", "rk45", "rk78"]:
-                self.adaptive_stepper = create_adaptive_stepper(
-                    adaptive_method, rtol=rtol, atol=atol, **controller_kwargs
-                )
-                self.adaptive_enabled = True
-                self.scheme = adaptive_method
-            else:
-                # Fall back to non-adaptive scheme
-                self.scheme = adaptive_config.get("fallback_scheme", "rk4")
+        self.scheme, self.adaptive_enabled, self.adaptive_stepper = (
+            _configure_time_integration(scheme, adaptive_config)
+        )
+        _init_monitors(self, _RHO_FLOOR_2D, _P_FLOOR_2D)
 
         # Setup artificial viscosity if configured
         self.artificial_viscosity = None
@@ -621,19 +1049,20 @@ class SpectralSolver2D:
         # Setup gravity if configured
         self.gravity_config = gravity_config
 
-    def compute_dt(self, U: Array) -> float:
-        max_speed = self.equations.max_wave_speed(U)
-        if max_speed <= 0.0:
-            return 1e-6
-        # Use true minimum node spacing if available (Legendre/nonuniform)
-        dx_eff = getattr(self.grid, "dx_min", None) or self.grid.dx
-        dy_eff = getattr(self.grid, "dy_min", None) or self.grid.dy
-        dt = self.cfl * min(dx_eff, dy_eff) / max_speed
-        if getattr(self.grid, "_mixed_open_y", False):
-            rate = self.grid.sbp_dissipation_rate_bound(max_speed)
+    def _stability_limit(self, U: Array) -> float:
+        speed = _checked_wave_speed(self, U)
+        bounds = [
+            _hyperbolic_dt(self.cfl, _min_spacing(self.grid), speed),
+            _artificial_viscosity_dt(self.grid, self.artificial_viscosity),
+        ]
+        if getattr(self.grid, "_mixed_open_y", False) and speed > 0.0:
+            rate = self.grid.sbp_dissipation_rate_bound(speed)
             if rate > 0.0:
-                dt = min(dt, 1.0 / rate)
-        return dt
+                bounds.append(1.0 / rate)
+        return _smallest_finite(bounds)
+
+    def compute_dt(self, U: Array) -> float:
+        return _public_dt(self, U)
 
     def step(self, U: Array, dt: float) -> Array:
         """Perform one time step using the configured scheme.
@@ -656,11 +1085,11 @@ class SpectralSolver2D:
         """Perform one fixed time step."""
         U_split = self.grid.apply_spectral_dissipation(U, 0.5 * dt)
         if self.scheme.lower() == "rk2":
-            Un = _rk2_step_2d(self.grid, self.equations, U_split, dt, self.artificial_viscosity, self.gravity_config)
+            Un = _rk2_step_2d(self.grid, self.equations, U_split, dt, self.artificial_viscosity, self.gravity_config, self.positivity)
         else:
-            Un = _rk4_step_2d(self.grid, self.equations, U_split, dt, self.artificial_viscosity, self.gravity_config)
+            Un = _rk4_step_2d(self.grid, self.equations, U_split, dt, self.artificial_viscosity, self.gravity_config, self.positivity)
         return _apply_accepted_state_stabilization_2d(
-            self.grid, Un, dt=0.5 * dt
+            self.grid, Un, self.equations, dt=0.5 * dt
         )
     
     def _adaptive_step(self, U: Array, dt: float) -> Array:
@@ -677,11 +1106,14 @@ class SpectralSolver2D:
         else:
             solution_scale = float(np.max(np.abs(U_split)))
         
-        result = self.adaptive_stepper.step(rhs_func, U_split, dt, solution_scale)
+        result = _call_adaptive_step(
+            self, self.adaptive_stepper, rhs_func, U_split, dt, solution_scale,
+            limit_state=lambda state: _limit_euler_stage(self, state),
+        )
         
         if result.accepted:
             Un = _apply_accepted_state_stabilization_2d(
-                self.grid, result.U_new, dt=0.5 * dt
+                self.grid, result.U_new, self.equations, dt=0.5 * dt
             )
         else:
             Un = U
@@ -707,13 +1139,17 @@ class SpectralSolver2D:
         else:
             solution_scale = float(np.max(np.abs(U_split)))
         
-        result = self.adaptive_stepper.step(rhs_func, U_split, dt, solution_scale)
+        result = _call_adaptive_step(
+            self, self.adaptive_stepper, rhs_func, U_split, dt, solution_scale,
+            limit_state=lambda state: _limit_euler_stage(self, state),
+        )
         
         if result.accepted:
             self.U = _apply_accepted_state_stabilization_2d(
-                self.grid, result.U_new, dt=0.5 * dt
+                self.grid, result.U_new, self.equations, dt=0.5 * dt
             )
             self.t += dt
+            _note_accepted(self)
             if on_step is not None:
                 on_step(step_count, dt, self.U)
             return result.dt_next
@@ -725,13 +1161,13 @@ class SpectralSolver2D:
         """Perform one step in fixed run loop."""
         self.U = self.step(self.U, dt)
         self.t += dt
+        _note_accepted(self)
         
         # Call monitoring callback
         if on_step is not None:
             on_step(step_count, dt, self.U)
         
-        # Return next CFL-based step size
-        return min(self.compute_dt(self.U), 1e-6 if self.equations.max_wave_speed(self.U) <= 0.0 else float('inf'))
+        return self._stability_limit(self.U)
 
     def run(
         self,
@@ -755,7 +1191,7 @@ class SpectralSolver2D:
         self.U = self.grid.project_dealiased(self.U)
         if getattr(self.grid, "_mixed_open_y", False):
             self.U = self.grid.initialize_boundary_conditions(self.U, self.equations)
-        self.t = float(t0)
+        _begin_run(self, t0, t_end)
         next_output = self.t + output_interval
         next_checkpoint = (
             self.t + checkpoint_interval
@@ -810,12 +1246,10 @@ class SpectralSolver2D:
         if on_output is not None:
             on_output(self.t, self.U)
 
-        # Initialize time step
-        dt = self.compute_dt(self.U) if self.U is not None else 1e-6
+        dt = float("inf")
         
         while self.t < t_end - 1e-12:
-            # Ensure we don't overshoot the end time
-            dt = min(dt, t_end - self.t)
+            dt = _cap_proposal(self, dt, t_end, next_output, next_checkpoint)
             dt_used = dt
             state_before = self.U
             time_before = self.t
@@ -854,9 +1288,7 @@ class SpectralSolver2D:
                 )
                 next_checkpoint += checkpoint_interval
 
-        record()
-        if on_output is not None:
-            on_output(self.t, self.U)
+        _emit_final_output(history, self.t, record, on_output, self.U)
         return history
 
 
@@ -893,6 +1325,12 @@ class SpectralSolverMHD:
     from the grid. Runtime MHD options (resistivity, viscosity,
     project_each_substage, divergence_clean) are read from ``grid.mhd_config`` if
     present, and can also be set as attributes after construction.
+
+    Artificial viscosity is applied only in 1D. Enabling it for 2D or 3D raises
+    ``NotImplementedError``. Fixed Runge-Kutta substages clamp density and
+    pressure and count those events. Embedded adaptive stages are not
+    positivity-limited; only the accepted state is clamped, together with the
+    magnetic projection. The hyperbolic CFL length is the minimum node spacing.
     """
 
     def __init__(self, grid, equations, U0: Optional[Array] = None,
@@ -902,7 +1340,6 @@ class SpectralSolverMHD:
                  gravity_config: Optional[Dict] = None):
         self.grid = grid
         self.equations = equations
-        self.scheme = scheme
         self.cfl = cfl
         self.t = 0.0
         self.U = U0
@@ -939,56 +1376,44 @@ class SpectralSolverMHD:
         self.cfl_diff = float(cfg.get("cfl_diff", 1.0))
         self._k2_max = self._grid_k2_max()
         self.artificial_viscosity = None
-        if self.dim == 1 and artificial_viscosity_config and artificial_viscosity_config.get("enabled", False):
+        if artificial_viscosity_config and artificial_viscosity_config.get("enabled", False):
+            if self.dim != 1:
+                _reject_unsupported_artificial_viscosity(
+                    artificial_viscosity_config, f"{self.dim}D MHD"
+                )
             from .artificial_viscosity import create_artificial_viscosity
 
             self.artificial_viscosity = create_artificial_viscosity(artificial_viscosity_config)
-
-        # Adaptive time-stepping
-        self.adaptive_enabled = False
-        self.adaptive_stepper = None
-        if adaptive_config and adaptive_config.get("enabled", False):
-            adaptive_method = adaptive_config.get("scheme", "rk45")
-            rtol = adaptive_config.get("rtol", 1e-6)
-            atol = adaptive_config.get("atol", 1e-8)
-            controller_kwargs = {
-                "safety_factor": adaptive_config.get("safety_factor", 0.9),
-                "min_dt_factor": adaptive_config.get("min_dt_factor", 0.1),
-                "max_dt_factor": adaptive_config.get("max_dt_factor", 5.0),
-                "max_rejections": adaptive_config.get("max_rejections", 10),
-            }
-            if adaptive_method in ["rk23", "rk45", "rk78"]:
-                self.adaptive_stepper = create_adaptive_stepper(
-                    adaptive_method, rtol=rtol, atol=atol, **controller_kwargs
-                )
-                self.adaptive_enabled = True
-                self.scheme = adaptive_method
-            else:
-                self.scheme = adaptive_config.get("fallback_scheme", "rk4")
+        self.scheme, self.adaptive_enabled, self.adaptive_stepper = (
+            _configure_time_integration(scheme, adaptive_config)
+        )
+        _init_monitors(self, self.rho_min, self.p_min)
 
     def _grid_k2_max(self) -> float:
-        """Max squared wavenumber on the grid (for the parabolic diffusion CFL)."""
+        """Max squared wavenumber on the grid (for the parabolic diffusion CFL).
+
+        A missing multi-D wavenumber array uses ``sum 4/dx_i**2``. Any other
+        failure propagates; returning 0 would silently drop the diffusive CFL.
+        """
         g = self.grid
-        try:
-            if getattr(g, "_mixed_open_y", False):
-                D = g._sbp_dy(np.eye(g.Ny))
-                root = np.sqrt(g.wy)
-                D = root[:, None]*D/root[None, :]
-                ky2_bound = np.linalg.norm(D, 1)*np.linalg.norm(D, np.inf)
-                kx = g.kx.detach().cpu().numpy() if g._use_torch else g.kx
-                return float(np.max(kx*kx)+ky2_bound)
-            if self.dim == 1:
-                if g._basis_name != "fourier":
-                    return 4.0 / g.dx ** 2
-                k = g.k
-                k2 = k * k
-            else:
-                k2 = g.k2
-            if _TORCH_AVAILABLE and isinstance(k2, torch.Tensor):
-                return float(torch.max(k2).item())
-            return float(np.max(np.asarray(k2)))
-        except Exception:
-            return 0.0
+        if getattr(g, "_mixed_open_y", False):
+            D = g._sbp_dy(np.eye(g.Ny))
+            root = np.sqrt(g.wy)
+            D = root[:, None]*D/root[None, :]
+            ky2_bound = np.linalg.norm(D, 1)*np.linalg.norm(D, np.inf)
+            kx = g.kx.detach().cpu().numpy() if g._use_torch else g.kx
+            return float(np.max(kx*kx)+ky2_bound)
+        if self.dim == 1:
+            if getattr(g, "_basis_name", "fourier") != "fourier":
+                return 4.0 / float(g.dx) ** 2
+            k2 = g.k * g.k
+        else:
+            k2 = getattr(g, "k2", None)
+            if k2 is None:
+                return _spacing_wavenumber_bound(g)
+        if _TORCH_AVAILABLE and isinstance(k2, torch.Tensor):
+            return float(torch.max(k2).item())
+        return float(np.max(np.asarray(k2)))
 
     # --- physics helpers ---
     def _flux_divergence(self, U: Array) -> Array:
@@ -1032,6 +1457,10 @@ class SpectralSolverMHD:
 
     def _clamp(self, U: Array) -> Array:
         rho, ux, uy, uz, p, Bx, By, Bz = self.equations.primitive(U)
+        monitor = getattr(self, "positivity", None)
+        if monitor is not None:
+            monitor.note(_count_below(rho, self.rho_min) + _count_below(p, self.p_min))
+        # Always rebuild, matching the previous MHD stage update.
         if _TORCH_AVAILABLE and isinstance(U, torch.Tensor):
             rho_c = torch.clamp(rho, min=self.rho_min)
             p_c = torch.clamp(p, min=self.p_min)
@@ -1092,28 +1521,27 @@ class SpectralSolverMHD:
         return _max_abs_float(d)
 
     # --- time stepping ---
-    def compute_dt(self, U: Array) -> float:
-        max_speed = self.equations.max_wave_speed(U)
-        if max_speed <= 0.0:
-            return 1e-6
+    def _stability_limit(self, U: Array) -> float:
+        speed = _checked_wave_speed(self, U)
+        bounds = [_hyperbolic_dt(self.cfl, _min_spacing(self.grid), speed)]
         if self.dim == 1:
-            dx = self.grid.dx
-        elif self.dim == 2:
-            dx = min(self.grid.dx, self.grid.dy)
-        else:
-            dx = min(self.grid.dx, self.grid.dy, self.grid.dz)
-        dt_hyp = self.cfl * dx / max_speed
-        if self.dim == 1:
-            dt_hyp = min(dt_hyp, _artificial_viscosity_dt(self.grid, self.artificial_viscosity))
+            bounds.append(_artificial_viscosity_dt(self.grid, self.artificial_viscosity))
         # Parabolic CFL for explicit resistivity/viscosity: dt <= cfl_diff/(D k^2_max)
         diff = max(self.resistivity, self.viscosity)
         rate = diff * self._k2_max
         if getattr(self.grid, "_mixed_open_y", False):
-            rate += self.grid.sbp_dissipation_rate_bound(max_speed)
+            rate += self.grid.sbp_dissipation_rate_bound(speed)
         if rate > 0.0:
-            dt_diff = self.cfl_diff / rate
-            return min(dt_hyp, dt_diff)
-        return dt_hyp
+            if not np.isfinite(rate):
+                raise FloatingPointError(
+                    f"Non-finite diffusive rate ({rate}) at "
+                    f"step {self._accepted_steps}, t={self.t}"
+                )
+            bounds.append(self.cfl_diff / rate)
+        return _smallest_finite(bounds)
+
+    def compute_dt(self, U: Array) -> float:
+        return _public_dt(self, U)
 
     def step(self, U: Array, dt: float) -> Array:
         if self.adaptive_enabled and self.adaptive_stepper is not None:
@@ -1149,7 +1577,9 @@ class SpectralSolverMHD:
             solution_scale = float(torch.max(torch.abs(U_split)).item())
         else:
             solution_scale = float(np.max(np.abs(U_split)))
-        result = self.adaptive_stepper.step(rhs_func, U_split, dt, solution_scale)
+        result = _call_adaptive_step(
+            self, self.adaptive_stepper, rhs_func, U_split, dt, solution_scale
+        )
         if result.accepted:
             Un = self._project_B(self._clamp(result.U_new))
             Un = self.grid.apply_accepted_state_stabilization(Un, 0.5 * dt)
@@ -1169,7 +1599,10 @@ class SpectralSolverMHD:
             solution_scale = float(torch.max(torch.abs(U_split)).item())
         else:
             solution_scale = float(np.max(np.abs(U_split)))
-        result = self.adaptive_stepper.step(rhs_func, U_split, dt, solution_scale)
+        # Embedded MHD stages are not positivity-limited. The accepted state is.
+        result = _call_adaptive_step(
+            self, self.adaptive_stepper, rhs_func, U_split, dt, solution_scale
+        )
         if result.accepted:
             Un = self._project_B(self._clamp(result.U_new))
             Un = self.grid.apply_accepted_state_stabilization(Un, 0.5 * dt)
@@ -1177,6 +1610,7 @@ class SpectralSolverMHD:
                 Un = self.grid.apply_boundary_conditions(Un, self.equations)
             self.U = Un
             self.t += dt
+            _note_accepted(self)
             if on_step is not None:
                 on_step(step_count, dt, self.U)
             return result.dt_next
@@ -1186,10 +1620,10 @@ class SpectralSolverMHD:
                         on_step: Optional[Callable[[int, float, Array], None]]) -> float:
         self.U = self.step(self.U, dt)
         self.t += dt
+        _note_accepted(self)
         if on_step is not None:
             on_step(step_count, dt, self.U)
-        return min(self.compute_dt(self.U),
-                   1e-6 if self.equations.max_wave_speed(self.U) <= 0.0 else float("inf"))
+        return self._stability_limit(self.U)
 
     def run(self, U0: Array, t0: float, t_end: float,
             output_interval: float = 0.1, checkpoint_interval: float = 0.0,
@@ -1208,7 +1642,7 @@ class SpectralSolverMHD:
         self.U = self.grid.project_dealiased(self.U)
         if self.dim == 1 or getattr(self.grid, "_mixed_open_y", False):
             self.U = self.grid.initialize_boundary_conditions(self.U, self.equations)
-        self.t = float(t0)
+        _begin_run(self, t0, t_end)
         next_output = self.t + output_interval
         next_checkpoint = (
             self.t + checkpoint_interval
@@ -1237,11 +1671,9 @@ class SpectralSolverMHD:
         if on_output is not None:
             on_output(self.t, self.U)
 
-        dt = self.compute_dt(self.U) if self.U is not None else 1e-6
+        dt = float("inf")
         while self.t < t_end - 1e-12:
-            if self.dim == 1:
-                dt = min(dt, self.compute_dt(self.U))
-            dt = min(dt, t_end - self.t)
+            dt = _cap_proposal(self, dt, t_end, next_output, next_checkpoint)
             dt_used = dt
             state_before = self.U
             time_before = self.t
@@ -1270,9 +1702,7 @@ class SpectralSolverMHD:
                                        equations=self.equations, tracers=tracers)
                 next_checkpoint += checkpoint_interval
 
-        record()
-        if on_output is not None:
-            on_output(self.t, self.U)
+        _emit_final_output(history, self.t, record, on_output, self.U)
         return history
 
 
@@ -1324,24 +1754,40 @@ def _compute_rhs_3d(grid: Grid3D, eqs: EulerEquations3D, U: Array,
 
 def _rk2_step_3d(grid: Grid3D, eqs: EulerEquations3D, U: Array, dt: float,
                  artificial_viscosity: Optional[SpectralArtificialViscosity] = None,
-                 gravity_config: Optional[Dict] = None) -> Array:
+                 gravity_config: Optional[Dict] = None,
+                 monitor: Optional[PositivityMonitor] = None,
+                 rho_min: float = _RHO_FLOOR_1D,
+                 p_min: float = _P_FLOOR_1D) -> Array:
+    def clamp(state):
+        return _clamp_conserved(
+            state, eqs, rho_min, p_min, monitor, rebuild_always=False
+        )
+
     k1 = _compute_rhs_3d(grid, eqs, U, artificial_viscosity, gravity_config)
-    U1 = U + dt * 0.5 * k1
+    U1 = clamp(U + dt * 0.5 * k1)
     k2 = _compute_rhs_3d(grid, eqs, U1, artificial_viscosity, gravity_config)
-    return U + dt * k2
+    return clamp(U + dt * k2)
 
 
 def _rk4_step_3d(grid: Grid3D, eqs: EulerEquations3D, U: Array, dt: float,
                  artificial_viscosity: Optional[SpectralArtificialViscosity] = None,
-                 gravity_config: Optional[Dict] = None) -> Array:
+                 gravity_config: Optional[Dict] = None,
+                 monitor: Optional[PositivityMonitor] = None,
+                 rho_min: float = _RHO_FLOOR_1D,
+                 p_min: float = _P_FLOOR_1D) -> Array:
+    def clamp(state):
+        return _clamp_conserved(
+            state, eqs, rho_min, p_min, monitor, rebuild_always=False
+        )
+
     k1 = _compute_rhs_3d(grid, eqs, U, artificial_viscosity, gravity_config)
-    U2 = U + 0.5 * dt * k1
+    U2 = clamp(U + 0.5 * dt * k1)
     k2 = _compute_rhs_3d(grid, eqs, U2, artificial_viscosity, gravity_config)
-    U3 = U + 0.5 * dt * k2
+    U3 = clamp(U + 0.5 * dt * k2)
     k3 = _compute_rhs_3d(grid, eqs, U3, artificial_viscosity, gravity_config)
-    U4 = U + dt * k3
+    U4 = clamp(U + dt * k3)
     k4 = _compute_rhs_3d(grid, eqs, U4, artificial_viscosity, gravity_config)
-    return U + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+    return clamp(U + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4))
 
 
 def _apply_accepted_state_stabilization_3d(
@@ -1379,52 +1825,33 @@ class SpectralSolver3D:
             scheme: Time integration scheme ("rk2", "rk4", "rk23", "rk45", "rk78")
             cfl: CFL number
             adaptive_config: Configuration for adaptive time-stepping
-            artificial_viscosity_config: Ignored (kept for API compatibility with BaseProblem).
+            artificial_viscosity_config: Not implemented. ``enabled: true`` raises.
             gravity_config: Configuration for gravity
         """
         self.grid = grid
         self.equations = equations
-        self.scheme = scheme
         self.cfl = cfl
         self.t = 0.0
         self.U = U0
-        
-        # Setup adaptive time-stepping if configured
-        self.adaptive_enabled = False
-        self.adaptive_stepper = None
-        
-        if adaptive_config and adaptive_config.get("enabled", False):
-            adaptive_method = adaptive_config.get("scheme", "rk45")
-            rtol = adaptive_config.get("rtol", 1e-6)
-            atol = adaptive_config.get("atol", 1e-8)
-            
-            # Extract controller parameters
-            controller_kwargs = {
-                "safety_factor": adaptive_config.get("safety_factor", 0.9),
-                "min_dt_factor": adaptive_config.get("min_dt_factor", 0.1),
-                "max_dt_factor": adaptive_config.get("max_dt_factor", 5.0),
-                "max_rejections": adaptive_config.get("max_rejections", 10)
-            }
-            
-            # Check if scheme is adaptive
-            if adaptive_method in ["rk23", "rk45", "rk78"]:
-                self.adaptive_stepper = create_adaptive_stepper(
-                    adaptive_method, rtol=rtol, atol=atol, **controller_kwargs
-                )
-                self.adaptive_enabled = True
-                self.scheme = adaptive_method
-            else:
-                # Fall back to non-adaptive scheme
-                self.scheme = adaptive_config.get("fallback_scheme", "rk4")
+        _reject_unsupported_artificial_viscosity(
+            artificial_viscosity_config, "SpectralSolver3D"
+        )
+        self.scheme, self.adaptive_enabled, self.adaptive_stepper = (
+            _configure_time_integration(scheme, adaptive_config)
+        )
+        _init_monitors(self, _RHO_FLOOR_1D, _P_FLOOR_1D)
 
         # Setup gravity if configured
         self.gravity_config = gravity_config
 
+    def _stability_limit(self, U: Array) -> float:
+        speed = _checked_wave_speed(self, U)
+        return _smallest_finite((
+            _hyperbolic_dt(self.cfl, _min_spacing(self.grid), speed),
+        ))
+
     def compute_dt(self, U: Array) -> float:
-        max_speed = self.equations.max_wave_speed(U)
-        if max_speed <= 0.0:
-            return 1e-6
-        return self.cfl * min(self.grid.dx, self.grid.dy, self.grid.dz) / max_speed
+        return _public_dt(self, U)
 
     def step(self, U: Array, dt: float) -> Array:
         """Perform one time step using the configured scheme.
@@ -1447,9 +1874,15 @@ class SpectralSolver3D:
         """Perform one fixed time step."""
         U_split = self.grid.apply_spectral_dissipation(U, 0.5 * dt)
         if self.scheme.lower() == "rk2":
-            Un = _rk2_step_3d(self.grid, self.equations, U_split, dt, None, self.gravity_config)
+            Un = _rk2_step_3d(
+                self.grid, self.equations, U_split, dt, None, self.gravity_config,
+                self.positivity, self.rho_floor, self.p_floor,
+            )
         else:
-            Un = _rk4_step_3d(self.grid, self.equations, U_split, dt, None, self.gravity_config)
+            Un = _rk4_step_3d(
+                self.grid, self.equations, U_split, dt, None, self.gravity_config,
+                self.positivity, self.rho_floor, self.p_floor,
+            )
         return _apply_accepted_state_stabilization_3d(
             self.grid, Un, dt=0.5 * dt
         )
@@ -1468,7 +1901,10 @@ class SpectralSolver3D:
         else:
             solution_scale = float(np.max(np.abs(U_split)))
         
-        result = self.adaptive_stepper.step(rhs_func, U_split, dt, solution_scale)
+        result = _call_adaptive_step(
+            self, self.adaptive_stepper, rhs_func, U_split, dt, solution_scale,
+            limit_state=lambda state: _limit_euler_stage(self, state),
+        )
         
         if result.accepted:
             Un = _apply_accepted_state_stabilization_3d(
@@ -1492,13 +1928,17 @@ class SpectralSolver3D:
         else:
             solution_scale = float(np.max(np.abs(U_split)))
         
-        result = self.adaptive_stepper.step(rhs_func, U_split, dt, solution_scale)
+        result = _call_adaptive_step(
+            self, self.adaptive_stepper, rhs_func, U_split, dt, solution_scale,
+            limit_state=lambda state: _limit_euler_stage(self, state),
+        )
         
         if result.accepted:
             self.U = _apply_accepted_state_stabilization_3d(
                 self.grid, result.U_new, dt=0.5 * dt
             )
             self.t += dt
+            _note_accepted(self)
             if on_step is not None:
                 on_step(step_count, dt, self.U)
             return result.dt_next
@@ -1510,13 +1950,13 @@ class SpectralSolver3D:
         """Perform one step in fixed run loop."""
         self.U = self.step(self.U, dt)
         self.t += dt
+        _note_accepted(self)
         
         # Call monitoring callback
         if on_step is not None:
             on_step(step_count, dt, self.U)
         
-        # Return next CFL-based step size
-        return min(self.compute_dt(self.U), 1e-6 if self.equations.max_wave_speed(self.U) <= 0.0 else float('inf'))
+        return self._stability_limit(self.U)
 
     def run(
         self,
@@ -1532,21 +1972,13 @@ class SpectralSolver3D:
     ) -> Dict[str, List[float]]:
         from .io import save_solution_snapshot
 
-        try:
-            import torch  # type: ignore
-
-            _TORCH_AVAILABLE = True
-        except Exception:
-            _TORCH_AVAILABLE = False
-            torch = None  # type: ignore
-
         if _TORCH_AVAILABLE and isinstance(U0, (torch.Tensor,)):
             self.U = U0.clone()
         else:
             self.U = U0.copy()
         # Start Fourier runs in the same retained subspace enforced after steps.
         self.U = self.grid.project_dealiased(self.U)
-        self.t = float(t0)
+        _begin_run(self, t0, t_end)
         next_output = self.t + output_interval
         next_checkpoint = (
             self.t + checkpoint_interval
@@ -1599,12 +2031,10 @@ class SpectralSolver3D:
         if on_output is not None:
             on_output(self.t, self.U)
 
-        # Initialize time step
-        dt = self.compute_dt(self.U) if self.U is not None else 1e-6
+        dt = float("inf")
         
         while self.t < t_end - 1e-12:
-            # Ensure we don't overshoot the end time
-            dt = min(dt, t_end - self.t)
+            dt = _cap_proposal(self, dt, t_end, next_output, next_checkpoint)
             dt_used = dt
             state_before = self.U
             time_before = self.t
@@ -1643,7 +2073,5 @@ class SpectralSolver3D:
                 )
                 next_checkpoint += checkpoint_interval
 
-        record()
-        if on_output is not None:
-            on_output(self.t, self.U)
+        _emit_final_output(history, self.t, record, on_output, self.U)
         return history
