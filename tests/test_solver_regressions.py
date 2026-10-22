@@ -4,9 +4,7 @@ Numerical checks use the NumPy backend. Simulation files written by these
 tests stay under the job scratch directory, not in the repository tree.
 """
 
-import shutil
 import warnings
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -39,12 +37,6 @@ from phrike.solver import (
     _positivity_clamp_2d,
 )
 import phrike.solver as solver_module
-
-
-SCRATCH = Path(
-    "/private/tmp/claude-502/-Users-moseley-phrike--claude-worktrees-phrike-quality-review-8f931f"
-    "/3db2d5f4-da8f-479f-bb9e-a228619911f8/scratchpad/grok/jobB/pytest_outputs"
-)
 
 
 def _ones(shape):
@@ -528,16 +520,14 @@ def test_mhd_adaptive_stages_are_not_positivity_limited():
     assert recorder.limit_state is None
 
 
-def test_outputs_and_checkpoints_land_on_requested_times_once():
+def test_outputs_and_checkpoints_land_on_requested_times_once(tmp_path):
     grid, equations, state = _euler1d(n=32)
     solver = SpectralSolver1D(grid, equations, scheme="rk2", cfl=0.4)
     dt_cfl = solver.compute_dt(state)
     output_interval = dt_cfl * 2.5
     t_end = output_interval * 2.0
-    outdir = SCRATCH / "output_timing"
-    if outdir.exists():
-        shutil.rmtree(outdir)
-    outdir.mkdir(parents=True)
+    outdir = tmp_path / "output_timing"
+    outdir.mkdir()
     seen = []
 
     def on_output(time, _state):
