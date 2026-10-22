@@ -1,3 +1,4 @@
+# Validated non-periodic Sod tube. configs/sod.yaml uses the same setup.
 problem: sod
 
 grid:

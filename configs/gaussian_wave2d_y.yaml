@@ -1,11 +1,7 @@
 # 2D Gaussian Wave Packet Configuration - Y-direction only
 # Tests 2D Legendre basis with a 1D wave copied along x-direction
 
-problem:
-  name: "gaussian_wave2d_y"
-  description: "2D Gaussian wave packet traveling in y-direction only (1D copied along x)"
-
-# Grid configuration
+problem: gaussian_wave2d_y
 grid:
   Nx: 32                    # Fewer modes in x since it's constant
   Ny: 64                    # More modes in y for the wave
@@ -31,23 +27,18 @@ initial_conditions:
 # Physics
 physics:
   gamma: 1.4                # Adiabatic index
-  gravity:
-    enabled: false          # No gravity for this test
-
-# Integration
 integration:
   t0: 0.0                   # Start time
   t_end: 1.0                # End time (shorter for y-direction test)
-  dt: 1e-4                  # Initial time step
   scheme: "rk4"             # 4th order Runge-Kutta
   cfl: 0.5                  # CFL number
-  adaptive_dt: true         # Use adaptive time stepping
   modal_filter:
     enabled: true           # Enable spectral filtering
     p: 8                    # Filter order
     alpha: 36.0             # Filter strength
 
 # Artificial viscosity (small amount for stability)
+  output_interval: 0.05
 artificial_viscosity:
   enabled: true
   nu_max: 1e-4              # Maximum viscosity
@@ -66,17 +57,5 @@ artificial_viscosity:
 # Output
 io:
   outdir: "outputs/gaussian_wave2d_y"
-  output_interval: 0.05     # Output every 0.05 time units
-  save_frames: true         # Save frames for video generation
-  frames_dir: "frames"      # Subdirectory for frames
-
-# Monitoring
 monitoring:
   step_interval: 10         # Print status every 10 steps
-  verbose: true             # Verbose output
-
-# Visualization
-visualization:
-  create_plots: true        # Create analysis plots
-  plot_interval: 0.05       # Plot every 0.05 time units
-  save_plots: true          # Save plots to disk

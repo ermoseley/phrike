@@ -4,12 +4,10 @@ problem: khi2d
 grid:
   Nx: 3840
   Ny: 2160
-  Lx: 1.77777777777777778
+  Lx: 1.77777777777777768
   Ly: 1.0
   dealias: true
   precision: single      # single or double precision
-  fft_workers: 4
-
 physics:
   gamma: 1.4
 
@@ -18,8 +16,6 @@ integration:
   t_end: 5.0
   cfl: 0.25
   scheme: rk78
-  rtol: 1e-6
-  atol: 1e-8
   output_interval: 0.02
   checkpoint_interval: 0.5
   spectral_dissipation:
@@ -77,9 +73,7 @@ initial_conditions:
   perturb_kx: 2          # wavenumber for sinusoidal modulation in x
 
 io:
-  outdir: outputs/khi2d
-  save_spectra: true
-
+  outdir: outputs/khi2d_4k
 monitoring:
   enabled: true
   step_interval: 50
@@ -99,17 +93,15 @@ video:
   quality: high              # Quality preset: low, medium, high
 
   # FFmpeg encoding parameters
-  codec: h264_videotoolbox   # Video codec (h264_videotoolbox, libx264, libopenh264, etc.)
+  codec: libx264             # Video codec (h264_videotoolbox, libx264, libopenh264, etc.)
   crf: 23                    # Constant Rate Factor (0-51, lower = better quality)
   preset: medium             # Encoding preset (ultrafast, fast, medium, slow, veryslow)
   pix_fmt: yuv420p           # Pixel format (yuv420p, yuv444p, etc.)
-  
   # Additional FFmpeg options
-  bitrate: null              # Target bitrate (e.g., "2M" for 2 Mbps, null = use CRF)
-  maxrate: null              # Maximum bitrate (e.g., "4M")
-  bufsize: null              # Buffer size (e.g., "8M")
-  
+  bitrate:                   # Target bitrate (e.g., "2M" for 2 Mbps, null = use CRF)
+  maxrate:                   # Maximum bitrate (e.g., "4M")
+  bufsize:                   # Buffer size (e.g., "8M")
   # Quality settings
-  tune: null                 # Tune for specific content (film, animation, grain, etc.)
+  tune:                      # Tune for specific content (film, animation, grain, etc.)
   profile: high              # H.264 profile (baseline, main, high, high10, etc.)
   level: 4.1                 # H.264 level (3.0, 3.1, 4.0, 4.1, etc.)

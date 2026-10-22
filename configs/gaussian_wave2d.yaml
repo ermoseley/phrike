@@ -1,11 +1,7 @@
 # 2D Gaussian Wave Packet Configuration
 # Tests 2D wave propagation with boundary reflections using Legendre basis
 
-problem:
-  name: "gaussian_wave2d"
-  description: "2D Gaussian wave packet traveling at 45° with wall reflections"
-
-# Grid configuration
+problem: gaussian_wave2d
 grid:
   Nx: 64                    # Number of modes in x-direction
   Ny: 64                    # Number of modes in y-direction
@@ -32,23 +28,18 @@ initial_conditions:
 # Physics
 physics:
   gamma: 1.4                # Adiabatic index
-  gravity:
-    enabled: false          # No gravity for this test
-
-# Integration
 integration:
   t0: 0.0                   # Start time
   t_end: 2.0                # End time (enough for multiple reflections)
-  dt: 1e-4                  # Initial time step
   scheme: "rk4"             # 4th order Runge-Kutta
   cfl: 0.5                  # CFL number
-  adaptive_dt: true         # Use adaptive time stepping
   modal_filter:
     enabled: true           # Enable spectral filtering
     p: 8                    # Filter order
     alpha: 36.0             # Filter strength
 
 # Artificial viscosity (small amount for stability)
+  output_interval: 0.0125
 artificial_viscosity:
   enabled: true
   nu_max: 1e-4              # Maximum viscosity
@@ -67,17 +58,5 @@ artificial_viscosity:
 # Output
 io:
   outdir: "outputs/gaussian_wave2d"
-  output_interval: 0.0125   # Output every 0.0125 time units (4x more frames)
-  save_frames: true         # Save frames for video generation
-  frames_dir: "frames"      # Subdirectory for frames
-
-# Monitoring
 monitoring:
   step_interval: 10         # Print status every 10 steps
-  verbose: true             # Verbose output
-
-# Visualization
-visualization:
-  create_plots: true        # Create analysis plots
-  plot_interval: 0.0125     # Plot every 0.0125 time units (4x more frames)
-  save_plots: true          # Save plots to disk

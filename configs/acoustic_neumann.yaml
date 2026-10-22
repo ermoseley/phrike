@@ -1,12 +1,12 @@
-# Configuration for 1D acoustic wave problem with Neumann/open BCs
+# Right-going acoustic eigenmode on a Legendre grid with Neumann ends.
+# The periodic translate is not a reference once the wave hits a wall.
 problem: acoustic1d
 
 grid:
-  N: 256
+  N: 64
   Lx: 1.0
-  x0: 0.5               # wave center
-  basis: legendre         # Legendre basis for non-periodic BCs
-  bc: neumann           # zero-gradient boundaries
+  basis: legendre
+  bc: neumann
   precision: double
 
 physics:
@@ -17,8 +17,6 @@ integration:
   t_end: 0.5
   cfl: 0.3
   scheme: rk45
-  rtol: 1e-6
-  atol: 1e-8
   output_interval: 0.05
   checkpoint_interval: 0.1
   modal_filter:
@@ -26,11 +24,14 @@ integration:
     p: 8
     alpha: 50.0
 
-# Initial conditions for acoustic wave
 initial_conditions:
-  amplitude: 0.01        # small amplitude for linear regime
-  width: 0.1            # Gaussian width
-  center: 0.5           # wave center
+  wave: acoustic
+  direction: right
+  rho0: 1.0
+  u0: 0.0
+  p0: 1.0
+  amplitude: 0.01
+  k: 1
 
 # Adaptive time-stepping
 adaptive:
@@ -44,25 +45,8 @@ adaptive:
   max_rejections: 10
   fallback_scheme: rk4
 
-# Artificial viscosity for stability
-artificial_viscosity:
-  enabled: false
-  nu_max: 1e-4
-  s_ref: 1.0
-  s_min: 0.1
-  p: 2.0
-  epsilon: 1e-12
-  variable_weights:
-    density: 1.0
-    momentum_x: 1.0
-    energy: 1.0
-  sensor_variable: "density"
-  diagnostic_output: false
-
 io:
   outdir: outputs/acoustic_neumann
-  save_spectra: true
-
 monitoring:
   enabled: true
   step_interval: 20

@@ -1,16 +1,16 @@
-# Legendre-Lobatto 1D Sod shock tube (non-periodic BC)
+# Legendre-Lobatto Sod shock tube. Fixed endpoints pin the initial
+# primitive state; they are not reflecting walls. N=64 is a runnable
+# default. Raise N for a finer shock profile.
 problem: sod
 
 grid:
-  N: 4096
+  N: 64
   Lx: 1.0
+  x0: 0.5
   basis: legendre
-  bc: dirichlet       # reflective/dirichlet at endpoints for momentum
-  dealias: false      # not applicable to non-Fourier bases
-  precision: single
-runtime:
-  num_threads: 7   # or set an explicit integer, e.g., 8
-
+  bc: dirichlet
+  dealias: false
+  precision: double
 
 physics:
   gamma: 1.4
@@ -18,34 +18,14 @@ physics:
 integration:
   t0: 0.0
   t_end: 0.2
-  cfl: 0.15           # smaller CFL due to clustered LGL nodes near boundaries
-  scheme: rk78
-  output_interval: 0.005
-  checkpoint_interval: 0.01
+  cfl: 0.2
+  scheme: rk4
+  output_interval: 0.05
+  checkpoint_interval: 0.0
   modal_filter:
     enabled: true
     p: 8
-    alpha: 36.0      # stronger modal filtering for discontinuities
-
-adaptive:
-  enabled: true
-  scheme: rk78
-  rtol: 1e-6
-  atol: 1e-8
-  safety_factor: 0.9
-  min_dt_factor: 0.1
-  max_dt_factor: 5.0
-  max_rejections: 10
-  fallback_scheme: rk4
-
-artificial_viscosity:
-  enabled: true
-  nu_max: 0.005       # cap on viscosity strength (tunable)
-  s_ref: 1.0
-  s_min: 0.1
-  p: 2.0
-  epsilon: 1e-12
-  sensor_variable: density
+    alpha: 36.0
 
 initial_conditions:
   left:
@@ -56,29 +36,23 @@ initial_conditions:
     rho: 0.125
     u: 0.0
     p: 0.1
+  smoothing:
+    enabled: false
+
+artificial_viscosity:
+  enabled: true
+  mode: constant
+  nu_constant: 0.001
 
 io:
   outdir: outputs/sod_legendre
-  save_spectra: true
-
 
 monitoring:
   enabled: true
   step_interval: 20
-  include_conservation: true
-  include_timestep: true
-  include_time: true
-  include_velocity_stats: true
-  include_density_stats: true
 
 video:
-  fps: 30
-  width: 1280
-  height: 720
-  scale: 1.5
-  frame_dpi: 120
-  codec: h264_videotoolbox
-  crf: 20
-  preset: medium
+  fps: 20
+  codec: libx264
+  crf: 23
   pix_fmt: yuv420p
-

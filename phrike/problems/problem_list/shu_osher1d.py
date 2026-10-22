@@ -1,17 +1,19 @@
 """
-1D Periodic Shu-Osher Test Problem for Compressible Euler Equations
+1D Shu-Osher shock-entropy interaction.
 
-This problem tests shock-capturing and wave propagation in a high-order solver.
-The initial condition consists of a shock region (x < 0.5) and a sinusoidal
-density region (x >= 0.5) with periodic boundary conditions.
+The post-shock state is the Mach-3 Rankine-Hugoniot state (u_post = u_L,
+p_post = p_L). The pre-shock gas is an entropy wave at rest. There is no
+closed-form solution once the shock enters that wave. A periodic grid adds a
+second discontinuity at the seam; the shipped setup uses a non-periodic basis.
 
-Reference: Shu, C.-W. & Osher, S. (1988) "Efficient implementation of essentially
-non-oscillatory shock-capturing schemes"
+Reference: Shu, C.-W. & Osher, S. (1988).
 """
+
+import warnings
 
 import numpy as np
 import matplotlib.pyplot as plt
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional
 from ..base import BaseProblem
 from phrike.equations import EulerEquations1D
 from phrike.grid import Grid1D
@@ -21,11 +23,10 @@ from phrike.io import save_solution_snapshot
 
 
 class ShuOsher1DProblem(BaseProblem):
-    """1D Periodic Shu-Osher Test Problem for Compressible Euler Equations.
-    
-    This problem tests shock-capturing and wave propagation capabilities.
-    The initial condition features a shock region and a sinusoidal density
-    region with periodic boundary conditions.
+    """Shu-Osher shock-entropy interaction.
+
+    The left state is the post-shock Rankine-Hugoniot state. Gamma is taken
+    from the base class so ``equations.gamma`` and ``physics.gamma`` agree.
     """
     
     def __init__(self, config_path: Optional[str] = None, config: Optional[Dict[str, Any]] = None, restart_from: Optional[str] = None):
@@ -37,40 +38,43 @@ class ShuOsher1DProblem(BaseProblem):
             restart_from: Path to restart file
         """
         super().__init__(config_path, config, restart_from)
-        
-        # Problem parameters
-        self.gamma = self.config.get("physics", {}).get("gamma", 1.4)
-        self.Lx = self.config.get("grid", {}).get("Lx", 1.0)  # Domain length
-        self.N = self.config.get("grid", {}).get("N", 256)    # Grid resolution
-        
-        # Shock region parameters (x < 0.5)
-        self.rho_L = 3.857143
-        self.u_L = 2.629369
-        self.p_L = 10.33333
-        
-        # Sinusoidal region parameters (x >= 0.5)
-        self.rho_R = 1.0
-        self.u_R = 0.0
-        self.p_R = 1.0
-        self.rho_amplitude = 0.2
-        self.rho_frequency = 2.0 * np.pi
-        
-        # Compute reference solution parameters
+
+        grid_cfg = self.config.get("grid", {})
+        ic_cfg = self.config.get("initial_conditions", {})
+        self.Lx = float(grid_cfg.get("Lx", 1.0))
+        self.N = int(grid_cfg.get("N", 256))
+        self.x_shock = float(ic_cfg.get("x_shock", 0.5))
+
+        # Post-shock (left) state for a Mach-3 shock into (rho, u, p) = (1, 0, 1)
+        # at gamma = 1.4. These are the Rankine-Hugoniot values: u_post = u_L.
+        self.rho_L = float(ic_cfg.get("rho_L", 3.857143))
+        self.u_L = float(ic_cfg.get("u_L", 2.629369))
+        self.p_L = float(ic_cfg.get("p_L", 10.33333))
+
+        self.rho_R = float(ic_cfg.get("rho_R", 1.0))
+        self.u_R = float(ic_cfg.get("u_R", 0.0))
+        self.p_R = float(ic_cfg.get("p_R", 1.0))
+        self.rho_amplitude = float(ic_cfg.get("rho_amplitude", 0.2))
+        self.rho_frequency = float(ic_cfg.get("rho_frequency", 2.0 * np.pi))
+
         self._compute_reference_solution()
     
     def _compute_reference_solution(self):
-        """Compute reference solution parameters using Rankine-Hugoniot conditions."""
-        # Shock speed from Rankine-Hugoniot condition
-        # S = (rho_L * u_L - rho_R * u_R) / (rho_L - rho_R)
-        self.shock_speed = (self.rho_L * self.u_L - self.rho_R * self.u_R) / (self.rho_L - self.rho_R)
-        
-        # Post-shock state (right side of shock)
-        # Using Rankine-Hugoniot jump conditions
-        self.rho_post = self.rho_R * (self.shock_speed - self.u_R) / (self.shock_speed - self.u_L)
-        self.u_post = self.shock_speed
-        self.p_post = self.p_R + self.rho_R * (self.shock_speed - self.u_R) * (self.u_post - self.u_R)
-        
-        # Sound speed in post-shock region
+        """Shock speed from the Rankine-Hugoniot mass flux.
+
+        The left state is already the post-shock state, so u_post = u_L and
+        p_post = p_L. Setting u_post to the shock speed does not satisfy the
+        jump conditions.
+        """
+        denominator = self.rho_L - self.rho_R
+        if denominator == 0.0:
+            raise ValueError("Shu-Osher left and right densities must differ")
+        self.shock_speed = (
+            self.rho_L * self.u_L - self.rho_R * self.u_R
+        ) / denominator
+        self.rho_post = self.rho_L
+        self.u_post = self.u_L
+        self.p_post = self.p_L
         self.c_post = np.sqrt(self.gamma * self.p_post / self.rho_post)
     
     def create_grid(self, backend: str = "numpy", device: Optional[str] = None, debug: bool = False):
@@ -81,6 +85,15 @@ class ShuOsher1DProblem(BaseProblem):
         dealias = bool(grid_cfg.get("dealias", True))
         basis = str(grid_cfg.get("basis", "fourier")).lower()
         bc = grid_cfg.get("bc", None)
+        if basis == "fourier":
+            warnings.warn(
+                "Shu-Osher on a periodic Fourier grid has a second "
+                "discontinuity where the post-shock state meets the "
+                "pre-shock state at the domain seam. Use chebyshev or "
+                "legendre with fixed endpoints.",
+                UserWarning,
+                stacklevel=2,
+            )
         return Grid1D(
             N=N,
             Lx=Lx,
@@ -126,72 +139,18 @@ class ShuOsher1DProblem(BaseProblem):
         u = np.zeros_like(x)
         p = np.zeros_like(x)
         
-        # Shock region (x < 0.5)
-        shock_mask = x < 0.5
+        shock_mask = x < self.x_shock
         rho[shock_mask] = self.rho_L
         u[shock_mask] = self.u_L
         p[shock_mask] = self.p_L
-        
-        # Sinusoidal region (x >= 0.5)
-        sinusoidal_mask = x >= 0.5
+
+        sinusoidal_mask = x >= self.x_shock
         rho[sinusoidal_mask] = self.rho_R + self.rho_amplitude * np.sin(self.rho_frequency * x[sinusoidal_mask])
         u[sinusoidal_mask] = self.u_R
         p[sinusoidal_mask] = self.p_R
         
         # Apply initial conditions smoothing if configured
         rho, u, p = self.apply_initial_conditions_smoothing(rho, u, p, grid)
-        
-        # Convert to conservative variables
-        equations = self.create_equations()
-        return equations.conservative(rho, u, p)
-    
-    def get_analytical_solution(self, t: float, grid) -> np.ndarray:
-        """Compute analytical solution at time t.
-        
-        Args:
-            t: Time at which to compute the solution
-            grid: Grid instance
-            
-        Returns:
-            Analytical conservative variables U = [rho, rho*u, E]
-        """
-        x = grid.x
-        
-        # Initialize arrays
-        rho = np.zeros_like(x)
-        u = np.zeros_like(x)
-        p = np.zeros_like(x)
-        
-        # Shock position at time t
-        shock_position = 0.5 + self.shock_speed * t
-        
-        # Apply periodic boundary conditions to shock position
-        shock_position = shock_position % self.Lx
-        
-        # Left side of shock (post-shock state)
-        left_mask = x < shock_position
-        rho[left_mask] = self.rho_post
-        u[left_mask] = self.u_post
-        p[left_mask] = self.p_post
-        
-        # Right side of shock (sinusoidal region)
-        right_mask = x >= shock_position
-        
-        # Advect sinusoidal profile along characteristics
-        # For the right-going characteristic: x - c*t = constant
-        # For the left-going characteristic: x + c*t = constant
-        c_R = np.sqrt(self.gamma * self.p_R / self.rho_R)
-        
-        # Characteristic coordinates
-        x_char = x[right_mask] - c_R * t
-        
-        # Apply periodic boundary conditions to characteristic coordinates
-        x_char = x_char % self.Lx
-        
-        # Sinusoidal density profile
-        rho[right_mask] = self.rho_R + self.rho_amplitude * np.sin(self.rho_frequency * x_char)
-        u[right_mask] = self.u_R
-        p[right_mask] = self.p_R
         
         # Convert to conservative variables
         equations = self.create_equations()
@@ -205,55 +164,38 @@ class ShuOsher1DProblem(BaseProblem):
             t: Current time
             U: Current solution state
         """
-        # Get current solution
-        U = solver.U
-        
-        # Convert to primitive variables
         equations = self.create_equations()
         rho, u, p, _ = equations.primitive(U)
-        
-        # Get analytical solution
-        U_analytical = self.get_analytical_solution(t, solver.grid)
-        rho_analytical, u_analytical, p_analytical, _ = equations.primitive(U_analytical)
-        
-        # Create plots
+        x, rho, u, p = self.convert_torch_to_numpy(solver.grid.x, rho, u, p)
+
         fig, axs = plt.subplots(2, 2, figsize=(12, 8), constrained_layout=True)
-        
-        # Density
-        axs[0, 0].plot(solver.grid.x, rho, 'b-', label='Numerical', linewidth=2)
-        axs[0, 0].plot(solver.grid.x, rho_analytical, 'r--', label='Analytical', linewidth=2)
+
+        axs[0, 0].plot(x, rho, 'b-', linewidth=2)
         axs[0, 0].set_title(f'Density at t = {t:.3f}')
         axs[0, 0].set_xlabel('x')
         axs[0, 0].set_ylabel('ρ')
-        axs[0, 0].legend()
         axs[0, 0].grid(True, alpha=0.3)
-        
-        # Velocity
-        axs[0, 1].plot(solver.grid.x, u, 'b-', label='Numerical', linewidth=2)
-        axs[0, 1].plot(solver.grid.x, u_analytical, 'r--', label='Analytical', linewidth=2)
+
+        axs[0, 1].plot(x, u, 'b-', linewidth=2)
         axs[0, 1].set_title(f'Velocity at t = {t:.3f}')
         axs[0, 1].set_xlabel('x')
         axs[0, 1].set_ylabel('u')
-        axs[0, 1].legend()
         axs[0, 1].grid(True, alpha=0.3)
-        
-        # Pressure
-        axs[1, 0].plot(solver.grid.x, p, 'b-', label='Numerical', linewidth=2)
-        axs[1, 0].plot(solver.grid.x, p_analytical, 'r--', label='Analytical', linewidth=2)
+
+        axs[1, 0].plot(x, p, 'b-', linewidth=2)
         axs[1, 0].set_title(f'Pressure at t = {t:.3f}')
         axs[1, 0].set_xlabel('x')
         axs[1, 0].set_ylabel('p')
-        axs[1, 0].legend()
         axs[1, 0].grid(True, alpha=0.3)
-        
-        # Error
-        error = np.abs(rho - rho_analytical)
-        axs[1, 1].plot(solver.grid.x, error, 'g-', linewidth=2)
-        axs[1, 1].set_title(f'Density Error at t = {t:.3f}')
+
+        # No closed-form reference: show the entropy-wave density ahead of
+        # the shock at t = 0, which is stationary until the shock arrives.
+        axs[1, 1].plot(x, rho, 'b-', linewidth=2)
+        axs[1, 1].axvline(self.x_shock, color='k', linestyle='--', linewidth=1)
+        axs[1, 1].set_title('Density (no closed-form reference)')
         axs[1, 1].set_xlabel('x')
-        axs[1, 1].set_ylabel('|ρ - ρ_analytical|')
+        axs[1, 1].set_ylabel('ρ')
         axs[1, 1].grid(True, alpha=0.3)
-        axs[1, 1].set_yscale('log')
         
         plt.suptitle(f'Shu-Osher 1D Problem - t = {t:.3f}')
         plt.tight_layout()
@@ -267,46 +209,27 @@ class ShuOsher1DProblem(BaseProblem):
         plt.close()
     
     def compute_diagnostics(self, solver: SpectralSolver1D, t: float) -> Dict[str, float]:
-        """Compute diagnostic quantities.
-        
-        Args:
-            solver: The solver containing the current solution
-            t: Current time
-            
-        Returns:
-            Dictionary of diagnostic quantities
+        """Primitive ranges and conservation errors.
+
+        ``compute_conservation_errors`` takes the state, not the time. There
+        is no closed-form error to report for this shock-entropy interaction.
         """
         U = solver.U
         equations = self.create_equations()
         rho, u, p, _ = equations.primitive(U)
-        
-        # Conservation errors
-        cons_errors = self.compute_conservation_errors(solver, t)
-        
-        # L2 and L∞ errors against analytical solution
-        U_analytical = self.get_analytical_solution(t, solver.grid)
-        rho_analytical, u_analytical, p_analytical, _ = equations.primitive(U_analytical)
-        
-        # L2 errors
-        l2_rho = np.sqrt(np.mean((rho - rho_analytical)**2))
-        l2_u = np.sqrt(np.mean((u - u_analytical)**2))
-        l2_p = np.sqrt(np.mean((p - p_analytical)**2))
-        
-        # L∞ errors
-        linf_rho = np.max(np.abs(rho - rho_analytical))
-        linf_u = np.max(np.abs(u - u_analytical))
-        linf_p = np.max(np.abs(p - p_analytical))
-        
+        rho, u, p = self.convert_torch_to_numpy(rho, u, p)
+        cons_errors = self.compute_conservation_errors(solver, U)
         return {
             **cons_errors,
-            "l2_rho_error": l2_rho,
-            "l2_u_error": l2_u,
-            "l2_p_error": l2_p,
-            "linf_rho_error": linf_rho,
-            "linf_u_error": linf_u,
-            "linf_p_error": linf_p,
-            "shock_position": (0.5 + self.shock_speed * t) % self.Lx,
-            "shock_speed": self.shock_speed
+            "t": float(t),
+            "rho_min": float(np.min(rho)),
+            "rho_max": float(np.max(rho)),
+            "u_min": float(np.min(u)),
+            "u_max": float(np.max(u)),
+            "p_min": float(np.min(p)),
+            "p_max": float(np.max(p)),
+            "shock_speed": float(self.shock_speed),
+            "shock_position": float(self.x_shock + self.shock_speed * t),
         }
     
     def get_wave_parameters(self) -> Dict[str, float]:

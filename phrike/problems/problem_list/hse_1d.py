@@ -30,7 +30,7 @@ def hse_initial_conditions(
         rho_right: Density on the right side
         pressure_left: Pressure at left boundary
         gamma: Adiabatic index
-        gx: Gravity in x-direction (negative for gravity pointing left)
+        gx: Signed acceleration. Positive accelerates toward +x.
         x0: Discontinuity location
         sigma: Smoothing parameter for tanh transition
         
@@ -53,17 +53,15 @@ def hse_initial_conditions(
         rho = float(rho_right) + (float(rho_left) - float(rho_right)) * tanh_step
         u = torch.zeros_like(xl)
         
-        # Hydrostatic pressure integration: dp/dx = rho * gx
-        # Simple trapezoidal integration
+        # Hydrostatic balance for the solver: dp/dx = rho * gx.
+        # +gx accelerates toward +x. Integrate on the actual node spacing.
         N = len(xl)
         p = torch.zeros_like(xl)
         p[0] = float(pressure_left)
-        
-        # Get grid spacing (assuming uniform)
-        dx = xl[1] - xl[0]
         gx_tensor = torch.tensor(float(gx), dtype=xl.dtype, device=xl.device)
-        
+
         for j in range(1, N):
+            dx = xl[j] - xl[j - 1]
             rho_mid = 0.5 * (rho[j - 1] + rho[j])
             p[j] = p[j - 1] + rho_mid * gx_tensor * dx
             
@@ -75,22 +73,40 @@ def hse_initial_conditions(
         rho = float(rho_right) + (float(rho_left) - float(rho_right)) * tanh_step
         u = np.zeros_like(x_arr)
         
-        # Hydrostatic pressure integration: dp/dx = rho * gx
-        # Simple trapezoidal integration
+        # Hydrostatic balance for the solver: dp/dx = rho * gx.
+        # +gx accelerates toward +x. Integrate on the actual node spacing
+        # so a non-uniform (Legendre/Chebyshev) grid stays in equilibrium.
         N = len(x_arr)
         p = np.zeros_like(x_arr)
         p[0] = float(pressure_left)
-        
-        # Get grid spacing (assuming uniform)
-        dx = x_arr[1] - x_arr[0]
-        
+
         for j in range(1, N):
+            dx = x_arr[j] - x_arr[j - 1]
             rho_mid = 0.5 * (rho[j - 1] + rho[j])
             p[j] = p[j - 1] + rho_mid * float(gx) * dx
+
+    p_min = _positive_pressure(p)
+    if p_min <= 0.0:
+        raise ValueError(
+            "Hydrostatic integration produced non-positive pressure "
+            f"(minimum {p_min:.3g}). +gx accelerates toward +x, so the "
+            "left pressure must exceed the weight of the column."
+        )
 
     # Convert to conservative variables
     eq = EulerEquations1D(gamma=gamma)
     return eq.conservative(rho, u, p)
+
+
+def _positive_pressure(p) -> float:
+    try:
+        import torch
+
+        if isinstance(p, torch.Tensor):
+            return float(torch.min(p).detach().cpu())
+    except Exception:
+        pass
+    return float(np.min(np.asarray(p)))
 
 
 class HSE1DProblem(BaseProblem):
@@ -198,7 +214,7 @@ class HSE1DProblem(BaseProblem):
         fig.suptitle(f"HSE Test at t={t:.3f}", fontsize=14)
         
         x = solver.grid.x
-        rho, u, p = solver.equations.primitive(U)
+        rho, u, p, _ = solver.equations.primitive(U)
         
         # Convert to numpy if needed
         x = self.convert_torch_to_numpy(x)[0]
