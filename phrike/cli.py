@@ -3,8 +3,97 @@
 import argparse
 import os
 import sys
+import warnings
 
-from .problems import ProblemRegistry
+
+_BLAS_THREAD_VARS = (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+)
+
+
+def _apply_runtime_threads_from_argv(argv=None) -> None:
+    """Set BLAS/OpenMP thread counts before NumPy is imported.
+
+    OpenMP and BLAS read these variables when they are first loaded.
+    ``python -m phrike`` and the ``phrike`` console script import this
+    module before NumPy, so ``runtime.num_threads`` in ``--config`` takes
+    effect. Importing PHRIKE first, then calling :func:`main`, cannot
+    resize a BLAS pool that is already initialized. Torch's own thread
+    count is updated later in :func:`main`.
+    """
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--config", default=None)
+    try:
+        known, _ = parser.parse_known_args(argv)
+    except SystemExit:
+        return
+    if not known.config or not os.path.isfile(known.config):
+        return
+    try:
+        import yaml
+    except ImportError:
+        return
+    try:
+        with open(known.config, "r", encoding="utf-8") as handle:
+            loaded = yaml.safe_load(handle) or {}
+    except (OSError, yaml.YAMLError):
+        return
+    if not isinstance(loaded, dict):
+        return
+    runtime = loaded.get("runtime") or {}
+    if not isinstance(runtime, dict):
+        return
+    num_threads = _parse_num_threads(runtime.get("num_threads", None))
+    if num_threads is None:
+        return
+    for var in _BLAS_THREAD_VARS:
+        os.environ[var] = str(num_threads)
+
+
+def _parse_num_threads(num_threads_cfg):
+    """Return a positive thread count, or None when the setting is absent or invalid."""
+    if num_threads_cfg is None:
+        return None
+    if isinstance(num_threads_cfg, str) and num_threads_cfg.strip().lower() == "auto":
+        return os.cpu_count() or 1
+    try:
+        num_threads = int(num_threads_cfg)
+    except (TypeError, ValueError):
+        warnings.warn(
+            f"Ignoring runtime.num_threads={num_threads_cfg!r}",
+            UserWarning,
+            stacklevel=2,
+        )
+        return None
+    if num_threads < 1:
+        warnings.warn(
+            f"Ignoring runtime.num_threads={num_threads}; it must be positive",
+            UserWarning,
+            stacklevel=2,
+        )
+        return None
+    return num_threads
+
+
+def _video_flag_overrides(args) -> dict:
+    """CLI video settings that were explicitly passed. Defaults stay None."""
+    overrides = {}
+    if getattr(args, "video_quality", None) is not None:
+        overrides["quality"] = args.video_quality
+    if getattr(args, "video_fps", None) is not None:
+        overrides["fps"] = args.video_fps
+    if getattr(args, "video_codec", None) is not None:
+        overrides["codec"] = args.video_codec
+    return overrides
+
+
+# Must run before the package import below, which imports NumPy.
+_apply_runtime_threads_from_argv()
+
+from .problems import ProblemRegistry  # noqa: E402
 
 
 def main() -> None:
@@ -88,8 +177,8 @@ Examples:
         "--video-quality",
         type=str,
         choices=["low", "medium", "high"],
-        default="high",
-        help="Video quality setting (default: high)",
+        default=None,
+        help="Override YAML video quality (low, medium, or high)",
     )
     parser.add_argument("--video-fps", type=int, help="Video frames per second")
     parser.add_argument("--video-codec", type=str, help="Video codec (e.g., libx264, h264_videotoolbox)")
@@ -135,63 +224,74 @@ Examples:
 
             ensure_outdir(problem.outdir)
         
-        # Optional runtime threading control via config: runtime.num_threads: int|"auto"
-        try:
-            runtime_cfg = problem.config.get("runtime", {})
-            num_threads_cfg = runtime_cfg.get("num_threads", None)
-            if num_threads_cfg is not None:
-                if isinstance(num_threads_cfg, str) and num_threads_cfg.strip().lower() == "auto":
-                    num_threads = os.cpu_count() or 1
-                else:
-                    num_threads = int(num_threads_cfg)
-                # Set common BLAS/OpenMP env vars before heavy ops
-                for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
-                    os.environ[var] = str(num_threads)
-                # Torch threading (CPU codepaths)
+        runtime_cfg = problem.config.get("runtime") or {}
+        if runtime_cfg and not isinstance(runtime_cfg, dict):
+            warnings.warn("runtime must be a mapping; ignoring it", UserWarning, stacklevel=1)
+            runtime_cfg = {}
+        num_threads = _parse_num_threads(runtime_cfg.get("num_threads", None))
+        if num_threads is not None:
+            # Too late to change an already initialized BLAS pool. The import
+            # hook above covers the console-script path. Torch is set here.
+            for var in _BLAS_THREAD_VARS:
+                os.environ[var] = str(num_threads)
+            try:
+                import torch  # type: ignore
+            except ImportError:
+                torch = None
+            if torch is not None:
                 try:
-                    import torch  # type: ignore
-
                     torch.set_num_threads(num_threads)
-                    try:
-                        torch.set_num_interop_threads(num_threads)
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-                if args.verbose:
-                    print(f"Threads: {num_threads} (from runtime.num_threads)")
-        except Exception:
-            # Non-fatal: continue with defaults
-            pass
-        
-        # Determine video generation setting
-        # Default: no video unless explicitly enabled via CLI or config
-        generate_video = args.video or problem.config.get('video', {}).get('enabled', False)
-        
-        # Override video settings if specified
-        if generate_video:
-            if 'video' not in problem.config:
-                problem.config['video'] = {}
-            
-            if args.video_quality:
-                problem.config['video']['quality'] = args.video_quality
-            if args.video_fps:
-                problem.config['video']['fps'] = args.video_fps
-            if args.video_codec:
-                problem.config['video']['codec'] = args.video_codec
+                except (RuntimeError, ValueError) as exc:
+                    warnings.warn(
+                        f"Torch thread count was not changed: {exc}",
+                        UserWarning,
+                        stacklevel=1,
+                    )
+                try:
+                    torch.set_num_interop_threads(num_threads)
+                except RuntimeError as exc:
+                    warnings.warn(
+                        "Torch inter-op threads were not changed "
+                        f"({exc}). Set runtime.num_threads before Torch starts.",
+                        UserWarning,
+                        stacklevel=1,
+                    )
+            if args.verbose:
+                print(f"Threads: {num_threads} (from runtime.num_threads)")
 
-        # Run simulation
-        if args.verbose:
-            print(f"Running {args.problem} problem...")
-            print(f"Backend: {args.backend}")
-            if args.device:
-                print(f"Device: {args.device}")
-            print(f"Precision: {args.precision or problem.precision}")
-            print(f"Output directory: {problem.outdir}")
+        # YAML video settings apply first. CLI flags override them only when
+        # the flag was actually passed (the defaults are None, not "high").
+        video_cfg = problem.config.get("video") or {}
+        if video_cfg and not isinstance(video_cfg, dict):
+            warnings.warn("video must be a mapping; ignoring it", UserWarning, stacklevel=1)
+            video_cfg = {}
+            problem.config["video"] = {}
+        yaml_video = bool(video_cfg.get("enabled", False))
+        generate_video = bool(args.video or yaml_video)
+        overrides = _video_flag_overrides(args)
+        if overrides and not args.video:
+            if generate_video:
+                warnings.warn(
+                    "Video options were given without --video; they override "
+                    "the YAML video settings because video.enabled is true",
+                    UserWarning,
+                    stacklevel=1,
+                )
+            else:
+                warnings.warn(
+                    "Video options were given without --video and video "
+                    "generation is off; the options have no effect",
+                    UserWarning,
+                    stacklevel=1,
+                )
+                overrides = {}
+        if generate_video and overrides:
+            problem.config.setdefault("video", {})
+            problem.config["video"].update(overrides)
 
         # Inject CLI overrides into problem config if provided
         if args.basis or args.bc or args.precision:
-            if "grid" not in problem.config:
+            if "grid" not in problem.config or not isinstance(problem.config["grid"], dict):
                 problem.config["grid"] = {}
             if args.basis:
                 problem.config["grid"]["basis"] = args.basis
@@ -199,17 +299,21 @@ Examples:
                 problem.config["grid"]["bc"] = args.bc
             if args.precision:
                 problem.config["grid"]["precision"] = args.precision
-                # Ensure in-memory attribute reflects CLI override applied post-init
-                try:
-                    problem.precision = args.precision
-                except Exception:
-                    pass
+                problem.precision = args.precision
+
+        if args.verbose:
+            print(f"Running {args.problem} problem...")
+            print(f"Backend: {args.backend}")
+            if args.device:
+                print(f"Device: {args.device}")
+            print(f"Output directory: {problem.outdir}")
 
         solver, history = problem.run(
             backend=args.backend, device=args.device, generate_video=generate_video, debug=args.debug
         )
 
         if args.verbose:
+            print(f"Precision: {solver.grid.precision}")
             print(f"Simulation completed at t={solver.t:.6f}")
             print(f"Results saved to: {problem.outdir}")
 

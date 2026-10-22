@@ -57,6 +57,18 @@ class ProblemRegistry:
             Problem instance
         """
         problem_class = cls.get_problem_class(name)
+        # The registered name is the one used for output paths. A config that
+        # sets ``problem:`` to a mapping must not become a dict-repr directory.
+        if config is None and config_path is not None:
+            from phrike.io import load_config
+
+            config = load_config(config_path)
+            config_path = None
+        if config is not None:
+            if not isinstance(config, dict):
+                raise TypeError("Problem config must be a mapping")
+            config = dict(config)
+            config["problem"] = name
         return problem_class(
             config_path=config_path, config=config, restart_from=restart_from
         )

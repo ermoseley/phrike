@@ -1,16 +1,303 @@
 """Base problem class for PHRIKE simulations."""
 
 import os
-import subprocess
 import shutil
+import subprocess
+import warnings
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import numpy as np
 
-from phrike.io import load_config, ensure_outdir, save_solution_snapshot
+from phrike.io import (
+    ensure_outdir,
+    grid_snapshot_identity,
+    load_config,
+    save_solution_snapshot,
+)
 from phrike.tracers import FourierTracers1D, FourierTracers2D, FourierTracers3D
+
+# ffmpeg image sequence. Frames are renamed to this pattern before encoding.
+_FRAME_SEQUENCE = "frame_%08d.png"
+_MOMENTUM_SCALE_NOTE = "normalized by max(sum|rho*u|, mass*c_s)"
+_QUALITY_CRF = {"low": 28, "medium": 23, "high": 18}
+_QUALITY_BITRATE = {"low": "5M", "medium": "10M", "high": "15M"}
+_CRF_CODECS = {"libx264", "libx265", "libopenh264", "libvpx-vp9", "libaom-av1"}
+_PRESET_CODECS = {"libx264", "libx265", "libaom-av1"}
+_TUNE_CODECS = {"libx264", "libx265"}
+_HARDWARE_CODECS = {
+    "h264_videotoolbox",
+    "hevc_videotoolbox",
+    "h264_nvenc",
+    "hevc_nvenc",
+}
+
+# Keys read by BaseProblem or by the problem, grid, and solver code that
+# consumes these sections. Unknown keys inside these sections warn.
+# ``initial_conditions`` is problem-specific and is not checked here.
+_CONFIG_KEYS = {
+    "grid": {
+        "N",
+        "Nx",
+        "Ny",
+        "Nz",
+        "Lx",
+        "Ly",
+        "Lz",
+        "x0",
+        "dealias",
+        "precision",
+        "basis",
+        "basis_x",
+        "basis_y",
+        "bc",
+        "bc_values",
+        "bc_config",
+        "fft_workers",
+    },
+    "integration": {
+        "t0",
+        "t_end",
+        "cfl",
+        "scheme",
+        "output_interval",
+        "checkpoint_interval",
+        "spectral_filter",
+        "spectral_dissipation",
+        "modal_filter",
+        "sbp_dissipation",
+        "adaptive",
+    },
+    "physics": {"gamma", "mhd"},
+    "equations": {"gamma"},
+    "io": {"outdir"},
+    "monitoring": {
+        "enabled",
+        "step_interval",
+        "output_file",
+        "include_conservation",
+        "include_timestep",
+        "include_time",
+        "include_velocity_stats",
+        "include_density_stats",
+    },
+    "video": {
+        "enabled",
+        "fps",
+        "width",
+        "height",
+        "scale",
+        "codec",
+        "quality",
+        "crf",
+        "preset",
+        "pix_fmt",
+        "bitrate",
+        "maxrate",
+        "bufsize",
+        "tune",
+        "profile",
+        "level",
+        "frame_dpi",
+        "projection_type",
+        "column_axis",
+        "column_thickness",
+        "slice_axis",
+        "slice_position",
+        "colorbar_scale",
+        "colorbar_min",
+        "colorbar_max",
+        "colorbar_fixed",
+    },
+    "runtime": {"num_threads"},
+    "adaptive": {
+        "enabled",
+        "scheme",
+        "rtol",
+        "atol",
+        "safety_factor",
+        "min_dt_factor",
+        "max_dt_factor",
+        "max_rejections",
+        "fallback_scheme",
+    },
+    "artificial_viscosity": {
+        "enabled",
+        "mode",
+        "nu_constant",
+        "nu_max",
+        "s_ref",
+        "s_min",
+        "p",
+        "epsilon",
+        "variable_weights",
+        "sensor_variable",
+        "diagnostic_output",
+    },
+    "initial_conditions_smoothing": {
+        "enabled",
+        "kernel_size",
+        "mode",
+        "variables",
+        "diagnostic_output",
+    },
+    "gravity": {"enabled", "type", "gx", "gy", "gz"},
+    "tracers": {
+        "enabled",
+        "num",
+        "layout",
+        "seed",
+        "mass",
+        "plot_density",
+        "density_grid",
+    },
+}
+_NESTED_CONFIG_KEYS = {
+    ("integration", "spectral_dissipation"): {
+        "enabled",
+        "p",
+        "order",
+        "rate",
+        "e_folding_time_at_cutoff",
+        "onset_fraction",
+        "alpha",
+        "interval",
+    },
+    ("integration", "modal_filter"): {"enabled", "p", "order", "alpha"},
+    ("integration", "sbp_dissipation"): {"enabled", "strength"},
+    ("integration", "adaptive"): _CONFIG_KEYS["adaptive"],
+    ("physics", "mhd"): {
+        "resistivity",
+        "viscosity",
+        "project_each_substage",
+        "divergence_clean",
+        "rho_min",
+        "p_min",
+        "ambipolar",
+        "cfl_diff",
+    },
+    ("physics", "mhd", "ambipolar"): {
+        "enabled",
+        "eta",
+        "alpha",
+        "method",
+        "preconditioner",
+        "midpoint_preconditioner",
+        "midpoint_tol",
+        "midpoint_maxiter",
+    },
+}
+_PROBLEM_MAPPING_KEYS = {"name", "description"}
+
+
+def _warn_unknown_config_keys(config: Dict[str, Any]) -> None:
+    """Warn when a parsed section contains a key the code does not read."""
+    if not isinstance(config, dict):
+        return
+    for section, allowed in _CONFIG_KEYS.items():
+        block = config.get(section)
+        if not isinstance(block, dict):
+            continue
+        for key in sorted(set(block) - allowed):
+            warnings.warn(
+                f"Unknown configuration key '{section}.{key}' is ignored",
+                UserWarning,
+                stacklevel=3,
+            )
+    for path, allowed in _NESTED_CONFIG_KEYS.items():
+        block: Any = config
+        for part in path:
+            if not isinstance(block, dict):
+                block = None
+                break
+            block = block.get(part)
+        if not isinstance(block, dict):
+            continue
+        prefix = ".".join(path)
+        for key in sorted(set(block) - allowed):
+            warnings.warn(
+                f"Unknown configuration key '{prefix}.{key}' is ignored",
+                UserWarning,
+                stacklevel=3,
+            )
+    problem = config.get("problem")
+    if isinstance(problem, dict):
+        for key in sorted(set(problem) - _PROBLEM_MAPPING_KEYS):
+            warnings.warn(
+                f"Unknown configuration key 'problem.{key}' is ignored",
+                UserWarning,
+                stacklevel=3,
+            )
+
+
+def _pressure_field(primitive_vars: Any) -> Any:
+    """Return the pressure array for Euler (1D/2D/3D) and MHD primitives.
+
+    1D Euler primitives are ``(rho, u, p, a)``. 2D Euler primitives are
+    ``(rho, ux, uy, p)``. 3D Euler and MHD put pressure at index 4.
+    """
+    count = len(primitive_vars)
+    rho = primitive_vars[0]
+    if count in (5, 8):
+        return primitive_vars[4]
+    if count == 4:
+        if getattr(rho, "ndim", 0) == 1:
+            return primitive_vars[2]
+        return primitive_vars[3]
+    return None
+
+
+def _field_minmax(values: Any) -> tuple:
+    if torch is not None and isinstance(values, torch.Tensor):
+        return float(torch.max(values).item()), float(torch.min(values).item())
+    return float(np.max(values)), float(np.min(values))
+
+
+def _restart_values_match(current: Any, stored: Any) -> bool:
+    if isinstance(current, dict) or isinstance(stored, dict):
+        return current == stored
+    if isinstance(current, bool) or isinstance(stored, bool):
+        return current == stored
+    if isinstance(current, (int, float)) and isinstance(stored, (int, float)):
+        scale = max(1.0, abs(float(current)), abs(float(stored)))
+        return abs(float(current) - float(stored)) <= 1e-12 * scale
+    return current == stored
+
+
+def _codec_rate_args(codec: str, video_config: Dict[str, Any]) -> list:
+    """ffmpeg rate-control flags taken from the resolved video config."""
+    args = []
+    crf = video_config.get("crf")
+    bitrate = video_config.get("bitrate")
+    if codec == "mpeg4":
+        quality = str(video_config.get("quality", "high"))
+        quantizer = {"high": "1", "medium": "2", "low": "5"}.get(quality, "2")
+        args.extend(["-q:v", quantizer])
+    elif codec in _CRF_CODECS and crf is not None:
+        args.extend(["-crf", str(int(crf))])
+    if codec == "libvpx-vp9" and not bitrate:
+        args.extend(["-b:v", "0"])
+    if bitrate:
+        args.extend(["-b:v", str(bitrate)])
+    elif codec in _HARDWARE_CODECS:
+        quality = str(video_config.get("quality", "high"))
+        args.extend(["-b:v", _QUALITY_BITRATE.get(quality, "10M")])
+    preset = video_config.get("preset")
+    if preset and codec in _PRESET_CODECS:
+        args.extend(["-preset", str(preset)])
+    tune = video_config.get("tune")
+    if tune and codec in _TUNE_CODECS:
+        args.extend(["-tune", str(tune)])
+    if video_config.get("maxrate"):
+        args.extend(["-maxrate", str(video_config["maxrate"])])
+    if video_config.get("bufsize"):
+        args.extend(["-bufsize", str(video_config["bufsize"])])
+    if video_config.get("profile") and codec not in {"mpeg4", "libvpx-vp9"}:
+        args.extend(["-profile:v", str(video_config["profile"])])
+    if video_config.get("level") and codec not in {"mpeg4", "libvpx-vp9"}:
+        args.extend(["-level", str(video_config["level"])])
+    return args
 
 try:
     import torch  # type: ignore
@@ -22,27 +309,38 @@ class BaseProblem(ABC):
     """Base class for all PHRIKE problems."""
 
     @staticmethod
-    def clear_numba_cache():
-        """Clear numba cache to prevent module name conflicts.
+    def clear_numba_cache(root: Optional[Path] = None) -> None:
+        """Remove this package's Numba caches.
 
-        This is primarily useful as a one-time fix after package renames.
-        Use the --clear-cache CLI flag when needed.
+        Numba writes compiled caches under ``__pycache__``. PHRIKE does not
+        use ``~/.numba_cache``, and that directory is left untouched.
+        Individual removal failures are reported instead of discarded.
+
+        Args:
+            root: Package directory to scan. Defaults to the ``phrike`` package.
         """
-        try:
-            # Clear user's numba cache
-            numba_cache = Path.home() / ".numba_cache"
-            if numba_cache.exists():
-                shutil.rmtree(numba_cache)
-
-            # Clear local __pycache__ directories
-            current_dir = Path(__file__).parent.parent
-            for pycache in current_dir.rglob("__pycache__"):
-                if pycache.is_dir():
-                    shutil.rmtree(pycache)
-
-        except Exception:
-            # Silently fail if cache clearing doesn't work
-            pass
+        package_root = Path(root) if root is not None else Path(__file__).resolve().parent.parent
+        failures = []
+        if not package_root.exists():
+            warnings.warn(
+                f"Numba cache directory does not exist: {package_root}",
+                UserWarning,
+                stacklevel=2,
+            )
+            return
+        for pycache in package_root.rglob("__pycache__"):
+            if not pycache.is_dir():
+                continue
+            try:
+                shutil.rmtree(pycache)
+            except OSError as exc:
+                failures.append(f"{pycache}: {exc}")
+        if failures:
+            warnings.warn(
+                "Could not remove every Numba cache directory: " + "; ".join(failures),
+                UserWarning,
+                stacklevel=2,
+            )
 
     def __init__(
         self,
@@ -73,19 +371,30 @@ class BaseProblem(ABC):
         if self.restart_from is not None:
             self.load_restart_data()
 
+    def _problem_label(self) -> str:
+        """Registered or configured problem name, never a mapping's repr."""
+        raw = self.config.get("problem", "unknown")
+        if isinstance(raw, dict):
+            nested = raw.get("name")
+            if isinstance(nested, str) and nested.strip():
+                return nested.strip()
+            return "unknown"
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+        return "unknown"
+
     def setup_output_directory(self) -> None:
         """Setup output directory from configuration."""
         if "io" in self.config and "outdir" in self.config["io"]:
             self.outdir = os.path.abspath(self.config["io"]["outdir"])
         else:
-            # Default to problem name in outputs/
-            problem_name = self.config.get("problem", "unknown")
-            self.outdir = os.path.abspath(f"outputs/{problem_name}")
+            self.outdir = os.path.abspath(f"outputs/{self._problem_label()}")
 
         ensure_outdir(self.outdir)
 
     def setup_common_parameters(self) -> None:
         """Extract common parameters from configuration."""
+        _warn_unknown_config_keys(self.config)
         # Support both "equations" and "physics" for backward compatibility
         if "equations" in self.config and "gamma" in self.config["equations"]:
             self.gamma = float(self.config["equations"]["gamma"])
@@ -127,12 +436,21 @@ class BaseProblem(ABC):
         # Grid parameters
         self.precision = str(self.config["grid"].get("precision", "double"))
         
-        # Adaptive time-stepping parameters
-        # Prefer the nested form, while continuing to load the public
-        # top-level `adaptive:` blocks used by existing configurations.
-        adaptive_raw = self.config["integration"].get(
-            "adaptive"
-        ) or self.config.get("adaptive")
+        # Adaptive time-stepping parameters.
+        # A nested integration.adaptive block and a top-level adaptive block
+        # are both accepted, but not together: the nested value used to hide
+        # the top-level one.
+        has_nested_adaptive = "adaptive" in self.config["integration"]
+        has_top_adaptive = "adaptive" in self.config
+        if has_nested_adaptive and has_top_adaptive:
+            raise ValueError(
+                "Both integration.adaptive and top-level adaptive are set. "
+                "Keep only one of them."
+            )
+        if has_nested_adaptive:
+            adaptive_raw = self.config["integration"].get("adaptive")
+        else:
+            adaptive_raw = self.config.get("adaptive")
         if adaptive_raw:
             self.adaptive_config = {
                 "enabled": bool(adaptive_raw.get("enabled", False)),
@@ -209,7 +527,13 @@ class BaseProblem(ABC):
             else:
                 try:
                     threads = int(num_threads_cfg)
-                except Exception:
+                except (TypeError, ValueError):
+                    warnings.warn(
+                        f"runtime.num_threads={num_threads_cfg!r} is not an integer; "
+                        "using the CPU count",
+                        UserWarning,
+                        stacklevel=2,
+                    )
                     threads = os.cpu_count() or 1
         else:
             threads = None
@@ -218,7 +542,13 @@ class BaseProblem(ABC):
         if grid_threads is not None:
             try:
                 self.fft_workers = int(grid_threads)
-            except Exception:
+            except (TypeError, ValueError):
+                warnings.warn(
+                    f"grid.fft_workers={grid_threads!r} is not an integer; "
+                    "using the CPU count",
+                    UserWarning,
+                    stacklevel=2,
+                )
                 self.fft_workers = os.cpu_count() or 1
         elif threads is not None:
             self.fft_workers = threads
@@ -230,9 +560,24 @@ class BaseProblem(ABC):
         self.monitoring_enabled = bool(
             self.monitoring_config.get("enabled", True)
         )  # Default: True
-        self.monitoring_step_interval = int(
-            self.monitoring_config.get("step_interval", 10)
-        )  # Default: 10
+        raw_interval = self.monitoring_config.get("step_interval", 10)
+        if isinstance(raw_interval, bool):
+            raise ValueError(
+                "monitoring.step_interval must be a positive integer, "
+                f"got {raw_interval!r}"
+            )
+        try:
+            interval_value = float(raw_interval)
+            self.monitoring_step_interval = int(interval_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "monitoring.step_interval must be a positive integer"
+            ) from exc
+        if interval_value != self.monitoring_step_interval or self.monitoring_step_interval < 1:
+            raise ValueError(
+                "monitoring.step_interval must be a positive integer, "
+                f"got {raw_interval!r}"
+            )
         self.monitoring_output_file = self.monitoring_config.get(
             "output_file", None
         )  # Default: None (stdout)
@@ -280,37 +625,88 @@ class BaseProblem(ABC):
         print(f"Restarting simulation at t = {self.t0:.6f}")
 
     def validate_restart_data(self, grid, equations) -> None:
-        """Validate that restart data is compatible with current problem configuration."""
+        """Raise if a restart snapshot was written for a different problem setup.
+
+        Domain length, basis, boundary condition, dimension, and gamma are
+        checked when the snapshot recorded them. Snapshots that predate those
+        fields still load; the missing fields produce a warning. A gamma
+        mismatch is an error.
+        """
         if self.restart_data is None:
             return
 
-        # Check gamma parameter
-        if "gamma" in self.restart_data["meta"]:
-            restart_gamma = self.restart_data["meta"]["gamma"]
-            if abs(restart_gamma - equations.gamma) > 1e-10:
-                print(
-                    f"Warning: Gamma mismatch - restart: {restart_gamma}, current: {equations.gamma}"
-                )
+        meta = self.restart_data.get("meta") or {}
+        if not isinstance(meta, dict):
+            warnings.warn(
+                "Restart snapshot has no metadata dictionary; "
+                "domain and physics settings were not checked",
+                UserWarning,
+                stacklevel=2,
+            )
+            return
 
-        # Check grid dimensions
-        restart_meta = self.restart_data["meta"]
-        if "N" in restart_meta:  # 1D case
-            if restart_meta["N"] != grid.N:
-                raise ValueError(
-                    f"Grid size mismatch - restart: {restart_meta['N']}, current: {grid.N}"
+        current = grid_snapshot_identity(grid, equations)
+        compared = ["dimension", "basis", "bc", "gamma", "Lx"]
+        if current["dimension"] >= 2:
+            compared.append("Ly")
+        if current["dimension"] == 3:
+            compared.append("Lz")
+        if "bc_config" in current or "bc_config" in meta:
+            compared.append("bc_config")
+
+        missing = []
+        mismatches = []
+        for key in compared:
+            if key not in meta:
+                missing.append(key)
+                continue
+            current_value = current.get(key)
+            if not _restart_values_match(current_value, meta[key]):
+                mismatches.append(
+                    f"{key}: snapshot={meta[key]!r}, current={current_value!r}"
                 )
-        elif "Nx" in restart_meta:  # 2D/3D case
-            if restart_meta["Nx"] != grid.Nx:
+        if mismatches:
+            raise ValueError(
+                "Restart snapshot is incompatible with the current problem: "
+                + "; ".join(mismatches)
+            )
+        if missing:
+            warnings.warn(
+                "Restart snapshot is missing "
+                + ", ".join(missing)
+                + "; those settings were not checked. Re-save the snapshot "
+                "with this version of PHRIKE to record them.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        dimension = current["dimension"]
+        if "N" in meta and "Nx" not in meta:
+            if dimension != 1:
                 raise ValueError(
-                    f"Grid Nx mismatch - restart: {restart_meta['Nx']}, current: {grid.Nx}"
+                    "Restart snapshot is 1D but the current grid is "
+                    f"{dimension}D"
                 )
-            if "Ny" in restart_meta and restart_meta["Ny"] != grid.Ny:
+            if meta["N"] != grid.N:
                 raise ValueError(
-                    f"Grid Ny mismatch - restart: {restart_meta['Ny']}, current: {grid.Ny}"
+                    f"Grid size mismatch - restart: {meta['N']}, current: {grid.N}"
                 )
-            if "Nz" in restart_meta and restart_meta["Nz"] != grid.Nz:
+        elif "Nx" in meta:
+            if dimension == 1:
                 raise ValueError(
-                    f"Grid Nz mismatch - restart: {restart_meta['Nz']}, current: {grid.Nz}"
+                    "Restart snapshot is multi-dimensional but the current grid is 1D"
+                )
+            if meta["Nx"] != grid.Nx:
+                raise ValueError(
+                    f"Grid Nx mismatch - restart: {meta['Nx']}, current: {grid.Nx}"
+                )
+            if "Ny" in meta and meta["Ny"] != grid.Ny:
+                raise ValueError(
+                    f"Grid Ny mismatch - restart: {meta['Ny']}, current: {grid.Ny}"
+                )
+            if "Nz" in meta and meta["Nz"] != grid.Nz:
+                raise ValueError(
+                    f"Grid Nz mismatch - restart: {meta['Nz']}, current: {grid.Nz}"
                 )
 
     @abstractmethod
@@ -338,163 +734,219 @@ class BaseProblem(ABC):
         pass
 
     def setup_video_generation(self) -> Dict[str, Any]:
-        """Setup video generation parameters from config."""
-        video_config = self.config.get("video", {})
+        """Setup video generation parameters from config.
+
+        An explicit ``crf`` wins over the quality preset. When ``crf`` is
+        omitted, ``quality`` selects the constant-rate-factor (18/23/28).
+        """
+        video_config = self.config.get("video", {}) or {}
+        quality = str(video_config.get("quality", "high"))
+        if video_config.get("crf") is not None:
+            crf = int(video_config["crf"])
+        else:
+            crf = _QUALITY_CRF.get(quality, 23)
         return {
             "fps": int(video_config.get("fps", 30)),
             "width": int(video_config.get("width", 0)),  # 0 = auto
             "height": int(video_config.get("height", 0)),  # 0 = auto
             "scale": float(video_config.get("scale", 1.0)),
             "codec": str(video_config.get("codec", "h264_videotoolbox")),
-            "quality": str(video_config.get("quality", "high")),  # low, medium, high
-            "crf": int(video_config.get("crf", 23)),  # Default to higher quality
-            "preset": str(video_config.get("preset", "medium")),
+            "quality": quality,
+            "crf": crf,
+            "preset": video_config.get("preset", "medium"),
             "pix_fmt": str(video_config.get("pix_fmt", "yuv420p")),
-            "bitrate": video_config.get("bitrate"),
-            "maxrate": video_config.get("maxrate"),
-            "bufsize": video_config.get("bufsize"),
-            "tune": video_config.get("tune"),
-            "profile": str(video_config.get("profile", "high")),
-            "level": str(video_config.get("level", "4.1")),
+            "bitrate": video_config.get("bitrate") or None,
+            "maxrate": video_config.get("maxrate") or None,
+            "bufsize": video_config.get("bufsize") or None,
+            "tune": video_config.get("tune") or None,
+            "profile": video_config.get("profile", "high"),
+            "level": video_config.get("level", "4.1"),
         }
 
-    def generate_video(self, frames_dir: str, video_name: str) -> str:
-        """Generate video from frames using enhanced ffmpeg parameters based on amr2vid.py approach."""
+    def _prepare_frames_directory(self) -> str:
+        """Return a frames directory that contains only this run's images.
+
+        Problem visualizers write ``outdir/frames/frame_*.png``. Removing that
+        directory at the start of a video run keeps a rerun from mixing its
+        frames with the previous numbering.
+        """
+        frames_dir = os.path.join(self.outdir, "frames")
+        if os.path.isdir(frames_dir):
+            existing = [
+                name
+                for name in os.listdir(frames_dir)
+                if name.startswith("frame_") and name.endswith(".png")
+            ]
+            if existing:
+                warnings.warn(
+                    f"Removing {len(existing)} existing frame(s) in {frames_dir} "
+                    "so this video does not reuse frames from a previous run",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            shutil.rmtree(frames_dir)
+        ensure_outdir(frames_dir)
+        return frames_dir
+
+    def _renumber_frames(self, frames_dir: str) -> int:
+        """Rename ``frame_*.png`` to ``frame_%08d.png`` through a staging directory.
+
+        Renaming inside the destination directory overwrites an older numbered
+        frame when a time-stamped name sorts first. The staging directory
+        keeps every source file.
+        """
+        frames = sorted(
+            name
+            for name in os.listdir(frames_dir)
+            if name.startswith("frame_") and name.endswith(".png")
+        )
+        if not frames:
+            return 0
+        staging = frames_dir.rstrip(os.sep) + ".renumbering"
+        if os.path.isdir(staging):
+            shutil.rmtree(staging)
+        os.makedirs(staging)
+        for index, name in enumerate(frames):
+            os.replace(
+                os.path.join(frames_dir, name),
+                os.path.join(staging, f"frame_{index:08d}.png"),
+            )
+        for name in list(os.listdir(frames_dir)):
+            path = os.path.join(frames_dir, name)
+            if os.path.isfile(path):
+                os.remove(path)
+        for name in sorted(os.listdir(staging)):
+            os.replace(os.path.join(staging, name), os.path.join(frames_dir, name))
+        os.rmdir(staging)
+        return len(frames)
+
+    def _ffmpeg_command(
+        self,
+        frames_dir: str,
+        video_path: str,
+        video_config: Dict[str, Any],
+        codec: str,
+    ) -> list:
+        command = [
+            "ffmpeg",
+            "-y",
+            "-framerate",
+            str(video_config["fps"]),
+            "-i",
+            os.path.join(frames_dir, _FRAME_SEQUENCE),
+            "-c:v",
+            codec,
+        ]
+        command.extend(_codec_rate_args(codec, video_config))
+        command.extend(["-pix_fmt", str(video_config["pix_fmt"])])
+        scale = video_config.get("scale", 1.0)
+        if scale not in (1, 1.0):
+            command.extend(["-vf", f"scale=iw*{scale}:ih*{scale}"])
+        elif int(video_config.get("width") or 0) > 0 and int(video_config.get("height") or 0) > 0:
+            command.extend(
+                [
+                    "-vf",
+                    f"scale={int(video_config['width'])}:{int(video_config['height'])}",
+                ]
+            )
+        command.append(video_path)
+        return command
+
+    def generate_video(self, frames_dir: str, video_name: str) -> Optional[str]:
+        """Encode ``frames_dir`` to ``{video_name}.mp4``.
+
+        Returns the video path when ffmpeg writes a movie, and None when
+        ffmpeg is missing or every codec fails. The frames are left on disk
+        either way. The requested codec is tried first, with its crf, preset,
+        bitrate, and related flags; the other codecs are fallbacks.
+        """
         video_config = self.setup_video_generation()
         video_path = os.path.join(self.outdir, f"{video_name}.mp4")
+        n_frames = self._renumber_frames(frames_dir)
+        print(f"Found {n_frames} frames")
+        if n_frames == 0:
+            warnings.warn(
+                f"No frames in {frames_dir}; video was not created",
+                UserWarning,
+                stacklevel=2,
+            )
+            return None
 
-        # Normalize frame indices - find all frame files and rename them sequentially
-        frames = sorted(
-            [
-                f
-                for f in os.listdir(frames_dir)
-                if f.startswith("frame_") and f.endswith(".png")
-            ]
-        )
-        
-        print(f"Found {len(frames)} frames to rename")
-        for i, fname in enumerate(frames):
-            src = os.path.join(frames_dir, fname)
-            dst = os.path.join(frames_dir, f"frame_{i:08d}.png")
-            if src != dst:
-                print(f"Renaming {fname} -> frame_{i:08d}.png")
-                os.replace(src, dst)
-
-        # Check if ffmpeg is available
         try:
             subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
         except (subprocess.CalledProcessError, FileNotFoundError):
-            print("Error: ffmpeg not found. Please install ffmpeg to create movies.")
-            print("Frames have been generated in:", frames_dir)
-            return frames_dir
+            warnings.warn(
+                "ffmpeg was not found, so the movie was not created. "
+                f"Frames are in {frames_dir}",
+                UserWarning,
+                stacklevel=2,
+            )
+            return None
 
-        # Define encoding options based on quality and available codecs
-        quality = video_config["quality"]
-        
-        # Try different encoding options based on what's available
-        encoding_options = [
-            # Option 1: H.264 with libx264 (best quality)
-            {
-                "name": "H.264 (libx264)",
-                "cmd": [
-                    "ffmpeg", "-y",
-                    "-framerate", str(video_config["fps"]),
-                    "-i", os.path.join(frames_dir, "frame_%08d.png"),
-                    "-c:v", "libx264",
-                    "-crf", "18" if quality == "high" else "23" if quality == "medium" else "28",
-                    "-pix_fmt", video_config["pix_fmt"],
-                ]
-            },
-            # Option 2: H.264 with h264_videotoolbox (macOS hardware acceleration)
-            {
-                "name": "H.264 (videotoolbox)",
-                "cmd": [
-                    "ffmpeg", "-y",
-                    "-framerate", str(video_config["fps"]),
-                    "-i", os.path.join(frames_dir, "frame_%08d.png"),
-                    "-c:v", "h264_videotoolbox",
-                    "-b:v", "15M" if quality == "high" else "10M" if quality == "medium" else "5M",
-                    "-pix_fmt", video_config["pix_fmt"],
-                    "-profile:v", video_config["profile"],
-                    "-level", video_config["level"],
-                ]
-            },
-            # Option 3: H.264 with nvenc (NVIDIA hardware acceleration)
-            {
-                "name": "H.264 (nvenc)",
-                "cmd": [
-                    "ffmpeg", "-y",
-                    "-framerate", str(video_config["fps"]),
-                    "-i", os.path.join(frames_dir, "frame_%08d.png"),
-                    "-c:v", "h264_nvenc",
-                    "-b:v", "15M" if quality == "high" else "10M" if quality == "medium" else "5M",
-                    "-pix_fmt", video_config["pix_fmt"],
-                ]
-            },
-            # Option 4: MPEG-4 (more widely supported)
-            {
-                "name": "MPEG-4",
-                "cmd": [
-                    "ffmpeg", "-y",
-                    "-framerate", str(video_config["fps"]),
-                    "-i", os.path.join(frames_dir, "frame_%08d.png"),
-                    "-c:v", "mpeg4",
-                    "-q:v", "1" if quality == "high" else "2" if quality == "medium" else "5",
-                    "-pix_fmt", video_config["pix_fmt"],
-                ]
-            },
-            # Option 5: VP9 (good compression)
-            {
-                "name": "VP9",
-                "cmd": [
-                    "ffmpeg", "-y",
-                    "-framerate", str(video_config["fps"]),
-                    "-i", os.path.join(frames_dir, "frame_%08d.png"),
-                    "-c:v", "libvpx-vp9",
-                    "-crf", "15" if quality == "high" else "20" if quality == "medium" else "25",
-                    "-b:v", "0",  # Use CRF mode
-                    "-pix_fmt", video_config["pix_fmt"],
-                ]
-            }
+        requested = str(video_config["codec"])
+        fallbacks = [
+            "libx264",
+            "h264_videotoolbox",
+            "h264_nvenc",
+            "mpeg4",
+            "libvpx-vp9",
         ]
-
-        # Add scaling and output file to all options
-        for option in encoding_options:
-            # Add scaling if specified
-            if video_config["scale"] != 1.0:
-                option["cmd"].extend(["-vf", f"scale=iw*{video_config['scale']}:ih*{video_config['scale']}"])
-            elif video_config["width"] > 0 and video_config["height"] > 0:
-                option["cmd"].extend(["-vf", f"scale={video_config['width']}:{video_config['height']}"])
-            
-            # Add output file
-            option["cmd"].append(video_path)
+        codecs = [requested]
+        for name in fallbacks:
+            if name not in codecs:
+                codecs.append(name)
 
         print(f"Creating movie: {video_path}")
-        print(f"Using {len(frames)} frames at {video_config['fps']} fps")
-        print(f"Quality setting: {quality}")
+        print(
+            f"Using {n_frames} frames at {video_config['fps']} fps, "
+            f"codec {requested}, crf {video_config['crf']}"
+        )
 
-        # Try each encoding option until one works
-        for option in encoding_options:
-            print(f"Trying {option['name']}...")
+        manual = (
+            f"ffmpeg -framerate {video_config['fps']} -i "
+            f"{frames_dir}/{_FRAME_SEQUENCE} -c:v {requested} "
+            f"-crf {video_config['crf']} -pix_fmt {video_config['pix_fmt']} "
+            f"{video_path}"
+        )
+        for codec in codecs:
+            command = self._ffmpeg_command(frames_dir, video_path, video_config, codec)
+            print(f"Trying {codec}...")
             try:
-                result = subprocess.run(option['cmd'], capture_output=True, text=True, timeout=300)
-                if result.returncode == 0:
-                    print(f"Movie created successfully using {option['name']}: {video_path}")
-                    return video_path
-                else:
-                    print(f"Failed with {option['name']}: {result.stderr}")
-                    continue
+                result = subprocess.run(
+                    command, capture_output=True, text=True, timeout=300
+                )
             except subprocess.TimeoutExpired:
-                print(f"Timeout with {option['name']}")
+                print(f"Timeout with {codec}")
                 continue
-            except Exception as e:
-                print(f"Exception with {option['name']}: {e}")
+            except OSError as exc:
+                warnings.warn(
+                    f"Could not run ffmpeg for codec {codec}: {exc}",
+                    UserWarning,
+                    stacklevel=2,
+                )
                 continue
+            if result.returncode == 0:
+                print(f"Movie created successfully using {codec}: {video_path}")
+                return video_path
+            print(f"Failed with {codec}: {result.stderr}")
+            if codec == requested:
+                warnings.warn(
+                    f"Requested video codec {requested!r} failed; "
+                    "trying fallback encoders",
+                    UserWarning,
+                    stacklevel=2,
+                )
 
+        warnings.warn(
+            "All video encoders failed. Frames are available for manual "
+            f"processing: {manual}",
+            UserWarning,
+            stacklevel=2,
+        )
         print("All encoding options failed. Frames are available for manual processing.")
         print("You can try creating the movie manually with:")
-        print(f"ffmpeg -framerate {video_config['fps']} -i {frames_dir}/frame_%05d.png -c:v libx264 -crf 23 -pix_fmt yuv420p {video_path}")
-        return frames_dir
+        print(manual)
+        return None
 
     def convert_torch_to_numpy(self, *arrays):
         """Convert torch tensors to numpy arrays for plotting."""
@@ -679,24 +1131,108 @@ class BaseProblem(ABC):
                     f"Unexpected number of primitive variables: {len(primitive_vars)}"
                 )
 
-        # Compute conservation errors relative to initial values.
-        # Keep sign for mass and energy; keep momentum errors absolute.
+        # Mass and energy stay relative to their initial values. Momentum is
+        # normalized by a physical scale: a signed initial momentum is often
+        # only round-off, and dividing by it reports a meaningless ratio.
+        scales = getattr(self, "monitoring_momentum_scales", None) or {}
         errors = {}
         for key, initial_val in self.monitoring_initial_values.items():
-            if key in current_cons:
-                if initial_val != 0:
-                    delta = (current_cons[key] - initial_val) / initial_val
+            if key not in current_cons:
+                continue
+            change = current_cons[key] - initial_val
+            if key.startswith("momentum"):
+                scale = scales.get(key, 0.0)
+                if not np.isfinite(scale) or scale <= 0.0:
+                    warnings.warn(
+                        f"No physical scale for {key}; reporting the absolute change",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    errors[f"{key}_error"] = abs(change)
                 else:
-                    delta = current_cons[key] - initial_val
-
-                # Momentum components (including 1D 'momentum') remain absolute
-                if key.startswith("momentum"):
-                    errors[f"{key}_error"] = abs(delta)
-                else:
-                    # mass and energy (and any other conserved scalars) keep sign
-                    errors[f"{key}_error"] = delta
+                    errors[f"{key}_error"] = abs(change) / scale
+            elif initial_val != 0:
+                errors[f"{key}_error"] = change / initial_val
+            else:
+                errors[f"{key}_error"] = change
 
         return errors
+
+    def _momentum_reference_scales(self, solver, U) -> Dict[str, float]:
+        """Scale for each momentum component.
+
+        The scale is ``max(sum(|rho u_i|), mass * c_s)`` using the same
+        summation as the conservation diagnostic (quadrature weights on the
+        mixed Fourier/SBP grid, otherwise a plain sum). ``c_s`` is the rms
+        sound speed ``sqrt(gamma p / rho)``.
+        """
+        primitive_vars = solver.equations.primitive(U)
+        rho = primitive_vars[0]
+        is_torch = torch is not None and isinstance(rho, torch.Tensor)
+        pressure = _pressure_field(primitive_vars)
+        if pressure is None:
+            raise ValueError(
+                "Cannot scale momentum errors for "
+                f"{len(primitive_vars)} primitive fields"
+            )
+        if len(primitive_vars) == 4 and getattr(rho, "ndim", 0) == 1:
+            velocities = [primitive_vars[1]]
+            names = ["momentum"]
+        elif len(primitive_vars) == 4:
+            velocities = [primitive_vars[1], primitive_vars[2]]
+            names = ["momentum_x", "momentum_y"]
+        else:
+            velocities = [primitive_vars[1], primitive_vars[2], primitive_vars[3]]
+            names = ["momentum_x", "momentum_y", "momentum_z"]
+
+        weight = None
+        if getattr(solver.grid, "_mixed_open_y", False):
+            try:
+                _, weights = solver.grid._sbp_arrays(U)
+                weight = solver.grid.dx * np.asarray(weights)[:, None]
+            except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+                warnings.warn(
+                    f"Momentum scale is unweighted; SBP weights were unavailable ({exc})",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                weight = None
+        if weight is not None and is_torch:
+            weight = torch.as_tensor(weight, dtype=rho.dtype, device=rho.device)
+
+        def total(values: Any, absolute: bool = False) -> float:
+            data = torch.abs(values) if absolute and is_torch else values
+            if absolute and not is_torch:
+                data = np.abs(values)
+            if weight is not None:
+                data = data * weight
+            if is_torch:
+                return float(torch.sum(data).item())
+            return float(np.sum(data))
+
+        mass = abs(total(rho))
+        if is_torch:
+            safe_rho = torch.clamp(rho, min=torch.finfo(rho.dtype).tiny)
+            c2 = solver.equations.gamma * pressure / safe_rho
+            finite = torch.isfinite(c2) & (c2 > 0)
+            if bool(torch.any(finite).item()):
+                c_ref = float(torch.sqrt(torch.mean(c2[finite])).item())
+            else:
+                c_ref = 0.0
+        else:
+            rho_np = np.asarray(rho)
+            c2 = np.asarray(solver.equations.gamma * pressure / np.maximum(rho_np, 1e-300))
+            finite = np.isfinite(c2) & (c2 > 0)
+            c_ref = float(np.sqrt(np.mean(c2[finite]))) if np.any(finite) else 0.0
+        mass_scale = mass * c_ref
+
+        scales: Dict[str, float] = {}
+        for name, velocity in zip(names, velocities):
+            scales[name] = max(total(rho * velocity, absolute=True), mass_scale)
+        if "momentum" not in scales and "momentum_x" in scales:
+            # 2D Euler's conserved_quantities currently reports one "momentum" key.
+            scales["momentum"] = scales["momentum_x"]
+        return scales
 
     def compute_velocity_stats(self, solver, U):
         """Compute velocity statistics."""
@@ -779,7 +1315,7 @@ class BaseProblem(ABC):
             torch = None
 
         if is_torch:
-            return {
+            stats = {
                 "rho_mean": float(torch.mean(rho).item()),
                 "rho_max": float(torch.max(rho).item()),
                 "rho_min": float(torch.min(rho).item()),
@@ -792,16 +1328,27 @@ class BaseProblem(ABC):
                 "rho_min": float(np.min(rho)),
                 "rho_std": float(np.std(rho)),
             }
-            # Also report pressure min/max for positivity diagnostics
-            try:
-                rho_np, ux_np, uy_np, p_np = primitive_vars
-                stats.update({
-                    "p_max": float(np.max(p_np)),
-                    "p_min": float(np.min(p_np)),
-                })
-            except Exception:
-                pass
+        pressure = _pressure_field(primitive_vars)
+        if pressure is None:
+            warnings.warn(
+                "Pressure statistics need 4, 5, or 8 primitive fields, "
+                f"got {len(primitive_vars)}",
+                UserWarning,
+                stacklevel=2,
+            )
             return stats
+        try:
+            p_max, p_min = _field_minmax(pressure)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            warnings.warn(
+                f"Pressure statistics were not computed: {exc}",
+                UserWarning,
+                stacklevel=2,
+            )
+            return stats
+        stats["p_max"] = p_max
+        stats["p_min"] = p_min
+        return stats
 
     def compute_mhd_stats(self, solver, U):
         """Compute MHD diagnostics for an 8-component state, else empty dict.
@@ -821,7 +1368,12 @@ class BaseProblem(ABC):
 
         try:
             max_div_b = float(solver.max_div_b(U))
-        except Exception:
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+            warnings.warn(
+                f"max|div B| was not computed: {exc}",
+                UserWarning,
+                stacklevel=2,
+            )
             max_div_b = float("nan")
 
         if getattr(solver.grid, "_mixed_open_y", False):
@@ -875,9 +1427,16 @@ class BaseProblem(ABC):
             # If Legendre weights are available, compute weighted conserved quantities
             wy = getattr(solver.grid, "wy", None)
             wx = getattr(solver.grid, "wx", None)
-            if wy is not None and wx is not None:
+            primitive_for_weights = solver.equations.primitive(U)
+            rho_for_weights = primitive_for_weights[0]
+            if (
+                wy is not None
+                and wx is not None
+                and len(primitive_for_weights) == 4
+                and getattr(rho_for_weights, "ndim", 0) == 2
+            ):
                 try:
-                    rho, ux, uy, p = solver.equations.primitive(U)
+                    rho, ux, uy, p = primitive_for_weights
                     import numpy as _np
                     if torch is not None and isinstance(rho, torch.Tensor):
                         wyt = torch.from_numpy(_np.asarray(wy)).to(rho.device, rho.dtype)
@@ -897,11 +1456,20 @@ class BaseProblem(ABC):
                     info_lines.append(f"momentum_x_w: {momx_w:.6e}")
                     info_lines.append(f"momentum_y_w: {momy_w:.6e}")
                     info_lines.append(f"energy_w: {energy_w:.6e}")
-                except Exception:
-                    pass
+                except (RuntimeError, TypeError, ValueError) as exc:
+                    warnings.warn(
+                        f"Weighted conservation statistics were not computed: {exc}",
+                        UserWarning,
+                        stacklevel=2,
+                    )
             errors = self.compute_conservation_errors(solver, U)
             for key, error in errors.items():
-                info_lines.append(f"{key}: {error:.2e}")
+                if key.startswith("momentum") and key.endswith("_error"):
+                    info_lines.append(
+                        f"{key}: {error:.2e} ({_MOMENTUM_SCALE_NOTE})"
+                    )
+                else:
+                    info_lines.append(f"{key}: {error:.2e}")
 
         if self.monitoring_include_velocity_stats:
             v_stats = self.compute_velocity_stats(solver, U)
@@ -916,10 +1484,15 @@ class BaseProblem(ABC):
         # MHD diagnostics (only for 8-component states; headline is max|divB|)
         try:
             mhd_stats = self.compute_mhd_stats(solver, U)
-            for key, value in mhd_stats.items():
-                info_lines.append(f"{key}: {value:.3e}")
-        except Exception:
-            pass
+        except (RuntimeError, TypeError, ValueError) as exc:
+            warnings.warn(
+                f"MHD monitoring statistics were not computed: {exc}",
+                UserWarning,
+                stacklevel=2,
+            )
+            mhd_stats = {}
+        for key, value in mhd_stats.items():
+            info_lines.append(f"{key}: {value:.3e}")
 
         # Output the information
         output_text = " | ".join(info_lines)
@@ -993,6 +1566,7 @@ class BaseProblem(ABC):
                     f"Unexpected number of primitive variables: {len(primitive_vars)}"
                 )
 
+        self.monitoring_momentum_scales = self._momentum_reference_scales(solver, U)
         # Reset step counter
         self.monitoring_step_count = 0
 
@@ -1012,17 +1586,24 @@ class BaseProblem(ABC):
             and hasattr(grid, "Ny")
             and getattr(grid, "Ny", None) is not None
         )
-        if is_2d and (
-            getattr(grid, "basis_x", None) != "fourier"
-            or getattr(grid, "basis_y", None) != "fourier"
-        ):
-            return None
-        if (
-            not is_3d
-            and not is_2d
-            and getattr(grid, "_basis_name", None) != "fourier"
-        ):
-            return None
+        if is_3d:
+            basis = getattr(grid, "basis", "fourier")
+            fourier_grid = str(basis).lower() == "fourier"
+        elif is_2d:
+            fourier_grid = (
+                str(getattr(grid, "basis_x", "")).lower() == "fourier"
+                and str(getattr(grid, "basis_y", "")).lower() == "fourier"
+            )
+        else:
+            basis_name = getattr(grid, "_basis_name", None)
+            if basis_name is None:
+                basis_name = getattr(grid, "basis", "")
+            fourier_grid = str(basis_name).lower() == "fourier"
+        if not fourier_grid:
+            raise ValueError(
+                "Tracers are only supported on periodic Fourier grids. "
+                "Disable tracers.enabled or select a Fourier basis."
+            )
         num = int(tcfg.get("num", 100))
         if num <= 0:
             raise ValueError("tracers.num must be positive")
@@ -1207,12 +1788,19 @@ class BaseProblem(ABC):
         self,
         backend: str = "auto",
         device: Optional[str] = None,
-        generate_video: bool = True,
+        generate_video: bool = False,
         debug: bool = False,
     ) -> Any:
         """Run the simulation."""
         # Create components
         grid = self.create_grid(backend, device, debug)
+        resolved_precision = getattr(grid, "precision", None)
+        if resolved_precision:
+            self.precision = str(resolved_precision)
+        grid._phrike_provenance = {
+            "config": self.config,
+            "problem": self._problem_label(),
+        }
         equations = self.create_equations()
 
         # Create initial conditions (use restart data if available)
@@ -1250,10 +1838,11 @@ class BaseProblem(ABC):
             gravity_config=self.gravity_config
         )
 
-        # Setup visualization
+        # Setup visualization. Problem visualizers write outdir/frames, so a
+        # video run starts by clearing that directory.
         frames_dir = os.path.join(self.outdir, "frames")
         if generate_video:
-            ensure_outdir(frames_dir)
+            frames_dir = self._prepare_frames_directory()
 
         # Initialize monitoring
         self.initialize_monitoring(solver, U0)
@@ -1362,13 +1951,16 @@ class BaseProblem(ABC):
                     title="Tracer particle density (t={:.3f})".format(solver.t),
                 )
                 print(f"Saved tracer density plot: {outpath}")
-            except Exception as e:
-                print(f"Tracer density plot failed: {e}")
+            except (ImportError, OSError, RuntimeError, ValueError) as exc:
+                warnings.warn(
+                    f"Tracer density plot failed: {exc}",
+                    UserWarning,
+                    stacklevel=2,
+                )
 
         # Generate video if requested
-        if generate_video and os.path.exists(frames_dir):
-            problem_name = self.config.get("problem", "simulation")
-            self.generate_video(frames_dir, problem_name)
+        if generate_video and os.path.isdir(frames_dir):
+            self.generate_video(frames_dir, self._problem_label())
 
         return solver, history
 
@@ -1399,21 +1991,31 @@ class BaseProblem(ABC):
         try:
             from scipy import ndimage
         except ImportError:
-            print("Warning: scipy not available for initial conditions smoothing")
+            warnings.warn(
+                "scipy is not available; initial conditions were not smoothed",
+                UserWarning,
+                stacklevel=2,
+            )
             return rho, u, p
         
-        # Calculate sigma in grid points
-        if hasattr(grid, 'N'):
-            # 1D case
-            sigma = kernel_size * grid.N / grid.Lx
-        elif hasattr(grid, 'Nx'):
-            # 2D case
+        # Calculate sigma in grid points. 3D grids also have Nx, so test Nz first.
+        if hasattr(grid, "Nz"):
+            sigma = (
+                kernel_size
+                * (grid.Nx + grid.Ny + grid.Nz)
+                / (grid.Lx + grid.Ly + grid.Lz)
+                / 3
+            )
+        elif hasattr(grid, "Nx"):
             sigma = kernel_size * grid.Nx / grid.Lx
-        elif hasattr(grid, 'Nx') and hasattr(grid, 'Ny'):
-            # 3D case - use average
-            sigma = kernel_size * (grid.Nx + grid.Ny + grid.Nz) / (grid.Lx + grid.Ly + grid.Lz) / 3
+        elif hasattr(grid, "N"):
+            sigma = kernel_size * grid.N / grid.Lx
         else:
-            print("Warning: Cannot determine grid size for smoothing")
+            warnings.warn(
+                "Cannot determine the grid size; initial conditions were not smoothed",
+                UserWarning,
+                stacklevel=2,
+            )
             return rho, u, p
         
         if diagnostic:
