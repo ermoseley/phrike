@@ -19,7 +19,7 @@ portable NumPy/PyTorch backends—not a production CFD package.
   including independent endpoint and per-variable settings.
 - 2D Fourier-x/SBP-y grids with periodic x and approximately open y faces,
   plus midpoint-resolvent ambipolar diffusion for 2D MHD.
-- Fixed-step RK2/RK4 and embedded RK23, RK45, and Fehlberg RKF78 integration.
+- Fixed-step RK2 and RK4, and embedded RK23, RK45, and rk78 (Fehlberg 7(8)).
 - NumPy CPU execution plus optional PyTorch CPU, CUDA, and Apple Metal/MPS
   backends.
 - Lagrangian tracer particles with tracer-density reconstruction.
@@ -38,7 +38,7 @@ python -m pip install -e ".[dev]"
 python -m phrike acoustic1d --config configs/acoustic1d.yaml \
   --backend cpu --outdir /tmp/phrike-acoustic
 
-# Run the test suite.
+# Run the test suite. Tests pass an explicit backend.
 python -m pytest -q
 ```
 
@@ -55,7 +55,8 @@ python -m phrike alfven1d --config configs/alfven1d.yaml --backend metal
 # Use --backend cuda on an NVIDIA system.
 ```
 
-Metal/MPS executes in single precision.
+If PyTorch is installed and the backend is left on `auto`, Apple Silicon
+uses Metal/MPS. Metal/MPS executes in single precision.
 
 ## Example problems
 
@@ -81,8 +82,11 @@ For the 1D shock examples:
 ```bash
 python -m phrike sod --config configs/sod_chebyshev_1d.yaml --backend cpu
 python -m phrike brio_wu1d --config configs/brio_wu1d.yaml --backend cpu
-# Either example also accepts --basis legendre and --bc outflow or --bc wall.
 ```
+
+The validated shock combination is Chebyshev with fixed or wall endpoints.
+`--basis legendre` selects the other polynomial basis. `--bc outflow` is
+experimental, and Legendre with outflow is not a validated Brio–Wu setup.
 
 See [1D boundary configuration and validation](docs/validation.rst) for the
 endpoint semantics, fixed-value overrides, and measured shock-profile errors.
@@ -98,9 +102,10 @@ before interpreting growth rates or boundary-sensitive results.
 The shipped Fourier configurations use a hard 2/3 dealias projection. Optional
 smooth damping is configured separately with
 `integration.spectral_dissipation`: set `enabled`, an even `order`, and exactly
-one of `rate` or `e_folding_time_at_cutoff`. The exponential is integrated in
-simulation time with a Strang half-step on either side of the Runge–Kutta
-step. Optional `onset_fraction` confines damping to the corresponding upper
+one of `rate` or `e_folding_time_at_cutoff`. `rate` is the damping rate at
+the cutoff wavenumber; the e-folding time of that mode is `1/rate`. The
+exponential is integrated in simulation time with a Strang half-step on
+either side of the Runge–Kutta step. Optional `onset_fraction` confines damping to the corresponding upper
 fraction of the retained band (for example, `0.8` leaves the lower 80% exactly
 untouched). Legendre and Chebyshev grids instead use the independently named
 `integration.modal_filter`; its `alpha` remains a dimensionless modal-filter
@@ -112,7 +117,11 @@ The automated suite checks adaptive Runge–Kutta tableaus and controller order,
 basis operators, boundary handling, shock-tube profiles, backend selection and
 error handling, and Torch CPU tensor behavior. It is a unit and regression
 suite, not a full numerical-validation campaign; measured results and their
-limits are recorded in [docs/validation.rst](docs/validation.rst).
+limits are recorded in [docs/validation.rst](docs/validation.rst). The
+equations that are integrated, including the CFL definition and the
+unit convention, are in [docs/equations.rst](docs/equations.rst). YAML
+keys and the accepted integrator names are in
+[docs/configuration.rst](docs/configuration.rst).
 
 Use the code as experimental research software. In particular:
 
@@ -123,6 +132,7 @@ Use the code as experimental research software. In particular:
 - Non-periodic polynomial workflows are still exploratory; the 3D Legendre path
   is not implemented.
 - CUDA and Metal/MPS hardware are not exercised in continuous integration.
+  A separate job installs a CPU-only PyTorch wheel and runs the Torch tests.
 
 ## Repository layout
 

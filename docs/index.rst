@@ -10,5 +10,7 @@ the workflows that are maintained in this repository.
 
    installation
    quickstart
+   equations
+   configuration
    validation
    development

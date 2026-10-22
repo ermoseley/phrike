@@ -8,8 +8,11 @@ Run a CPU acoustic-wave smoke test from the repository root:
    python -m phrike acoustic1d --config configs/acoustic1d.yaml \
      --backend cpu --outdir /tmp/phrike-acoustic
 
-The command writes its outputs to the chosen directory. Video generation is
-disabled unless ``--video`` is supplied.
+The command writes its outputs to the chosen directory. The command-line
+interface leaves video off unless ``--video`` is supplied or
+``video.enabled`` is true. ``run_simulation`` and ``BaseProblem.run``
+default ``generate_video`` to true, so a direct Python call renders
+frames unless that argument is false.
 
 List the available problem names and options with:
 
@@ -24,5 +27,8 @@ For a system with a configured accelerator backend, select it explicitly:
    python -m phrike alfven1d --config configs/alfven1d.yaml --backend metal
    python -m phrike alfven1d --config configs/alfven1d.yaml --backend cuda
 
-Metal/MPS uses single precision because of the PyTorch MPS precision support.
+Metal/MPS uses single precision. On Apple Silicon, that is also the
+default backend when PyTorch is installed and no backend is selected.
 CUDA and Metal/MPS runs should be validated on the intended hardware.
+The equations, CFL definition, and YAML keys are in :doc:`equations` and
+:doc:`configuration`.
