@@ -98,6 +98,41 @@ def test_wall_boundary_flux_conserves_mass_exactly(basis, mhd, dealias):
     assert abs(_mass_rate(grid, eqs, U, mhd)) < 1e-12
 
 
+@pytest.mark.parametrize("dealias", [False, True])
+def test_wall_boundary_flux_conserves_mass_and_energy_at_a_discontinuity(basis, dealias):
+    # The overintegrated endpoint trace differs from the physical endpoint
+    # flux here, so the Rusanov flux must use the physical one to close.
+    grid = Grid1D(N=9, Lx=1.0, basis=basis, bc="wall", backend="numpy", dealias=dealias)
+    eqs = EulerEquations1D(gamma=1.4)
+    left = np.asarray(grid.x) < 0.5
+    U = eqs.conservative(np.where(left, 1.0, 0.01), np.where(left, 0.4, 0.0),
+                         np.where(left, 1.0, 0.01))
+    grid.initialize_boundary_conditions(U, eqs)
+    rhs = _compute_rhs(grid, eqs, U)
+    weights = np.asarray(grid.wx)
+    assert abs(float(np.sum(weights * rhs[0]))) < 1e-12
+    assert abs(float(np.sum(weights * rhs[2]))) < 1e-12
+
+
+def test_restart_keeps_the_outflow_far_field(basis, mhd, tmp_path):
+    from phrike.io import load_checkpoint, save_solution_snapshot
+
+    grid, eqs, U, _ = _case(basis, mhd, "outflow")
+    grid.initialize_boundary_conditions(U, eqs)
+    evolved = 1.03 * U
+    expected = (SpectralSolverMHD(grid, eqs, scheme="rk2")._compute_rhs(evolved) if mhd
+                else _compute_rhs(grid, eqs, evolved))
+    path = save_solution_snapshot(str(tmp_path), 0.1, U=evolved, grid=grid, equations=eqs)
+
+    restarted, _, _, _ = _case(basis, mhd, "outflow")
+    data = load_checkpoint(path)
+    restarted.restore_boundary_reference(data["boundary_reference"])
+    restarted.initialize_boundary_conditions(data["U"], eqs)
+    rhs = (SpectralSolverMHD(restarted, eqs, scheme="rk2")._compute_rhs(data["U"]) if mhd
+           else _compute_rhs(restarted, eqs, data["U"]))
+    np.testing.assert_allclose(rhs, expected, rtol=0, atol=1e-13)
+
+
 def test_outflow_boundary_flux_vanishes_on_the_reference_state(basis, mhd):
     grid, eqs, _, _ = _case(basis, mhd, "outflow")
     x = np.asarray(grid.x)

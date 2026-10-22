@@ -1844,6 +1844,9 @@ class BaseProblem(ABC):
                     )
                 except ImportError:
                     raise ImportError("PyTorch is required for torch backend but not available")
+            reference = self.restart_data.get("boundary_reference")
+            if reference is not None and hasattr(grid, "restore_boundary_reference"):
+                grid.restore_boundary_reference(reference)
         else:
             U0 = self.create_initial_conditions(grid)
 

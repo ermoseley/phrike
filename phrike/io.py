@@ -280,6 +280,8 @@ def load_checkpoint(checkpoint_path: str) -> Dict[str, Any]:
         - meta: snapshot metadata (grid and physics parameters)
         - primitive_vars: primitive variables (rho, u, p, etc.)
         - optional tracer arrays (tracer_x, tracer_y, tracer_z, tracer_mass)
+        - optional boundary_reference: the far-field/fixed boundary state
+          captured at the start of the original run
     """
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
@@ -319,6 +321,8 @@ def load_checkpoint(checkpoint_path: str) -> Dict[str, Any]:
             result[key] = data[key]
     if "tracer_lattice_shape" in data:
         result["tracer_lattice_shape"] = data["tracer_lattice_shape"]
+    if "boundary_reference" in data:
+        result["boundary_reference"] = data["boundary_reference"]
 
     return result
 
@@ -444,6 +448,10 @@ def save_solution_snapshot(
             u=_to_numpy(u),
             p=_to_numpy(p),
         )
+
+    boundary_reference = getattr(grid, "_boundary_reference", None)
+    if boundary_reference is not None:
+        save_kw["boundary_reference"] = _to_numpy(boundary_reference)
 
     np.savez(filename, **save_kw)
     return filename

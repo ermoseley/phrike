@@ -52,12 +52,15 @@ transforms, derivatives, and filters currently use dense matrices.
   magnetic conducting-wall model is imposed.
 * ``periodic`` requires Fourier. Non-periodic BCs on Fourier are rejected.
 
-The penalty uses the endpoint value of the flux polynomial that the volume
-term differentiates (with 3/2 overintegration this differs from the flux of
-the endpoint state), and diffusion terms (artificial viscosity, explicit
-resistivity and viscosity) use a zero-flux endpoint closure. Together these
-keep the summation-by-parts balance: with ``wall`` endpoints the total mass
-changes only at round-off. Earlier versions copied neighbouring nodal values
+The Rusanov flux is built from the physical fluxes of the endpoint and
+exterior states, and the penalty removes the endpoint value of the flux
+polynomial that the volume term differentiates (with 3/2 overintegration this
+trace differs from the physical endpoint flux). Diffusion terms (artificial
+viscosity, explicit resistivity and viscosity) use a zero-flux endpoint
+closure. Together these keep the summation-by-parts balance: with ``wall``
+endpoints the total mass and energy change only at round-off, also at a
+discontinuity next to the wall. The far-field state is stored in checkpoints,
+so a restarted ``outflow`` run keeps the original exterior state. Earlier versions copied neighbouring nodal values
 instead; that closure is unstable for the global polynomial derivative.
 
 On a smooth right-going acoustic pulse (amplitude 1e-3, N=64, t=1) the
@@ -69,7 +72,7 @@ basis spreads Gibbs error to every node: on the shipped ``sod.yaml`` and
 ``brio_wu1d.yaml`` settings at N=64 and N=48, the nodes next to a ``fixed``
 endpoint already deviate from the initial density by up to 3% (Sod) and 10%
 (Brio–Wu, Legendre) at t=0.02, before any wave arrives. ``outflow`` endpoints
-now stay within 0.5% of their initial density in those cases, and ``wall``
+now stay within 1% of their initial density in those cases, and ``wall``
 endpoints stay within a factor of two of the error at the nodes next to a
 ``fixed`` endpoint.
 
