@@ -1,0 +1,62 @@
+# Shearing-sheet ADSI: axisymmetric local box with ambipolar diffusion (pure shear, Omega = 0).
+# Vertical axis x, radial axis y, azimuthal z = x cross y. B0 = (Bv, 0, Bphi); the seed is the
+# fastest-growing eigenvector, with its box mode fitted to the fastest wavevector (k_v, k_r).
+# Instability needs S k_r k_v Bv Bphi < 0 and |k_r Bphi/(k_v Bv)| > Am = 1/(rho0 eta S).
+#   python -m phrike adsi_shear --config configs/adsi_shear.yaml --backend cpu
+problem: adsi_shear
+
+grid:
+  Nx: 16
+  Ny: 16
+  Lx: auto               # 2*pi*mode_v/k_v of the fastest mode; Lx and Ly are both numbers or both auto
+  Ly: auto               # 2*pi*|mode_r|/|k_r| (the sign of k_r selects the sign of mode_r)
+  dealias: true
+  precision: double      # the 1e-6 seed needs double precision
+
+physics:
+  gamma: 1.6666666666666667
+  mhd:
+    enabled: true
+    resistivity: 0.0
+    viscosity: 0.0
+    divergence_clean: projection
+    project_each_substage: true
+    shearing_sheet:
+      omega: 0.0           # pure shear; omega: 1.0, q: 1.5 gives the Keplerian AD-modified MRI
+      shear: 1.0
+      vertical_axis: 0
+      radial_axis: 1
+    ambipolar:
+      enabled: true
+      eta: 2.0             # E_AD = eta |B|^2 J_perp, so Am = 1/(rho0 eta S) = 0.5
+      method: midpoint_resolvent
+      midpoint_tol: 1.0e-11
+
+integration:
+  t0: 0.0
+  t_end: 60.0              # set to about 6 e-foldings of the growth rate printed at setup
+  cfl: 0.3
+  scheme: rk4
+  output_interval: 5.0
+  checkpoint_interval: 0.0
+  spectral_dissipation:
+    enabled: false
+
+initial_conditions:
+  rho0: 1.0
+  Bv: 1.0                  # vertical field
+  Bphi: 1.0                # azimuthal field: tan(theta) = Bphi/Bv
+  beta: 10.0               # 2 p0/|B0|^2
+  mode_v: 1                # box mode of the seed along the vertical axis
+  mode_r: 1                # |box mode| along the radial axis (sign follows k_r when Lx, Ly are auto)
+  amplitude: 1.0e-6        # |b|/|B0|
+
+io:
+  outdir: outputs/adsi_shear
+
+monitoring:
+  enabled: true            # required: the mode amplitude is sampled at monitoring steps
+  step_interval: 20
+  include_conservation: false
+  include_timestep: true
+  include_time: true

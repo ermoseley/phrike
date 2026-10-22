@@ -601,7 +601,7 @@ over fixed ``k l`` reports the drift per unit perturbation energy, its fitted or
 contributions separately; the stabilization filters the total energy field, which leaves
 its volume mean unchanged). The outer step keeps the ideal CFL limit.
 ``scripts/hall_viability.py`` reports these pieces
-(``--suite waves|invariants|convergence|energy|cost|shear|mri|ot|stability|precision``)
+(``--suite waves|invariants|convergence|energy|cost|shear|mri|adsi|ot|stability|precision``)
 and must be run on a cluster. The ``cost`` suite times Hall-only steps under a shared
 phase-error ceiling; it is not an equal-error comparison of coupled runs. The ``ot``
 suite is the coupled comparison: inertia runs against the reference at ``N`` with
@@ -620,8 +620,10 @@ axisymmetric local-disc terms for the velocity ``u`` relative to
 ``dB_phi/dt -= S B_r``, ``dE/dt += S (rho u_r u_phi - B_r B_phi)``, with
 ``phi = z_v x r`` taken from the right-handed basis (vertical x, radial y gives
 ``+z``). Internal energy is unchanged and ``B_phi`` is generated along ``phi``,
-so ``div B`` is untouched. Fields must not vary along ``r``: only 1D grids with
-``vertical_axis: 0`` are accepted. ``omega: 0`` with ``shear != 0`` is pure shear.
+so ``div B`` is untouched. On a 1D grid fields must not vary along ``r`` (``vertical_axis: 0``);
+on a 2D grid the vertical axis is x, the radial axis is y and ``phi = +z`` is ignorable, so
+the local sources are exact for fields that depend on x and y. 3D is rejected.
+``omega: 0`` with ``shear != 0`` is pure shear.
 
 For ``k`` along ``B0`` the ``hall_mri1d`` problem seeds the fastest-growing
 eigenvector of the 4x4 system in ``phrike/problems/problem_list/hall_mri1d.py``,
@@ -632,3 +634,22 @@ and, with ``v_H**2 = 2 Omega eta_H sgn(B0)``, Balbus and Terquem (2001) eqs. 45
 and 57 for ``eta = 0`` (checked by hand, not by a published table): the neutral
 Keplerian wavenumbers are ``(k v_A)**2 = 3 Omega**2 - 2 Omega h`` and
 ``-Omega h/2``. Wardle (1999) and Sano and Stone (2002) were not compared.
+
+Shearing-sheet ADSI
+~~~~~~~~~~~~~~~~~~~
+
+The ``adsi_shear`` problem is the local counterpart of ``adsi2d``: a periodic axisymmetric
+(x vertical, y radial) box with uniform shear ``S``, optional rotation, a uniform field
+``B0 = (B_v, 0, B_phi)`` and ``physics.mhd.ambipolar`` (``E_AD = eta |B|**2 J_perp``). It seeds
+the fastest-growing eigenvector of the compressible 7x7 system in
+``phrike/problems/problem_list/adsi_shear.py`` at a box mode ``(k_v, k_r)``. For ``k_r = 0``
+the shear cannot act when ``Omega = 0`` (``u_r, b_r`` form a closed block), so the radial
+wavenumber is essential. For ``Omega = 0`` and ``Am = 1/(rho eta S)`` the incompressible
+system is unstable iff ``S k_r k_v B_v B_phi < 0`` and ``|k_r B_phi/(k_v B_v)| > Am``.
+Growth never exceeds ``|S|/2`` (energy argument); the incompressible quartic is the
+``B_R = 0`` dispersion relation of Kunz and Balbus (2004), compared by hand with the
+derivation. ``python scripts/hall_viability.py --suite adsi`` (NumPy, 2D) checks ideal
+MRI, the quartic, pure shear and Keplerian cases against the evolved eigenmode, with a
+timestep-halving check of the second-order ambipolar splitting; ``--adsi-quick`` keeps the
+unstable eigenmode runs. It does not test finite layer width, competition with the
+Kelvin--Helmholtz mode, open boundaries or advection.
