@@ -684,6 +684,28 @@ class Grid1D:
             raise ValueError("Fourier grids require periodic boundary conditions")
         if self._basis_name != "fourier" and "periodic" in configured_bcs:
             raise ValueError("Periodic boundary conditions require the Fourier basis")
+        # Unset boundaries, and variables a mapping leaves unspecified, are walls.
+        effective_bcs = list(configured_bcs)
+        if not configured_bcs:
+            effective_bcs.append("wall")
+        if self._bc_map is not None and "default" not in self._bc_map:
+            effective_bcs.append("wall")
+        if self._bc_boundary_map is not None:
+            if len(self._bc_boundary_map) < 2 or any(
+                "default" not in m for m in self._bc_boundary_map.values()
+            ):
+                effective_bcs.append("wall")
+        if self._basis_name != "fourier" and any(b in ("outflow", "wall") for b in effective_bcs):
+            # Copying or reflecting endpoint values is not a characteristic
+            # closure for the global polynomial derivative; endpoint states drift
+            # from their initial values even before any wave arrives.
+            warnings.warn(
+                "Outflow and wall boundaries on 1D polynomial grids are experimental: "
+                "endpoint states can drift by percent levels before waves reach the "
+                "boundary (see docs/validation.rst). Fixed boundaries are validated.",
+                UserWarning,
+                stacklevel=3,
+            )
 
         if self._basis_name == "fourier":
             # Existing periodic uniform grid path

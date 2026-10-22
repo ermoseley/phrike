@@ -7,6 +7,10 @@ from phrike.grid import Grid1D
 from phrike.solver import SpectralSolver1D, SpectralSolverMHD, _compute_rhs
 
 
+# These tests exercise the experimental outflow/wall closures on purpose.
+pytestmark = pytest.mark.filterwarnings("ignore:Outflow and wall boundaries:UserWarning")
+
+
 @pytest.fixture(params=["legendre", "chebyshev"])
 def basis(request):
     return request.param
