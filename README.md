@@ -85,9 +85,8 @@ python -m phrike brio_wu1d --config configs/brio_wu1d.yaml --backend cpu
 ```
 
 The validated shock combination is Chebyshev with fixed endpoints.
-`--basis legendre` selects the other polynomial basis. `--bc outflow` and
-`--bc wall` are experimental: their endpoint states drift before any wave
-arrives, most strongly on Legendre grids, and PHRIKE warns when they are used.
+`--basis legendre` selects the other polynomial basis, and `--bc outflow` or
+`--bc wall` select weakly imposed far-field and reflecting endpoints.
 
 See [1D boundary configuration and validation](docs/validation.rst) for the
 endpoint semantics, fixed-value overrides, and measured shock-profile errors.

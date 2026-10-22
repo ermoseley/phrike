@@ -7,9 +7,6 @@ from phrike.grid import Grid1D
 from phrike.solver import SpectralSolver1D, SpectralSolverMHD, _compute_rhs
 
 
-# These tests exercise the experimental outflow/wall closures on purpose.
-pytestmark = pytest.mark.filterwarnings("ignore:Outflow and wall boundaries:UserWarning")
-
 
 @pytest.fixture(params=["legendre", "chebyshev"])
 def basis(request):
@@ -62,19 +59,12 @@ def test_fixed_captures_first_endpoints_and_paired_values(basis, mhd, bc):
 
 
 @pytest.mark.parametrize("bc", ["outflow", "neumann", "wall"])
-def test_extrapolating_boundaries_copy_adjacent_values_without_mutation(basis, mhd, bc):
+def test_weak_boundaries_leave_the_state_to_the_boundary_flux(basis, mhd, bc):
     grid, eqs, U, _ = _case(basis, mhd, bc)
     original = U.copy()
     result = grid.apply_boundary_conditions(U, eqs)
-    expected = original[:, [1, -2]].copy()
-    if bc == "wall":
-        energy = 4 if mhd else 2
-        expected[energy] -= expected[1]**2/(2*expected[0])
-        expected[1] = 0.0
-    np.testing.assert_allclose(result[:, [0, -1]], expected, atol=2e-15)
-    np.testing.assert_array_equal(result[:, 1:-1], original[:, 1:-1])
+    np.testing.assert_array_equal(result, original)
     np.testing.assert_array_equal(U, original)
-    np.testing.assert_allclose(_pressure(result, mhd)[[0, -1]], _pressure(U, mhd)[[1, -2]])
 
 
 def test_mixed_left_and_right_conditions(basis, mhd):
@@ -83,11 +73,73 @@ def test_mixed_left_and_right_conditions(basis, mhd):
     grid.apply_boundary_conditions(U, eqs)
     changed = 1.03*U
     result = grid.apply_boundary_conditions(changed, eqs)
+    # Fixed density is imposed strongly; the weak momentum and pressure keep
+    # the evolved endpoint values.
     assert result[0, 0] == U[0, 0]
-    assert result[1, 0] == 0.0
-    np.testing.assert_allclose(_pressure(result, mhd)[0], _pressure(changed, mhd)[1])
+    assert result[1, 0] == changed[1, 0]
+    np.testing.assert_allclose(_pressure(result, mhd)[0], _pressure(changed, mhd)[0])
     np.testing.assert_allclose(result[:, -1], U[:, -1], atol=2e-15)
     np.testing.assert_array_equal(changed, 1.03*U)
+
+
+def _mass_rate(grid, eqs, U, mhd):
+    if mhd:
+        solver = SpectralSolverMHD(grid, eqs, scheme="rk2")
+        rhs = solver._compute_rhs(U)
+    else:
+        rhs = _compute_rhs(grid, eqs, U)
+    return float(np.sum(np.asarray(grid.wx) * rhs[0]))
+
+
+@pytest.mark.parametrize("dealias", [False, True])
+def test_wall_boundary_flux_conserves_mass_exactly(basis, mhd, dealias):
+    grid, eqs, U, _ = _case(basis, mhd, "wall", dealias=dealias)
+    grid.initialize_boundary_conditions(U, eqs)
+    assert abs(_mass_rate(grid, eqs, U, mhd)) < 1e-12
+
+
+def test_outflow_boundary_flux_vanishes_on_the_reference_state(basis, mhd):
+    grid, eqs, _, _ = _case(basis, mhd, "outflow")
+    x = np.asarray(grid.x)
+    if mhd:
+        U = eqs.conservative(1 + 0*x, 0.1 + 0*x, 0.2 + 0*x, -0.1 + 0*x, 1 + 0*x,
+                             0.7 + 0*x, 0.3 + 0*x, -0.2 + 0*x)
+        rhs = SpectralSolverMHD(grid, eqs, scheme="rk2")._compute_rhs(U)
+    else:
+        U = eqs.conservative(1 + 0*x, 0.1 + 0*x, 1 + 0*x)
+        rhs = _compute_rhs(grid, eqs, U)
+    np.testing.assert_allclose(rhs, 0.0, atol=1e-11)
+
+
+def test_acoustic_pulse_leaves_through_outflow_and_reflects_off_walls(basis):
+    gamma, rho0, p0, amplitude = 1.4, 1.0, 1.0, 1e-3
+    c = np.sqrt(gamma * p0 / rho0)
+
+    def remaining(bc):
+        grid = Grid1D(N=64, Lx=1.0, basis=basis, bc=bc, backend="numpy", dealias=False)
+        eqs = EulerEquations1D(gamma=gamma)
+        x = np.asarray(grid.x)
+        d = amplitude * np.exp(-((x - 0.5) / 0.05) ** 2)
+        U0 = eqs.conservative(rho0 + d, c * d / rho0, p0 + c * c * d)
+        solver = SpectralSolver1D(grid, eqs, scheme="rk4", cfl=0.3)
+        solver.run(U0, t0=0.0, t_end=1.0, output_interval=1.0)
+        rho, u, p, _ = eqs.primitive(solver.U)
+        w = np.asarray(grid.wx)
+        energy = np.sum(w * ((p - p0) ** 2 / (rho0 * c * c) + rho0 * u ** 2))
+        initial = np.sum(w * (2.0 * rho0 * (c * d) ** 2))
+        return np.sqrt(energy / initial)
+
+    assert remaining("outflow") < 1e-4
+    assert abs(remaining("wall") - 1.0) < 1e-3
+
+
+def test_diffusion_has_zero_boundary_flux(basis):
+    grid = Grid1D(N=17, Lx=2.0, basis=basis, bc="outflow", backend="numpy")
+    x = np.asarray(grid.x)
+    f = np.exp(np.sin(3.0 * x)) + x ** 3
+    w = np.asarray(grid.wx)
+    assert abs(np.sum(w * grid.diffusion(f))) < 1e-9
+    np.testing.assert_allclose(grid.diffusion(f)[1:-1], grid.laplacian(f)[1:-1])
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -113,7 +165,7 @@ def test_torch_cpu_grid_initializes_and_boundary_rhs_preserve_input(basis, mhd):
     bounded = grid.apply_boundary_conditions(state, eqs)
     assert bounded.device == state.device
     assert bounded.dtype == state.dtype
-    assert torch.all(bounded[1, [0, -1]] == 0.0)
+    assert torch.equal(bounded, state)
     rhs = SpectralSolverMHD(grid, eqs)._compute_rhs(state) if mhd else _compute_rhs(grid, eqs, state)
     assert torch.isfinite(rhs).all()
     assert torch.equal(state, original)
