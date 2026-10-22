@@ -5,28 +5,32 @@ All notable changes to PHRIKE are recorded here. The format follows
 
 ## Unreleased
 
-### Added
-
-- Ideal MHD solvers in 1D, 2D, and 3D with Helmholtz projection of the
-  magnetic field, plus Alfvén-wave, Brio–Wu, Orszag–Tang, and 3D MHD
-  turbulence problems.
-- Midpoint-resolvent ambipolar diffusion for 2D MHD and the single-layer
-  ambipolar-diffusion shear instability (`adsi2d`) problem.
-- A 1D Chebyshev–Lobatto basis, 1D fixed/outflow/wall boundary conditions,
-  and 2D Fourier-x/SBP-y grids with approximately open transverse faces.
-- Timestep-aware spectral dissipation (`integration.spectral_dissipation`)
-  alongside the hard 2/3 Fourier dealias projection.
-- Lagrangian tracer particles and tracer-density reconstruction.
-- Explicit backend selection for NumPy CPU, PyTorch CPU, CUDA, and Metal/MPS.
-- An RKF78 adaptive integrator with tests for its tableau and controller.
-
 ### Changed
 
-- Consolidated post-processing, benchmark, and validation helpers under
-  `scripts/`.
-- Tightened packaging, documentation, and continuous-integration checks.
+- Document the equations that are integrated, the shared YAML keys, the
+  CFL definition, and the spectral-dissipation rate. The adaptive Fehlberg
+  integrator is named `rk78` (Fehlberg 7(8)). The strings `RKF78` and
+  `rkf78` are not accepted.
+- Require Python 3.10 or newer, matching the versions exercised in CI.
+- Include `configs/` and the Sphinx sources in the sdist, and check those
+  paths in CI. Remove the unused SymPy extra. Declare optional FINUFFT
+  for off-grid Fourier evaluation.
+- Run the test suite in CI against a CPU-only PyTorch wheel. Lint is not
+  a required check.
 
 ## 0.1.0
 
-- Initial research-code version: 1D/2D/3D compressible Euler solvers on
-  Fourier and Legendre grids with NumPy and PyTorch backends.
+- 1D, 2D, and 3D compressible Euler and ideal MHD solvers on Fourier,
+  Legendre, and 1D Chebyshev grids, with NumPy and optional PyTorch
+  backends (CPU, CUDA, and Metal/MPS).
+- Ideal MHD with Helmholtz projection of the magnetic field, plus
+  Alfvén-wave, Brio–Wu, Orszag–Tang, ambipolar-diffusion shear, and 3D
+  MHD turbulence problems.
+- Midpoint-resolvent ambipolar diffusion for 2D MHD.
+- 1D fixed, outflow, and wall boundaries, and 2D Fourier-x/SBP-y grids
+  with open transverse faces.
+- Hard 2/3 Fourier dealiasing and timestep-aware spectral dissipation.
+- Lagrangian tracer particles and tracer-density reconstruction.
+- Fixed-step RK2 and RK4, and embedded RK23, RK45, and rk78
+  (Fehlberg 7(8)).
+- Source-tree post-processing and diagnostic helpers under `scripts/`.

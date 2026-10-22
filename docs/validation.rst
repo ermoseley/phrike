@@ -12,6 +12,11 @@ order, backend selection, unavailable-device errors, and Torch CPU behavior.
 It does not constitute a complete validation suite for every equation set,
 configuration, or accelerator.
 
+On Apple Silicon with PyTorch installed, the default backend is Metal/MPS
+in single precision. Tests pass an explicit backend into the grid. See
+:doc:`installation`. The timestep and unit conventions used below are
+defined in :doc:`equations`.
+
 PHRIKE is therefore best treated as experimental research software. Numerical
 results should be accompanied by their configuration, commit, backend,
 precision, and problem-specific convergence or conservation evidence. The
@@ -79,8 +84,8 @@ Lobatto MHD projection retains the quadrature-weighted mean longitudinal field.
 These polynomial-boundary checks cover NumPy and Torch CPU; they do not
 qualify polynomial runs on CUDA or Metal/MPS hardware.
 
-1D shock runs (2026-10-20)
---------------------------
+1D shock runs
+--------------
 
 The examples run sharp Sod to ``t=0.2`` and sharp Brio-Wu to ``t=0.1``:
 
@@ -91,7 +96,8 @@ The examples run sharp Sod to ``t=0.2`` and sharp Brio-Wu to ``t=0.1``:
    # Repeat either with --basis legendre.
 
 Both use N=192, NumPy CPU double precision, fixed reservoir endpoints,
-CFL=0.2, RK4, and no initial smoothing. Sod uses constant viscosity 0.001;
+CFL=0.2 (see :doc:`equations`), RK4, and no initial smoothing. Sod uses
+constant viscosity 0.001;
 Brio-Wu uses 0.0015. Both disable the accepted-step modal filter and enable
 ``grid.dealias``. For polynomial grids this now evaluates nonlinear fluxes
 on a 3/2-sized grid and projects their derivatives onto the original basis.
@@ -113,12 +119,25 @@ other boundary/viscosity configurations retain the spacing-based limit.
 The Brio-Wu state uses gamma=2, Bx=0.75, By=+1/-1, rho=1/0.125, p=1/0.1,
 and zero velocities/Bz, following the
 `Athena shock-tube input <https://github.com/PrincetonUniversity/athena/blob/main/inputs/mhd/athinput.bw>`_.
-Comparisons used 2001 uniformly spaced samples after linear interpolation
-from the Lobatto nodes. Sod was compared with its exact Euler Riemann
-solution. Brio-Wu was compared with an independent 2048-cell primitive-minmod
-MUSCL/HLL finite-volume solution using SSPRK2 and outflow BCs. That reference
+Two sampling methods are used on this page.
+
+* The N=192 Chebyshev mean-absolute table, the quoted Sod velocity extrema
+  (minimum about -0.0142 and maximum 0.9324), and the matching Legendre
+  mean-absolute errors use 2001 uniformly spaced samples after linear
+  interpolation from the Lobatto nodes. Those figures include
+  interpolation error.
+* The Dedalus comparison, the higher-resolution successive-difference
+  table, the N=512 errors against the inviscid and finite-volume
+  references, and the halved-viscosity L1 errors use evaluation of the
+  conservative polynomial on 5001 common uniform points, with primitive
+  fields recovered after that evaluation.
+
+Sod was compared with its exact Euler Riemann solution. Brio-Wu was
+compared with an independent 2048-cell primitive-minmod MUSCL/HLL
+finite-volume solution using SSPRK2 and outflow BCs. That reference
 stayed positive without floors; its 1024-to-2048 density difference was
-0.00150. It is an approximate MHD reference.
+0.00150. It is an approximate MHD reference. The finite-volume driver is
+not in this repository.
 
 The earlier N=96 examples combined insufficient resolution and nonlinear
 aliasing with an overly strong per-step filter in Sod. Changing resolution,
@@ -145,9 +164,15 @@ Chebyshev comparison; it is not an ablation of their separate contributions:
      - 0.02116 / 0.02001
 
 The improved Chebyshev runs needed no evolved-stage pressure-floor
-repairs, and accepted nodal densities stayed positive. Minimum raw pressures were 0.08118 (Sod) and 0.04312
-(Brio-Wu). The extra-node interpolation safeguard is separate from this
-stage-positivity check. Brio-Wu max absolute div(B) was 3.64e-12.
+repairs, and accepted nodal densities stayed positive. Minimum raw
+pressure is the smallest thermal pressure recovered on an evolved
+Runge-Kutta stage before the positivity clamp (``p_min`` of 1e-12 on
+these 1D updates). It is not the minimum pressure on the final Lobatto
+nodes, and it is not evaluated on the extra flux nodes. The recorded
+stage minima were 0.08118 (Sod) and 0.04312 (Brio-Wu). The script that
+recorded them is not in this repository. The extra-node interpolation
+safeguard is separate from this stage-positivity check. Brio-Wu max
+absolute div(B) was 3.64e-12.
 The relative quadrature-integrated mass and total-energy changes were
 below 4e-7 in these two Chebyshev runs; this is a case-specific check.
 Sod's final velocity minimum improved from about -0.36 to -0.0142;
@@ -157,16 +182,18 @@ nor resolution convergence.
 
 Repeating the same setup on Legendre gave mean density/velocity/pressure
 errors 0.00766/0.01114/0.00589 for Sod and 0.01353/0.02357/0.01553 for
-Brio-Wu, also without pressure-floor activations. The minimum raw pressures
-were 0.08119 and 0.04318; Brio-Wu max absolute div(B) was 1.21e-12.
+Brio-Wu, also without pressure-floor activations. The minimum raw
+pressures, in the same stage sense as above, were 0.08119 and 0.04318.
+Brio-Wu max absolute div(B) was 1.21e-12.
 
-The local viscous Dedalus Sod script was also run with Dedalus 3.0.3 through
-``t=0.2``: N=256, viscosity 0.0003, initial tanh width 0.01, primitive-variable
-diffusion, wall/Neumann tau constraints, and RK443. A timestep of 1e-5 was
-qualified against the original 1e-6 through ``t=0.005``; the maximum primitive
+A viscous Dedalus 3.0.3 Sod comparison was run outside this repository.
+Its driver is not included. That run used N=256, viscosity 0.0003,
+initial tanh width 0.01, primitive-variable diffusion, wall/Neumann tau
+constraints, and RK443, through ``t=0.2``. A timestep of 1e-5 was
+qualified against 1e-6 through ``t=0.005``; the maximum primitive
 differences were below 3.4e-8. The full run stayed finite and positive.
-The local filtered variant failed on its first step with a singular system
-and provides no comparison curve.
+A filtered variant of that external script failed on its first step with
+a singular system and provides no comparison curve.
 
 Evaluating the saved spectral profiles on 5001 common uniform samples gave
 density/velocity/pressure L1 errors 0.01097/0.02973/0.01115 for that Dedalus
@@ -189,10 +216,10 @@ diffusion or the tau and endpoint-extrapolation boundary treatments.
 Higher-resolution checks
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
-Sharp Chebyshev runs at N=192, 256, 384, and 512 held viscosity, initial data,
-and fixed endpoints constant. Profiles were evaluated from the conservative
-polynomial on 5001 common uniform points before recovering primitive fields;
-linear interpolation would introduce its own resolution-dependent error.
+Sharp Chebyshev runs at N=192, 256, 384, and 512 held viscosity, initial
+data, and fixed endpoints constant. These runs use the 5001-point
+polynomial sampling described above, rather than the 2001-point linear
+interpolation of the mean-absolute table.
 
 .. list-table:: L1 differences between successive resolutions
    :header-rows: 1
@@ -224,22 +251,25 @@ resolution alone does not remove this regularization bias. Sod's sampled
 velocity undershoot decreased from -0.0197 at N=192 to -0.000955 at N=384.
 These finite refinement checks do not establish an asymptotic spectral order.
 
-The production explicit Sod solver was run at N=192 and 256. To avoid the
-clustered-grid explicit diffusion restriction at higher resolution, a temporary
-study driver used exact constant diffusion of the interior Laplacian with an
-affine fixed-boundary lift, Strang-split around the production RK4 flux solver.
-It leaves MHD Bx undiffused. Its N=192 profiles agreed with explicit evolution
-to within 1.1e-6 in every primitive L1 component. A smooth, fallback-free control
-gave a 3.94-fold error reduction on timestep halving. At N=512, doubling the
-study timestep changed primitive profiles by at most 1.80e-7 (Sod) and 6.35e-8
+The production explicit Sod solver was run at N=192 and 256. A separate
+split-diffusion study, whose driver is not included in this repository,
+used exact constant diffusion of the interior Laplacian with an affine
+fixed-boundary lift, Strang-split around the production RK4 flux solver.
+That arrangement avoids the clustered-grid explicit diffusion restriction
+at higher resolution. It leaves MHD Bx undiffused. Its N=192 profiles
+agreed with explicit evolution to within 1.1e-6 in every primitive L1
+component. A smooth control with no fallback gave a 3.94-fold error
+reduction on timestep halving. At N=512, doubling the study timestep
+changed primitive profiles by at most 1.80e-7 (Sod) and 6.35e-8
 (Brio-Wu), below the measured resolution differences.
 
 All split runs recorded no nonpositive density/pressure stages or invalid
 diffusion half-steps. The extra-node interpolation safeguard remained active;
 N=512 used 100 (Sod) and 1336 (Brio-Wu) replacement-node evaluations over the
 whole run. Maximum absolute div(B) was 4.69e-11 in the refined Brio-Wu runs.
-The temporary integrator is not part of the production solver; these runs do
-not qualify a new production time scheme or establish wall-clock scaling.
+That split integrator is not part of the production solver and cannot be
+rerun from this tree. These runs do not qualify a new production time
+scheme or establish wall-clock scaling.
 
 A separate N=512 sensitivity run halved viscosity to 0.0005 for Sod and
 0.00075 for Brio-Wu. Density/normal-velocity/pressure L1 errors fell to
@@ -285,9 +315,12 @@ must be checked for nonlinear results. The timestep includes its damping
 bound. The ADSI example enables it because centered y derivatives otherwise
 admit nearly alternating computational modes that nonlinear terms can feed.
 
-Specify ``left``/``right`` as ``periodic`` and ``bottom``/``top`` as ``open``
-in ``bc_config``; ``outflow`` and ``neumann`` are aliases for this open flux
-closure, not derivative constraints. Endpoints evolve through an SBP/Rusanov
+On this grid, ``left`` and ``right`` are ``periodic`` and ``bottom`` and
+``top`` are ``open``. ``outflow`` and ``neumann`` are aliases for this
+open flux closure, not derivative constraints. Only ``gaussian_wave2d_y``
+reads ``grid.bc_config`` from YAML. ``adsi2d`` hard-codes periodic x and
+open y and does not read ``bc_config``. Endpoints evolve through an
+SBP/Rusanov
 boundary flux against the initial ambient exterior state. Unlike endpoint
 copying, this lets outgoing acoustic energy leave without a later recurrence.
 The exterior is recaptured by ``solver.run``; restart boundary values therefore
@@ -363,6 +396,10 @@ fields depend only on x and y. The flow is out of plane,
 the ambipolar coupling coefficient is one. Periodic x has length one; the
 shipped transverse domain has length two. This geometry suppresses the usual
 flow-parallel Kelvin--Helmholtz mode while retaining ambipolar shear coupling.
+With the :math:`\mu_0 = 1` convention in :doc:`equations`,
+:math:`B^2 = 2b^2 = 1/(2\pi)`, the magnetic pressure :math:`B^2/2` is
+:math:`1/(4\pi)`, and the plasma beta :math:`p/(B^2/2)` is :math:`240\pi`.
+The Alfven speed :math:`\sqrt{B^2/\rho}` is :math:`1/\sqrt{2\pi}`.
 
 The seed is a compressible linear eigenmode computed independently on a padded
 periodic perturbation domain, with the same localized single-layer shear.
@@ -376,12 +413,17 @@ ambipolar diffusion to retain identical initial data in an ideal-MHD control.
 Measured MPS refinement
 ~~~~~~~~~~~~~~~~~~~~~~~
 
-A local study on 2026-10-21 used the published ``6653d3d`` split-advection solver
-with MPS float32, CPU fallback disabled, CFL 0.65, seed amplitude 0.001, and SBP
-dissipation strength 0.01. All four grids reached t=0.5 with the physical
-parameters above unchanged and ``Ny = 2*Nx + 1``. The ambipolar increment solve
-used tolerance 1e-5 and the Fourier-tensor preconditioner. Refinement reduced
-both the mesh spacing and timestep; this measures coupled space/time behavior.
+These rows are not a run of the shipped ``configs/adsi2d.yaml``. They were
+recorded on MPS float32 with the split-advection solver. Relative to that
+file they override ``t_end`` from 5.0 to 0.5, ``cfl`` from 0.35 to 0.65,
+and ``seed_amplitude`` from 0.0003 to 0.001, and they set
+``Ny = 2*Nx + 1`` on four grids instead of the single 128 x 257 grid.
+SBP dissipation strength stays 0.01, the ambipolar tolerance stays 1e-5,
+and the preconditioner stays ``fourier_tensor``. The physical parameters
+in the ADSI example above are unchanged. The driver that applied these
+overrides is not in this repository. All four grids reached t=0.5.
+Refinement reduced both the mesh spacing and the timestep; this measures
+coupled space/time behavior.
 
 The relative errors below compare the complex first x Fourier coefficients
 with their initial profiles multiplied by ``exp(lambda*t)``, using the
