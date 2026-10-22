@@ -72,6 +72,19 @@ def projection_axis_labels(axis: str = "z") -> Tuple[str, str]:
 def plot_fields(
     grid, U, equations, title: str = "", outpath: Optional[str] = None
 ) -> None:
+    try:
+        n_cons = int(U.shape[0])
+    except Exception as exc:
+        raise ValueError(
+            "plot_fields expected a state array with shape (n_vars, ...)"
+        ) from exc
+    if n_cons != 3:
+        raise ValueError(
+            "plot_fields only plots 1D Euler states with 3 conserved variables "
+            f"(density, momentum, energy); got {n_cons} components. "
+            "MHD and multidimensional states are not supported."
+        )
+
     import matplotlib.pyplot as plt
 
     rho, u, p, _ = equations.primitive(U)

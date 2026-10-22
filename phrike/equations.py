@@ -86,16 +86,13 @@ def _flux_kernel(U: np.ndarray, gamma: float) -> np.ndarray:
     return F
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=False)
 def _max_wave_speed_kernel(U: np.ndarray, gamma: float) -> float:
-    # U shape (3, N)
+    # U shape (3, N). fastmath stays off: it makes np.max skip NaN, so one
+    # bad cell used to report the max of the rest (or 0 if every cell was NaN).
     rho, u, p, a = _primitive_kernel(U, gamma)
     c = np.abs(u) + a
-    max_c = 0.0
-    for i in range(c.shape[0]):
-        if c[i] > max_c:
-            max_c = c[i]
-    return max_c
+    return np.max(c)
 
 
 # --- 2D Euler kernels ---
@@ -134,17 +131,13 @@ def _flux2d_kernel(U: np.ndarray, gamma: float) -> Tuple[np.ndarray, np.ndarray]
     return Fx, Fy
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=False)
 def _max_wave_speed2d_kernel(U: np.ndarray, gamma: float) -> float:
+    # fastmath stays off so a NaN cell is not dropped. See _max_wave_speed_kernel.
     rho, ux, uy, p = _primitive2d_kernel(U, gamma)
     a = np.sqrt(gamma * p / rho)
     c = np.maximum(np.abs(ux), np.abs(uy)) + a
-    max_c = 0.0
-    for j in range(c.shape[0]):
-        for i in range(c.shape[1]):
-            if c[j, i] > max_c:
-                max_c = c[j, i]
-    return max_c
+    return np.max(c)
 
 
 @njit(cache=True, fastmath=True)
@@ -196,22 +189,48 @@ def _flux3d_kernel(
     return Fx, Fy, Fz
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=False)
 def _max_wave_speed3d_kernel(U: np.ndarray, gamma: float) -> float:
+    # fastmath stays off so a NaN cell is not dropped. See _max_wave_speed_kernel.
     rho, ux, uy, uz, p = _primitive3d_kernel(U, gamma)
     a = np.sqrt(gamma * p / rho)
     # conservative bound using max component speed
     comp = np.maximum(np.maximum(np.abs(ux), np.abs(uy)), np.abs(uz)) + a
-    max_c = 0.0
-    for k in range(comp.shape[0]):
-        for j in range(comp.shape[1]):
-            for i in range(comp.shape[2]):
-                if comp[k, j, i] > max_c:
-                    max_c = comp[k, j, i]
-    return max_c
+    return np.max(comp)
 
 
 Array = np.ndarray
+
+
+def _is_torch(x: Array) -> bool:
+    return _TORCH_AVAILABLE and isinstance(x, torch.Tensor)
+
+
+def _grid_sum(q: Array) -> float:
+    """Unweighted sum of a cell-centered field, as a Python float.
+
+    Conserved-quantity diagnostics are these grid sums, not volume integrals.
+    The equation object does not know the mesh spacing, so it cannot multiply
+    by a cell volume or by SBP quadrature weights. On a uniform mesh the
+    integral is this sum times the cell volume (``dx``, ``dx*dy`` or
+    ``dx*dy*dz``). ``Grid2D.conserved_quantities`` already returns a
+    quadrature integral on mixed Fourier/SBP grids. Relative errors
+    ``(sum - sum_0) / sum_0`` are unchanged by a uniform cell-volume factor.
+    """
+    if _is_torch(q):
+        return float(torch.sum(q).item())
+    return float(np.sum(q))
+
+
+def _max_wave_speed_value(speed: Array) -> float:
+    """Maximum wave speed, propagating NaN and Inf like NumPy and Torch.
+
+    A NaN anywhere in ``speed`` makes the result NaN. Inf with no NaN returns
+    Inf. Callers must not replace that with a finite fallback.
+    """
+    if _is_torch(speed):
+        return float(torch.max(speed).item())
+    return float(np.max(speed))
 
 
 @dataclass
@@ -295,27 +314,22 @@ class EulerEquations1D:
         return _flux_kernel(U, self.gamma)
 
     def max_wave_speed(self, U: Array) -> float:
-        if _TORCH_AVAILABLE and isinstance(U, (torch.Tensor,)):
+        if _is_torch(U):
             _, u, _, a = self.primitive(U)
-            return float(torch.max(torch.abs(u) + a).item())
+            return _max_wave_speed_value(torch.abs(u) + a)
         return float(_max_wave_speed_kernel(U, self.gamma))
 
     def conserved_quantities(self, U: Array) -> Dict[str, float]:
+        """Unweighted grid sums of mass, momentum and energy, not integrals.
+
+        On a uniform mesh multiply by the cell volume to integrate. Relative
+        conservation errors are invariant under that factor. See ``_grid_sum``.
+        """
         rho, u, p, _ = self.primitive(U)
-        if _TORCH_AVAILABLE and isinstance(rho, (torch.Tensor,)):
-            total_mass = float(torch.sum(rho).item())
-            total_momentum = float(torch.sum(rho * u).item())
-            total_energy = float(
-                torch.sum(p / (self.gamma - 1.0) + 0.5 * rho * u * u).item()
-            )
-        else:
-            total_mass = float(rho.sum())
-            total_momentum = float((rho * u).sum())
-            total_energy = float((p / (self.gamma - 1.0) + 0.5 * rho * u * u).sum())
         return {
-            "mass": total_mass,
-            "momentum": total_momentum,
-            "energy": total_energy,
+            "mass": _grid_sum(rho),
+            "momentum": _grid_sum(rho * u),
+            "energy": _grid_sum(p / (self.gamma - 1.0) + 0.5 * rho * u * u),
         }
 
 
@@ -363,190 +377,32 @@ class EulerEquations2D:
         return _flux2d_kernel(U, self.gamma)
 
     def max_wave_speed(self, U: Array) -> float:
-        if _TORCH_AVAILABLE and isinstance(U, (torch.Tensor,)):
+        if _is_torch(U):
             rho, ux, uy, p = self.primitive(U)
             a = torch.sqrt(self.gamma * p / rho)
-            return float(torch.max(torch.maximum(torch.abs(ux), torch.abs(uy)) + a).item())
+            speed = torch.maximum(torch.abs(ux), torch.abs(uy)) + a
+            return _max_wave_speed_value(speed)
         return float(_max_wave_speed2d_kernel(U, self.gamma))
 
     def conserved_quantities(self, U: Array) -> Dict[str, float]:
-        rho, u, p, _ = self.primitive(U)
-        total_mass = float(rho.sum())
-        total_momentum = float((rho * u).sum())
-        total_energy = float((p / (self.gamma - 1.0) + 0.5 * rho * u * u).sum())
+        """Unweighted grid sums of mass, momentum and energy, not integrals.
+
+        ``momentum`` is an alias of ``momentum_x`` for callers that still look
+        up that key. Prefer ``momentum_x`` and ``momentum_y``. On a uniform
+        mesh multiply by the cell volume to integrate; relative conservation
+        errors are invariant under that factor. See ``_grid_sum``.
+        """
+        rho, ux, uy, p = self.primitive(U)
+        momx = _grid_sum(rho * ux)
+        momy = _grid_sum(rho * uy)
+        kinetic = 0.5 * rho * (ux * ux + uy * uy)
         return {
-            "mass": total_mass,
-            "momentum": total_momentum,
-            "energy": total_energy,
+            "mass": _grid_sum(rho),
+            "momentum_x": momx,
+            "momentum_y": momy,
+            "momentum": momx,
+            "energy": _grid_sum(p / (self.gamma - 1.0) + kinetic),
         }
-
-
-# -------------------- 2D split-form and boundary helper utilities --------------------
-
-def _ensure_numpy(a: Array) -> np.ndarray:
-    """Convert input to numpy array without copying if already numpy."""
-    if _TORCH_AVAILABLE and isinstance(a, (torch.Tensor,)):
-        return a.detach().cpu().numpy()
-    return np.asarray(a)
-
-
-def build_wall_state_y(U_row: Array, gamma: float) -> Array:
-    """Build bottom-wall boundary state for a y-normal face (v=0, recompute E).
-
-    Args:
-        U_row: Conservative variables on the interior boundary row, shape (4, Nx)
-        gamma: Adiabatic index
-    Returns:
-        U_bc: Wall state with v=0 and consistent energy, shape (4, Nx)
-    """
-    U = _ensure_numpy(U_row)
-    rho = U[0]
-    momx = U[1]
-    ux = momx / rho
-    # Estimate pressure from interior conservative vars
-    E = U[3]
-    p = (gamma - 1.0) * (E - 0.5 * rho * ux * ux)
-    uy = np.zeros_like(ux)
-    momy = rho * uy
-    Eb = p / (gamma - 1.0) + 0.5 * rho * (ux * ux + uy * uy)
-    return np.stack([rho, rho * ux, momy, Eb], axis=0)
-
-
-def flux_x_from_U(U: Array, gamma: float) -> Array:
-    """Return physical x-flux Fx(U) for 2D Euler. U shape (4, Ny, Nx) or (4, N)."""
-    U_np = _ensure_numpy(U)
-    rho = U_np[0]
-    momx = U_np[1]
-    momy = U_np[2]
-    E = U_np[3]
-    ux = momx / rho
-    uy = momy / rho
-    p = (gamma - 1.0) * (E - 0.5 * rho * (ux * ux + uy * uy))
-    Fx0 = momx
-    Fx1 = momx * ux + p
-    Fx2 = momx * uy
-    Fx3 = (E + p) * ux
-    return np.stack([Fx0, Fx1, Fx2, Fx3], axis=0)
-
-
-def flux_y_from_U(U: Array, gamma: float) -> Array:
-    """Return physical y-flux Fy(U) for 2D Euler. U shape (4, Ny, Nx) or (4, N)."""
-    U_np = _ensure_numpy(U)
-    rho = U_np[0]
-    momx = U_np[1]
-    momy = U_np[2]
-    E = U_np[3]
-    ux = momx / rho
-    uy = momy / rho
-    p = (gamma - 1.0) * (E - 0.5 * rho * (ux * ux + uy * uy))
-    Fy0 = momy
-    Fy1 = momy * ux
-    Fy2 = momy * uy + p
-    Fy3 = (E + p) * uy
-    return np.stack([Fy0, Fy1, Fy2, Fy3], axis=0)
-
-
-def rusanov_flux_x(U_L: Array, U_R: Array, gamma: float) -> Array:
-    """Rusanov (local Lax-Friedrichs) numerical flux for x-normal interfaces.
-
-    Args:
-        U_L, U_R: Left/right conservative states, shape (4, N)
-        gamma: Adiabatic index
-    Returns:
-        F*: Numerical flux, shape (4, N)
-    """
-    UL = _ensure_numpy(U_L)
-    UR = _ensure_numpy(U_R)
-    FxL = flux_x_from_U(UL, gamma)
-    FxR = flux_x_from_U(UR, gamma)
-    rhoL = UL[0]; uxL = UL[1] / rhoL; pL = (gamma - 1.0) * (UL[3] - 0.5 * rhoL * (uxL * uxL + (UL[2] / rhoL) ** 2))
-    rhoR = UR[0]; uxR = UR[1] / rhoR; pR = (gamma - 1.0) * (UR[3] - 0.5 * rhoR * (uxR * uxR + (UR[2] / rhoR) ** 2))
-    aL = np.sqrt(gamma * pL / rhoL)
-    aR = np.sqrt(gamma * pR / rhoR)
-    alpha = np.maximum(np.abs(uxL) + aL, np.abs(uxR) + aR)
-    return 0.5 * (FxL + FxR) - 0.5 * alpha[None, :] * (UR - UL)
-
-
-def rusanov_flux_y(U_D: Array, U_U: Array, gamma: float) -> Array:
-    """Rusanov (local Lax-Friedrichs) numerical flux for y-normal interfaces.
-
-    Args:
-        U_D: Downwind/interior state (at j=0 row), shape (4, N)
-        U_U: Upwind/boundary/exterior state, shape (4, N)
-        gamma: Adiabatic index
-    Returns:
-        F*: Numerical flux, shape (4, N)
-    """
-    UD = _ensure_numpy(U_D)
-    UU = _ensure_numpy(U_U)
-    FyD = flux_y_from_U(UD, gamma)
-    FyU = flux_y_from_U(UU, gamma)
-    rhoD = UD[0]; uyD = UD[2] / rhoD; pD = (gamma - 1.0) * (UD[3] - 0.5 * rhoD * ((UD[1] / rhoD) ** 2 + uyD * uyD))
-    rhoU = UU[0]; uyU = UU[2] / rhoU; pU = (gamma - 1.0) * (UU[3] - 0.5 * rhoU * ((UU[1] / rhoU) ** 2 + uyU * uyU))
-    aD = np.sqrt(gamma * pD / rhoD)
-    aU = np.sqrt(gamma * pU / rhoU)
-    alpha = np.maximum(np.abs(uyD) + aD, np.abs(uyU) + aU)
-    return 0.5 * (FyD + FyU) - 0.5 * alpha[None, :] * (UU - UD)
-
-
-def skew_symmetric_flux_divergence_2d(grid, eqs: EulerEquations2D, U: Array) -> Array:
-    """Compute skew-symmetric split-form flux divergence for 2D Euler.
-
-    Args:
-        grid: Grid2D providing dx1, dy1
-        eqs: EulerEquations2D with gamma
-        U: Conservative state, shape (4, Ny, Nx)
-    Returns:
-        rhs_div: Flux divergence contribution (no sources/BCs), shape (4, Ny, Nx)
-    """
-    U_np = _ensure_numpy(U)
-    rho, ux, uy, p = eqs.primitive(U_np)
-    E = U_np[3]
-
-    # Derivatives of primitives and products
-    dx = grid.dx1; dy = grid.dy1
-    drx = dx(rho); dry = dy(rho)
-    dux = dx(ux); duy = dy(ux)
-    dvy = dy(uy); dvx = dx(uy)
-    dpx = dx(p); dpy = dy(p)
-
-    rhou = U_np[1]
-    rhov = U_np[2]
-    drhou_dx = dx(rhou); drhov_dy = dy(rhov)
-
-    # Mass
-    div_mass = 0.5 * (drhou_dx + ux * drx + rho * dux) + 0.5 * (drhov_dy + uy * dry + rho * dvy)
-
-    # Momentum x: ∂x(ρu^2 + p) + ∂y(ρuv)
-    rho_u2 = rho * ux * ux
-    dx_rho_u2 = dx(rho_u2)
-    term_x_mx = 0.5 * (dx_rho_u2 + (ux * ux) * drx + 2.0 * rho * ux * dux) + dpx
-    rho_uv = rho * ux * uy
-    dy_rho_uv = dy(rho_uv)
-    term_y_mx = 0.5 * (dy_rho_uv + (ux * uy) * dry + rho * (uy * duy + ux * dvy))
-    div_mx = term_x_mx + term_y_mx
-
-    # Momentum y: ∂x(ρuv) + ∂y(ρv^2 + p)
-    dx_rho_uv = dx(rho_uv)
-    term_x_my = 0.5 * (dx_rho_uv + (ux * uy) * drx + rho * (uy * dux + ux * dvx))
-    rho_v2 = rho * uy * uy
-    dy_rho_v2 = dy(rho_v2)
-    term_y_my = 0.5 * (dy_rho_v2 + (uy * uy) * dry + 2.0 * rho * uy * dvy) + dpy
-    div_my = term_x_my + term_y_my
-
-    # Energy: ∂x((E+p)u) + ∂y((E+p)v)
-    H = E + p
-    dHdx = dx(H); dHdy = dy(H)
-    term_x_E = 0.5 * (dx(H * ux) + H * dux + ux * dHdx)
-    term_y_E = 0.5 * (dy(H * uy) + H * dvy + uy * dHdy)
-    div_E = term_x_E + term_y_E
-
-    rhs_div = np.empty_like(U_np)
-    rhs_div[0] = -div_mass
-    rhs_div[1] = -div_mx
-    rhs_div[2] = -div_my
-    rhs_div[3] = -div_E
-    return rhs_div
 
 
 @dataclass
@@ -607,7 +463,7 @@ class EulerEquations3D:
         return _flux3d_kernel(U, self.gamma)
 
     def max_wave_speed(self, U: Array) -> float:
-        if _TORCH_AVAILABLE and isinstance(U, (torch.Tensor,)):
+        if _is_torch(U):
             rho, ux, uy, uz, p = self.primitive(U)
             a = torch.sqrt(self.gamma * p / rho)
             comp = (
@@ -616,24 +472,19 @@ class EulerEquations3D:
                 )
                 + a
             )
-            return float(torch.max(comp).item())
+            return _max_wave_speed_value(comp)
         return float(_max_wave_speed3d_kernel(U, self.gamma))
 
     def conserved_quantities(self, U: Array) -> Dict[str, float]:
+        """Unweighted grid sums, not volume integrals. See ``_grid_sum``."""
         rho, ux, uy, uz, p = self.primitive(U)
-        total_mass = float(rho.sum())
-        momx = float((rho * ux).sum())
-        momy = float((rho * uy).sum())
-        momz = float((rho * uz).sum())
-        total_energy = float(
-            (p / (self.gamma - 1.0) + 0.5 * rho * (ux * ux + uy * uy + uz * uz)).sum()
-        )
+        kinetic = 0.5 * rho * (ux * ux + uy * uy + uz * uz)
         return {
-            "mass": total_mass,
-            "momentum_x": momx,
-            "momentum_y": momy,
-            "momentum_z": momz,
-            "energy": total_energy,
+            "mass": _grid_sum(rho),
+            "momentum_x": _grid_sum(rho * ux),
+            "momentum_y": _grid_sum(rho * uy),
+            "momentum_z": _grid_sum(rho * uz),
+            "energy": _grid_sum(p / (self.gamma - 1.0) + kinetic),
         }
 
 
@@ -649,10 +500,6 @@ class EulerEquations3D:
 #
 # The magnetic-flux rows form the antisymmetric (uB - Bu) tensor, i.e. the
 # induction equation  dB/dt + div(uB - Bu) = 0  <=>  dB/dt = curl(u x B).
-
-
-def _is_torch(x: Array) -> bool:
-    return _TORCH_AVAILABLE and isinstance(x, torch.Tensor)
 
 
 @dataclass
@@ -738,15 +585,16 @@ class MHDEquations1D:
             cax2 = (Bx * Bx) / rho
             disc = torch.clamp((a2 + b2) * (a2 + b2) - 4.0 * a2 * cax2, min=0.0)
             cf = torch.sqrt(0.5 * (a2 + b2 + torch.sqrt(disc)))
-            return float(torch.max(torch.abs(ux) + cf).item())
+            return _max_wave_speed_value(torch.abs(ux) + cf)
         a2 = self.gamma * p / rho
         b2 = (Bx * Bx + By * By + Bz * Bz) / rho
         cax2 = (Bx * Bx) / rho
         disc = np.maximum((a2 + b2) ** 2 - 4.0 * a2 * cax2, 0.0)
         cf = np.sqrt(0.5 * (a2 + b2 + np.sqrt(disc)))
-        return float(np.max(np.abs(ux) + cf))
+        return _max_wave_speed_value(np.abs(ux) + cf)
 
     def conserved_quantities(self, U: Array) -> Dict[str, float]:
+        """Unweighted grid sums, not volume integrals. See ``_grid_sum``."""
         rho, ux, uy, uz, p, Bx, By, Bz = self.primitive(U)
         b2 = Bx * Bx + By * By + Bz * Bz
         total_energy = (
@@ -756,13 +604,13 @@ class MHDEquations1D:
         )
         cross_hel = ux * Bx + uy * By + uz * Bz
         return {
-            "mass": float(rho.sum()),
-            "momentum_x": float((rho * ux).sum()),
-            "momentum_y": float((rho * uy).sum()),
-            "momentum_z": float((rho * uz).sum()),
-            "energy": float(total_energy.sum()),
-            "magnetic_energy": float((0.5 * b2).sum()),
-            "cross_helicity": float(cross_hel.sum()),
+            "mass": _grid_sum(rho),
+            "momentum_x": _grid_sum(rho * ux),
+            "momentum_y": _grid_sum(rho * uy),
+            "momentum_z": _grid_sum(rho * uz),
+            "energy": _grid_sum(total_energy),
+            "magnetic_energy": _grid_sum(0.5 * b2),
+            "cross_helicity": _grid_sum(cross_hel),
         }
 
 
@@ -879,14 +727,15 @@ class MHDEquations2D:
             b2 = (Bx * Bx + By * By + Bz * Bz) / rho
             fast = torch.sqrt(torch.clamp(a2 + b2, min=0.0))
             comp = torch.maximum(torch.abs(ux), torch.abs(uy)) + fast
-            return float(torch.max(comp).item())
+            return _max_wave_speed_value(comp)
         a2 = self.gamma * p / rho
         b2 = (Bx * Bx + By * By + Bz * Bz) / rho
         fast = np.sqrt(np.maximum(a2 + b2, 0.0))
         comp = np.maximum(np.abs(ux), np.abs(uy)) + fast
-        return float(np.max(comp))
+        return _max_wave_speed_value(comp)
 
     def conserved_quantities(self, U: Array) -> Dict[str, float]:
+        """Unweighted grid sums, not volume integrals. See ``_grid_sum``."""
         rho, ux, uy, uz, p, Bx, By, Bz = self.primitive(U)
         b2 = Bx * Bx + By * By + Bz * Bz
         total_energy = (
@@ -896,13 +745,13 @@ class MHDEquations2D:
         )
         cross_hel = ux * Bx + uy * By + uz * Bz
         return {
-            "mass": float(rho.sum()),
-            "momentum_x": float((rho * ux).sum()),
-            "momentum_y": float((rho * uy).sum()),
-            "momentum_z": float((rho * uz).sum()),
-            "energy": float(total_energy.sum()),
-            "magnetic_energy": float((0.5 * b2).sum()),
-            "cross_helicity": float(cross_hel.sum()),
+            "mass": _grid_sum(rho),
+            "momentum_x": _grid_sum(rho * ux),
+            "momentum_y": _grid_sum(rho * uy),
+            "momentum_z": _grid_sum(rho * uz),
+            "energy": _grid_sum(total_energy),
+            "magnetic_energy": _grid_sum(0.5 * b2),
+            "cross_helicity": _grid_sum(cross_hel),
         }
 
 
@@ -1053,33 +902,15 @@ class MHDEquations3D:
                 )
                 + fast
             )
-            return float(torch.max(comp).item())
+            return _max_wave_speed_value(comp)
         a2 = self.gamma * p / rho
         b2 = (Bx * Bx + By * By + Bz * Bz) / rho
         fast = np.sqrt(np.maximum(a2 + b2, 0.0))
         comp = np.maximum(np.maximum(np.abs(ux), np.abs(uy)), np.abs(uz)) + fast
-        return float(np.max(comp))
-
-    def fast_speed_directional(self, U: Array, axis: int) -> float:
-        """Exact fast magnetosonic speed |u_n| + c_f,n along axis (0=x,1=y,2=z)."""
-        rho, ux, uy, uz, p, Bx, By, Bz = self.primitive(U)
-        un = (ux, uy, uz)[axis]
-        Bn = (Bx, By, Bz)[axis]
-        if _is_torch(U):
-            a2 = self.gamma * p / rho
-            b2 = (Bx * Bx + By * By + Bz * Bz) / rho
-            can2 = (Bn * Bn) / rho
-            disc = torch.clamp((a2 + b2) * (a2 + b2) - 4.0 * a2 * can2, min=0.0)
-            cf = torch.sqrt(0.5 * (a2 + b2 + torch.sqrt(disc)))
-            return float(torch.max(torch.abs(un) + cf).item())
-        a2 = self.gamma * p / rho
-        b2 = (Bx * Bx + By * By + Bz * Bz) / rho
-        can2 = (Bn * Bn) / rho
-        disc = np.maximum((a2 + b2) ** 2 - 4.0 * a2 * can2, 0.0)
-        cf = np.sqrt(0.5 * (a2 + b2 + np.sqrt(disc)))
-        return float(np.max(np.abs(un) + cf))
+        return _max_wave_speed_value(comp)
 
     def conserved_quantities(self, U: Array) -> Dict[str, float]:
+        """Unweighted grid sums, not volume integrals. See ``_grid_sum``."""
         rho, ux, uy, uz, p, Bx, By, Bz = self.primitive(U)
         b2 = Bx * Bx + By * By + Bz * Bz
         total_energy = (
@@ -1089,11 +920,11 @@ class MHDEquations3D:
         )
         cross_hel = ux * Bx + uy * By + uz * Bz
         return {
-            "mass": float(rho.sum()),
-            "momentum_x": float((rho * ux).sum()),
-            "momentum_y": float((rho * uy).sum()),
-            "momentum_z": float((rho * uz).sum()),
-            "energy": float(total_energy.sum()),
-            "magnetic_energy": float((0.5 * b2).sum()),
-            "cross_helicity": float(cross_hel.sum()),
+            "mass": _grid_sum(rho),
+            "momentum_x": _grid_sum(rho * ux),
+            "momentum_y": _grid_sum(rho * uy),
+            "momentum_z": _grid_sum(rho * uz),
+            "energy": _grid_sum(total_energy),
+            "magnetic_energy": _grid_sum(0.5 * b2),
+            "cross_helicity": _grid_sum(cross_hel),
         }
