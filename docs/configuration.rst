@@ -96,7 +96,7 @@ and the nested value is non-empty.
      - Fixed scheme used only when adaptive stepping was requested
        with ``rk2`` or ``rk4``. Must itself be ``rk2`` or ``rk4``.
 
-Ambipolar diffusion rejects an enabled adaptive block.
+Ambipolar diffusion and the Hall term reject an enabled adaptive block.
 
 Integration
 -----------
@@ -183,8 +183,13 @@ solver. Keys, all optional:
   ``midpoint_resolvent``), ``preconditioner`` or
   ``midpoint_preconditioner`` (``fourier_tensor``, ``none``, or
   ``identity``; default ``fourier_tensor``), ``midpoint_tol`` (default
-  ``2e-5`` in float32 and ``1e-10`` otherwise), and ``midpoint_maxiter``
-  (default 200).
+  ``2e-5`` in float32 and ``1e-10`` otherwise), ``midpoint_maxiter``
+  (default 200), and ``eta_max`` (optional cap; see :doc:`validation`).
+* ``resistivity_max`` — optional cap on ``resistivity``; see :doc:`validation`.
+* ``hall`` — Hall induction on periodic Fourier grids. Keys are listed in
+  :doc:`validation`.
+* ``shearing_sheet`` — 1D axisymmetric shearing-sheet sources; see
+  :doc:`validation`.
 
 Artificial viscosity, gravity, and smoothing
 --------------------------------------------

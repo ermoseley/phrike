@@ -406,7 +406,7 @@ def test_hall_shear_instability_closed_form_and_sign():
 @pytest.mark.parametrize("hall", [None, dict(eta_h=0.5, method="reference"),
                                   dict(eta_h=-0.25, method="inertia", length=0.2)])
 def test_hall_mri_eigenmode_grows_at_the_linear_rate(hall, tmp_path):
-    mhd = dict(enabled=True, shearing_sheet=dict(omega=1.0, q=1.5))
+    mhd = dict(shearing_sheet=dict(omega=1.0, q=1.5))
     if hall is not None:
         mhd["hall"] = dict(hall, enabled=True)
     problem = HallMRI1DProblem(config=dict(
@@ -488,8 +488,7 @@ def test_hall_mri_restart_rebuilds_mode_metadata_and_history(tmp_path):
     def config():
         return dict(
             problem="hall_mri1d", grid=dict(N=16, Lx="auto", precision="double"),
-            physics=dict(gamma=5.0/3.0, mhd=dict(enabled=True,
-                                                 shearing_sheet=dict(omega=1.0, q=1.5))),
+            physics=dict(gamma=5.0/3.0, mhd=dict(shearing_sheet=dict(omega=1.0, q=1.5))),
             integration=dict(t0=0.0, t_end=1.0, cfl=0.3, scheme="rk4"),
             initial_conditions=dict(rho0=1.0, B0=1.0, beta=100.0, mode=1, amplitude=1e-6),
             io=dict(outdir=str(tmp_path)), monitoring=dict(enabled=True))
@@ -555,8 +554,8 @@ def test_adsi_shear_growth_never_exceeds_half_the_shear():
 def test_adsi_shear_seed_roundtrip_and_box(tmp_path):
     problem = ADSIShearProblem(config=dict(
         problem="adsi_shear", grid=dict(Nx=16, Ny=16, Lx="auto", Ly="auto", precision="double"),
-        physics=dict(gamma=5.0/3.0, mhd=dict(enabled=True, shearing_sheet=dict(omega=0.0, shear=1.0),
-                                              ambipolar=dict(enabled=True, eta=2.0))),
+        physics=dict(gamma=5.0/3.0, mhd=dict(shearing_sheet=dict(omega=0.0, shear=1.0),
+                                             ambipolar=dict(enabled=True, eta=2.0))),
         integration=dict(t0=0.0, t_end=1.0, cfl=0.3, scheme="rk4"),
         initial_conditions=dict(rho0=1.0, Bv=1.0, Bphi=1.0, beta=10.0, mode_v=1, mode_r=1,
                                 amplitude=1e-6),

@@ -13,7 +13,6 @@ grid:
 physics:
   gamma: 1.6666666666666667
   mhd:
-    enabled: true
     resistivity: 0.0
     viscosity: 0.0
     divergence_clean: projection
