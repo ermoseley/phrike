@@ -750,7 +750,7 @@ class BaseProblem(ABC):
             "width": int(video_config.get("width", 0)),  # 0 = auto
             "height": int(video_config.get("height", 0)),  # 0 = auto
             "scale": float(video_config.get("scale", 1.0)),
-            "codec": str(video_config.get("codec", "h264_videotoolbox")),
+            "codec": str(video_config.get("codec", "libx264")),
             "quality": quality,
             "crf": crf,
             "preset": video_config.get("preset", "medium"),

@@ -36,10 +36,8 @@ stripped and lowercased. The accepted names are:
 
 Any other string raises ``ValueError``. An embedded name with adaptive
 stepping left off also raises ``ValueError``. ``rk23``, ``rk45``, and
-``rk78`` run only when adaptive stepping is enabled.
-``configs/sod_mixed_bc_example.yaml`` sets ``integration.scheme: rk45``
-and has no adaptive block, so that 1D configuration raises rather than
-integrating with RK4.
+``rk78`` run only when adaptive stepping is enabled (see
+``configs/sod_mixed_bc_example.yaml`` for a 1D adaptive RK45 example).
 
 If adaptive stepping is on and ``adaptive.scheme`` is omitted, an embedded
 ``integration.scheme`` is used; otherwise the embedded method defaults to
@@ -226,21 +224,25 @@ prints ``plasma_beta`` as defined in :doc:`equations`.
 
 ``video.enabled`` is read by the command-line interface only. The CLI
 renders video when ``--video`` is passed or when ``video.enabled`` is
-true. ``phrike.run_simulation`` and ``BaseProblem.run`` default
-``generate_video`` to true, so a direct Python call renders frames unless
-that flag is set false. Frame rendering reads ``video.frame_dpi`` in the
-problem visualizers that draw frames; the fallback used there is 120 or
-150, depending on the problem.
+true; ``--video-fps``, ``--video-quality`` and ``--video-codec`` override
+the YAML values only for a run that renders video. ``phrike.run_simulation``
+and ``BaseProblem.run`` default ``generate_video`` to false. A video run
+clears ``<outdir>/frames`` first. Frame rendering reads
+``video.frame_dpi`` in the problem visualizers that draw frames; the
+fallback used there is 120 or 150, depending on the problem.
 
-The encoder uses ``fps`` (default 30), ``quality`` (``low``, ``medium``,
-or ``high``; default ``high``), ``pix_fmt`` (default ``yuv420p``),
-``scale`` (default 1), and ``width`` and ``height`` (default 0, meaning
-unused). ``profile`` (default ``high``) and ``level`` (default ``4.1``)
-are passed only to the VideoToolbox attempt. The encoder tries
-``libx264``, ``h264_videotoolbox``, ``h264_nvenc``, ``mpeg4``, and
-``libvpx-vp9``, in that order. ``codec``, ``crf``, ``preset``,
-``bitrate``, ``maxrate``, ``bufsize``, and ``tune`` are stored and are
-not passed to those commands.
+The encoder uses ``fps`` (default 30), ``codec`` (default ``libx264``),
+``quality`` (``low``, ``medium``, or ``high``; default ``high``), ``crf``
+(default from ``quality``: 28, 23, 18), ``preset``, ``tune``,
+``bitrate``, ``maxrate``, ``bufsize``, ``pix_fmt`` (default
+``yuv420p``), ``scale`` (default 1), and ``width`` and ``height``
+(default 0, meaning unused). ``profile`` (default ``high``) and ``level``
+(default ``4.1``) are passed to every encoder except ``mpeg4`` and
+``libvpx-vp9``. If the requested
+codec fails, the encoder warns and tries ``libx264``,
+``h264_videotoolbox``, ``h264_nvenc``, ``mpeg4`` and ``libvpx-vp9`` in
+that order; if all fail, the frames are kept and the equivalent ffmpeg
+command is printed.
 
 The 3D turbulence frame also reads ``projection_type`` (default
 ``column_density``; any other value selects a slice), ``column_axis``
