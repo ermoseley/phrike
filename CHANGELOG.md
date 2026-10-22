@@ -12,6 +12,10 @@ All notable changes to PHRIKE are recorded here. The format follows
   exterior states), consistent with the overintegrated flux and with a
   zero-flux closure for diffusion terms. The previous copy-the-neighbour
   closure was unstable: a smooth acoustic pulse grew instead of leaving.
+- With overintegration, the 1D wall flux no longer leaks mass and energy at a
+  discontinuity next to the wall.
+- Checkpoints store the 1D and mixed-grid boundary reference, so a restarted
+  `outflow` run keeps its original far-field state.
 
 ### Changed
 
