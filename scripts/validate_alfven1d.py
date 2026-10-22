@@ -4,11 +4,19 @@ Checks:
   - max|div B| at round-off (1D: dBx/dx, Bx = const),
   - phase speed = c_A = B0/sqrt(rho0) (from the fundamental-mode phase slope),
   - exactness after one full period (L2 error vs analytic),
-  - spectral spatial convergence and RK4 temporal order (CPU / double).
+  - spatial error at a fixed small dt (CPU / double),
+  - RK4 temporal order at fixed N (CPU / double).
 
-Primary run is on Metal (device='mps', float32); a CPU/double run confirms the
-machine-precision claims that single precision cannot show.
+The spatial and temporal studies are separate because dt scaled with dx
+would fold the RK4 time error into a "spatial" table. The wave is a single
+Fourier mode, so its spatial error is zero once the grid retains the mode and
+the fixed-dt table shows the round-off floor, not a finite convergence order.
+
+The CPU/double run is the default. ``--mps`` adds an optional Metal
+(float32) run when PyTorch reports MPS as available.
 """
+
+import argparse
 
 import numpy as np
 
@@ -63,6 +71,46 @@ def run(N, t_end, backend, device, precision, cfl=0.4, scheme="rk4", filt=False)
     return grid, eqs, solver, hist
 
 
+def run_fixed_dt(N, t_end, dt, backend="numpy", device=None, precision="double",
+                 scheme="rk4", filt=False):
+    """Advance to ``t_end`` with a step independent of N.
+
+    ``dt`` is rounded down to ``t_end / ceil(t_end / dt)`` so that the final
+    time is hit exactly. Returns ``(grid, eqs, U, nsteps)``.
+    """
+    grid = make_grid(N, backend, device, precision, filt)
+    eqs = MHDEquations1D(gamma=GAMMA)
+    U = circularly_polarized_alfven_1d(grid.x, t=0.0, rho0=RHO0, p0=P0, B0=B0,
+                                       b1=B1, m=M, Lx=LX, gamma=GAMMA)
+    solver = SpectralSolverMHD1D(grid, eqs, scheme=scheme, cfl=0.4)
+    nsteps = max(1, int(np.ceil(t_end / dt - 1e-12)))
+    h = t_end / nsteps
+    U = grid.project_dealiased(U)
+    for _ in range(nsteps):
+        U = solver.step(U, h)
+    return grid, eqs, U, nsteps
+
+
+def spatial_convergence(Ns=(4, 6, 8, 12, 16, 24, 32, 64), t_end=0.25, dt=2e-4,
+                        backend="numpy", device=None, precision="double"):
+    """L2(B_perp) error versus N at one fixed dt. Returns [(N, error), ...]."""
+    rows = []
+    for N in Ns:
+        grid, eqs, U, _ = run_fixed_dt(N, t_end, dt, backend, device, precision)
+        rows.append((N, b_perp_error(grid, eqs, U, t_end)))
+    return rows
+
+
+def temporal_convergence(N=32, t_end=0.25, dts=(8e-3, 4e-3, 2e-3, 1e-3),
+                         backend="numpy", device=None, precision="double"):
+    """L2(B_perp) error versus dt at one fixed N. Returns [(dt, error), ...]."""
+    rows = []
+    for dt in dts:
+        grid, eqs, U, nsteps = run_fixed_dt(N, t_end, dt, backend, device, precision)
+        rows.append((t_end / nsteps, b_perp_error(grid, eqs, U, t_end)))
+    return rows
+
+
 def measure_phase_speed(N=256, backend="numpy", device=None, precision="double"):
     """Fit c_A from the phase of the fundamental +k Fourier mode of By(t)."""
     grid = make_grid(N, backend, device, precision)
@@ -97,70 +145,86 @@ def measure_phase_speed(N=256, backend="numpy", device=None, precision="double")
     return omega / k   # c_A
 
 
-def main():
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Diagnostic validation of the 1-D circularly polarized "
+                    "Alfven wave (div B, phase speed, one-period exactness, "
+                    "fixed-dt spatial error, fixed-N temporal order).",
+    )
+    parser.add_argument("--mps", action="store_true",
+                        help="also run the primary N=256 case on Metal (float32) "
+                             "if PyTorch reports MPS as available")
+    parser.add_argument("--n", type=int, default=256, metavar="N",
+                        help="resolution of the one-period runs (default: 256)")
+    parser.add_argument("--spatial-dt", type=float, default=2e-4, metavar="DT",
+                        help="fixed step for the spatial table (default: 2e-4)")
+    parser.add_argument("--skip-convergence", action="store_true",
+                        help="skip the spatial and temporal tables")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    N0 = args.n
     print("=" * 78)
     print("1D CIRCULARLY POLARIZED ALFVEN WAVE — VALIDATION")
     print(f"  rho0={RHO0} p0={P0} B0={B0} b1={B1}  c_A={C_A:.6f}  period={PERIOD:.6f}")
     print("=" * 78)
 
-    # --- Primary run on Metal (MPS, float32) ---
-    try:
-        import torch
-        mps_ok = torch.backends.mps.is_available()
-    except Exception:
-        mps_ok = False
-
-    if mps_ok:
-        print("\n[Metal / MPS, float32]  N=256, one period")
-        grid, eqs, solver, hist = run(256, PERIOD, "torch", "mps", "single", cfl=0.4)
-        e = b_perp_error(grid, eqs, solver.U, solver.t)
-        dE = abs(hist["energy"][-1] - hist["energy"][0]) / abs(hist["energy"][0])
-        print(f"  max|divB|        = {hist['div_b_max'][-1]:.3e}")
-        print(f"  L2(B_perp) error = {e:.3e}   (after 1 period, vs analytic)")
-        print(f"  energy drift     = {dE:.3e}")
-        print(f"  mag-energy drift = {abs(hist['magnetic_energy'][-1]-hist['magnetic_energy'][0]):.3e}")
-        ca = measure_phase_speed(256, "torch", "mps", "single")
-        print(f"  measured c_A     = {ca:.6f}  (exact {C_A:.6f}, rel err {abs(ca-C_A)/C_A:.2e})")
-    else:
-        print("\n[Metal / MPS] not available on this machine — skipping")
+    # --- Optional Metal (MPS, float32) run ---
+    if args.mps:
+        try:
+            import torch
+            mps_ok = torch.backends.mps.is_available()
+        except Exception:
+            mps_ok = False
+        if mps_ok:
+            print(f"\n[Metal / MPS, float32]  N={N0}, one period")
+            grid, eqs, solver, hist = run(N0, PERIOD, "torch", "mps", "single", cfl=0.4)
+            e = b_perp_error(grid, eqs, solver.U, solver.t)
+            dE = abs(hist["energy"][-1] - hist["energy"][0]) / abs(hist["energy"][0])
+            print(f"  max|divB|        = {hist['div_b_max'][-1]:.3e}")
+            print(f"  L2(B_perp) error = {e:.3e}   (after 1 period, vs analytic)")
+            print(f"  energy drift     = {dE:.3e}")
+            print(f"  mag-energy drift = {abs(hist['magnetic_energy'][-1]-hist['magnetic_energy'][0]):.3e}")
+            ca = measure_phase_speed(N0, "torch", "mps", "single")
+            print(f"  measured c_A     = {ca:.6f}  (exact {C_A:.6f}, rel err {abs(ca-C_A)/C_A:.2e})")
+        else:
+            print("\n[Metal / MPS] requested but not available — skipping")
 
     # --- CPU / double: machine-precision div(B) + one-period exactness ---
-    print("\n[CPU / double]  N=256, one period")
-    grid, eqs, solver, hist = run(256, PERIOD, "numpy", None, "double", cfl=0.4)
+    print(f"\n[CPU / double]  N={N0}, one period")
+    grid, eqs, solver, hist = run(N0, PERIOD, "numpy", None, "double", cfl=0.4)
     e = b_perp_error(grid, eqs, solver.U, solver.t)
     dE = abs(hist["energy"][-1] - hist["energy"][0]) / abs(hist["energy"][0])
     print(f"  max|divB|        = {hist['div_b_max'][-1]:.3e}")
     print(f"  L2(B_perp) error = {e:.3e}")
     print(f"  energy drift     = {dE:.3e}")
-    ca = measure_phase_speed(256, "numpy", None, "double")
+    ca = measure_phase_speed(N0, "numpy", None, "double")
     print(f"  measured c_A     = {ca:.8f}  (exact {C_A:.8f}, rel err {abs(ca-C_A)/C_A:.2e})")
 
-    # --- Spatial convergence (CPU/double), short time, tiny dt so error ~ spatial ---
-    print("\n[CPU / double]  spatial convergence at t=0.25 (cfl=0.1, rk4)")
-    prev = None
-    for N in (16, 24, 32, 48, 64):
-        grid, eqs, solver, hist = run(N, 0.25, "numpy", None, "double", cfl=0.1)
-        e = b_perp_error(grid, eqs, solver.U, solver.t)
-        msg = f"  N={N:4d}  L2 error = {e:.3e}"
-        if prev is not None and e > 0 and prev[1] > 0:
-            rate = np.log(prev[1] / e) / np.log(N / prev[0])
-            msg += f"   (order ~ {rate:.1f})"
-        print(msg)
-        prev = (N, e)
+    if args.skip_convergence:
+        print("\nDone.")
+        return
 
-    # --- Temporal (RK4) convergence: fixed large N, vary dt via cfl ---
-    print("\n[CPU / double]  temporal RK4 convergence at t=0.25, N=128 (filter off)")
+    # --- Spatial error at fixed dt (CPU/double) ---
+    print(f"\n[CPU / double]  spatial error at t=0.25, fixed dt={args.spatial_dt:g} (rk4)")
+    for N, err in spatial_convergence(dt=args.spatial_dt):
+        print(f"  N={N:4d}  L2 error = {err:.3e}")
+    print("  The wave is one Fourier mode: once N retains it, the spatial error is zero\n"
+          "  and the values above are the round-off (plus residual time-error) floor,\n"
+          "  so no finite convergence order is expected or reported.")
+
+    # --- Temporal (RK4) convergence at fixed N ---
+    print("\n[CPU / double]  temporal RK4 convergence at t=0.25, N=32 (fixed dt, filter off)")
     prev = None
-    for cfl in (0.4, 0.2, 0.1, 0.05):
-        grid, eqs, solver, hist = run(128, 0.25, "numpy", None, "double",
-                                      cfl=cfl, scheme="rk4", filt=False)
-        e = b_perp_error(grid, eqs, solver.U, solver.t)
-        msg = f"  cfl={cfl:5.3f}  L2 error = {e:.3e}"
-        if prev is not None and e > 0 and prev[1] > 0:
-            rate = np.log(prev[1] / e) / np.log(prev[0] / cfl)
+    for dt, err in temporal_convergence():
+        msg = f"  dt={dt:9.3e}  L2 error = {err:.3e}"
+        if prev is not None and err > 1e-13 and prev[1] > 1e-13:
+            rate = np.log(prev[1] / err) / np.log(prev[0] / dt)
             msg += f"   (order ~ {rate:.1f})"
         print(msg)
-        prev = (cfl, e)
+        prev = (dt, err)
 
     print("\nDone.")
 

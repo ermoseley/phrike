@@ -49,6 +49,17 @@ class UnboundedTimeStep(RuntimeError):
     """The step is not bounded by a wave speed, a parabolic limit, or a horizon."""
 
 
+class StalledTimeStep(RuntimeError):
+    """The stability limit collapsed far below its initial value."""
+
+
+# A step bound this far below the initial one, or one that is 1e3 smaller and
+# leaves more than 1e6 steps to t_end, is a stalled run, not a slow one.
+_STALL_COLLAPSE_FRACTION = 1e-8
+_STALL_SLOW_FRACTION = 1e-3
+_STALL_MAX_REMAINING_STEPS = 1e6
+
+
 class PositivityMonitor:
     """Count positivity-floor hits and warn once per run.
 
@@ -367,6 +378,7 @@ def _install_adaptive_floor(solver, t0: float, t_end: float) -> None:
 def _begin_run(solver, t0: float, t_end: float) -> None:
     solver.t = float(t0)
     solver._accepted_steps = 0
+    solver._dt_reference = None
     monitor = getattr(solver, "positivity", None)
     if monitor is not None:
         monitor.reset_run()
@@ -451,6 +463,41 @@ def _event_horizon(t, t_end, next_output, next_checkpoint) -> float:
     return horizon
 
 
+def _check_stalled_step(solver, free_dt: float, t_end) -> None:
+    """Raise when the step bound has collapsed against the first one.
+
+    ``free_dt`` is the proposal or stability limit before any output-time cap,
+    which can legitimately be tiny. The first finite value is the reference.
+    """
+    reference = getattr(solver, "_dt_reference", None)
+    if reference is None:
+        if np.isfinite(free_dt) and free_dt > 0.0:
+            solver._dt_reference = float(free_dt)
+        return
+    if not np.isfinite(free_dt):
+        return
+    ratio = free_dt / reference
+    remaining = max(float(t_end) - float(solver.t), 0.0)
+    if ratio < _STALL_COLLAPSE_FRACTION or (
+        ratio < _STALL_SLOW_FRACTION
+        and remaining > _STALL_MAX_REMAINING_STEPS * free_dt
+    ):
+        monitor = getattr(solver, "positivity", None)
+        floored = (
+            f" The positivity floor was hit for {monitor.cells} values."
+            if monitor is not None and monitor.cells
+            else ""
+        )
+        raise StalledTimeStep(
+            f"Time step collapsed to {free_dt:.3e} ({ratio:.1e} of the initial "
+            f"{reference:.3e}) at step {solver._accepted_steps}, t={solver.t}; "
+            f"the run would not reach t_end={float(t_end):g}.{floored} "
+            "The solution has likely lost resolution, for example a vacuum-like "
+            "state with an extreme wave speed. Increase resolution or "
+            "dissipation."
+        )
+
+
 def _cap_proposal(solver, proposal, t_end, next_output, next_checkpoint) -> float:
     """Cap a proposed step by the stability limit and the next output time.
 
@@ -478,6 +525,8 @@ def _cap_proposal(solver, proposal, t_end, next_output, next_checkpoint) -> floa
         raise UnboundedTimeStep(
             f"No positive time step at step {solver._accepted_steps}, t={solver.t}."
         )
+    free = [float(v) for v in (proposal, limit) if np.isfinite(float(v))]
+    _check_stalled_step(solver, min(free) if free else float("inf"), t_end)
     return dt
 
 
@@ -507,10 +556,66 @@ def _note_accepted(solver) -> None:
     _require_finite_state(solver, "after accepted step")
 
 
-def _copy_initial_state(U0):
-    if _TORCH_AVAILABLE and isinstance(U0, torch.Tensor):
-        return U0.clone()
-    return U0.copy()
+def nodal_quadrature_weights(grid, U):
+    """Quadrature weights for a 1D non-Fourier grid, on ``U``'s backend.
+
+    Returns ``None`` for Fourier grids, for grids without weights, and for
+    states that are not a 1D ``(components, N)`` array. Callers then keep the
+    plain grid sums of ``equations.conserved_quantities``.
+    """
+    if getattr(grid, "_basis_name", "fourier") == "fourier":
+        return None
+    weights = getattr(grid, "wx", None)
+    if weights is None or getattr(U, "ndim", 0) != 2:
+        return None
+    if _is_torch_array(U):
+        return torch.as_tensor(weights, dtype=U.dtype, device=U.device)
+    return np.asarray(weights, dtype=U.dtype)
+
+
+def conserved_diagnostics(grid, equations, U) -> Dict[str, float]:
+    """Mass, momentum and energy diagnostics of a state.
+
+    Fourier grids return ``equations.conserved_quantities(U)``, the plain grid
+    sums, unchanged. Chebyshev and Legendre grids integrate with the grid's
+    quadrature weights: node sums are not integrals there, and they drift by
+    the node-clustering imbalance even when the weighted integral is
+    conserved. The keys match those of ``equations.conserved_quantities``.
+    """
+    weights = nodal_quadrature_weights(grid, U)
+    ncomp = int(U.shape[0])
+    if weights is None or ncomp not in (3, 8):
+        return equations.conserved_quantities(U)
+
+    def integral(q) -> float:
+        if _is_torch_array(q):
+            return float(torch.sum(q * weights).item())
+        return float(np.sum(q * weights))
+
+    primitive = equations.primitive(U)
+    if ncomp == 3:
+        rho, u, p, _ = primitive
+        return {
+            "mass": integral(rho),
+            "momentum": integral(rho * u),
+            "energy": integral(p / (equations.gamma - 1.0) + 0.5 * rho * u * u),
+        }
+    rho, ux, uy, uz, p, Bx, By, Bz = primitive
+    b2 = Bx * Bx + By * By + Bz * Bz
+    energy = (
+        p / (equations.gamma - 1.0)
+        + 0.5 * rho * (ux * ux + uy * uy + uz * uz)
+        + 0.5 * b2
+    )
+    return {
+        "mass": integral(rho),
+        "momentum_x": integral(rho * ux),
+        "momentum_y": integral(rho * uy),
+        "momentum_z": integral(rho * uz),
+        "energy": integral(energy),
+        "magnetic_energy": integral(0.5 * b2),
+        "cross_helicity": integral(ux * Bx + uy * By + uz * Bz),
+    }
 
 
 def _compute_rhs(grid: Grid1D, eqs: EulerEquations1D, U: Array, 
@@ -844,7 +949,7 @@ class SpectralSolver1D:
         step_count = 0
 
         def record() -> None:
-            cons = self.equations.conserved_quantities(self.U)  # type: ignore[arg-type]
+            cons = conserved_diagnostics(self.grid, self.equations, self.U)  # type: ignore[arg-type]
             history["time"].append(self.t)
             history["mass"].append(cons["mass"])  # type: ignore[index]
             history["momentum"].append(cons["momentum"])  # type: ignore[index]
@@ -1455,12 +1560,20 @@ class SpectralSolverMHD:
             rhs[3] = rhs[3] + nu * self.grid.laplacian(U[3])
         return rhs
 
-    def _clamp(self, U: Array) -> Array:
+    def _clamp(self, U: Array, *, rebuild_always: bool = True) -> Array:
+        """Floor density and thermal pressure, rebuilding the total energy.
+
+        Stages always rebuild, matching the previous MHD stage update. The
+        accepted-state limiter passes ``rebuild_always=False`` so a positive
+        state is returned untouched.
+        """
         rho, ux, uy, uz, p, Bx, By, Bz = self.equations.primitive(U)
+        below = _count_below(rho, self.rho_min) + _count_below(p, self.p_min)
         monitor = getattr(self, "positivity", None)
         if monitor is not None:
-            monitor.note(_count_below(rho, self.rho_min) + _count_below(p, self.p_min))
-        # Always rebuild, matching the previous MHD stage update.
+            monitor.note(below)
+        if below == 0 and not rebuild_always:
+            return U
         if _TORCH_AVAILABLE and isinstance(U, torch.Tensor):
             rho_c = torch.clamp(rho, min=self.rho_min)
             p_c = torch.clamp(p, min=self.p_min)
@@ -1468,6 +1581,18 @@ class SpectralSolverMHD:
             rho_c = np.maximum(rho, self.rho_min)
             p_c = np.maximum(p, self.p_min)
         return self.equations.conservative(rho_c, ux, uy, uz, p_c, Bx, By, Bz)
+
+    def _limit_accepted(self, U: Array) -> Array:
+        """Restore positivity after the accepted-state stabilization.
+
+        The hard 2/3 Fourier projection and the modal filter act on each
+        conserved field separately and can ring below zero near steep fronts.
+        Density and thermal pressure are floored as in the stage clamp, and
+        the total energy is rebuilt from the stabilized B and velocity. B is
+        not touched, so div B stays at the projection's round-off. A state
+        that is already positive is returned unchanged.
+        """
+        return self._clamp(U, rebuild_always=False)
 
     def _project_B(self, U: Array) -> Array:
         """Helmholtz-project B and recompute E holding thermal pressure fixed."""
@@ -1560,7 +1685,7 @@ class SpectralSolverMHD:
         Un = self._project_B(Un)
         if self.ambipolar is not None:
             Un = self.ambipolar.step(Un, self.equations, 0.5 * dt)
-        Un = self.grid.apply_accepted_state_stabilization(Un, 0.5 * dt)
+        Un = self._limit_accepted(self.grid.apply_accepted_state_stabilization(Un, 0.5 * dt))
         if self.dim == 1:
             Un = self.grid.apply_boundary_conditions(Un, self.equations)
         elif getattr(self.grid, "_mixed_open_y", False):
@@ -1582,7 +1707,9 @@ class SpectralSolverMHD:
         )
         if result.accepted:
             Un = self._project_B(self._clamp(result.U_new))
-            Un = self.grid.apply_accepted_state_stabilization(Un, 0.5 * dt)
+            Un = self._limit_accepted(
+                self.grid.apply_accepted_state_stabilization(Un, 0.5 * dt)
+            )
             if self.dim == 1:
                 Un = self.grid.apply_boundary_conditions(Un, self.equations)
         else:
@@ -1605,7 +1732,9 @@ class SpectralSolverMHD:
         )
         if result.accepted:
             Un = self._project_B(self._clamp(result.U_new))
-            Un = self.grid.apply_accepted_state_stabilization(Un, 0.5 * dt)
+            Un = self._limit_accepted(
+                self.grid.apply_accepted_state_stabilization(Un, 0.5 * dt)
+            )
             if self.dim == 1:
                 Un = self.grid.apply_boundary_conditions(Un, self.equations)
             self.U = Un
@@ -1660,7 +1789,7 @@ class SpectralSolverMHD:
         def record() -> None:
             cons = (self.grid.conserved_quantities(self.U, self.equations)
                     if getattr(self.grid, "_mixed_open_y", False)
-                    else self.equations.conserved_quantities(self.U))
+                    else conserved_diagnostics(self.grid, self.equations, self.U))
             history["time"].append(self.t)
             for key in ("mass", "momentum_x", "momentum_y", "momentum_z",
                         "energy", "magnetic_energy", "cross_helicity"):

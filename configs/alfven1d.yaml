@@ -1,18 +1,17 @@
 # 1D circularly polarized Alfven wave — primary MHD validation.
-# Run on Metal (MPS):
-#   python -m phrike alfven1d --config configs/alfven1d.yaml --backend torch --device mps
+#   python -m phrike alfven1d --config configs/alfven1d.yaml --backend numpy
+# Metal (--backend torch --device mps) is available and float32-only.
 problem: alfven1d
 
 grid:
   N: 256
   Lx: 1.0
   dealias: true
-  precision: double      # ignored on MPS (forced to float32); use cpu for double
+  precision: double      # MPS is float32-only and overrides this
 
 physics:
   gamma: 1.6666666666666667   # 5/3
   mhd:
-    enabled: true
     resistivity: 0.0          # eta (0 = ideal)
     viscosity: 0.0            # nu  (0 = ideal)
     divergence_clean: projection

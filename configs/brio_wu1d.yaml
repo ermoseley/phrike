@@ -12,7 +12,6 @@ grid:
 physics:
   gamma: 2.0
   mhd:
-    enabled: true
     resistivity: 0.0
     viscosity: 0.0
     divergence_clean: none

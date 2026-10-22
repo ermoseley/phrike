@@ -1,5 +1,8 @@
 # 2.5D ADSI: periodic x, open y, out-of-plane shear U_z(y).
-# python -m phrike adsi2d --config configs/adsi2d.yaml --backend torch --device mps
+# python -m phrike adsi2d --config configs/adsi2d.yaml --backend numpy
+# Ambipolar diffusion drives the growth. Set physics.mhd.ambipolar.enabled to
+# false for an ideal-MHD control: it is expected NOT to grow, and the run reports
+# the |By_k1| amplitude envelope (adsi_growth.json) instead of a growth rate.
 problem: adsi2d
 
 grid:
@@ -13,7 +16,6 @@ grid:
 physics:
   gamma: 1.6666666666666667
   mhd:
-    enabled: true
     resistivity: 0.0
     viscosity: 0.0
     divergence_clean: projection
@@ -46,7 +48,7 @@ initial_conditions:
   field: 0.28209479177387814
   seed_amplitude: 0.0003    # max |delta B_y| relative to the background component
   reference_points: 257
-  reference_alpha: 1.0     # keep the same initial mode in an ideal-MHD control
+  reference_alpha: 1.0     # ambipolar coefficient of the seed eigenmode; keep it at 1 for an ideal control
 
 io:
   outdir: outputs/adsi2d

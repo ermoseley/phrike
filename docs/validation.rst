@@ -49,6 +49,28 @@ transforms, derivatives, and filters currently use dense matrices.
   additional magnetic conducting-wall model is imposed.
 * ``periodic`` requires Fourier. Non-periodic BCs on Fourier are rejected.
 
+Only ``fixed`` endpoints are validated. ``outflow`` and ``wall`` copy or
+reflect nodal values, which is not a characteristic closure for the global
+polynomial derivative, so endpoint states drift before any wave reaches the
+boundary; ``Grid1D`` warns when either is used, including the implicit
+``wall`` default. With the shipped ``sod.yaml`` and ``brio_wu1d.yaml``
+settings at N=64 (Sod) and N=48 (Brio–Wu), the largest relative change of
+the endpoint density from its initial value is as follows, although no wave
+reaches either boundary by t=0.02:
+
+=====================  ==========  ===========  ==========
+Case, t=0.02           Basis       ``outflow``  ``wall``
+=====================  ==========  ===========  ==========
+Sod                    Chebyshev   4.5%         1.0%
+Sod                    Legendre    37%          6.6%
+Brio–Wu                Chebyshev   14%          4.5%
+Brio–Wu                Legendre    61%          35%
+=====================  ==========  ===========  ==========
+
+The drift grows faster than linearly in time (Legendre ``outflow`` Brio–Wu
+left endpoint: 3e-4, 4e-3, 2e-2 and 7e-2 at t = 0.0005, 0.002, 0.005 and
+0.01). Treat results from these boundaries as experimental.
+
 For example:
 
 .. code-block:: yaml
@@ -350,6 +372,18 @@ boundaries. Strang half-steps around the ideal RK update give second-order
 combined time integration. Total energy evolves through the corresponding
 conservative diffusive Poynting flux, allowing magnetic energy to heat the gas.
 
+On a periodic 32 x 32 Fourier grid, take a smooth field with
+:math:`|k| \le 2` plus :math:`B_x = 1`, amplitude 0.3, :math:`\eta = 0.4`
+and :math:`T = 0.4`. Against a fine-step reference of the same
+2/3-dealiased discretization, the midpoint-resolvent step converges at
+second order in :math:`\Delta t`: the errors are 1.28e-4, 3.44e-5, 8.94e-6,
+2.28e-6 and 5.74e-7 for 8, 16, 32, 64 and 128 steps (successive ratios
+3.72, 3.85, 3.92 and 3.97). Against an :math:`N = 128` reference the error
+saturates at 3.8e-5, which matches the 3.6e-5 error of the 2/3-band
+truncation itself. At fixed :math:`N` the attainable accuracy is therefore
+set by the retained Fourier band, as for the rest of the solver, not by the
+time step.
+
 At open y faces the diffusive closure sets tangential ambipolar electric field
 to zero. This differs from transparent diffusion and from the ideal-MHD open
 flux. The boundary tensor is projected on both sides to preserve weighted
@@ -404,11 +438,44 @@ The Alfven speed :math:`\sqrt{B^2/\rho}` is :math:`1/\sqrt{2\pi}`.
 The seed is a compressible linear eigenmode computed independently on a padded
 periodic perturbation domain, with the same localized single-layer shear.
 Initial in-plane magnetic perturbations use a discrete vector potential.
-The reference growth is 0.450648772464; doubling reference resolution changes
-it by approximately 5e-13, and doubling its transverse domain changes it by
-4.2e-9. This is a padded linear reference, not an exact solution of the
-production open boundary conditions. Set ``reference_alpha: 1`` when disabling
-ambipolar diffusion to retain identical initial data in an ideal-MHD control.
+The reference growth is 0.450648772464. At the shipped :math:`L_y = 2`,
+doubling the reference resolution (257 to 513 points) changes it by 3e-13.
+Doubling the transverse domain to :math:`L_y = 4` at fixed grid spacing
+(257 points at :math:`L_y = 2` against 513 at :math:`L_y = 4`) changes it by
++4.2e-9. At a fixed 257 points the same doubling changes it by -3.8e-8, but
+that comparison also coarsens the spacing: at :math:`L_y = 4`, going from 257
+to 513 points alone changes the growth by 4.2e-8. The 4.2e-9 figure is
+therefore the domain sensitivity. This is a padded linear reference, not an
+exact solution of the production open boundary conditions.
+
+Ambipolar diffusion is what drives the instability: the shear does not grow in
+ideal MHD. The ideal-MHD control evolves the same ambipolar eigenmode seed with
+``physics.mhd.ambipolar.enabled: false`` (keep ``reference_alpha: 1`` so the
+initial data are identical). It is a stable control that is expected not to
+grow, and it has no reference eigenvalue. Asking ``reference_alpha`` for an
+ideal-limit eigenmode (for example :math:`10^{-6}`) fails with an explicit
+"no growing eigenmode" error, because none exists.
+
+Every run writes ``adsi_growth.json`` and prints the envelope of the seeded
+mode: the largest :math:`|B_y|` amplitude of the first x Fourier coefficient,
+relative to its initial value, with its minimum and maximum over the outputs.
+For an ambipolar run, a growth rate is fitted to the logarithm of that
+amplitude over the last half of the outputs and reported only if the window is
+a clean exponential (monotone, rms deviation from a straight line at most 0.02
+in :math:`\ln` amplitude); otherwise only the envelope is reported. Ideal runs
+never receive a fitted rate. The reference eigenvalue is quoted only when the
+run's ``eta`` equals ``reference_alpha``.
+
+For orientation, these runs used this checkout on NumPy float64, with
+:math:`N_y = 2N_x + 1`, ``seed_amplitude`` 0.001, ``cfl`` 0.65 and the
+shipped SBP dissipation and ambipolar settings, and are not the table below.
+The ambipolar fit is 0.197 on 32 x 65 (the amplitude grows by only 1.09 by
+t = 0.5) and 0.400 on 64 x 129 (amplitude 1.23 at t = 0.5; the reference
+growth is 0.4506). The ideal control at 64 x 129 dips to 0.08 of its initial
+amplitude near t = 0.15 and returns to 2.4 by t = 0.5. At 32 x 65 it dips to
+0.19 near t = 0.15, rises to 3.5 near t = 1, and falls back to 0.5 by
+t = 2. This oscillation of the seed is a transient whose phase and size depend
+on resolution; it is not growth, and no rate is fitted to it.
 
 Measured MPS refinement
 ~~~~~~~~~~~~~~~~~~~~~~~

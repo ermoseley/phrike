@@ -10,9 +10,11 @@ The flow is transonic (sound speed = 1, |u| = 1); density develops a contrast of
 ~6 (peaks near rho ~ 0.45-0.5). The initial field is analytically
 divergence-free (Bx depends only on y, By only on x); the Helmholtz projection
 keeps it div-free to machine precision as small-scale current sheets form. The
-vortex develops MHD turbulence/shocks, so a small explicit
-resistivity/viscosity (physics.mhd.resistivity / .viscosity) may be needed for
-stability at high resolution.
+vortex develops MHD turbulence/shocks. Without dissipation the hard 2/3
+truncation rings at the steepening fronts and drives density and pressure to
+their floors by t~0.18, after which the step collapses; the shipped config
+therefore enables integration.spectral_dissipation (order 8, onset at half the
+cutoff). Even then a few cells reach the pressure floor (the solver warns).
 """
 
 import os

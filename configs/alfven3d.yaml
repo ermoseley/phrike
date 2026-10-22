@@ -1,5 +1,5 @@
 # 3D circularly polarized Alfven wave (propagating along x) — 3D MHD validation.
-#   python -m phrike alfven3d --config configs/alfven3d.yaml --backend torch --device mps
+#   python -m phrike alfven3d --config configs/alfven3d.yaml --backend numpy
 problem: alfven3d
 
 grid:
@@ -15,7 +15,6 @@ grid:
 physics:
   gamma: 1.6666666666666667
   mhd:
-    enabled: true
     resistivity: 0.0
     viscosity: 0.0
     divergence_clean: projection
