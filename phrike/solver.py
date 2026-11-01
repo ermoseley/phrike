@@ -25,6 +25,7 @@ from .equations import (
     MHDEquations3D,
 )
 from .adaptive import AdaptiveTimeStepper, create_adaptive_stepper
+from .spectral3d import Euler3DSpectral
 from .artificial_viscosity import SpectralArtificialViscosity, ArtificialViscosityConfig
 
 
@@ -51,6 +52,10 @@ class UnboundedTimeStep(RuntimeError):
 
 class StalledTimeStep(RuntimeError):
     """The stability limit collapsed far below its initial value."""
+
+
+class _UseReferenceStep(Exception):
+    """A fast-path attempt would need the positivity limiter; redo it exactly."""
 
 
 # A step bound this far below the initial one, or one that is 1e3 smaller and
@@ -386,9 +391,12 @@ def _begin_run(solver, t0: float, t_end: float) -> None:
     _require_finite_state(solver, "before time integration")
 
 
-def _checked_wave_speed(solver, U) -> float:
-    _require_finite_state(solver, "while computing the time step", U)
-    speed = solver.equations.max_wave_speed(U)
+def _checked_wave_speed(solver, U, speed=None) -> float:
+    """Validated maximum wave speed; ``speed`` may come from a fused kernel
+    that has already established that ``U`` is finite."""
+    if speed is None:
+        _require_finite_state(solver, "while computing the time step", U)
+        speed = solver.equations.max_wave_speed(U)
     try:
         speed = float(speed)
     except (TypeError, ValueError) as exc:
@@ -2025,7 +2033,8 @@ class SpectralSolver3D:
 
     def __init__(self, grid: Grid3D, equations: EulerEquations3D, U0: Optional[Array] = None,
                  scheme: str = "rk4", cfl: float = 0.25, adaptive_config: Optional[Dict] = None,
-                 artificial_viscosity_config: Optional[Dict] = None, gravity_config: Optional[Dict] = None):
+                 artificial_viscosity_config: Optional[Dict] = None, gravity_config: Optional[Dict] = None,
+                 spectral_fast_path: Optional[bool] = None):
         """Initialize the 3D spectral solver.
 
         Args:
@@ -2037,6 +2046,12 @@ class SpectralSolver3D:
             adaptive_config: Configuration for adaptive time-stepping
             artificial_viscosity_config: Not implemented. ``enabled: true`` raises.
             gravity_config: Configuration for gravity
+            spectral_fast_path: Step with ``spectral3d`` (real-to-complex FFTs,
+                spectral-space RK stages, Triton kernels on CUDA): the same
+                step to round-off with far less memory traffic. ``None`` (the
+                default) enables it on Torch grids; NumPy grids keep the
+                reference path unless ``True``. Only plain ``EulerEquations3D``
+                without gravity is accelerated.
         """
         self.grid = grid
         self.equations = equations
@@ -2054,8 +2069,42 @@ class SpectralSolver3D:
         # Setup gravity if configured
         self.gravity_config = gravity_config
 
+        if spectral_fast_path is None:
+            spectral_fast_path = bool(getattr(grid, "_use_torch", False))
+        # Subclassed equations may change the flux; they keep the reference path.
+        self.spectral = (
+            Euler3DSpectral(grid, equations, self.rho_floor, self.p_floor)
+            if spectral_fast_path and type(equations) is EulerEquations3D
+            else None
+        )
+        self._speed_cache = None  # (U, U._version, max wave speed)
+
+    def _fast(self) -> Optional[Euler3DSpectral]:
+        gravity = self.gravity_config and self.gravity_config.get("enabled", False)
+        return None if gravity else self.spectral
+
+    def _note_accepted_state(self) -> None:
+        """``_note_accepted`` with the finite check fused into the wave-speed pass."""
+        if self.spectral is None or not self.spectral._torch:
+            _note_accepted(self)
+            return
+        finite, speed = self.spectral.finite_and_speed(self.U)
+        if not finite:
+            _note_accepted(self)  # raises with the reference message
+        self._accepted_steps = int(getattr(self, "_accepted_steps", 0)) + 1
+        self._speed_cache = (self.U, self.U._version, speed)
+
     def _stability_limit(self, U: Array) -> float:
-        speed = _checked_wave_speed(self, U)
+        cache = self._speed_cache
+        if cache is not None and cache[0] is U and cache[1] == U._version:
+            speed = _checked_wave_speed(self, U, cache[2])
+        elif self.spectral is not None and self.spectral._torch:
+            finite, speed = self.spectral.finite_and_speed(U)
+            if not finite:
+                _require_finite_state(self, "while computing the time step", U)
+            speed = _checked_wave_speed(self, U, speed)
+        else:
+            speed = _checked_wave_speed(self, U)
         return _smallest_finite((
             _hyperbolic_dt(self.cfl, _min_spacing(self.grid), speed),
         ))
@@ -2082,6 +2131,13 @@ class SpectralSolver3D:
     
     def _fixed_step(self, U: Array, dt: float) -> Array:
         """Perform one fixed time step."""
+        fast = self._fast()
+        if fast is not None:
+            U_split = fast.dissipate(U, 0.5 * dt)
+            Un = fast.rk_step(U_split, dt, self.scheme.lower(), 0.5 * dt)
+            if Un is not None:
+                return Un
+            # A positivity clamp would act: repeat the step on the reference path.
         U_split = self.grid.apply_spectral_dissipation(U, 0.5 * dt)
         if self.scheme.lower() == "rk2":
             Un = _rk2_step_3d(
@@ -2097,70 +2153,99 @@ class SpectralSolver3D:
             self.grid, Un, dt=0.5 * dt
         )
     
-    def _adaptive_step(self, U: Array, dt: float) -> Array:
-        """Perform one adaptive time step."""
+    def _adaptive_attempt(self, U: Array, dt: float):
+        """One embedded-RK attempt; returns (result, accepted state or None)."""
         def rhs_func(U_current: Array) -> Array:
-            """RHS function for adaptive stepper."""
             return _compute_rhs_3d(self.grid, self.equations, U_current, None, self.gravity_config)
-        
-        U_split = self.grid.apply_spectral_dissipation(U, 0.5 * dt)
+
+        fast = self._fast()
+        U_split = (
+            fast.dissipate(U, 0.5 * dt) if fast is not None
+            else self.grid.apply_spectral_dissipation(U, 0.5 * dt)
+        )
 
         # Compute solution scale for relative error
         if _TORCH_AVAILABLE and isinstance(U_split, torch.Tensor):
             solution_scale = float(torch.max(torch.abs(U_split)).item())
         else:
             solution_scale = float(np.max(np.abs(U_split)))
-        
+
+        if fast is not None and fast.embedded_ready(U_split):
+            result = self._embedded_attempt(fast, U_split, dt, solution_scale)
+            if result is not None:
+                if not result.accepted:
+                    return result, None
+                # Already dissipated and projected in spectral space.
+                fast.commit(result.U_new)
+                return result, result.U_new
+
         result = _call_adaptive_step(
             self, self.adaptive_stepper, rhs_func, U_split, dt, solution_scale,
             limit_state=lambda state: _limit_euler_stage(self, state),
         )
-        
-        if result.accepted:
-            Un = _apply_accepted_state_stabilization_3d(
-                self.grid, result.U_new, dt=0.5 * dt
+        if not result.accepted:
+            return result, None
+        stabilize = (
+            (lambda V: fast.dissipate(V, 0.5 * dt, project=True)) if fast is not None
+            else (lambda V: _apply_accepted_state_stabilization_3d(self.grid, V, dt=0.5 * dt))
+        )
+        return result, stabilize(result.U_new)
+
+    def _embedded_attempt(self, fast, U_split, dt, solution_scale):
+        """Spectral embedded step; ``None`` means the stage limiter would act."""
+        stepper = self.adaptive_stepper
+        method = getattr(stepper, "method", None)
+        if not isinstance(stepper, AdaptiveTimeStepper) or method is None:
+            return None  # duck-typed steppers keep their own step
+
+        def embedded(U_in, dt_in):
+            out = fast.embedded_step(
+                U_in, dt_in, method.a, method.b_high, method.b_low, 0.5 * dt
             )
-        else:
-            Un = U
-            
-        return Un
+            if out is None:
+                raise _UseReferenceStep
+            return out[0], None, out[1]
+
+        try:
+            return stepper.step(None, U_split, dt, solution_scale, embedded=embedded)
+        except _UseReferenceStep:
+            return None
+        except FloatingPointError as exc:
+            message = str(exc)
+            if "t=" in message:
+                raise
+            raise FloatingPointError(
+                f"{message} At step {int(getattr(self, '_accepted_steps', 0))}, t={self.t}."
+            ) from exc
+        except Exception as exc:  # pragma: no cover - depends on toolchain
+            if isinstance(exc, (RuntimeError,)) and "Adaptive" in str(exc):
+                raise
+            fast.disable_triton(exc)
+            return None
+
+    def _adaptive_step(self, U: Array, dt: float) -> Array:
+        """Perform one adaptive time step."""
+        result, Un = self._adaptive_attempt(U, dt)
+        return Un if result.accepted else U
 
     def _adaptive_run_step(self, dt: float, step_count: int, 
                           on_step: Optional[Callable[[int, float, Array], None]]) -> float:
         """Perform one step in adaptive run loop."""
-        def rhs_func(U_current: Array) -> Array:
-            return _compute_rhs_3d(self.grid, self.equations, U_current, None, self.gravity_config)
-        
-        U_split = self.grid.apply_spectral_dissipation(self.U, 0.5 * dt)
-
-        if _TORCH_AVAILABLE and isinstance(U_split, torch.Tensor):
-            solution_scale = float(torch.max(torch.abs(U_split)).item())
-        else:
-            solution_scale = float(np.max(np.abs(U_split)))
-        
-        result = _call_adaptive_step(
-            self, self.adaptive_stepper, rhs_func, U_split, dt, solution_scale,
-            limit_state=lambda state: _limit_euler_stage(self, state),
-        )
-        
+        result, Un = self._adaptive_attempt(self.U, dt)
         if result.accepted:
-            self.U = _apply_accepted_state_stabilization_3d(
-                self.grid, result.U_new, dt=0.5 * dt
-            )
+            self.U = Un
             self.t += dt
-            _note_accepted(self)
+            self._note_accepted_state()
             if on_step is not None:
                 on_step(step_count, dt, self.U)
-            return result.dt_next
-        else:
-            return result.dt_next
+        return result.dt_next
     
     def _fixed_run_step(self, dt: float, step_count: int,
                        on_step: Optional[Callable[[int, float, Array], None]]) -> float:
         """Perform one step in fixed run loop."""
         self.U = self.step(self.U, dt)
         self.t += dt
-        _note_accepted(self)
+        self._note_accepted_state()
         
         # Call monitoring callback
         if on_step is not None:

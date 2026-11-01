@@ -728,7 +728,7 @@ class AdaptiveTimeStepper:
 
     def step(
         self, rhs_func, U: np.ndarray, dt: float, solution_scale: float,
-        limit_state=None,
+        limit_state=None, *, embedded=None,
     ) -> AdaptiveStepResult:
         """Perform one adaptive time step.
 
@@ -738,6 +738,9 @@ class AdaptiveTimeStepper:
             dt: Proposed time step
             solution_scale: Scale of the solution (for relative error)
             limit_state: Optional stage limiter forwarded to the embedded method.
+            embedded: Optional ``f(U, dt) -> (U_high, U_low, error)`` replacing
+                ``self.method.step`` (a spectral-space implementation of the
+                same tableau); ``rhs_func`` and ``limit_state`` are then unused.
 
         Returns:
             AdaptiveStepResult containing step outcome and recommendations.
@@ -749,9 +752,12 @@ class AdaptiveTimeStepper:
         accepts the high-order state, warns, and sets ``forced``.
         """
         # Perform embedded RK step
-        U_high, U_low, error = self.method.step(
-            rhs_func, U, dt, limit_state=limit_state
-        )
+        if embedded is not None:
+            U_high, U_low, error = embedded(U, dt)
+        else:
+            U_high, U_low, error = self.method.step(
+                rhs_func, U, dt, limit_state=limit_state
+            )
 
         # Check if we should accept or reject the step. A non-finite estimate
         # comes back as a rejection with a smaller dt, or raises at the floor.
