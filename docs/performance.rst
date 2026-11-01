@@ -1,7 +1,8 @@
 GPU performance
 ===============
 
-This page records how the 3D Euler solver was profiled and sped up on GPUs.
+This page records how the 3D Euler and 3D MHD solvers were profiled and sped
+up on GPUs.
 The benchmark is ``scripts/bench_hydro3d.py``: a Taylor-Green vortex with
 dealiasing on, spectral dissipation (``p = 8``, ``rate = 40``), and the step
 capped at CFL 0.2, run through the same loop body as ``SpectralSolver3D.run``.
@@ -137,6 +138,75 @@ round-off: 1e-12 relative in fp64 and 1e-5 in fp32. It covers:
   They are not closer because the controller turns round-off in the reference
   error estimate, which is a difference of two O(\|U\|) states, into tiny
   ``dt`` changes.
+
+3D MHD
+------
+
+``SpectralSolverMHD`` steps 3D runs on Torch grids through
+``phrike/spectral_mhd3d.py``. The benchmark is ``scripts/bench_mhd3d.py``: the
+3D Orszag-Tang vortex with the settings in ``configs/orszag_tang3d.yaml``
+(projection after every substage, dissipation ``rate = 300`` with onset 0.5,
+CFL 0.25). On the A100, in Mzups per accepted step:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Scheme
+     - Precision
+     - 64\ :sup:`3`
+     - 128\ :sup:`3`
+     - 256\ :sup:`3`
+   * - RK4
+     - fp64
+     - 12 → 95 (7.9x)
+     - 19 → 166 (8.7x)
+     - 19 → 195 (10.0x)
+   * - RK4
+     - fp32
+     - 17 → 123 (7.4x)
+     - 40 → 301 (7.5x)
+     - 38 → 363 (9.6x)
+   * - RK45
+     - fp64
+     -
+     -
+     - 14 → 107 (7.9x)
+
+Peak memory halves (256\ :sup:`3` fp64: 22.5 → 11.4 GB). 384\ :sup:`3` fp32
+now fits (19 GB, 309 Mzups). The reference step spent 36% of its 887 ms in
+cuFFT and 64% in elementwise kernels, all near DRAM bandwidth. Each stage
+transformed all 24 flux components, projected B with six more transforms, and
+rebuilt the conserved state in the clamp. The fast step (78 ms of GPU time at
+256\ :sup:`3` fp64) spends 75% in cuFFT, 12% in the fused flux kernel and 8% in
+the Triton stage kernel. About 9 ms of the wall time is the device copy that
+``torch.fft.irfftn`` makes of its input. That copy is needed because cuFFT's
+complex-to-real transform overwrites the input, and splitting the transform to
+avoid it was slower.
+
+How the fast path works:
+
+- Each stage transforms 12 flux fields: the symmetric Maxwell-stress momentum
+  flux (6), the energy flux (3) and the antisymmetric induction tensor
+  ``A_ij = u_i B_j - u_j B_i`` (3). The mass flux is the stage momentum, and
+  resistive and viscous Laplacians enter the spectral RHS directly.
+- The spectral RHS of B is ``i k_j A_ji``, which is solenoidal because ``A`` is
+  antisymmetric. A stage state built from a solenoidal, band-limited state is
+  therefore already projected to round-off. The Leray projection of B is
+  applied once per step, in the final stage, so div B stays at round-off
+  (about 1e-13 in fp64 at 256\ :sup:`3`).
+- As in the hydro path, floor violations of every limited state are counted on
+  the device. A step whose clamps would act is repeated on the reference path.
+  Its output seeds the spectral cache only when the accepted-state clamp left
+  it band-limited.
+- The first step of a run, and runs with Hall or ambipolar terms, artificial
+  viscosity, ``divergence_clean: none`` or other equation classes, use the
+  reference path.
+
+``tests/test_spectral_mhd3d.py`` checks RK2/RK4 with dissipation on and off,
+resistivity and viscosity, and ``project_each_substage`` off, at 1e-11 in fp64
+and 1e-5 in fp32 on Torch CPU and CUDA. It also covers whole adaptive runs
+(the same accept and reject sequence), the embedded step at fixed ``dt``, the
+clamp fallback, and div B.
 
 Remaining headroom
 ------------------

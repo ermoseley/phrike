@@ -202,15 +202,15 @@ def _combine_kernel(
     fx_ptr, fy_ptr, fz_ptr,
     w_ptr, w0, nk,
     total, Kx, Kyr, Kzr, cy, cz, Ny, Nz,
-    HAS_BASE: tl.constexpr, MASK: tl.constexpr, BLOCK: tl.constexpr,
+    HAS_BASE: tl.constexpr, MASK: tl.constexpr, NC: tl.constexpr, BLOCK: tl.constexpr,
 ):
-    """O = [f *] ([B +] sum_j w[w0 + j] * K[j]) over the visited modes."""
+    """O = [f *] ([B +] sum_j w[w0 + j] * K[j]) over the visited modes, NC components."""
     offs, mask, ix, iy, iz = _mode_index(BLOCK, total, Kx, Kyr, Kzr, cy, cz, Ny, Nz)
     if MASK:
         m = _factor(fx_ptr, fy_ptr, fz_ptr, ix, iy, iz, mask)
     offS = iz * sSz + iy * sSy + 2 * ix
     offK = 2 * offs
-    for c in tl.static_range(5):
+    for c in tl.static_range(NC):
         if HAS_BASE:
             re, im = _ld(B_ptr, offS + c * sSc, mask)
         else:
@@ -310,5 +310,214 @@ def combine(K, nk, base, out, w, w0, factors, modes: RetainedModes, masked: bool
         fx, fy, fz,
         w, w0, nk,
         modes.total, modes.Kx, modes.Kyr, modes.Kzr, modes.cy, modes.cz, modes.Ny, modes.Nz,
-        HAS_BASE=base is not None, MASK=masked, BLOCK=block, num_warps=num_warps,
+        HAS_BASE=base is not None, MASK=masked, NC=out.shape[0], BLOCK=block, num_warps=num_warps,
+    )
+
+
+# --- ideal/resistive MHD (8 components) --------------------------------------
+#
+# Flux spectra order: [Txx, Tyy, Tzz, Txy, Txz, Tyz, Hx, Hy, Hz, Axy, Axz, Ayz]
+# with T_ij = rho u_i u_j + (p + B^2/2) delta_ij - B_i B_j,
+# H_i = (E + p + B^2/2) u_i - B_i (u.B) and A_ij = u_i B_j - u_j B_i.
+# The induction fluxes are F_x[By] = Axy, F_x[Bz] = Axz, F_y[Bz] = Ayz and
+# F_j[B_i] = -F_i[B_j], so the spectral RHS of B is exactly solenoidal.
+
+
+@triton.jit
+def _mhd_emit(c, kr, ki, U0_ptr, offS, Sout_ptr, H_ptr, A_ptr, K_ptr, offA, sSc, sAc, mask,
+              wa, wn, MODE: tl.constexpr, FIRST: tl.constexpr):
+    """MODE 0: stage update; 1: store k only (embedded RK)."""
+    if MODE == 1:
+        _st(K_ptr, offA + c * sAc, mask, kr, ki)
+    else:
+        ur, ui = _ld(U0_ptr, offS + c * sSc, mask)
+        if FIRST:
+            ar = kr * 0.0
+            ai = ki * 0.0
+        else:
+            ar, ai = _ld(A_ptr, offA + c * sAc, mask)
+        _st(A_ptr, offA + c * sAc, mask, ar + wa * kr, ai + wa * ki)
+        _st(Sout_ptr, offS + c * sSc, mask, ur + wn * kr, ui + wn * ki)
+
+
+@triton.jit
+def _mhd_final(c, kr, ki, U0_ptr, offS, A_ptr, offA, sSc, sAc, mask, wa, FIRST: tl.constexpr):
+    ur, ui = _ld(U0_ptr, offS + c * sSc, mask)
+    if FIRST:
+        return ur + wa * kr, ui + wa * ki
+    ar, ai = _ld(A_ptr, offA + c * sAc, mask)
+    return ur + ar + wa * kr, ui + ai + wa * ki
+
+
+@triton.jit
+def _mhd3d_stage_kernel(
+    F_ptr, sFc, sFz, sFy,
+    Sin_ptr, Sout_ptr, H_ptr, U0_ptr, sSc, sSz, sSy,
+    A_ptr, sAc,
+    kx_ptr, ky_ptr, kz_ptr, mx_ptr, my_ptr, mz_ptr, fx_ptr, fy_ptr, fz_ptr,
+    w_ptr, ia, inx,
+    total, Kx, Kyr, Kzr, cy, cz, Ny, Nz,
+    MODE: tl.constexpr, FIRST: tl.constexpr, FINAL: tl.constexpr, BLOCK: tl.constexpr,
+):
+    """One MHD RK stage (MODE 0) or the compact spectral RHS (MODE 1) over the visited modes.
+
+    w = [1/N, eta, nu, ...]; the final stage writes the pre-projection state to
+    H and f * (Leray-projected state) to Sout.
+    """
+    offs, mask, ix, iy, iz = _mode_index(BLOCK, total, Kx, Kyr, Kzr, cy, cz, Ny, Nz)
+    kx, ky, kz, m = _waves(kx_ptr, ky_ptr, kz_ptr, mx_ptr, my_ptr, mz_ptr, ix, iy, iz, mask)
+    inv_n = tl.load(w_ptr)
+    eta = tl.load(w_ptr + 1)
+    nu = tl.load(w_ptr + 2)
+    wa = tl.load(w_ptr + ia)
+    wn = tl.load(w_ptr + inx)
+    mf = m * inv_n
+    k2m = (kx * kx + ky * ky + kz * kz) * m
+    offF = iz * sFz + iy * sFy + 2 * ix
+    offS = iz * sSz + iy * sSy + 2 * ix
+    offA = 2 * offs
+    zero = kx * 0.0
+
+    # Everything read from Sin happens before Sout (possibly the same buffer) is written.
+    m1r, m1i = _ld(Sin_ptr, offS + sSc, mask)
+    m2r, m2i = _ld(Sin_ptr, offS + 2 * sSc, mask)
+    m3r, m3i = _ld(Sin_ptr, offS + 3 * sSc, mask)
+    b1r, b1i = _ld(Sin_ptr, offS + 5 * sSc, mask)
+    b2r, b2i = _ld(Sin_ptr, offS + 6 * sSc, mask)
+    b3r, b3i = _ld(Sin_ptr, offS + 7 * sSc, mask)
+
+    # density
+    k0r, k0i = _div(kx, ky, kz, m, m1r, m1i, m2r, m2i, m3r, m3i)
+    # momentum (+ viscosity)
+    f0r, f0i = _ld(F_ptr, offF, mask)
+    f3r, f3i = _ld(F_ptr, offF + 3 * sFc, mask)
+    f4r, f4i = _ld(F_ptr, offF + 4 * sFc, mask)
+    k1r, k1i = _div(kx, ky, kz, mf, f0r, f0i, f3r, f3i, f4r, f4i)
+    k1r -= nu * k2m * m1r
+    k1i -= nu * k2m * m1i
+    f1r, f1i = _ld(F_ptr, offF + sFc, mask)
+    f5r, f5i = _ld(F_ptr, offF + 5 * sFc, mask)
+    k2r, k2i = _div(kx, ky, kz, mf, f3r, f3i, f1r, f1i, f5r, f5i)
+    k2r -= nu * k2m * m2r
+    k2i -= nu * k2m * m2i
+    f2r, f2i = _ld(F_ptr, offF + 2 * sFc, mask)
+    k3r, k3i = _div(kx, ky, kz, mf, f4r, f4i, f5r, f5i, f2r, f2i)
+    k3r -= nu * k2m * m3r
+    k3i -= nu * k2m * m3i
+    # energy
+    f6r, f6i = _ld(F_ptr, offF + 6 * sFc, mask)
+    f7r, f7i = _ld(F_ptr, offF + 7 * sFc, mask)
+    f8r, f8i = _ld(F_ptr, offF + 8 * sFc, mask)
+    k4r, k4i = _div(kx, ky, kz, mf, f6r, f6i, f7r, f7i, f8r, f8i)
+    # induction (+ resistivity)
+    axyr, axyi = _ld(F_ptr, offF + 9 * sFc, mask)
+    axzr, axzi = _ld(F_ptr, offF + 10 * sFc, mask)
+    ayzr, ayzi = _ld(F_ptr, offF + 11 * sFc, mask)
+    k5r, k5i = _div(kx, ky, kz, mf, zero, zero, -axyr, -axyi, -axzr, -axzi)
+    k6r, k6i = _div(kx, ky, kz, mf, axyr, axyi, zero, zero, -ayzr, -ayzi)
+    k7r, k7i = _div(kx, ky, kz, mf, axzr, axzi, ayzr, ayzi, zero, zero)
+    k5r -= eta * k2m * b1r
+    k5i -= eta * k2m * b1i
+    k6r -= eta * k2m * b2r
+    k6i -= eta * k2m * b2i
+    k7r -= eta * k2m * b3r
+    k7i -= eta * k2m * b3i
+
+    if FINAL:
+        f = _factor(fx_ptr, fy_ptr, fz_ptr, ix, iy, iz, mask)
+        h0r, h0i = _mhd_final(0, k0r, k0i, U0_ptr, offS, A_ptr, offA, sSc, sAc, mask, wa, FIRST)
+        h1r, h1i = _mhd_final(1, k1r, k1i, U0_ptr, offS, A_ptr, offA, sSc, sAc, mask, wa, FIRST)
+        h2r, h2i = _mhd_final(2, k2r, k2i, U0_ptr, offS, A_ptr, offA, sSc, sAc, mask, wa, FIRST)
+        h3r, h3i = _mhd_final(3, k3r, k3i, U0_ptr, offS, A_ptr, offA, sSc, sAc, mask, wa, FIRST)
+        h4r, h4i = _mhd_final(4, k4r, k4i, U0_ptr, offS, A_ptr, offA, sSc, sAc, mask, wa, FIRST)
+        h5r, h5i = _mhd_final(5, k5r, k5i, U0_ptr, offS, A_ptr, offA, sSc, sAc, mask, wa, FIRST)
+        h6r, h6i = _mhd_final(6, k6r, k6i, U0_ptr, offS, A_ptr, offA, sSc, sAc, mask, wa, FIRST)
+        h7r, h7i = _mhd_final(7, k7r, k7i, U0_ptr, offS, A_ptr, offA, sSc, sAc, mask, wa, FIRST)
+        _st(H_ptr, offS, mask, h0r, h0i)
+        _st(H_ptr, offS + sSc, mask, h1r, h1i)
+        _st(H_ptr, offS + 2 * sSc, mask, h2r, h2i)
+        _st(H_ptr, offS + 3 * sSc, mask, h3r, h3i)
+        _st(H_ptr, offS + 4 * sSc, mask, h4r, h4i)
+        _st(H_ptr, offS + 5 * sSc, mask, h5r, h5i)
+        _st(H_ptr, offS + 6 * sSc, mask, h6r, h6i)
+        _st(H_ptr, offS + 7 * sSc, mask, h7r, h7i)
+        # Leray projection of B (k = 0 keeps the mean field).
+        k2 = kx * kx + ky * ky + kz * kz
+        inv_k2 = tl.where(k2 == 0.0, 0.0, 1.0 / tl.where(k2 == 0.0, 1.0, k2))
+        cr = (kx * h5r + ky * h6r + kz * h7r) * inv_k2
+        ci = (kx * h5i + ky * h6i + kz * h7i) * inv_k2
+        _st(Sout_ptr, offS, mask, f * h0r, f * h0i)
+        _st(Sout_ptr, offS + sSc, mask, f * h1r, f * h1i)
+        _st(Sout_ptr, offS + 2 * sSc, mask, f * h2r, f * h2i)
+        _st(Sout_ptr, offS + 3 * sSc, mask, f * h3r, f * h3i)
+        _st(Sout_ptr, offS + 4 * sSc, mask, f * h4r, f * h4i)
+        _st(Sout_ptr, offS + 5 * sSc, mask, f * (h5r - kx * cr), f * (h5i - kx * ci))
+        _st(Sout_ptr, offS + 6 * sSc, mask, f * (h6r - ky * cr), f * (h6i - ky * ci))
+        _st(Sout_ptr, offS + 7 * sSc, mask, f * (h7r - kz * cr), f * (h7i - kz * ci))
+    else:
+        _mhd_emit(0, k0r, k0i, U0_ptr, offS, Sout_ptr, H_ptr, A_ptr, A_ptr, offA, sSc, sAc, mask, wa, wn, MODE, FIRST)
+        _mhd_emit(1, k1r, k1i, U0_ptr, offS, Sout_ptr, H_ptr, A_ptr, A_ptr, offA, sSc, sAc, mask, wa, wn, MODE, FIRST)
+        _mhd_emit(2, k2r, k2i, U0_ptr, offS, Sout_ptr, H_ptr, A_ptr, A_ptr, offA, sSc, sAc, mask, wa, wn, MODE, FIRST)
+        _mhd_emit(3, k3r, k3i, U0_ptr, offS, Sout_ptr, H_ptr, A_ptr, A_ptr, offA, sSc, sAc, mask, wa, wn, MODE, FIRST)
+        _mhd_emit(4, k4r, k4i, U0_ptr, offS, Sout_ptr, H_ptr, A_ptr, A_ptr, offA, sSc, sAc, mask, wa, wn, MODE, FIRST)
+        _mhd_emit(5, k5r, k5i, U0_ptr, offS, Sout_ptr, H_ptr, A_ptr, A_ptr, offA, sSc, sAc, mask, wa, wn, MODE, FIRST)
+        _mhd_emit(6, k6r, k6i, U0_ptr, offS, Sout_ptr, H_ptr, A_ptr, A_ptr, offA, sSc, sAc, mask, wa, wn, MODE, FIRST)
+        _mhd_emit(7, k7r, k7i, U0_ptr, offS, Sout_ptr, H_ptr, A_ptr, A_ptr, offA, sSc, sAc, mask, wa, wn, MODE, FIRST)
+
+
+@triton.jit
+def _leray_scale_kernel(
+    X_ptr, sSc, sSz, sSy, kx_ptr, ky_ptr, kz_ptr, mx_ptr, my_ptr, mz_ptr, fx_ptr, fy_ptr, fz_ptr,
+    total, Kx, Kyr, Kzr, cy, cz, Ny, Nz, BLOCK: tl.constexpr,
+):
+    """In place: X = f * X for all 8 components, with B Leray-projected first."""
+    offs, mask, ix, iy, iz = _mode_index(BLOCK, total, Kx, Kyr, Kzr, cy, cz, Ny, Nz)
+    kx, ky, kz, m = _waves(kx_ptr, ky_ptr, kz_ptr, mx_ptr, my_ptr, mz_ptr, ix, iy, iz, mask)
+    f = _factor(fx_ptr, fy_ptr, fz_ptr, ix, iy, iz, mask)
+    offS = iz * sSz + iy * sSy + 2 * ix
+    for c in tl.static_range(5):
+        xr, xi = _ld(X_ptr, offS + c * sSc, mask)
+        _st(X_ptr, offS + c * sSc, mask, f * xr, f * xi)
+    b1r, b1i = _ld(X_ptr, offS + 5 * sSc, mask)
+    b2r, b2i = _ld(X_ptr, offS + 6 * sSc, mask)
+    b3r, b3i = _ld(X_ptr, offS + 7 * sSc, mask)
+    k2 = kx * kx + ky * ky + kz * kz
+    inv_k2 = tl.where(k2 == 0.0, 0.0, 1.0 / tl.where(k2 == 0.0, 1.0, k2))
+    cr = (kx * b1r + ky * b2r + kz * b3r) * inv_k2
+    ci = (kx * b1i + ky * b2i + kz * b3i) * inv_k2
+    _st(X_ptr, offS + 5 * sSc, mask, f * (b1r - kx * cr), f * (b1i - kx * ci))
+    _st(X_ptr, offS + 6 * sSc, mask, f * (b2r - ky * cr), f * (b2i - ky * ci))
+    _st(X_ptr, offS + 7 * sSc, mask, f * (b3r - kz * cr), f * (b3i - kz * ci))
+
+
+def mhd_stage(F, Sin, Sout, U0, acc, w, ia, inx, waves, modes: RetainedModes, first: bool,
+              final: bool, rhs_only: bool = False, high=None, final_factors=None,
+              block: int = 256, num_warps: int = 4) -> None:
+    """Launch one MHD stage; with ``rhs_only`` the compact k goes to ``acc``."""
+    Fr = torch.view_as_real(F)
+    Sinr, Soutr, U0r = (torch.view_as_real(x) for x in (Sin, Sout, U0))
+    Ar = torch.view_as_real(acc)
+    Hr = torch.view_as_real(high) if high is not None else Soutr
+    assert Sinr.stride() == Soutr.stride() == U0r.stride() == Hr.stride()
+    kx, ky, kz, mx, my, mz = waves
+    fx, fy, fz = final_factors if final_factors is not None else (mx, my, mz)
+    _mhd3d_stage_kernel[(triton.cdiv(modes.total, block),)](
+        Fr, Fr.stride(0), Fr.stride(1), Fr.stride(2),
+        Sinr, Soutr, Hr, U0r, Soutr.stride(0), Soutr.stride(1), Soutr.stride(2),
+        Ar, Ar.stride(0),
+        kx, ky, kz, mx, my, mz, fx, fy, fz,
+        w, ia, inx,
+        modes.total, modes.Kx, modes.Kyr, modes.Kzr, modes.cy, modes.cz, modes.Ny, modes.Nz,
+        MODE=1 if rhs_only else 0, FIRST=first, FINAL=final, BLOCK=block, num_warps=num_warps,
+    )
+
+
+def leray_scale(X, waves, factors, modes: RetainedModes, block: int = 256, num_warps: int = 4) -> None:
+    Xr = torch.view_as_real(X)
+    kx, ky, kz, mx, my, mz = waves
+    fx, fy, fz = factors
+    _leray_scale_kernel[(triton.cdiv(modes.total, block),)](
+        Xr, Xr.stride(0), Xr.stride(1), Xr.stride(2), kx, ky, kz, mx, my, mz, fx, fy, fz,
+        modes.total, modes.Kx, modes.Kyr, modes.Kzr, modes.cy, modes.cz, modes.Ny, modes.Nz,
+        BLOCK=block, num_warps=num_warps,
     )

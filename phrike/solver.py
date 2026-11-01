@@ -26,6 +26,7 @@ from .equations import (
 )
 from .adaptive import AdaptiveTimeStepper, create_adaptive_stepper
 from .spectral3d import Euler3DSpectral
+from .spectral_mhd3d import MHD3DSpectral
 from .artificial_viscosity import SpectralArtificialViscosity, ArtificialViscosityConfig
 
 
@@ -1465,7 +1466,15 @@ class SpectralSolverMHD:
                  scheme: str = "rk4", cfl: float = 0.3,
                  adaptive_config: Optional[Dict] = None,
                  artificial_viscosity_config: Optional[Dict] = None,
-                 gravity_config: Optional[Dict] = None):
+                 gravity_config: Optional[Dict] = None,
+                 spectral_fast_path: Optional[bool] = None):
+        """``spectral_fast_path``: step 3D runs on Torch grids with
+        ``spectral_mhd3d`` (the same step to round-off with far less memory
+        traffic). ``None`` enables it for 3D Torch grids; it applies to plain
+        ``MHDEquations3D`` with dealiasing, projection cleaning and no Hall,
+        ambipolar or artificial-viscosity terms, and other runs keep the
+        reference path.
+        """
         self.grid = grid
         self.equations = equations
         self.cfl = cfl
@@ -1553,6 +1562,39 @@ class SpectralSolverMHD:
             _configure_time_integration(scheme, adaptive_config)
         )
         _init_monitors(self, self.rho_min, self.p_min)
+
+        if spectral_fast_path is None:
+            spectral_fast_path = bool(getattr(grid, "_use_torch", False))
+        self.spectral = None
+        self._speed_cache = None  # (U, U._version, max wave speed)
+        if (spectral_fast_path and self.dim == 3 and getattr(grid, "_use_torch", False)
+                and type(equations) is MHDEquations3D and bool(getattr(grid, "dealias", False))):
+            self.spectral = MHD3DSpectral(grid, equations, self.rho_min, self.p_min,
+                                          self.resistivity, self.viscosity)
+
+    def _fast(self) -> Optional[MHD3DSpectral]:
+        """The fast path when the run's options allow it (they may change after construction)."""
+        fast = self.spectral
+        if fast is None:
+            return None
+        if (self.divergence_clean != "projection" or self.hall is not None
+                or self.ambipolar is not None or self.artificial_viscosity is not None
+                or self.shearing_sheet is not None):
+            fast.invalidate()
+            return None
+        fast.eta, fast.nu = float(self.resistivity), float(self.viscosity)
+        return fast
+
+    def _note_accepted_state(self) -> None:
+        """``_note_accepted`` with the finite check fused into the wave-speed pass."""
+        if self.spectral is None:
+            _note_accepted(self)
+            return
+        finite, speed = self.spectral.finite_and_speed(self.U)
+        if not finite:
+            _note_accepted(self)  # raises with the reference message
+        self._accepted_steps = int(getattr(self, "_accepted_steps", 0)) + 1
+        self._speed_cache = (self.U, self.U._version, speed)
 
     def _grid_k2_max(self) -> float:
         """Max squared wavenumber on the grid (for the parabolic diffusion CFL).
@@ -1727,7 +1769,16 @@ class SpectralSolverMHD:
 
     # --- time stepping ---
     def _stability_limit(self, U: Array) -> float:
-        speed = _checked_wave_speed(self, U)
+        cache = self._speed_cache
+        if cache is not None and cache[0] is U and cache[1] == U._version:
+            speed = _checked_wave_speed(self, U, cache[2])
+        elif self.spectral is not None:
+            finite, speed = self.spectral.finite_and_speed(U)
+            if not finite:
+                _require_finite_state(self, "while computing the time step", U)
+            speed = _checked_wave_speed(self, U, speed)
+        else:
+            speed = _checked_wave_speed(self, U)
         bounds = [_hyperbolic_dt(self.cfl, _min_spacing(self.grid), speed)]
         if self.dim == 1:
             bounds.append(_artificial_viscosity_dt(self.grid, self.artificial_viscosity))
@@ -1758,6 +1809,31 @@ class SpectralSolverMHD:
         return self._fixed_step(U, dt)
 
     def _fixed_step(self, U: Array, dt: float) -> Array:
+        fast = self._fast()
+        if fast is not None:
+            U_split = fast.dissipate(U, 0.5 * dt)
+            if U_split is not None:
+                Un = fast.rk_step(U_split, dt, self.scheme.lower(), 0.5 * dt)
+                if Un is not None:
+                    return Un
+            # Not a fast-path state, or a positivity clamp would act: take the
+            # reference step and cache its output when it is band-limited.
+            events = self.positivity.events
+            return self._seed_if_band_limited(fast, self._reference_fixed_step(U, dt), events)
+        return self._reference_fixed_step(U, dt)
+
+    def _seed_if_band_limited(self, fast, Un: Array, events_before: int) -> Array:
+        """Cache a reference-step result unless a clamp acted on it.
+
+        The accepted-state clamp runs after the dealias projection, so a state
+        it changed is no longer band-limited and must not be re-masked.
+        """
+        if self.positivity.events != events_before:
+            fast.invalidate()
+            return Un
+        return fast.seed(Un)
+
+    def _reference_fixed_step(self, U: Array, dt: float) -> Array:
         if getattr(self.grid, "_mixed_open_y", False):
             U = self.grid.apply_boundary_conditions(U, self.equations)
         U_split = self.grid.apply_spectral_dissipation(U, 0.5 * dt)
@@ -1782,63 +1858,88 @@ class SpectralSolverMHD:
             Un = self._project_B(Un)
         return Un
 
-    def _adaptive_step(self, U: Array, dt: float) -> Array:
+    def _adaptive_attempt(self, U: Array, dt: float):
+        """One embedded-RK attempt; returns (result, accepted state or None)."""
         def rhs_func(Uc: Array) -> Array:
             return self._compute_rhs(Uc)
 
+        fast = self._fast()
+        U_split = fast.dissipate(U, 0.5 * dt) if fast is not None else None
+        if U_split is not None:
+            solution_scale = _max_abs_float(U_split)
+            result = self._embedded_attempt(fast, U_split, dt, solution_scale)
+            if result is not None:
+                if result.accepted:
+                    # Projected, dissipated and masked in spectral space.
+                    fast.commit(result.U_new)
+                    return result, result.U_new
+                return result, None
+
+        events = self.positivity.events
         U_split = self.grid.apply_spectral_dissipation(U, 0.5 * dt)
-        if _TORCH_AVAILABLE and isinstance(U_split, torch.Tensor):
-            solution_scale = float(torch.max(torch.abs(U_split)).item())
-        else:
-            solution_scale = float(np.max(np.abs(U_split)))
-        result = _call_adaptive_step(
-            self, self.adaptive_stepper, rhs_func, U_split, dt, solution_scale
-        )
-        if result.accepted:
-            Un = self._project_B(self._clamp(result.U_new))
-            Un = self._limit_accepted(
-                self.grid.apply_accepted_state_stabilization(Un, 0.5 * dt)
-            )
-            if self.dim == 1:
-                Un = self.grid.apply_boundary_conditions(Un, self.equations)
-        else:
-            Un = U
-        return Un
-
-    def _adaptive_run_step(self, dt: float, step_count: int,
-                           on_step: Optional[Callable[[int, float, Array], None]]) -> float:
-        def rhs_func(Uc: Array) -> Array:
-            return self._compute_rhs(Uc)
-
-        U_split = self.grid.apply_spectral_dissipation(self.U, 0.5 * dt)
-        if _TORCH_AVAILABLE and isinstance(U_split, torch.Tensor):
-            solution_scale = float(torch.max(torch.abs(U_split)).item())
-        else:
-            solution_scale = float(np.max(np.abs(U_split)))
+        solution_scale = _max_abs_float(U_split)
         # Embedded MHD stages are not positivity-limited. The accepted state is.
         result = _call_adaptive_step(
             self, self.adaptive_stepper, rhs_func, U_split, dt, solution_scale
         )
+        if not result.accepted:
+            return result, None
+        Un = self._project_B(self._clamp(result.U_new))
+        Un = self._limit_accepted(
+            self.grid.apply_accepted_state_stabilization(Un, 0.5 * dt)
+        )
+        if self.dim == 1:
+            Un = self.grid.apply_boundary_conditions(Un, self.equations)
+        if fast is not None:
+            Un = self._seed_if_band_limited(fast, Un, events)
+        return result, Un
+
+    def _embedded_attempt(self, fast, U_split, dt, solution_scale):
+        """Spectral embedded step; ``None`` means the accepted-state clamp would act."""
+        stepper = self.adaptive_stepper
+        method = getattr(stepper, "method", None)
+        if not isinstance(stepper, AdaptiveTimeStepper) or method is None:
+            return None  # duck-typed steppers keep their own step
+
+        def embedded(U_in, dt_in):
+            out = fast.embedded_step(U_in, dt_in, method.a, method.b_high, method.b_low, 0.5 * dt)
+            if out is None:
+                raise _UseReferenceStep
+            return out[0], None, out[1]
+
+        try:
+            return stepper.step(None, U_split, dt, solution_scale, embedded=embedded)
+        except _UseReferenceStep:
+            fast.invalidate()
+            return None
+        except FloatingPointError as exc:
+            message = str(exc)
+            if "t=" in message:
+                raise
+            raise FloatingPointError(
+                f"{message} At step {int(getattr(self, '_accepted_steps', 0))}, t={self.t}."
+            ) from exc
+
+    def _adaptive_step(self, U: Array, dt: float) -> Array:
+        result, Un = self._adaptive_attempt(U, dt)
+        return Un if result.accepted else U
+
+    def _adaptive_run_step(self, dt: float, step_count: int,
+                           on_step: Optional[Callable[[int, float, Array], None]]) -> float:
+        result, Un = self._adaptive_attempt(self.U, dt)
         if result.accepted:
-            Un = self._project_B(self._clamp(result.U_new))
-            Un = self._limit_accepted(
-                self.grid.apply_accepted_state_stabilization(Un, 0.5 * dt)
-            )
-            if self.dim == 1:
-                Un = self.grid.apply_boundary_conditions(Un, self.equations)
             self.U = Un
             self.t += dt
-            _note_accepted(self)
+            self._note_accepted_state()
             if on_step is not None:
                 on_step(step_count, dt, self.U)
-            return result.dt_next
         return result.dt_next
 
     def _fixed_run_step(self, dt: float, step_count: int,
                         on_step: Optional[Callable[[int, float, Array], None]]) -> float:
         self.U = self.step(self.U, dt)
         self.t += dt
-        _note_accepted(self)
+        self._note_accepted_state()
         if on_step is not None:
             on_step(step_count, dt, self.U)
         return self._stability_limit(self.U)
@@ -1858,6 +1959,9 @@ class SpectralSolverMHD:
         # Project the initial state so div(B)=0 from the first stored step.
         self.U = self._project_B(self.U)
         self.U = self.grid.project_dealiased(self.U)
+        fast = self._fast()
+        if fast is not None and self.divergence_clean == "projection":
+            self.U = fast.seed(self.U)
         if self.dim == 1 or getattr(self.grid, "_mixed_open_y", False):
             self.U = self.grid.initialize_boundary_conditions(self.U, self.equations)
         _begin_run(self, t0, t_end)
