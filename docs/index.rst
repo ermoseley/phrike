@@ -13,4 +13,5 @@ the workflows that are maintained in this repository.
    equations
    configuration
    validation
+   performance
    development
