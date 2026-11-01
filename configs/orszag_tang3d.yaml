@@ -1,0 +1,50 @@
+# 3D Orszag-Tang vortex; epsilon=0 recovers the planar problem.
+problem: orszag_tang3d
+
+grid:
+  Nx: 64
+  Ny: 64
+  Nz: 64
+  Lx: 1.0
+  Ly: 1.0
+  Lz: 1.0
+  dealias: true
+  precision: double
+
+physics:
+  gamma: 1.6666666666666667   # 5/3
+  mhd:
+    resistivity: 0.0          # eta. Explicit, so it tightens the time step (dt <~ 1/(eta k_max^2)).
+    viscosity: 0.0            # nu, explicit like eta
+    divergence_clean: projection
+    project_each_substage: true
+
+integration:
+  t0: 0.0
+  t_end: 0.5
+  cfl: 0.25
+  scheme: rk4
+  output_interval: 0.05
+  checkpoint_interval: 0.0
+  spectral_dissipation:
+    enabled: true
+    order: 8
+    rate: 300.0               # damping rate of the cutoff mode, 1/time
+    onset_fraction: 0.5       # modes below half the cutoff are untouched
+
+initial_conditions:
+  epsilon: 0.2
+
+io:
+  outdir: outputs/orszag_tang3d
+
+video:
+  fps: 20
+  frame_dpi: 130
+
+monitoring:
+  enabled: true
+  step_interval: 50
+  include_conservation: true
+  include_timestep: true
+  include_time: true

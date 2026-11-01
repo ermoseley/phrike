@@ -71,9 +71,9 @@ uses Metal/MPS. Metal/MPS executes in single precision.
 | Kelvin–Helmholtz instability | `khi2d` | `configs/khi2d.yaml` |
 | Taylor–Green vortex | `tgv3d` | `configs/tgv3d.yaml` |
 | Decaying 3D turbulence | `turb3d` | `configs/turb3d.yaml` |
-| Circularly polarized Alfvén wave | `alfven1d`, `alfven3d` | `configs/alfven1d.yaml`, `configs/alfven3d.yaml` |
+| Circularly polarized Alfvén wave | `alfven1d`, `alfven3d` | `configs/alfven1d.yaml`, `configs/alfven3d.yaml`, `configs/alfven3d_diagonal.yaml` |
 | Brio–Wu MHD shock tube | `brio_wu1d` | `configs/brio_wu1d.yaml` |
-| Orszag–Tang vortex | `orszag_tang2d` | `configs/orszag_tang2d.yaml` |
+| Orszag–Tang vortex | `orszag_tang2d`, `orszag_tang3d` | `configs/orszag_tang2d.yaml`, `configs/orszag_tang3d.yaml` |
 | Ambipolar-diffusion shear instability | `adsi2d` | `configs/adsi2d.yaml` |
 | Decaying 3D MHD turbulence | `mhd_turb3d` | `configs/mhd_turb3d.yaml` |
 

@@ -166,7 +166,8 @@ Physics
 is required.
 
 ``physics.mhd`` is copied onto the grid by ``alfven1d``, ``alfven3d``,
-``brio_wu1d``, ``orszag_tang2d``, ``mhd_turb3d``, and ``adsi2d``. The flag
+``brio_wu1d``, ``orszag_tang2d``, ``orszag_tang3d``, ``mhd_turb3d``, and
+``adsi2d``. The flag
 ``physics.mhd.enabled`` is not read; the problem class selects the MHD
 solver. Keys, all optional:
 
@@ -213,6 +214,13 @@ from any ``initial_conditions.smoothing`` block a problem defines. Keys:
 ``enabled`` (default false), ``kernel_size`` (default 0), ``mode``
 (default ``wrap``), ``variables`` (default density, velocity, and
 pressure), and ``diagnostic_output`` (default false).
+
+``orszag_tang3d`` reads ``initial_conditions.epsilon`` (default 0.2); zero
+extrudes the 2D vortex in z. ``alfven3d`` reads
+``initial_conditions.orientation`` (``x`` by default, or ``diagonal``). The
+diagonal wave requires ``Lx = Ly = Lz`` and has period
+``Lx / (sqrt(3) * abs(m * B0 / sqrt(rho0)))``. See
+``configs/alfven3d_diagonal.yaml`` for a one-period run.
 
 I/O, monitoring, video, runtime, tracers
 ----------------------------------------
