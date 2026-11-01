@@ -233,7 +233,11 @@ I/O, monitoring, video, runtime, tracers
 output directory; stdout if omitted), ``include_conservation``,
 ``include_timestep``, ``include_time``, ``include_velocity_stats``, and
 ``include_density_stats`` (all default true). The MHD block of the monitor
-prints ``plasma_beta`` as defined in :doc:`equations`.
+prints ``plasma_beta`` as defined in :doc:`equations`. Its ``max|divB|`` is
+absolute, so it sits at round-off times ``k_max * max|B|``: near 1e-14 in
+double precision on a 32^3 grid, but near 1e-6 there and 1e-4 on a 1024^2
+grid in single precision, which Metal/MPS always uses. Spectral dissipation
+does not change it.
 
 ``video.enabled`` is read by the command-line interface only. The CLI
 renders video when ``--video`` is passed or when ``video.enabled`` is

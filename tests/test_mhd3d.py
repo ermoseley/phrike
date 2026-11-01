@@ -115,6 +115,36 @@ def test_ot_divergence_and_conservation():
     assert solver.positivity.events == 0
 
 
+@pytest.mark.parametrize("precision", ["double", "single"])
+def test_ot_divergence_with_spectral_dissipation_is_round_off(precision):
+    """Dissipation scales each mode by one scalar, so it commutes with the projection.
+
+    max|div B| is absolute: it sits at eps * k_max * max|B| of the working precision,
+    about 1e-14 in double and 1e-6 in single (Metal/MPS) on this 32^3 grid.
+    """
+    if precision == "single":
+        pytest.importorskip("torch")
+        kwargs = {"backend": "torch", "torch_device": "cpu"}
+    else:
+        kwargs = {"backend": "numpy"}
+    dissipation = {"spectral_dissipation": {"enabled": True, "order": 8, "rate": 300.0,
+                                            "onset_fraction": 0.5}}
+    grid = Grid3D(32, 32, 32, 1.0, 1.0, 1.0, precision=precision,
+                  filter_params=dissipation, **kwargs)
+    solver = SpectralSolverMHD3D(grid, MHDEquations3D(), scheme="rk4")
+    U = solver._project_B(orszag_tang_3d(*grid.xyz_mesh()))
+    max_div = 0.0
+    for _ in range(4):
+        U = solver.step(U, 0.002)
+        max_div = max(max_div, solver.max_div_b(U))
+    B = np.asarray(U[5:8].cpu() if hasattr(U, "cpu") else U[5:8])
+    eps = np.finfo(B.dtype).eps
+    k_max = 2.0 * np.pi * (32 // 3) * np.sqrt(3.0)
+    scale = eps * k_max * np.max(np.sqrt(np.sum(B * B, axis=0)))
+    print(f"{precision}: max div B={max_div:.3e}, eps*k_max*max|B|={scale:.3e}")
+    assert max_div < 10.0 * scale
+
+
 def test_torch_cpu_matches_numpy():
     torch = pytest.importorskip("torch")
     threads = torch.get_num_threads()
