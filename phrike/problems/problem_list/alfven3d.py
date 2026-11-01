@@ -1,4 +1,4 @@
-"""3D circularly polarized Alfven wave (propagating along x in a 3D box).
+"""3D circularly polarized Alfven wave along x or the box diagonal.
 
 Same exact nonlinear solution as the 1D problem, but run through the full 3D MHD
 machinery (Grid3D.project_solenoidal, MHDEquations3D flux). Used as the 3D
@@ -21,8 +21,35 @@ from ..base import BaseProblem
 
 
 def circularly_polarized_alfven_3d(X, t=0.0, rho0=1.0, p0=0.1, B0=1.0, b1=0.1,
-                                   m=1, Lx=1.0, direction=1, gamma=5.0 / 3.0):
-    """CP Alfven wave varying along x (uniform in y, z)."""
+                                   m=1, Lx=1.0, direction=1, gamma=5.0 / 3.0,
+                                   *, orientation="x", Y=None, Z=None,
+                                   Ly=1.0, Lz=1.0):
+    """Exact CP wave; diagonal uses n=(1,1,1)/sqrt(3) in a periodic cube."""
+    if orientation not in ("x", "diagonal"):
+        raise ValueError("alfven3d orientation must be 'x' or 'diagonal'")
+    if orientation == "diagonal":
+        if not (Lx == Ly == Lz):
+            raise ValueError("alfven3d diagonal requires a cubic box (Lx = Ly = Lz)")
+        if Y is None or Z is None:
+            raise ValueError("alfven3d diagonal requires X, Y and Z coordinates")
+        if hasattr(X, "cpu"):
+            import torch
+            xp = torch
+        else:
+            xp = np
+        phi = (2.0 * np.pi * m / Lx) * (
+            X + Y + Z - np.sqrt(3.0) * direction * B0 / np.sqrt(rho0) * t
+        )
+        c = b1 * xp.cos(phi); s = b1 * xp.sin(phi)
+        bx = c / np.sqrt(2.0) + s / np.sqrt(6.0)
+        by = -c / np.sqrt(2.0) + s / np.sqrt(6.0)
+        bz = -2.0 * s / np.sqrt(6.0)
+        guide = B0 / np.sqrt(3.0)
+        scale = -float(direction) / np.sqrt(rho0)
+        return MHDEquations3D(gamma=gamma).conservative(
+            xp.full_like(X, float(rho0)), scale * bx, scale * by, scale * bz,
+            xp.full_like(X, float(p0)), guide + bx, guide + by, guide + bz,
+        )
     is_torch = hasattr(X, "cpu")
     cA = B0 / np.sqrt(rho0)
     k = 2.0 * np.pi * m / Lx
@@ -56,6 +83,7 @@ class Alfven3DProblem(BaseProblem):
             rho0=float(icfg.get("rho0", 1.0)), p0=float(icfg.get("p0", 0.1)),
             B0=float(icfg.get("B0", 1.0)), b1=float(icfg.get("b1", 0.1)),
             m=int(icfg.get("m", 1)), direction=int(icfg.get("direction", 1)),
+            orientation=str(icfg.get("orientation", "x")),
         )
 
     def create_grid(self, backend="numpy", device=None, debug=False) -> Grid3D:
@@ -75,9 +103,13 @@ class Alfven3DProblem(BaseProblem):
         return MHDEquations3D(gamma=self.gamma)
 
     def create_initial_conditions(self, grid: Grid3D):
-        X, _, _ = grid.xyz_mesh()
+        return self._exact_state(grid, 0.0)
+
+    def _exact_state(self, grid: Grid3D, t: float):
+        X, Y, Z = grid.xyz_mesh()
         return circularly_polarized_alfven_3d(
-            X, t=0.0, Lx=grid.Lx, gamma=self.gamma, **self._ic_params()
+            X, t=t, Y=Y, Z=Z, Lx=grid.Lx, Ly=grid.Ly, Lz=grid.Lz,
+            gamma=self.gamma, **self._ic_params()
         )
 
     def create_visualization(self, solver, t, U):
@@ -87,6 +119,16 @@ class Alfven3DProblem(BaseProblem):
         snap = save_solution_snapshot(self.outdir, solver.t, U=solver.U,
                                       grid=solver.grid, equations=solver.equations)
         print(f"Saved final snapshot: {snap}")
+        actual = solver.equations.primitive(solver.U)
+        exact = solver.equations.primitive(self._exact_state(solver.grid, solver.t))
+        for name, indices in (("B", (5, 6, 7)), ("u", (1, 2, 3))):
+            fields = np.array(self.convert_torch_to_numpy(*(actual[i] for i in indices)))
+            reference = np.array(self.convert_torch_to_numpy(*(exact[i] for i in indices)))
+            error = fields - reference
+            norm = np.sqrt(np.sum(reference ** 2))
+            relative = np.sqrt(np.sum(error ** 2)) / (norm if norm > 0.0 else 1.0)
+            print(f"Alfven {name}: L2={np.sqrt(np.mean(error ** 2)):.6e}, "
+                  f"relative L2={relative:.6e}, max={np.max(np.abs(error)):.6e}")
         X, _, _ = solver.grid.xyz_mesh()
         x = X[0, 0, :]
         if hasattr(x, "cpu"):
@@ -96,6 +138,8 @@ class Alfven3DProblem(BaseProblem):
         line_y = By[0, 0, :]
         line_z = Bz[0, 0, :]
         Ua = circularly_polarized_alfven_3d(np.asarray(x), t=solver.t, Lx=solver.grid.Lx,
+                                            Y=np.zeros_like(x), Z=np.zeros_like(x),
+                                            Ly=solver.grid.Ly, Lz=solver.grid.Lz,
                                             gamma=self.gamma, **self._ic_params())
         eqs = MHDEquations3D(gamma=self.gamma)
         _, _, _, _, _, _, Bya, Bza = eqs.primitive(Ua)
