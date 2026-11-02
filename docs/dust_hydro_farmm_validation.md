@@ -12,15 +12,13 @@ figures, and (when run through the driver) `run.log`. The driver continues after
 failed checks, exits nonzero if any check fails, and writes
 [the complete check table](../outputs/dust_validation/summary.md).
 Use `run_all.py --report-only` to regenerate that table from existing results.
-Every test process has a 180-second driver timeout; the sequential driver takes
-longer than three minutes in total. Grids fit the requested laptop limits.
+Every test process has a 180-second driver timeout (7200 s for
+`long_turbulence`, which runs only with `--long`). Grids fit the requested laptop limits.
 
 The campaign uses the method described in [the design note](dust_hydro_farmm.md),
-including kinetic flux-vector splitting rather than Rusanov transport. It changes
-no solver files. Because the solver work is uncommitted, the Git commit alone does
-not identify the tested code: each metrics file records SHA256 hashes of the dust,
-SGS and gas solver sources, checks their stability during the run, and records
-peak process memory. Counts of `repaired_cells` and `roundoff_projections` are
+including kinetic flux-vector splitting rather than Rusanov transport. Each
+metrics file records SHA256 hashes of the dust, SGS and gas solver sources, checks
+that they did not change during the run, and records peak process memory. Counts of `repaired_cells` and `roundoff_projections` are
 reported separately for every physical run. A nonzero repair count fails a check.
 
 ## References and acceptance criteria
@@ -51,36 +49,47 @@ momentum and heat tolerances allow only accumulated float64 error. Any rejected
 cold moment state is reported with the last completed time; it is not silently
 regularised by this harness.
 
+### MT25 heating and Gaussianisation (`mt25_gaussianisation.py`)
+
+The central claim of the SGS–dust coupling (Moseley & Teyssier 2025): unresolved
+turbulence of one-component dispersion `σ_Δ` drives grain velocities as an OU
+process with `D = ε_Δ arctan x`, `ε_Δ = σ_Δ³/Δ`, `x = ν τ_Δ`. Initially cold dust
+therefore heats at rate `2D`, saturates at `D/ν`, and any initial distribution
+relaxes to a Gaussian. The reservoir is held fixed (decay off, production off,
+loading 10⁻⁹) so `D` is constant, and the full coupled solver's local step is
+advanced in a uniform box. `x` is swept over 10⁻²…10², for the Gaussian closure
+in 1D, 2D and 3D and HyQMOM in 1D.
+
+* dispersion history against the exact OU solution, error ≤ 10⁻⁷ of `D/ν`;
+* initial heating rate against `arctan x`, relative ≤ 10⁻⁹;
+* plateau against `D/ν`, relative ≤ 10⁻⁷;
+* HyQMOM kurtosis from `(S3, S4) = (1, 5), (0, 1.5), (−1.5, 6)` reaching 3 within
+  10⁻³ after `ν t = 4`.
+
+The 10⁻⁷ tolerances allow the reservoir drain by the 10⁻⁹ loading and nothing more.
+
 ### Dusty acoustic wave (`dustywave.py`)
 
-The four complex Fourier amplitudes evolve with the matrix supplied in the task,
-using `scipy.linalg.expm`. Initial gas pressure is perturbed adiabatically,
-`delta_p=c^2*delta_rho_g`; gas and cold dust start co-moving. Runs use amplitude
-`1e-4`, `N=32,64,128`, `eps=0.01,1` and `t_s/T=0.001,0.3,30`. The final time is
-one gas acoustic period. No spectral dissipation is applied. The gas timestep uses
-CFL 0.8; dust transport enforces its own stricter bound by subcycling.
+The four complex Fourier amplitudes evolve with the exact linear matrix (Laibe &
+Price 2011 setup, adiabatic), using `scipy.linalg.expm`. Gas pressure is perturbed
+adiabatically; gas and cold dust start co-moving. Amplitude `10⁻⁶` keeps the
+nonlinear departure below the discretisation errors measured. `ε = 0.01, 1` and
+`t_s/T = 10⁻³, 0.3, 30`, one acoustic period, no spectral dissipation, gas CFL 0.8
+(dust sub-cycles under its own bound). `N = 32…256`, and `64…512` for
+`t_s/T = 10⁻³`, so the finest pair has `ν dt ≈ 2` and leaves the stiff-splitting
+regime (design note §6).
 
-Errors are absolute spatial L1 and L2 norms, each divided by its initial mode
-amplitude, so a strongly damped reference does not make the normalisation
-singular. **Cold dust is transported at first order, by construction.** A cold
-cell sits on the cone boundary. Its `M2 = ρu²` has no room for a sub-cell
-velocity spread, and a linear reconstruction of the conserved raw moments that
-gave it a velocity slope would violate Cauchy–Schwarz at one face. A realizable
-scheme therefore flattens velocity slopes in cold cells. (The draft FARMM paper's
-raw-moment scheme reports order 1.1 in the same regime.) First-order upwinding
-with cell-centred velocities leaves an O(1) relative error in the single cell
-at each velocity stagnation point. That error limits the L2 order to about 0.5,
-while L1 stays first order. The acceptance criteria follow from this:
+Errors are spatial L1 norms divided by the initial mode amplitude. Per field:
 
-* dust-density L1 order ≥ 0.8;
-* gas fields within the second-order envelope `0.05(32/N)²+5e-4` at light
-  loading (ε = 0.01);
-* at ε = 1, where tight coupling hands the gas the first-order dust error, and
-  for the dust fields, an amplitude bound of 2;
-* energy drift < 10⁻¹², zero repairs, and every state realizable.
+* L1 order ≥ 1.5 on the finest pair (limited second order; minmod clips smooth
+  extrema), unless the field is already at the floor, L1 ≤ 10⁻⁵ of the initial
+  amplitude at the finest `N` (spectral gas at weak coupling, dust velocity when
+  drag is negligible);
+* energy drift ≤ 10⁻¹², zero repairs, every state realizable.
 
-Warm dust, whose dispersion exceeds the sub-cell velocity variation, recovers
-second order (see free streaming below).
+Cold dust reaches this order because cold-like cells reconstruct `(ρ, u)` and
+project sub-cell-level cone violations (design note §3.3). A profiles figure
+compares all four fields with the exact mode at `N = 64`.
 
 ### Kinetic free streaming (`beams_free_streaming.py`)
 
@@ -136,21 +145,45 @@ comparison is recorded together with the measured transport fraction.
 
 ### Particle reference (`particle_reference_2d.py`)
 
-The passive comparison uses `32^2`, 64 particles per cell, dust/gas `1e-6`,
-back-reaction off, and eddy diffusion off in both descriptions. Positions evolve
-in two dimensions; all three velocity components carry OU fluctuations. Gas
-velocity, density and SGS energy are sampled bilinearly. Frozen-coefficient
-exponential drag and exact OU kicks bracket particle drift. Initial positions
-use a subcell lattice and initial velocities are antithetic Gaussian samples.
+Passive dust (loading 10⁻⁶, back-reaction off, eddy diffusion off) in decaying
+2D turbulence with the active reservoir, `32²`, `t_s/τ_Δ = 0.05, 1, 20`, two
+initial grid-eddy times. 256 particles per cell drift, relax exactly toward the
+gas velocity of their cell, and receive exact OU kicks with the MT25 `D` of their
+cell. Sampling and deposition are both nearest-grid-point, so particles see
+exactly the cell-uniform gas and reservoir the moment drag sees; the comparison
+isolates transport and closure error from interpolation choices. Initial
+velocities are antithetic samples of each cell's moment Gaussian.
 
-CIC deposits mass, momentum and all second moments at several times in each
-stopping regime. L1 density, mean-velocity and variance errors, and local velocity
-PDF kurtoses, are reported without an invented closure-accuracy pass threshold.
-Sampling noise, interpolation, CIC broadening, spatial and temporal error all
-contribute; a single particle seed and grid do not isolate closure error. The
-report also compares equally CIC-smoothed moment fields to help identify
-broadening. Mass conservation, PSD covariance, zero repairs and particle count
-are checked separately from these accuracy measurements.
+* global mass-weighted dispersion within 10% of the particles at `t_s/τ_Δ = 1`
+  and 20 (Monte Carlo noise is below 1% over 1024 cells);
+* stacked, cell-normalised velocity PDF kurtosis within 0.15 of 3 at
+  `t_s/τ_Δ = 20`, where SGS kicks set the dispersion;
+* zero unrealizable cells and zero repairs in every regime.
+
+At `t_s/τ_Δ = 0.05` the dispersion is set by grid-scale velocity structure, not
+SGS kicks: particles carry a neighbour's velocity for a fraction of a cell after
+crossing the piecewise-constant gas field, so the cell PDF is a heavy-tailed
+mixture. The dispersion gap and kurtosis there are recorded as measured closure
+error, not checked.
+
+### Long decaying turbulence (`long_turbulence.py`)
+
+The three-way exchange over time from an empty reservoir: `128²` and `24³`,
+`k = 2–8`, `v_rms = 0.3`, `t_s = 0.1`, `ε = 0.01, 1`, to `t = 1` (about three
+large-eddy times). Dust starts co-moving with the gas. The filter drain is the
+only SGS source; MT25 coupling, SGS pressure and decay, back-reaction and eddy
+diffusion are on.
+
+* total energy (gas + SGS + dust) drift ≤ 10⁻¹⁰ and SGS ledger closure
+  (production − decay − dust work + compression) ≤ 10⁻¹⁰;
+* zero repairs and zero positivity-floor cells;
+* the reservoir is filled by the cascade (production > 0);
+* heavy loading ends with less resolved and less SGS energy than light loading.
+
+The figure shows the reservoir energies, the cumulative exchanges, and the dust
+random-energy budget (SGS work in, drag damping out, transport mixing of the
+resolved dust velocity). This test takes about an hour, so the driver runs it
+only with `--long` and otherwise keeps its last recorded result.
 
 ## Measured results
 

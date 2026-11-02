@@ -81,14 +81,53 @@ cold, fast dust, so the dust runs in float64 with explicit round-off tolerances 
 
 The dust points are PHRIKE's collocation points, treated as cell centres.
 
-* Piecewise-linear reconstruction of the conserved raw moments, minmod slopes.
-* Scaling toward the cell average by powers of ½ (Zhang–Shu) until both face
-  states are strictly realizable, and their quadrature-node velocities lie within
-  the neighbours' node range plus half its span. That is a relaxed kinetic maximum
-  principle: it keeps second order at smooth extrema but stops light extrapolated
-  faces from carrying spuriously fast nodes. Cells lighter than 10⁻⁶ of their
-  neighbourhood maximum are first order. Because the reconstruction is linear in
-  the conserved variables, the cell average is the mean of its two faces.
+* Piecewise-linear, minmod-limited faces. Each cell picks one of two
+  reconstructions:
+  * **Conserved (Zhang–Shu).** Limited slopes of the raw moments, scaled toward
+    the cell average by powers of ½ until both faces are strictly realizable and
+    their quadrature-node velocities lie within the neighbours' node range plus
+    half its span. That is a relaxed kinetic maximum principle: it keeps second
+    order at smooth extrema but stops light extrapolated faces from carrying
+    spuriously fast nodes. The reconstruction is linear in the conserved
+    variables, so the cell average is the mean of its faces and the update is
+    realizable by convexity. Used for warm cells near the cone boundary
+    (two-point mixtures, crossing streams) and for rough data.
+  * **Primitive.** Gaussian: `(ρ, u, C)`, with the `C` slope halved until both
+    faces are positive semi-definite. HyQMOM: `(ρ, u_x, v, S3, H4, u_y, u_z,
+    σ_⊥²)`, where realizability is the box `v, H4, σ_⊥² ≥ 0` and minmod keeps
+    each face inside its neighbours' range. HyQMOM uses this in the cone interior
+    (`H4 ≥ ½` in the cell and both neighbours; a Gaussian has `H4 = 2`): `q, r`
+    are small differences of `O(m³)` and `O(m⁴)` raw terms, and limiting raw
+    components separately makes the face skewness and kurtosis noisy. Both
+    closures also use it in **cold-like cells** (below), with the variance
+    slopes set to zero so a cold cell's faces are Diracs at the face velocities.
+
+  Why cold-like cells need it: a cold cell's raw `M2 = ρuu` has no room for a
+  sub-cell velocity spread, so any realizable conserved reconstruction flattens
+  its velocity, and cold dust drops to first order with an `O(1)` error at
+  velocity stagnation points. Primitive faces are realizable by construction,
+  but the cell average is no longer the mean of its faces, so the update can
+  leave the cone by about the variance a linear velocity profile carries within
+  a cell. That is resolved a posteriori (next bullets).
+
+  Cells lighter than 10⁻⁶ of their neighbourhood maximum are first order in
+  both reconstructions.
+* **Sub-cell budget and cold-like cells.** The exact cell average of a smooth
+  cold flow is not cold: a linear velocity profile carries variance `|Δu|²/12`.
+  The unresolved budget is `b = (1/12) Σ_d min(|Δ₋u|², |Δ₊u|²)` over resolved
+  axes; the minimum makes it vanish at discontinuities and extrema. A cell is
+  cold-like (`subcell_eligible`) when its total variance is at most `12 b` and
+  its one-sided velocity differences agree within a factor 2 on every axis
+  (smooth flow). After each RK stage, a cone violation in a cold-like cell that
+  is smaller than `b` is projected: HyQMOM cells become cold; Gaussian `C` has
+  its negative eigenvalue clipped. Mass and momentum are unchanged; the kinetic
+  energy change is returned to the gas (stage-1 changes with weight ½, because
+  the dust energy is linear in `M2`). The solver counts these as
+  `subcell_projections`; warm or rough cells are never projected.
+* **MOOD.** Any other cell whose stage update leaves the cone is recomputed at
+  first order, together with its neighbours, and the stage is redone. The
+  all-first-order kinetic update is realizable under the CFL bound, so the loop
+  terminates. The solver counts these as `mood_cells`.
 * **Kinetic flux-vector splitting over a quadrature of the closure** (Desjardins,
   Fox & Villedieu 2008; Vikas et al. 2011): `F = F⁺(U_L) + F⁻(U_R)`, where `F±`
   sums `ρ w_α v_{α,d} φ(v_α)` over nodes moving right or left.
@@ -230,3 +269,25 @@ exchanges are exact, so they do not enter `dt`.
   cannot hold it. Energy is.
 * The white-noise OU representation over-estimates the long-time diffusivity of
   large-Stokes grains relative to Reeks' result (the MT25 model limitation).
+* **Stiff-drag splitting.** Drag is exact, but gas and dust are transported by
+  different schemes between the two local half-steps. While `ν dt ≫ 1` their
+  velocities separate by `O(dt²)` per step and the drag pulls them back, so the
+  coupled scheme is first order in that regime and recovers second order once
+  `ν dt ≲ 1`. In the dusty wave at `ε = 1`, `t_s/T = 10⁻³` the L1 error is
+  about 0.6% of the mode amplitude at `N = 512` (order 1.6 on the finest pair).
+  Mixture-inertia (asymptotic-preserving) transport of the coupled pair would
+  remove this; it is not implemented.
+* **Cold dust order.** With primitive faces and sub-cell projection, smooth cold
+  dust converges at about order 1.5 in L1 (minmod clips smooth extrema); without
+  them it was first order.
+* **Velocity tails.** A single Gaussian per cell cannot hold the heavy tails of
+  short-`t_s` dust in turbulence, where a cell mixes grains that still carry
+  neighbouring cells' velocities. Against 256 particles per cell, the stacked
+  kurtosis is about 6 at `t_s/τ_Δ = 0.05` and the dispersion differs by about
+  20%. At `t_s/τ_Δ = 1` the dispersion agrees within 5% and the kurtosis is 3.3;
+  at `t_s/τ_Δ = 20`, within 0.4% and 3.0.
+  HyQMOM carries the fourth moment and represents these tails in 1D; a
+  multi-dimensional quadrature closure would be needed in 2D/3D.
+* **2D turbulence feeds little SGS energy.** The 2D cascade is inverse, so the
+  filter drains little kinetic energy and the reservoir stays small. The 3D
+  tests are the meaningful ones for the production channel.

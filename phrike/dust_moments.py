@@ -373,12 +373,6 @@ class HyqmomClosure:
         pick = lambda a, b: np.where(interior, a, b)
         return pick(prim_plus, cons_plus), pick(prim_minus, cons_minus), pick(prim_scale, cons_scale)
 
-    @staticmethod
-    def _coldlike(p: dict, axis: int) -> np.ndarray:
-        m = p["u"][0]
-        budget = np.maximum((m - np.roll(m, 1, axis))**2, (np.roll(m, -1, axis) - m)**2)
-        return p["cold"] | (p["v"] <= budget)
-
     def _reconstruct_primitive(self, U: np.ndarray, axis: int, first: np.ndarray) -> tuple:
         p = self.primitives(U)
         rho, u = p["rho"], p["u"]
@@ -497,13 +491,14 @@ def _neighbourhood(a: np.ndarray, axis: int, reduce) -> np.ndarray:
 
 def _reconstruct(U: np.ndarray, closure: Closure, axis: int,
                  first: np.ndarray | None = None) -> tuple:
-    """Limited linear faces of the conserved moments.
+    """Limited linear faces: the closure's hybrid reconstruction, or conserved Zhang-Shu faces.
 
-    The slope is scaled by powers of 1/2 until both faces are strictly
-    realizable and their node velocities lie within the range spanned by the
-    neighbouring cells' nodes plus half that span (a relaxed kinetic maximum
-    principle), so a light extrapolated face cannot carry spuriously fast nodes.  Scaling toward the
-    cell keeps the cell average equal to the mean of its faces.
+    Conserved faces scale the slope by powers of 1/2 until both faces are
+    strictly realizable and their node velocities lie within the range spanned
+    by the neighbouring cells' nodes plus half that span (a relaxed kinetic
+    maximum principle), so a light extrapolated face cannot carry spuriously
+    fast nodes.  Scaling toward the cell keeps the cell average equal to the
+    mean of its faces.
     """
     if first is None:
         first = np.zeros(U.shape[1:], dtype=bool)
