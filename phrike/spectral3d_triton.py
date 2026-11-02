@@ -743,3 +743,103 @@ def fluxes(kind, U, gamma, rho_min=0.0, p_min=0.0, count=False, block=1024, num_
     kernel[(triton.cdiv(n, block),)](U, F, cnt, n, params,
                                      COUNT=count, BLOCK=block, num_warps=num_warps)
     return (F, cnt) if count else F
+
+
+# --- 1D Euler (3 components), spectra viewed as (C, 1, 1, Xh) -----------------
+#
+# Flux spectra order: [m u + p, (E + p) u].
+
+
+@triton.jit
+def _euler1d_stage_kernel(
+    F_ptr, sFc, sFz, sFy,
+    Sin_ptr, Sout_ptr, H_ptr, U0_ptr, sSc, sSz, sSy,
+    A_ptr, sAc,
+    kx_ptr, ky_ptr, kz_ptr, mx_ptr, my_ptr, mz_ptr, fx_ptr, fy_ptr, fz_ptr,
+    w_ptr, ia, inx,
+    total, Kx, Kyr, Kzr, cy, cz, Ny, Nz,
+    MODE: tl.constexpr, FIRST: tl.constexpr, FINAL: tl.constexpr, ACC_FULL: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """1D Euler RK stage (MODE 0) or compact spectral RHS into A (MODE 1)."""
+    offs, mask, ix, iy, iz = _mode_index(BLOCK, total, Kx, Kyr, Kzr, cy, cz, Ny, Nz)
+    kx, ky, kz, m = _waves(kx_ptr, ky_ptr, kz_ptr, mx_ptr, my_ptr, mz_ptr, ix, iy, iz, mask)
+    inv_n = tl.load(w_ptr)
+    wa = tl.load(w_ptr + ia)
+    wn = tl.load(w_ptr + inx)
+    mf = m * inv_n
+    if FINAL:
+        mfin = _factor(fx_ptr, fy_ptr, fz_ptr, ix, iy, iz, mask)
+    else:
+        mfin = m
+    offF = iz * sFz + iy * sFy + 2 * ix
+    offS = iz * sSz + iy * sSy + 2 * ix
+    if ACC_FULL:
+        offA = offS
+    else:
+        offA = 2 * offs
+    m1r, m1i = _ld(Sin_ptr, offS + sSc, mask)
+    k0r, k0i = m * kx * m1i, -m * kx * m1r
+    f0r, f0i = _ld(F_ptr, offF, mask)
+    k1r, k1i = mf * kx * f0i, -mf * kx * f0r
+    f1r, f1i = _ld(F_ptr, offF + sFc, mask)
+    k2r, k2i = mf * kx * f1i, -mf * kx * f1r
+    if MODE == 1:
+        _st(A_ptr, offA, mask, k0r, k0i)
+        _st(A_ptr, offA + sAc, mask, k1r, k1i)
+        _st(A_ptr, offA + 2 * sAc, mask, k2r, k2i)
+    else:
+        _update(0, k0r, k0i, U0_ptr, offS, Sout_ptr, H_ptr, A_ptr, offA, sSc, sAc, mask, mfin, wa, wn, FIRST, FINAL)
+        _update(1, k1r, k1i, U0_ptr, offS, Sout_ptr, H_ptr, A_ptr, offA, sSc, sAc, mask, mfin, wa, wn, FIRST, FINAL)
+        _update(2, k2r, k2i, U0_ptr, offS, Sout_ptr, H_ptr, A_ptr, offA, sSc, sAc, mask, mfin, wa, wn, FIRST, FINAL)
+
+
+@triton.jit
+def _euler1d_flux_kernel(U_ptr, F_ptr, cnt_ptr, n, P_ptr,
+                         COUNT: tl.constexpr, BLOCK: tl.constexpr):
+    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    gamma = tl.load(P_ptr)
+    rho_min = tl.load(P_ptr + 1)
+    p_min = tl.load(P_ptr + 2)
+    rho = tl.load(U_ptr + offs, mask=mask, other=1.0)
+    m = tl.load(U_ptr + n + offs, mask=mask, other=0.0)
+    E = tl.load(U_ptr + 2 * n + offs, mask=mask, other=1.0)
+    u = m / rho
+    p = (gamma - 1.0) * (E - 0.5 * rho * u * u)
+    tl.store(F_ptr + offs, m * u + p, mask=mask)
+    tl.store(F_ptr + n + offs, (E + p) * u, mask=mask)
+    _count_store(cnt_ptr, rho, p, rho_min, p_min, mask, COUNT)
+
+
+_FLUX_KERNELS["euler1d"] = (_euler1d_flux_kernel, 2)
+
+
+def _launch_euler1d(F, Sin, Sout, U0, acc, w, ia, inx, waves, modes, mode, first, final, high,
+                    final_factors, block=256, num_warps=4):
+    Fr = torch.view_as_real(F)
+    Sinr, Soutr, U0r = (torch.view_as_real(x) for x in (Sin, Sout, U0))
+    Ar = torch.view_as_real(acc)
+    Hr = torch.view_as_real(high) if high is not None else Soutr
+    assert Sinr.stride() == Soutr.stride() == U0r.stride() == Hr.stride()
+    kx, ky, kz, mx, my, mz = waves
+    fx, fy, fz = final_factors if final_factors is not None else (mx, my, mz)
+    _euler1d_stage_kernel[(triton.cdiv(modes.total, block),)](
+        Fr, Fr.stride(0), Fr.stride(1), Fr.stride(2),
+        Sinr, Soutr, Hr, U0r, Soutr.stride(0), Soutr.stride(1), Soutr.stride(2),
+        Ar, Ar.stride(0),
+        kx, ky, kz, mx, my, mz, fx, fy, fz,
+        w, ia, inx,
+        modes.total, modes.Kx, modes.Kyr, modes.Kzr, modes.cy, modes.cz, modes.Ny, modes.Nz,
+        MODE=mode, FIRST=first, FINAL=final, ACC_FULL=acc.dim() > 2, BLOCK=block, num_warps=num_warps,
+    )
+
+
+def euler1d_stage(F, Sin, Sout, U0, acc, w, ia, inx, waves, modes: RetainedModes, first: bool,
+                  final: bool, high=None, final_factors=None) -> None:
+    _launch_euler1d(F, Sin, Sout, U0, acc, w, ia, inx, waves, modes, 0, first, final, high,
+                    final_factors)
+
+
+def euler1d_rhs(F, S, K, w, waves, modes: RetainedModes) -> None:
+    _launch_euler1d(F, S, S, S, K, w, 0, 0, waves, modes, 1, False, False, None, None)

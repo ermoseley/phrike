@@ -1,8 +1,8 @@
 GPU performance
 ===============
 
-This page records how the 3D Euler, 3D MHD and 2D Euler solvers were profiled
-and sped up on GPUs.
+This page records how the Euler and MHD solvers were profiled and sped up on
+GPUs. The work started with 3D and was then carried over to 2D and 1D.
 The benchmark is ``scripts/bench_hydro3d.py``: a Taylor-Green vortex with
 dealiasing on, spectral dissipation (``p = 8``, ``rate = 40``), and the step
 capped at CFL 0.2, run through the same loop body as ``SpectralSolver3D.run``.
@@ -255,6 +255,52 @@ chain per output and reached only about a third of DRAM bandwidth in fp32. In
 with dealiasing off, on odd grids, NumPy, Torch CPU and CUDA (fp64 and fp32).
 It also covers adaptive rk45 and rk78 runs, the embedded step and the clamp
 fallback.
+
+2D MHD and 1D
+-------------
+
+2.5D MHD (``Grid2D`` with ``MHDEquations2D``) and 1D MHD on periodic Fourier
+grids run through the 3D MHD kernels with single y and z modes. With zero
+wavenumber the z (and y) terms vanish. The Leray projection then leaves Bz
+alone in 2D and reduces to the constant-Bx projection in 1D, as the reference
+operators do. Only the speed bound is dimension specific.
+``configs/orszag_tang2d.yaml`` (RK4, order-8 dissipation) on the A100, in Mzups
+per accepted step:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Grid
+     - Precision
+     - Reference
+     - Fast
+   * - 1024 x 1024
+     - fp32
+     - 46
+     - 271 (5.9x)
+   * - 2048 x 2048
+     - fp32
+     - 53
+     - 323 (6.0x)
+   * - 4096 x 4096
+     - fp32
+     - 53
+     - 390 (7.4x)
+   * - 2048 x 2048
+     - fp64
+     - 26
+     - 179 (6.8x)
+
+1D problems are small and many use polynomial bases, which keep the reference
+path. On periodic Fourier grids ``Euler1DSpectral`` applies the same step
+(two flux transforms per stage). The gain there comes from about 236 kernel
+launches and 17 host synchronizations per RK4 step collapsing to a few dozen
+launches and two synchronizations. ``acoustic1d`` with RK4 takes 3.5 → 1.6 ms
+per step at N = 4096 and 4.1 → 1.8 ms at N = 262144. NumPy takes 1.8 ms and
+175 ms respectively.
+
+``tests/test_spectral_mhd2d.py`` and ``tests/test_spectral1d.py`` compare the
+fast and reference paths in the same way as the 3D tests.
 
 Remaining headroom
 ------------------

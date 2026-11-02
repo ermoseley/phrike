@@ -41,7 +41,7 @@ except Exception:  # pragma: no cover - torch may not be installed
     torch = None  # type: ignore
 
 from .grid import _build_exponential_filter_rate, _build_filter_mask, _spectral_dissipation_settings
-from .spectral3d import _RK_TABLES, _compile_default, _to_numpy
+from .spectral3d import _RK_TABLES, _compile_default, _ref_tensor, _to_numpy
 
 
 # --- pointwise kernels (compiled with torch.compile on CUDA/MPS) ---------------
@@ -110,7 +110,14 @@ class MHD3DSpectral:
 
     Spectral arrays use the ``rfftn`` layout divided by Nx*Ny*Nz
     (``norm="forward"``); ``self._uhat`` holds the spectrum of the cached state.
+    ``MHD2DSpectral`` runs 2.5D MHD through the same kernels with a single z mode.
     """
+
+    @staticmethod
+    def _grid_shape(grid):
+        return (grid.Nz, grid.Ny, grid.Nx)
+
+    _speed_fn = staticmethod(lambda U, gamma: _mhd_finite_and_speed(U, gamma))
 
     def __init__(self, grid, equations, rho_min: float, p_min: float, eta: float, nu: float,
                  compile: Optional[bool] = None):
@@ -118,17 +125,21 @@ class MHD3DSpectral:
         self.gamma = float(equations.gamma)
         self.rho_min, self.p_min = float(rho_min), float(p_min)
         self.eta, self.nu = float(eta), float(nu)
-        self.shape = (grid.Nz, grid.Ny, grid.Nx)
-        Nz, Ny, Nx = self.shape
+        self.shape = self._grid_shape(grid)
+        self._dims = tuple(range(-len(self.shape), 0))
+        self._kshape = (1,) * (3 - len(self.shape)) + self.shape
+        Nz, Ny, Nx = self._kshape
         Xh = Nx // 2 + 1
-        dev, rdt = grid.kx.device, grid.kx.dtype
+        ref = _ref_tensor(grid)
+        dev, rdt = ref.device, ref.dtype
         self.device, self.rdtype = str(dev), rdt
         self.cdtype = torch.complex64 if rdt == torch.float32 else torch.complex128
         to_r = lambda a: torch.as_tensor(np.ascontiguousarray(a), dtype=rdt, device=dev)
 
+        nd = len(self.shape)
         kx = 2.0 * np.pi * np.fft.rfftfreq(Nx, d=grid.dx)
-        ky = 2.0 * np.pi * np.fft.fftfreq(Ny, d=grid.dy)
-        kz = 2.0 * np.pi * np.fft.fftfreq(Nz, d=grid.dz)
+        ky = 2.0 * np.pi * np.fft.fftfreq(Ny, d=grid.dy) if nd >= 2 else np.zeros(1)
+        kz = 2.0 * np.pi * np.fft.fftfreq(Nz, d=grid.dz) if nd == 3 else np.zeros(1)
         # With the 2/3 rule (required here) Nyquist modes are never retained.
         mz, my, mx = (_build_filter_mask(n, True) for n in (Nz, Ny, Nx))
         mx = mx[:Xh]
@@ -139,14 +150,21 @@ class MHD3DSpectral:
             lx = lx[:Xh]
         else:
             lz, ly, lx = np.zeros(Nz), np.zeros(Ny), np.zeros(Xh)
-        mask = np.asarray(_to_numpy(grid.dealias_mask))[:, :, :Xh]
-        lam = np.asarray(_to_numpy(grid.filter_rate))[:, :, :Xh]
+        if nd <= 2:  # no z axis
+            mz, lz = np.ones(1), np.zeros(1)
+        if nd == 1:  # no y axis
+            my, ly = np.ones(1), np.zeros(1)
+        mask = np.asarray(_to_numpy(grid.dealias_mask))[..., :Xh]
+        lam = np.asarray(_to_numpy(grid.filter_rate))[..., :Xh]
         rtol = 1e-5 if rdt == torch.float32 else 1e-12
-        if not (np.allclose(mz[:, None, None] * my[None, :, None] * mx[None, None, :], mask, rtol=rtol, atol=0.0)
-                and np.allclose(lz[:, None, None] + ly[None, :, None] + lx[None, None, :], lam,
-                                rtol=rtol, atol=rtol * max(float(np.max(np.abs(lam))), 1.0))):
-            raise ValueError("MHD fast path needs the separable dealias mask and dissipation of Grid3D")
-        self.kx3, self.ky3, self.kz3 = to_r(kx[None, None, :]), to_r(ky[None, :, None]), to_r(kz[:, None, None])
+        prod = (mz[:, None, None] * my[None, :, None] * mx[None, None, :]).reshape(mask.shape)
+        total = (lz[:, None, None] + ly[None, :, None] + lx[None, None, :]).reshape(lam.shape)
+        if not (np.allclose(prod, mask, rtol=rtol, atol=0.0)
+                and np.allclose(total, lam, rtol=rtol, atol=rtol * max(float(np.max(np.abs(lam))), 1.0))):
+            raise ValueError("MHD fast path needs the separable dealias mask and dissipation of the grid")
+        bshape = {3: ((1, 1, Xh), (1, Ny, 1), (Nz, 1, 1)), 2: ((1, Xh), (Ny, 1), (1, 1)),
+                  1: ((Xh,), (1,), (1,))}[nd]
+        self.kx3, self.ky3, self.kz3 = (to_r(a.reshape(sh)) for a, sh in zip((kx, ky, kz), bshape))
         self.M3 = to_r(mask)
         self._mask1d = tuple(to_r(a) for a in (mx, my, mz))
         self._lam1d = tuple(to_r(a) for a in (lx, ly, lz))
@@ -168,7 +186,7 @@ class MHD3DSpectral:
                 self._c_fluxes_count = torch.compile(_mhd_fluxes_and_count, **opts)
                 self._c_count = torch.compile(_mhd_count_below, **opts)
                 self._c_checks = torch.compile(_mhd_embedded_checks, **opts)
-                self._c_speed = torch.compile(_mhd_finite_and_speed, **opts)
+                self._c_speed = torch.compile(self._speed_fn, **opts)
                 self._compiled = True
             except Exception as exc:  # pragma: no cover - depends on toolchain
                 warnings.warn(f"torch.compile unavailable for 3D MHD kernels ({exc}); using eager.")
@@ -177,7 +195,7 @@ class MHD3DSpectral:
                     from . import spectral3d_triton as st
 
                     self._triton = st
-                    self._modes = st.RetainedModes(self.shape, True)
+                    self._modes = st.RetainedModes(self._kshape, True)
                 except Exception as exc:  # pragma: no cover - depends on toolchain
                     warnings.warn(f"Triton unavailable for 3D MHD stages ({exc}); using torch kernels.")
 
@@ -219,15 +237,23 @@ class MHD3DSpectral:
         return self._call("_c_count", _mhd_count_below, U, self.gamma, self.rho_min, self.p_min)
 
     def finite_and_speed(self, U) -> Tuple[bool, float]:
-        finite, speed = self._call("_c_speed", _mhd_finite_and_speed, U, self.gamma)
+        finite, speed = self._call("_c_speed", self._speed_fn, U, self.gamma)
         finite, speed = torch.stack([finite.to(speed.dtype), speed]).tolist()
         return bool(finite), float(speed)
 
     def _irfftn(self, F):
-        return torch.fft.irfftn(F, s=self.shape, dim=(-3, -2, -1), norm="forward")
+        return torch.fft.irfftn(F, s=self.shape, dim=self._dims, norm="forward")
 
     def _rfftn_fwd(self, U):
-        return torch.fft.rfftn(U, dim=(-3, -2, -1), norm="forward")
+        return torch.fft.rfftn(U, dim=self._dims, norm="forward")
+
+    def _rfftn(self, F):
+        return torch.fft.rfftn(F, dim=self._dims)
+
+    def _k(self, X):
+        """Spectral array in the kernels' (C, Nz, Ny, Xh) layout (a view)."""
+        nd = len(self.shape)
+        return X if nd == 3 else (X[:, None] if nd == 2 else X[:, None, None])
 
     def _factors(self, h: float, project: bool):
         if self.dissipation:
@@ -240,13 +266,16 @@ class MHD3DSpectral:
 
     def _full(self, factors):
         fx, fy, fz = factors
-        return fz[:, None, None] * fy[None, :, None] * fx[None, None, :]
+        if len(self.shape) == 3:
+            return fz[:, None, None] * fy[None, :, None] * fx[None, None, :]
+        if len(self.shape) == 2:
+            return fy[:, None] * fx[None, :]
+        return fx * fy[0] * fz[0]
 
     def _buffers(self):
         if self._uhat is None:
-            Nz, Ny, Nx = self.shape
-            spec = (8, Nz, Ny, Nx // 2 + 1)
-            self._uhat = torch.zeros(spec, dtype=self.cdtype, device=self.grid.kx.device)
+            spec = (8,) + self.shape[:-1] + (self.shape[-1] // 2 + 1,)
+            self._uhat = torch.zeros(spec, dtype=self.cdtype, device=self.device)
             self._shat = torch.zeros_like(self._uhat)
         return self._uhat, self._shat
 
@@ -281,7 +310,7 @@ class MHD3DSpectral:
         factors = self._factors(h, project=False)
         if self._triton is not None:  # only the retained modes are nonzero
             w = torch.tensor([self._inv_n], dtype=self.rdtype, device=uhat.device)
-            self._triton.combine(None, 0, uhat, uhat, w, 0, factors, self._modes, masked=True)
+            self._triton.combine(None, 0, self._k(uhat), self._k(uhat), w, 0, factors, self._modes, masked=True)
         else:
             uhat.mul_(self._full(factors))
         Un = self._irfftn(uhat)
@@ -362,7 +391,7 @@ class MHD3DSpectral:
                 violations += c
             else:
                 F = self.fluxes(Us)
-            k = self._rhs_hat(torch.fft.rfftn(F, dim=(-3, -2, -1)) * self._inv_n, Sh)
+            k = self._rhs_hat(self._rfftn(F) * self._inv_n, Sh)
             if wn is None:
                 high = U0h + acc + (wa * dt) * k
                 return self._finish(high, h, violations)
@@ -409,12 +438,13 @@ class MHD3DSpectral:
                 violations += c
             else:
                 F = self.fluxes(Us)
-            Fh = torch.fft.rfftn(F, dim=(-3, -2, -1))
+            Fh = self._rfftn(F)
             del F
             final = i == last
-            st.mhd_stage(Fh, Sin, uhat if final else shat, uhat, acc, w, 3 + 2 * i, 4 + 2 * i,
+            k = self._k
+            st.mhd_stage(k(Fh), k(Sin), k(uhat if final else shat), k(uhat), acc, w, 3 + 2 * i, 4 + 2 * i,
                          self._waves, modes, first=(i == 0), final=final,
-                         high=shat, final_factors=fin)
+                         high=k(shat), final_factors=fin)
             del Fh
             Us = None
             if final:
@@ -462,22 +492,23 @@ class MHD3DSpectral:
         Us, S = U, uhat
         for i in range(s):
             if i > 0:
-                st.combine(K, i, uhat, shat, w, offsets[i], None, modes, masked=False)
+                st.combine(K, i, self._k(uhat), self._k(shat), w, offsets[i], None, modes, masked=False)
                 S = shat
                 Us = self._irfftn(shat)
-            Fh = torch.fft.rfftn(self.fluxes(Us), dim=(-3, -2, -1))
-            st.mhd_stage(Fh, S, S, S, K[i], w, 0, 0, self._waves, modes, first=False,
+            Fh = self._rfftn(self.fluxes(Us))
+            Sk = self._k(S)
+            st.mhd_stage(self._k(Fh), Sk, Sk, Sk, K[i], w, 0, 0, self._waves, modes, first=False,
                          final=False, rhs_only=True)
             del Fh
             Us = None
-        st.combine(K, s, None, shat, w, off_err, None, modes, masked=False)
+        st.combine(K, s, None, self._k(shat), w, off_err, None, modes, masked=False)
         E = self._irfftn(shat)
-        st.combine(K, s, uhat, shat, w, off_new, None, modes, masked=False)
+        st.combine(K, s, self._k(uhat), self._k(shat), w, off_new, None, modes, masked=False)
         U_high = self._irfftn(shat)
         c, err = self._call("_c_checks", _mhd_embedded_checks, U_high, E,
                             self.gamma, self.rho_min, self.p_min)
         del E, U_high
-        st.leray_scale(shat, self._waves, self._factors(h, project=True), modes)
+        st.leray_scale(self._k(shat), self._waves, self._factors(h, project=True), modes)
         Un = self._irfftn(shat)
         c = c + self.count_below(Un)
         nviol, error = torch.stack([c.to(err.dtype), err]).tolist()
@@ -496,7 +527,7 @@ class MHD3DSpectral:
             if i > 0:
                 Sh = U0h + sum(dt * float(a[i][j]) * k[j] for j in range(i) if a[i][j] != 0.0)
                 Us = self._irfftn(Sh)
-            k.append(self._rhs_hat(torch.fft.rfftn(self.fluxes(Us), dim=(-3, -2, -1)) * self._inv_n, Sh))
+            k.append(self._rhs_hat(self._rfftn(self.fluxes(Us)) * self._inv_n, Sh))
         Eh = sum(dt * float(b_high[i] - b_low[i]) * k[i] for i in range(s) if b_high[i] != b_low[i])
         high = U0h + sum(dt * float(b_high[i]) * k[i] for i in range(s) if b_high[i] != 0.0)
         c, err = _mhd_embedded_checks(self._irfftn(high), self._irfftn(Eh),
@@ -518,3 +549,52 @@ class MHD3DSpectral:
         self._uhat, self._shat = self._shat, self._uhat
         self._cache = (Un, Un._version)
         self._pending = None
+
+
+def _mhd2d_finite_and_speed(U, gamma):
+    """(all finite, MHDEquations2D.max_wave_speed) in one pass."""
+    rho, ux, uy, uz, _, Bx, By, Bz, p, _ = _mhd_primitive(U, gamma)
+    a2 = gamma * p / rho
+    b2 = (Bx * Bx + By * By + Bz * Bz) / rho
+    fast = torch.sqrt(torch.clamp(a2 + b2, min=0.0))
+    comp = torch.maximum(torch.abs(ux), torch.abs(uy)) + fast
+    return torch.isfinite(U).all(), torch.max(comp)
+
+
+class MHD2DSpectral(MHD3DSpectral):
+    """2.5D MHD (``Grid2D`` + ``MHDEquations2D``): 3D MHD with a single z mode.
+
+    With kz = 0 every z derivative vanishes, and the Leray projection leaves Bz
+    alone, as ``Grid2D.project_solenoidal`` does.
+    """
+
+    @staticmethod
+    def _grid_shape(grid):
+        return (grid.Ny, grid.Nx)
+
+    _speed_fn = staticmethod(lambda U, gamma: _mhd2d_finite_and_speed(U, gamma))
+
+
+def _mhd1d_finite_and_speed(U, gamma):
+    """(all finite, MHDEquations1D.max_wave_speed: |ux| + exact fast speed in x)."""
+    rho, ux, _, _, _, Bx, By, Bz, p, _ = _mhd_primitive(U, gamma)
+    a2 = gamma * p / rho
+    b2 = (Bx * Bx + By * By + Bz * Bz) / rho
+    cax2 = (Bx * Bx) / rho
+    disc = torch.clamp((a2 + b2) * (a2 + b2) - 4.0 * a2 * cax2, min=0.0)
+    cf = torch.sqrt(0.5 * (a2 + b2 + torch.sqrt(disc)))
+    return torch.isfinite(U).all(), torch.max(torch.abs(ux) + cf)
+
+
+class MHD1DSpectral(MHD3DSpectral):
+    """1D MHD on a periodic Fourier ``Grid1D``: 3D MHD with single y and z modes.
+
+    The Leray projection then removes every k != 0 mode of Bx, which is the 1D
+    projection (Bx constant); By and Bz are untouched.
+    """
+
+    @staticmethod
+    def _grid_shape(grid):
+        return (grid.N,)
+
+    _speed_fn = staticmethod(lambda U, gamma: _mhd1d_finite_and_speed(U, gamma))

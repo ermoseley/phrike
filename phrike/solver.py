@@ -25,8 +25,8 @@ from .equations import (
     MHDEquations3D,
 )
 from .adaptive import AdaptiveTimeStepper, create_adaptive_stepper
-from .spectral3d import Euler2DSpectral, Euler3DSpectral
-from .spectral_mhd3d import MHD3DSpectral
+from .spectral3d import Euler1DSpectral, Euler2DSpectral, Euler3DSpectral
+from .spectral_mhd3d import MHD1DSpectral, MHD2DSpectral, MHD3DSpectral
 from .artificial_viscosity import SpectralArtificialViscosity, ArtificialViscosityConfig
 
 
@@ -813,7 +813,7 @@ def _spacing_wavenumber_bound(grid) -> float:
     return float(sum(terms))
 
 
-class SpectralSolver1D:
+class SpectralSolver1D(_SpectralFastPathMixin):
     grid: Grid1D
     equations: EulerEquations1D
     scheme: str = "rk4"  # "rk2", "rk4", "rk23", "rk45", "rk78"
@@ -833,8 +833,15 @@ class SpectralSolver1D:
     gravity_config: Optional[Dict] = None
     def __init__(self, grid: Grid1D, equations: EulerEquations1D, U0: Optional[Array] = None, 
                  scheme: str = "rk4", cfl: float = 0.4, adaptive_config: Optional[Dict] = None,
-                 artificial_viscosity_config: Optional[Dict] = None, gravity_config: Optional[Dict] = None):
+                 artificial_viscosity_config: Optional[Dict] = None, gravity_config: Optional[Dict] = None,
+                 spectral_fast_path: Optional[bool] = None):
         """Initialize the 1D spectral solver.
+
+        ``spectral_fast_path`` steps periodic Fourier runs on Torch grids with
+        ``Euler1DSpectral`` (the same step to round-off with far fewer kernel
+        launches and host synchronizations). ``None`` enables it on Torch
+        grids for plain ``EulerEquations1D`` without artificial viscosity or
+        gravity.
         
         Args:
             grid: 1D grid
@@ -865,9 +872,24 @@ class SpectralSolver1D:
         # Setup gravity if configured
         self.gravity_config = gravity_config
 
+        if spectral_fast_path is None:
+            spectral_fast_path = bool(getattr(grid, "_use_torch", False))
+        self.spectral = (
+            Euler1DSpectral(grid, equations, self.rho_floor, self.p_floor)
+            if spectral_fast_path and getattr(grid, "_basis_name", "") == "fourier"
+            and type(equations) is EulerEquations1D
+            else None
+        )
+        self._speed_cache = None
+
+    def _fast(self) -> Optional[Euler1DSpectral]:
+        gravity = self.gravity_config and self.gravity_config.get("enabled", False)
+        if gravity or self.artificial_viscosity is not None:
+            return None
+        return self.spectral
 
     def _stability_limit(self, U: Array) -> float:
-        speed = _checked_wave_speed(self, U)
+        speed = self._wave_speed(U)
         # CFL for spectral (heuristic): dt <= cfl * dx / max_speed.
         # A zero wave speed is unbounded here. Artificial viscosity can still
         # supply a finite limit. A uniform state at rest with p > 0 is not a
@@ -899,6 +921,13 @@ class SpectralSolver1D:
     
     def _fixed_step(self, U: Array, dt: float) -> Array:
         """Perform one fixed time step."""
+        fast = self._fast()
+        if fast is not None:
+            U_split = fast.dissipate(U, 0.5 * dt)
+            Un = fast.rk_step(U_split, dt, self.scheme.lower(), 0.5 * dt)
+            if Un is not None:
+                return Un
+            # A positivity clamp would act: repeat the step on the reference path.
         U_split = self.grid.apply_spectral_dissipation(U, 0.5 * dt)
         if self.scheme.lower() == "rk2":
             Un = _rk2_step(self.grid, self.equations, U_split, dt, self.artificial_viscosity, self.gravity_config, self.positivity)
@@ -908,81 +937,65 @@ class SpectralSolver1D:
             self.grid, Un, self.equations, dt=0.5 * dt
         )
     
-    def _adaptive_step(self, U: Array, dt: float) -> Array:
-        """Perform one adaptive time step."""
+    def _adaptive_attempt(self, U: Array, dt: float):
+        """One embedded-RK attempt; returns (result, accepted state or None)."""
         def rhs_func(U_current: Array) -> Array:
-            """RHS function for adaptive stepper."""
             return _compute_rhs(self.grid, self.equations, U_current, self.artificial_viscosity, self.gravity_config)
-        
-        U_split = self.grid.apply_spectral_dissipation(U, 0.5 * dt)
 
-        # Compute solution scale for relative error
+        fast = self._fast()
+        U_split = (
+            fast.dissipate(U, 0.5 * dt) if fast is not None
+            else self.grid.apply_spectral_dissipation(U, 0.5 * dt)
+        )
         if _TORCH_AVAILABLE and isinstance(U_split, torch.Tensor):
             solution_scale = float(torch.max(torch.abs(U_split)).item())
         else:
             solution_scale = float(np.max(np.abs(U_split)))
-        
-        # Perform adaptive step. Stages after the first are positivity limited.
+
+        if fast is not None and fast.embedded_ready(U_split):
+            result = self._embedded_attempt(fast, U_split, dt, solution_scale)
+            if result is not None:
+                if not result.accepted:
+                    return result, None
+                fast.commit(result.U_new)
+                return result, result.U_new
+
+        # Stages after the first are positivity limited.
         result = _call_adaptive_step(
             self, self.adaptive_stepper, rhs_func, U_split, dt, solution_scale,
             limit_state=lambda state: _limit_euler_stage(self, state),
         )
-        
-        # Complete the split dissipation and projection for an accepted solution.
-        if result.accepted:
-            Un = _apply_accepted_state_stabilization(
-                self.grid, result.U_new, self.equations, dt=0.5 * dt
-            )
-        else:
-            # Return original solution if step was rejected
-            Un = U
-            
-        return Un
-    
+        if not result.accepted:
+            return result, None
+        if fast is not None:
+            return result, fast.dissipate(result.U_new, 0.5 * dt, project=True)
+        return result, _apply_accepted_state_stabilization(
+            self.grid, result.U_new, self.equations, dt=0.5 * dt
+        )
+
+    def _adaptive_step(self, U: Array, dt: float) -> Array:
+        """Perform one adaptive time step."""
+        result, Un = self._adaptive_attempt(U, dt)
+        return Un if result.accepted else U
+
     def _adaptive_run_step(self, dt: float, step_count: int, 
                           on_step: Optional[Callable[[int, float, Array], None]]) -> float:
         """Perform one step in adaptive run loop."""
-        def rhs_func(U_current: Array) -> Array:
-            return _compute_rhs(self.grid, self.equations, U_current, self.artificial_viscosity, self.gravity_config)
-        
-        U_split = self.grid.apply_spectral_dissipation(self.U, 0.5 * dt)
-
-        # Compute solution scale for relative error
-        if _TORCH_AVAILABLE and isinstance(U_split, torch.Tensor):
-            solution_scale = float(torch.max(torch.abs(U_split)).item())
-        else:
-            solution_scale = float(np.max(np.abs(U_split)))
-        
-        # Perform adaptive step. Stages after the first are positivity limited.
-        result = _call_adaptive_step(
-            self, self.adaptive_stepper, rhs_func, U_split, dt, solution_scale,
-            limit_state=lambda state: _limit_euler_stage(self, state),
-        )
-        
+        result, Un = self._adaptive_attempt(self.U, dt)
         if result.accepted:
-            # Step accepted - update solution and time
-            self.U = _apply_accepted_state_stabilization(
-                self.grid, result.U_new, self.equations, dt=0.5 * dt
-            )
+            self.U = Un
             self.t += dt
-            _note_accepted(self)
-            
-            # Call monitoring callback
+            self._note_accepted_state()
             if on_step is not None:
                 on_step(step_count, dt, self.U)
-            
-            # Return recommended next step size
-            return result.dt_next
-        else:
-            # Step rejected - return recommended smaller step size
-            return result.dt_next
+        return result.dt_next
     
     def _fixed_run_step(self, dt: float, step_count: int,
                        on_step: Optional[Callable[[int, float, Array], None]]) -> float:
         """Perform one step in fixed run loop."""
         self.U = self.step(self.U, dt)
         self.t += dt
-        _note_accepted(self)
+        self._note_accepted_state()
         
         # Call monitoring callback
         if on_step is not None:
@@ -1554,10 +1567,10 @@ class SpectralSolverMHD:
                  spectral_fast_path: Optional[bool] = None):
         """``spectral_fast_path``: step 3D runs on Torch grids with
         ``spectral_mhd3d`` (the same step to round-off with far less memory
-        traffic). ``None`` enables it for 3D Torch grids; it applies to plain
-        ``MHDEquations3D`` with dealiasing, projection cleaning and no Hall,
-        ambipolar or artificial-viscosity terms, and other runs keep the
-        reference path.
+        traffic). ``None`` enables it for periodic Fourier Torch grids in 1D,
+        2D and 3D; it applies to plain ``MHDEquations{1,2,3}D`` with
+        dealiasing, projection cleaning and no Hall, ambipolar, shearing-sheet
+        or artificial-viscosity terms, and other runs keep the reference path.
         """
         self.grid = grid
         self.equations = equations
@@ -1651,9 +1664,23 @@ class SpectralSolverMHD:
             spectral_fast_path = bool(getattr(grid, "_use_torch", False))
         self.spectral = None
         self._speed_cache = None  # (U, U._version, max wave speed)
-        if (spectral_fast_path and self.dim == 3 and getattr(grid, "_use_torch", False)
-                and type(equations) is MHDEquations3D and bool(getattr(grid, "dealias", False))):
+        eligible = (spectral_fast_path and getattr(grid, "_use_torch", False)
+                    and bool(getattr(grid, "dealias", False)))
+        periodic_2d = (
+            getattr(grid, "basis_x", "fourier") == "fourier"
+            and getattr(grid, "basis_y", "fourier") == "fourier"
+            and getattr(grid, "_legendre_basis", None) is None
+            and not getattr(grid, "_mixed_open_y", False)
+        )
+        if eligible and self.dim == 3 and type(equations) is MHDEquations3D:
             self.spectral = MHD3DSpectral(grid, equations, self.rho_min, self.p_min,
+                                          self.resistivity, self.viscosity)
+        elif eligible and self.dim == 2 and periodic_2d and type(equations) is MHDEquations2D:
+            self.spectral = MHD2DSpectral(grid, equations, self.rho_min, self.p_min,
+                                          self.resistivity, self.viscosity)
+        elif (eligible and self.dim == 1 and getattr(grid, "_basis_name", "") == "fourier"
+              and type(equations) is MHDEquations1D):
+            self.spectral = MHD1DSpectral(grid, equations, self.rho_min, self.p_min,
                                           self.resistivity, self.viscosity)
 
     def _fast(self) -> Optional[MHD3DSpectral]:
