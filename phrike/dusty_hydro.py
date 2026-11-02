@@ -94,6 +94,12 @@ class DustyHydroSolver:
         self.grid, self.equations = grid, equations
         self.scheme, self.cfl = scheme.lower(), float(cfl)
         self.dust_config, self.sgs_config = dict(dust_config or {}), dict(sgs_config or {})
+        self.coupling_integrator = self.dust_config.get("coupling_integrator", "strang")
+        if self.coupling_integrator not in ("strang", "exponential"):
+            raise ValueError("dust.coupling_integrator must be 'strang' or 'exponential'")
+        if self.coupling_integrator == "exponential" and (
+                not self._is_mhd or self.dust_config.get("closure", "gaussian") != "gaussian"):
+            raise ValueError("exponential coupling requires ideal MHD and Gaussian dust")
         self.dust_enabled = bool(self.dust_config.get("enabled", True))
         self.sgs_enabled = bool(self.sgs_config.get("enabled", True))
         name = self.dust_config.get("closure", "gaussian")
@@ -119,6 +125,10 @@ class DustyHydroSolver:
         self.transport_stats = dict(substeps=0, first_order_cells=0, max_doublings=0,
                                     halvings=0, repaired_cells=0, roundoff_projections=0,
                                     sgs_substeps=0, diffusion_substeps=0)
+        if self.coupling_integrator == "exponential":
+            self.ledger["mechanical_work"] = 0.0
+            self.transport_stats.update(exponential_rejections=0, exponential_mood_cells=0,
+                exponential_fallback_substeps=0, exponential_clamp_failures=0)
 
     @property
     def U(self):
@@ -227,6 +237,12 @@ class DustyHydroSolver:
 
     def step(self, dt):
         """Advance one accepted step and update state, time and cumulative ledgers."""
+        if self.coupling_integrator == "exponential":
+            from .coupled_step import exponential_step
+            return exponential_step(self, dt)
+        return self._strang_step(dt)
+
+    def _strang_step(self, dt):
         if not np.isfinite(dt) or dt <= 0:
             raise ValueError("dt must be finite and positive")
         self._validate_state()
@@ -250,8 +266,9 @@ class DustyHydroSolver:
             divu = sum(getattr(self.grid, name)(velocity[d])
                        for d, name in enumerate(("dx1", "dy1", "dz1")[:self.ndim]))
             compressed = self.e_s*sgs.compression_factor(divu, dt)
-            change = compressed - self.e_s
-            self.e_s = compressed
+            # Compression may withdraw at most half the available gas heat.
+            change = np.minimum(compressed - self.e_s, 0.5*self._internal_energy(self.U_gas))
+            self.e_s += change
             self.U_gas[self.energy_index] -= change
             self.ledger["compression_to_sgs"] += self._integral(change)
             diffusion = self.sgs_config.get("diffusion", {})

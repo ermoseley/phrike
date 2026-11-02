@@ -3,6 +3,8 @@
 ``dust`` defaults: enabled=True, closure='gaussian', cfl=0.8,
 backreaction=True, stopping={model: constant, t_s: 1},
 charge_to_mass=0 (neutral; code units),
+coupling_integrator='strang' ('exponential' selects the Gaussian ideal-MHD
+averaged-flux step; its failed attempts use counted resolved Strang recovery),
 eddy_diffusion={enabled: False, c_kappa: 1}. Epstein stopping instead takes
 ``grain_rho_a`` (default 1). HyQMOM is supported only in one dimension.
 

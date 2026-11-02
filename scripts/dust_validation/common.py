@@ -18,7 +18,8 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE_FILES = [ROOT/'phrike'/name for name in ('dust_moments.py', 'dust_sources.py',
-                'dusty_hydro.py', 'dusty_mhd.py', 'sgs.py', 'solver.py', 'equations.py')]
+                'dusty_hydro.py', 'dusty_mhd.py', 'sgs.py', 'solver.py', 'equations.py',
+                'coupled_exponential.py', 'exponential_path.py', 'coupled_step.py')]
 
 
 def source_hashes():

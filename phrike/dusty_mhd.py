@@ -2,7 +2,8 @@
 
 Only kinetic energy removed by the spectral filter feeds SGS. Magnetic energy
 removed by that filter remains in the gas total energy as thermal energy.
-There is no magnetic SGS reservoir and no guiding-centre averaging.
+There is no magnetic SGS reservoir. The default Strang step resolves coherent
+gyration; the optional exponential step uses averaged raw states for fluxes.
 """
 
 from dataclasses import dataclass, field
@@ -52,6 +53,8 @@ class DustyMHDSolver(DustyHydroSolver):
     dimension. ``dust.charge_to_mass`` is signed, in code units (default 0).
     Charged dust defaults to ``sgs.d_model='mt25_magnetized'``. Gaussian
     moments allow arbitrary fields; HyQMOM requires a straight field along x.
+    ``dust.coupling_integrator='exponential'`` requires Gaussian ideal MHD.
+    Its acceptance/recovery counters must accompany any AP accuracy claim.
     """
 
     _is_mhd = True
@@ -66,6 +69,8 @@ class DustyMHDSolver(DustyHydroSolver):
             if option and option.get("enabled", name == "shearing_sheet"):
                 raise ValueError(f"DustyMHDSolver does not support {name}")
         super().__init__(grid, equations, **kwargs)
+        if self.coupling_integrator == "exponential" and self.gas_solver.resistivity != 0:
+            raise ValueError("exponential coupling requires ideal MHD (zero resistivity)")
         charge = float(self.dust_config.get("charge_to_mass", 0.0))
         if not np.isfinite(charge):
             raise ValueError("dust.charge_to_mass must be finite")

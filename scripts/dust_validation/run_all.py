@@ -11,11 +11,16 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 TESTS = ('mt25_gaussianisation', 'ou_box', 'drag_decay', 'dustywave', 'beams_free_streaming',
          'sgs_acoustic', 'turb_energy_ledger', 'particle_reference_2d', 'charged_gyration',
-         'dusty_alfven', 'dusty_orszag_tang', 'ap_integrator_study', 'long_turbulence')
+         'dusty_alfven', 'dusty_orszag_tang', 'ap_integrator_study', 'charged_ap', 'long_turbulence')
 # long_turbulence takes ~40 min: it is rerun only with --long; otherwise its last
 # full result is reported (its metrics record the source hashes it ran on).
 LONG = {'long_turbulence'}
 OUT = ROOT/'outputs'/'dust_validation'
+
+
+def _timeout(name):
+    # The four MHD comparison cases each have a separate three-minute budget.
+    return 7200 if name in LONG else 720 if name == 'dusty_orszag_tang' else 180
 
 
 def summarize(executions):
@@ -32,7 +37,7 @@ def summarize(executions):
         status = execution.get('status', 'existing results')
         checks = list(result.get('checks', [])) if result else []
         if status not in ('completed', 'existing results'):
-            checks.append(dict(name=f'process completed within {7200 if name in LONG else 180} seconds', value=execution.get('returncode', -1),
+            checks.append(dict(name=f'process completed within {_timeout(name)} seconds', value=execution.get('returncode', -1),
                                threshold=0, op='==', passed=False))
         if result is None:
             checks.append(dict(name='metrics.json produced',value=0,threshold=1,op='==',passed=False))
@@ -85,7 +90,7 @@ def main():
                                             cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
                                             start_new_session=True)
                     try:
-                        proc.wait(timeout=7200 if name in LONG else 180)
+                        proc.wait(timeout=_timeout(name))
                     except subprocess.TimeoutExpired:
                         # Magnetic campaigns have bounded worker pools. Terminate
                         # their entire group so a timeout leaves no orphan work.

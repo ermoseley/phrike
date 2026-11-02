@@ -210,6 +210,31 @@ def test_production_cap_and_compression_ledgers():
     np.testing.assert_allclose(final["E_total"], initial["E_total"], rtol=1e-14)
 
 
+def test_compression_cannot_exhaust_gas_heat():
+    s = coupled(1, dust_on=False)
+    s.sgs_config.update(pressure=False, production="none", decay=False, d_model="none",
+                        diffusion={"enabled": False})
+    rho = np.ones(s.shape)
+    s.U_gas = s.equations.conservative(
+        rho, -0.1*np.sin(2*np.pi*s.grid.x), 1e-7*rho)
+    initial_gas = s.U_gas.copy()
+    # With pressure and local sources disabled, a zero-reservoir run gives
+    # the available gas heat just before the compression exchange.
+    s.e_s[:] = 0
+    s.step(0.001)
+    available = s._internal_energy(s.U_gas).copy()
+    s.U_gas = initial_gas
+    s.e_s[:] = 1
+    initial = s.diagnostics()
+    s.step(0.001)
+    assert np.min(s._internal_energy(s.U_gas)) > 0
+    assert np.all(s._internal_energy(s.U_gas) >= 0.5*available - 1e-18)
+    final = s.diagnostics()
+    np.testing.assert_allclose(final["E_sgs"] - initial["E_sgs"],
+        final["compression_to_sgs"] - initial["compression_to_sgs"], atol=3e-16)
+    np.testing.assert_allclose(final["E_total"], initial["E_total"], atol=3e-16)
+
+
 def test_time_history_callbacks_and_output_boundaries():
     s = coupled(1)
     outputs, steps = [], []
