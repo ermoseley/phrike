@@ -194,10 +194,25 @@ class MHD3DSpectral:
                 self._compiled = False
         return fallback(*args)
 
+    def _triton_fluxes(self, U, count):
+        if self._triton is None or not U.is_cuda:
+            return None
+        try:
+            return self._triton.fluxes("mhd3d", U, self.gamma, self.rho_min, self.p_min, count=count)
+        except Exception as exc:  # pragma: no cover - depends on toolchain
+            self._disable_triton(exc)
+            return None
+
     def fluxes(self, U):
+        out = self._triton_fluxes(U, False)
+        if out is not None:
+            return out
         return self._call("_c_fluxes", mhd3d_fluxes, U, self.gamma)
 
     def fluxes_and_count(self, U):
+        out = self._triton_fluxes(U, True)
+        if out is not None:
+            return out
         return self._call("_c_fluxes_count", _mhd_fluxes_and_count, U, self.gamma, self.rho_min, self.p_min)
 
     def count_below(self, U):
