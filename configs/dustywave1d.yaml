@@ -1,0 +1,51 @@
+problem: dustywave1d
+grid:
+  N: 64
+  Lx: 1.0
+  precision: double
+  dealias: true
+physics:
+  gamma: 1.4
+integration:
+  t0: 0.0
+  t_end: 0.05
+  cfl: 0.3
+  scheme: rk4
+  output_interval: 0.01
+  spectral_dissipation:
+    enabled: false
+    p: 4
+    rate: 10.0
+    onset_fraction: 0.0
+dust:
+  enabled: true
+  closure: gaussian
+  stopping:
+    model: constant
+    t_s: 0.1
+  eddy_diffusion:
+    enabled: false
+    c_kappa: 0.3
+sgs:
+  enabled: false
+  pressure: true
+  production: filter_drain
+  decay: true
+  d_model: mt25
+  c_eps: 1.0
+  c_ell: 1.0
+  f_cap: 0.5
+  diffusion:
+    enabled: false
+initial_conditions:
+  rho0: 1.0
+  p0: 1.0
+  dust_to_gas: 1.0
+  sigma0: 0.0
+  e_s0: 0.0
+  A: 0.0001
+  k: 1
+runtime:
+  num_threads: 1
+io:
+  outdir: outputs/dustywave1d

@@ -1,0 +1,58 @@
+problem: dusty_turb3d
+grid:
+  Nx: 32
+  Ny: 32
+  Lx: 1.0
+  Ly: 1.0
+  Nz: 32
+  Lz: 1.0
+  precision: double
+  dealias: true
+physics:
+  gamma: 1.4
+integration:
+  t0: 0.0
+  t_end: 0.02
+  cfl: 0.3
+  scheme: rk4
+  output_interval: 0.01
+  spectral_dissipation:
+    enabled: true
+    p: 4
+    rate: 10.0
+    onset_fraction: 0.0
+dust:
+  enabled: true
+  closure: gaussian
+  stopping:
+    model: constant
+    t_s: 0.1
+  eddy_diffusion:
+    enabled: true
+    c_kappa: 0.3
+sgs:
+  enabled: true
+  pressure: true
+  production: filter_drain
+  decay: true
+  d_model: mt25
+  c_eps: 1.0
+  c_ell: 1.0
+  f_cap: 0.5
+  diffusion:
+    enabled: false
+initial_conditions:
+  rho0: 1.0
+  p0: 1.0
+  dust_to_gas: 0.01
+  sigma0: 0.01
+  e_s0: 0.0
+  vrms: 0.2
+  kmin: 1
+  kmax: 5
+  seed: 42
+  alpha: 0.0
+runtime:
+  num_threads: 1
+io:
+  outdir: outputs/dusty_turb3d

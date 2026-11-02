@@ -24,6 +24,12 @@ from .problem_list.mhd_turb3d import MHDTurb3DProblem
 from .problem_list.hall_mri1d import HallMRI1DProblem
 from .problem_list.adsi_shear import ADSIShearProblem
 
+from .problem_list.dusty_box import DustyBoxProblem
+from .problem_list.dustywave1d import DustyWave1DProblem
+from .problem_list.dust_beams1d import DustBeams1DProblem
+from .problem_list.sgs_acoustic1d import SGSAcoustic1DProblem
+from .problem_list.dusty_turb2d import DustyTurb2DProblem
+from .problem_list.dusty_turb3d import DustyTurb3DProblem
 
 # Register all problems
 ProblemRegistry.register("sod", SodProblem)
@@ -48,3 +54,10 @@ ProblemRegistry.register("alfven3d", Alfven3DProblem)
 ProblemRegistry.register("mhd_turb3d", MHDTurb3DProblem)
 ProblemRegistry.register("hall_mri1d", HallMRI1DProblem)
 ProblemRegistry.register("adsi_shear", ADSIShearProblem)
+
+ProblemRegistry.register("dusty_box", DustyBoxProblem)
+ProblemRegistry.register("dustywave1d", DustyWave1DProblem)
+ProblemRegistry.register("dust_beams1d", DustBeams1DProblem)
+ProblemRegistry.register("sgs_acoustic1d", SGSAcoustic1DProblem)
+ProblemRegistry.register("dusty_turb2d", DustyTurb2DProblem)
+ProblemRegistry.register("dusty_turb3d", DustyTurb3DProblem)

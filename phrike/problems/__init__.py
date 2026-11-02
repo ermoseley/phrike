@@ -1,6 +1,7 @@
 """Problem registry and base classes for PHRIKE."""
 
 from .base import BaseProblem
+from .dusty_base import DustyProblemBase
 from .registry import ProblemRegistry
 
 # Import problem classes from problem_list
@@ -19,7 +20,21 @@ from .problem_list.orszag_tang3d import OrszagTang3DProblem
 from .problem_list.hall_mri1d import HallMRI1DProblem
 from .problem_list.adsi_shear import ADSIShearProblem
 
+from .problem_list.dusty_box import DustyBoxProblem
+from .problem_list.dustywave1d import DustyWave1DProblem
+from .problem_list.dust_beams1d import DustBeams1DProblem
+from .problem_list.sgs_acoustic1d import SGSAcoustic1DProblem
+from .problem_list.dusty_turb2d import DustyTurb2DProblem
+from .problem_list.dusty_turb3d import DustyTurb3DProblem
+
 __all__ = [
+    "DustyProblemBase",
+    "DustyBoxProblem",
+    "DustyWave1DProblem",
+    "DustBeams1DProblem",
+    "SGSAcoustic1DProblem",
+    "DustyTurb2DProblem",
+    "DustyTurb3DProblem",
     "BaseProblem", 
     "ProblemRegistry",
     "SodProblem",

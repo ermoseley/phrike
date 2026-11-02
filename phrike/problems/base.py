@@ -38,6 +38,8 @@ _HARDWARE_CODECS = {
 # consumes these sections. Unknown keys inside these sections warn.
 # ``initial_conditions`` is problem-specific and is not checked here.
 _CONFIG_KEYS = {
+    "dust": {"enabled", "closure", "cfl", "backreaction", "stopping", "eddy_diffusion"},
+    "sgs": {"enabled", "pressure", "production", "decay", "d_model", "c_eps", "c_ell", "f_cap", "diffusion"},
     "grid": {
         "N",
         "Nx",
@@ -155,6 +157,9 @@ _CONFIG_KEYS = {
     },
 }
 _NESTED_CONFIG_KEYS = {
+    ("dust", "stopping"): {"model", "t_s", "grain_rho_a"},
+    ("dust", "eddy_diffusion"): {"enabled", "c_kappa"},
+    ("sgs", "diffusion"): {"enabled", "kappa", "c_kappa"},
     ("integration", "spectral_dissipation"): {
         "enabled",
         "p",
