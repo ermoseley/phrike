@@ -1,0 +1,57 @@
+problem: dusty_orszag_tang2d
+grid:
+  Nx: 128
+  Ny: 128
+  Lx: 1.0
+  Ly: 1.0
+  precision: double
+  dealias: true
+physics:
+  gamma: 1.6666666666666667
+  mhd:
+    resistivity: 0.0
+    viscosity: 0.0
+    divergence_clean: projection
+    project_each_substage: true
+integration:
+  t0: 0.0
+  t_end: 0.5
+  cfl: 0.25
+  scheme: rk4
+  output_interval: 0.1
+  spectral_dissipation:
+    enabled: true
+    p: 2
+    rate: 500.0
+    onset_fraction: 0.0
+dust:
+  enabled: true
+  closure: gaussian
+  charge_to_mass: 10.0
+  backreaction: true
+  stopping:
+    model: constant
+    t_s: 0.1
+  eddy_diffusion:
+    enabled: true
+    c_kappa: 1.0
+sgs:
+  enabled: true
+  pressure: true
+  production: filter_drain
+  decay: true
+  d_model: mt25_magnetized
+  c_eps: 1.0
+  c_ell: 1.0
+  f_cap: 0.5
+  diffusion:
+    enabled: true
+    c_kappa: 1.0
+initial_conditions:
+  dust_to_gas: 0.01
+  sigma0: 0.05
+  e_s0: 0.01
+runtime:
+  num_threads: 1
+io:
+  outdir: outputs/dusty_orszag_tang2d

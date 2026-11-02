@@ -8,8 +8,12 @@ from .dust_moments import _divide, _grid, _minmod, diffuse
 
 
 def sgs_coefficients(e_s: np.ndarray, rho_g: np.ndarray, nu: np.ndarray,
-                     Delta: float, model: str = "mt25") -> dict:
-    """Evaluate the frozen, zero-magnetisation SGS forcing coefficients."""
+                     Delta: float, model: str = "mt25", *, omega=0.0) -> dict:
+    """Evaluate frozen SGS forcing; D retains the parallel coefficient API.
+
+    ``mt25_magnetized`` uses the infinite-inertial-range MT25 tensor.
+    Other models remain isotropic, independently of omega.
+    """
     e_s, rho_g, nu, Delta = np.broadcast_arrays(
         *[np.asarray(a, dtype=np.float64) for a in (e_s, rho_g, nu, Delta)])
     if np.any(e_s < 0) or np.any(rho_g <= 0) or np.any(nu < 0) or np.any(Delta <= 0):
@@ -19,7 +23,12 @@ def sgs_coefficients(e_s: np.ndarray, rho_g: np.ndarray, nu: np.ndarray,
     eps = sigma**3/Delta
     x = np.zeros_like(sigma)
     np.multiply(nu, tau, out=x, where=nu > 0)
-    if model == "mt25":
+    omega = np.broadcast_to(np.asarray(omega, dtype=np.float64), sigma.shape)
+    if not np.all(np.isfinite(omega)):
+        raise ValueError("omega must be finite")
+    y = np.zeros_like(sigma)
+    np.multiply(np.abs(omega), tau, out=y, where=omega != 0)
+    if model in ("mt25", "mt25_magnetized"):
         D = eps*np.arctan(x)
     elif model == "white":
         D = eps.copy()
@@ -29,7 +38,18 @@ def sgs_coefficients(e_s: np.ndarray, rho_g: np.ndarray, nu: np.ndarray,
         D = np.zeros_like(eps)
     else:
         raise ValueError(f"unknown SGS model: {model}")
-    return dict(sigma=sigma, tau=tau, eps=eps, x=x, D=D)
+    D_perp = D
+    if model == "mt25_magnetized":
+        # atan2 gives the continuous x -> 0 limits, including the half
+        # resonance at y=1. Zero-energy cells have x,y=infinity but D=0.
+        xx, yy = np.where(sigma > 0, x, 0.0), np.where(sigma > 0, y, 0.0)
+        # Complementary angles avoid subtracting two pi/2 terms when x is
+        # tiny and y<1. At exact resonance use the x -> 0+ half plateau.
+        lower = np.where((xx == 0) & (yy == 1), np.pi/2, np.arctan2(xx, 1 - yy))
+        D_perp = 0.5*eps*(lower + np.arctan2(xx, 1 + yy))
+        D_perp = np.where(y == 0, D, D_perp)
+    return dict(sigma=sigma, tau=tau, eps=eps, x=x, y=y, D=D,
+                D_par=D, D_perp=D_perp)
 
 
 def drain_production(K_drop: np.ndarray, dxs: tuple, Delta: float,

@@ -30,6 +30,9 @@ from .problem_list.dust_beams1d import DustBeams1DProblem
 from .problem_list.sgs_acoustic1d import SGSAcoustic1DProblem
 from .problem_list.dusty_turb2d import DustyTurb2DProblem
 from .problem_list.dusty_turb3d import DustyTurb3DProblem
+from .problem_list.charged_dust_box import ChargedDustBoxProblem
+from .problem_list.dusty_alfven1d import DustyAlfven1DProblem
+from .problem_list.dusty_orszag_tang2d import DustyOrszagTang2DProblem
 
 # Register all problems
 ProblemRegistry.register("sod", SodProblem)
@@ -61,3 +64,6 @@ ProblemRegistry.register("dust_beams1d", DustBeams1DProblem)
 ProblemRegistry.register("sgs_acoustic1d", SGSAcoustic1DProblem)
 ProblemRegistry.register("dusty_turb2d", DustyTurb2DProblem)
 ProblemRegistry.register("dusty_turb3d", DustyTurb3DProblem)
+ProblemRegistry.register("charged_dust_box", ChargedDustBoxProblem)
+ProblemRegistry.register("dusty_alfven1d", DustyAlfven1DProblem)
+ProblemRegistry.register("dusty_orszag_tang2d", DustyOrszagTang2DProblem)

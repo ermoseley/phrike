@@ -230,3 +230,133 @@ exchanges are exact, so they do not enter `dt`.
   cannot hold it. Energy is.
 * The white-noise OU representation over-estimates the long-time diffusivity of
   large-Stokes grains relative to Reeks' result (the MT25 model limitation).
+
+## 7. Charged dust in MHD (FARMM field-aligned phase)
+
+`phrike.dusty_mhd.DustyMHDSolver` couples the same finite-volume dust and SGS
+transport to `SpectralSolverMHD`. The gas state in **every** dimension is
+`[rho, mx, my, mz, E, Bx, By, Bz]`: all three momenta exchange with the dust.
+`E` includes thermal, kinetic and magnetic energy (`|B|²/2`). Epstein drag uses
+thermal pressure after subtracting both kinetic and magnetic energy.
+`dust.charge_to_mass` is signed, in code units, and defaults to zero. Euler
+problems retain the hydro source map, including their unresolved-component
+convention. No magnetic force is applied to an Euler state.
+
+### Exact mean and covariance maps
+
+Define `delta = u_d - u_g`, `eps = rho_d/rho_g`, `Omega = (q/m)|B|`, and
+`bhat = B/|B|`. The local two-body equations are
+
+```text
+du_d/dt = -nu delta + Omega delta cross bhat
+du_g/dt = -eps du_d/dt.
+```
+
+For a frozen field over duration `h`, the centre-of-mass velocity is unchanged.
+With `f = 1 + eps`, split the slip into parallel and perpendicular parts:
+
+```text
+delta_parallel' = exp(-f nu h) delta_parallel
+delta_perp' = exp(-f nu h) [cos(f Omega h) delta_perp
+                           + sin(f Omega h) delta_perp cross bhat].
+```
+
+The reduced mass density is `mu = rho_d/f`, and drag heat is
+`Q_mean = (mu/2)|delta|² [1 - exp(-2 f nu h)]`. Lorentz rotation does no work
+on the relative motion. With back-reaction disabled, `f=1` and gas momentum is
+fixed; the change in dust kinetic energy is exchanged with gas energy, as in
+the hydro source. A zero field or zero charge removes the rotation. At zero
+drag, the slip norm is conserved; for `nu h` large it relaxes to zero for any
+gyrofrequency.
+
+Dust fluctuations have no cell-level back-reaction in their damping rate.
+The Gaussian covariance follows the exact map
+
+```text
+C' = exp(-2 nu h) R C R^T + Sigma_tensor,
+R v = cos(Omega h) v + [1-cos(Omega h)] bhat (bhat dot v)
+      + sin(Omega h) v cross bhat.
+```
+
+Pure gyration preserves the covariance trace and eigenvalues. Rotation and
+non-negative Gaussian forcing preserve positive semidefiniteness. For an
+isotropic coefficient, this reduces to the hydro OU map.
+
+### Gyrotropic MT25 forcing and reservoir accounting
+
+`sgs.d_model: mt25_magnetized` is the default when MHD dust has nonzero charge.
+`mt25` remains isotropic and ignores magnetisation; `white`, `finite_tau` and
+`none` retain their existing meanings. Using the infinite-inertial-range MT25
+contract, with the same `sigma`, `tau`, `eps_D = sigma³/Delta` as above,
+`x = nu tau` and `y = |Omega| tau`, the coefficients are
+
+```text
+D_parallel = eps_D atan(x)
+D_perp = (eps_D/2) [pi - atan((1-y)/x) - atan((1+y)/x)]
+D_tensor = D_parallel bhat bhat^T + D_perp (I - bhat bhat^T).
+```
+
+The code evaluates complementary `atan2` angles to avoid cancellation for
+small `x`. At `x=0`, `D_perp/eps_D` is zero below `y=1`, `pi/4` at resonance,
+and `pi/2` above it. At `y=0`, both coefficients equal `eps_D atan(x)`. When
+`x` greatly exceeds both `1` and `y`, both approach `(pi/2) eps_D`. Thus weak
+drag above resonance retains perpendicular forcing; at exactly zero drag
+there is no stationary variance in that forced direction.
+
+Because `D_tensor` commutes with `R`, constant forcing gives
+`Sigma_tensor = 2 D_tensor phi(2 nu, h)`. The existing midpoint-rate reservoir
+subcycling and positive, linear-in-time ETD2 forcing are applied separately to
+the parallel and perpendicular coefficients. Their time-integrated work is
+split from the same reservoir loss in proportion to the midpoint coefficients.
+The dust work rate is `rho_d (D_parallel + 2 D_perp)`; the exact loss `L_dust`
+equals the dust random-energy gain plus drag heat, including the componentwise
+ETD2 correction. This keeps gas + SGS + dust energy consistent. For a held
+reservoir, each directional variance is exactly
+`v_i(t) = v_i(0) exp(-2 nu t) + (D_i/nu)[1-exp(-2 nu t)]`, continuously
+extended to `v_i(0)+2 D_i t` at `nu=0`.
+
+### Field-aligned HyQMOM and scope
+
+HyQMOM is restricted to 1D straight fields along x:
+`|By|, |Bz| <= 1e-12 |B|` in every cell, otherwise the solver raises. Its
+parallel `M0..M4` hierarchy is unchanged by rotation; transverse mean slip
+rotates, while isotropic transverse dispersion is unchanged by rotation.
+The OU map uses `Sigma_parallel` in `v, q, r` and `Sigma_perp` in
+`sigma_perp²`. The existing layout contains **eight** fields: five parallel
+moments, two transverse momenta, and one transverse energy. No redundant ninth
+field is introduced. A transverse Alfvén perturbation is an oblique field,
+so that problem uses the Gaussian closure.
+
+The Gaussian closure supports arbitrary fields in 1D/2D/3D, including exact
+gyro-rotation in 2D/3D. This phase performs **no guiding-centre averaging**.
+There is no gyro-resolution timestep limit: `Omega dt` is integrated exactly
+in each frozen local map. Accuracy of splitting with spatially evolving fields
+still depends on the timestep; exact local gyration is not an accuracy claim
+for arbitrarily large steps in an inhomogeneous flow.
+
+The supported gas equations are ideal/resistive MHD with fixed RK2/RK4 on
+NumPy float64 periodic Fourier grids. Hall, ambipolar and shearing-sheet
+sources raise. `SGSMHDEquations1D/2D/3D` add `p_sgs` to diagonal momentum
+fluxes and `p_sgs u_d` to directional gas energy fluxes (`u_d` here means the
+gas velocity in direction `d`). Their signal-speed bound is
+`max_d |u_d| + sqrt[(gamma p + |B|² + (5/3)p_sgs)/rho]`.
+
+The gas step mirrors `_reference_fixed_step`: spectral dissipation half-step,
+MHD RK substages and magnetic projection, then accepted-state stabilization
+and positivity limiting. Kinetic loss `K=|m|²/(2 rho)` is measured at both
+filter halves and transferred to SGS with the existing smoothing/cap rule.
+**Magnetic energy removed by the spectral filter remains in E as gas heat.**
+The existing magnetic projection holds thermal pressure fixed; divergence-free
+periodic evolution requires only round-off projection corrections. An SGS
+magnetic reservoir is not modelled.
+
+Registered examples are `configs/charged_dust_box.yaml` (uniform arbitrary
+field and slip), `configs/dusty_alfven1d.yaml` (cold charged dust, SGS off),
+and `configs/dusty_orszag_tang2d.yaml` (charged OT with SGS). Box gas and dust
+velocities and `initial_conditions.magnetic_field` each have three components.
+The magnetic validation scripts are `charged_gyration.py`, `dusty_alfven.py`
+and `dusty_orszag_tang.py`, registered with `scripts/dust_validation/run_all.py`.
+The OT example and validation use an explicitly broad order-two spectral
+filter (cutoff rate 500, onset zero). Their conservation and realizability
+checks qualify that filtered problem, rather than shock resolution or an
+ideal-MHD accuracy limit.

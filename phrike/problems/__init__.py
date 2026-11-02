@@ -26,6 +26,9 @@ from .problem_list.dust_beams1d import DustBeams1DProblem
 from .problem_list.sgs_acoustic1d import SGSAcoustic1DProblem
 from .problem_list.dusty_turb2d import DustyTurb2DProblem
 from .problem_list.dusty_turb3d import DustyTurb3DProblem
+from .problem_list.charged_dust_box import ChargedDustBoxProblem
+from .problem_list.dusty_alfven1d import DustyAlfven1DProblem
+from .problem_list.dusty_orszag_tang2d import DustyOrszagTang2DProblem
 
 __all__ = [
     "DustyProblemBase",
@@ -35,6 +38,9 @@ __all__ = [
     "SGSAcoustic1DProblem",
     "DustyTurb2DProblem",
     "DustyTurb3DProblem",
+    "ChargedDustBoxProblem",
+    "DustyAlfven1DProblem",
+    "DustyOrszagTang2DProblem",
     "BaseProblem", 
     "ProblemRegistry",
     "SodProblem",

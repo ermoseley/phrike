@@ -1,0 +1,43 @@
+problem: dusty_alfven1d
+grid:
+  N: 64
+  Lx: 1.0
+  precision: double
+  dealias: true
+physics:
+  gamma: 1.6666666666666667
+  mhd:
+    resistivity: 0.0
+    viscosity: 0.0
+    project_each_substage: true
+integration:
+  t0: 0.0
+  t_end: 0.1
+  cfl: 0.3
+  scheme: rk4
+  output_interval: 0.05
+  spectral_dissipation:
+    enabled: false
+dust:
+  enabled: true
+  closure: gaussian
+  charge_to_mass: 1.0
+  backreaction: true
+  stopping:
+    model: constant
+    t_s: 0.3
+sgs:
+  enabled: false
+initial_conditions:
+  rho0: 1.0
+  p0: 1.0
+  B0: 1.0
+  A: 0.000001
+  k: 1
+  direction: 1
+  dust_to_gas: 0.01
+  e_s0: 0.0
+runtime:
+  num_threads: 1
+io:
+  outdir: outputs/dusty_alfven1d

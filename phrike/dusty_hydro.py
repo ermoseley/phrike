@@ -16,6 +16,8 @@ from . import solver as gas_solver
 
 
 class _SGSFlux:
+    energy_index = -1
+
     def flux(self, U):
         base = super().flux(U)
         if self.p_sgs is None:
@@ -25,7 +27,7 @@ class _SGSFlux:
         for d, flux in enumerate(fluxes):
             flux = flux.copy()
             flux[1+d] += self.p_sgs
-            flux[-1] += self.p_sgs * U[1+d]/U[0]
+            flux[self.energy_index] += self.p_sgs * U[1+d]/U[0]
             result.append(flux)
         return result[0] if self.ndim == 1 else tuple(result)
 
@@ -58,6 +60,12 @@ class SGSEulerEquations3D(_SGSFlux, EulerEquations3D):
 class DustyHydroSolver:
     """Strang-split fixed-step gas, dust and SGS solver (float64, Fourier only)."""
 
+    _is_mhd = False
+    energy_index = -1
+    _equation_types = (SGSEulerEquations1D, SGSEulerEquations2D, SGSEulerEquations3D)
+    _gas_solver_types = (gas_solver.SpectralSolver1D, gas_solver.SpectralSolver2D,
+                         gas_solver.SpectralSolver3D)
+
     def __init__(self, grid, equations, *, scheme="rk4", cfl,
                  dust_config, sgs_config):
         if scheme.lower() not in ("rk2", "rk4"):
@@ -79,7 +87,8 @@ class DustyHydroSolver:
             raise ValueError("DustyHydroSolver supports only periodic Fourier grids")
         if getattr(grid, "precision", "double") != "double":
             raise ValueError("DustyHydroSolver requires float64 (grid.precision='double')")
-        eq_type = (SGSEulerEquations1D, SGSEulerEquations2D, SGSEulerEquations3D)[self.ndim-1]
+        self.nmom = 3 if self._is_mhd else self.ndim
+        eq_type = self._equation_types[self.ndim-1]
         if not isinstance(equations, eq_type):
             raise TypeError(f"expected {eq_type.__name__} for this grid")
         self.grid, self.equations = grid, equations
@@ -97,8 +106,7 @@ class DustyHydroSolver:
         self.dxs = tuple(float(getattr(grid, a)) for a in ("dx", "dy", "dz")[:self.ndim])
         self.cell_volume = float(np.prod(self.dxs))
         self.Delta = self.cell_volume**(1/self.ndim)
-        cls = (gas_solver.SpectralSolver1D, gas_solver.SpectralSolver2D,
-               gas_solver.SpectralSolver3D)[self.ndim-1]
+        cls = self._gas_solver_types[self.ndim-1]
         self.gas_solver = cls(grid, equations, scheme=self.scheme, cfl=self.cfl)
         self.positivity = self.gas_solver.positivity
         self.U_gas = None
@@ -118,7 +126,8 @@ class DustyHydroSolver:
         return self.U_gas
 
     def _validate_state(self):
-        for name, shape in (("U_gas", (self.ndim+2, *self.shape)),
+        nfields = 8 if self._is_mhd else self.ndim+2
+        for name, shape in (("U_gas", (nfields, *self.shape)),
                             ("U_dust", (self.closure.nfields, *self.shape)), ("e_s", self.shape)):
             value = getattr(self, name)
             if not isinstance(value, np.ndarray):
@@ -127,7 +136,7 @@ class DustyHydroSolver:
                 raise ValueError(f"{name} must be finite with shape {shape}")
             if value.dtype != np.float64:
                 raise TypeError(f"{name} must have dtype float64")
-        if np.any(self.U_gas[0] <= 0) or np.any(self.U_gas[-1] - self._kinetic(self.U_gas) <= 0):
+        if np.any(self.U_gas[0] <= 0) or np.any(self._internal_energy(self.U_gas) <= 0):
             raise ValueError("gas density and internal energy must be positive")
         if np.any(self.e_s < 0) or (not self.sgs_enabled and np.any(self.e_s != 0)):
             raise ValueError("SGS energy must be non-negative, and zero when SGS is disabled")
@@ -140,7 +149,10 @@ class DustyHydroSolver:
         return float(np.sum(field))*self.cell_volume
 
     def _kinetic(self, U):
-        return 0.5*np.sum(U[1:1+self.ndim]**2, axis=0)/U[0]
+        return 0.5*np.sum(U[1:1+self.nmom]**2, axis=0)/U[0]
+
+    def _internal_energy(self, U):
+        return U[self.energy_index] - self._kinetic(U)
 
     def _set_pressure(self):
         self.equations.p_sgs = ((2/3)*self.e_s if self.sgs_enabled and
@@ -168,14 +180,18 @@ class DustyHydroSolver:
             self.U_gas, self.U_dust, self.e_s, h, closure=self.closure,
             gamma=self.equations.gamma, nu=self._nu() if self.dust_enabled else 0.0,
             Delta=self.Delta, ndim=self.ndim,
-            d_model=self.sgs_config.get("d_model", "mt25") if self.sgs_enabled else "none",
+            d_model=self.sgs_config.get("d_model", self._default_d_model()) if self.sgs_enabled else "none",
             c_eps=float(self.sgs_config.get("c_eps", 1.0)),
             sgs_decay=self.sgs_enabled and self.sgs_config.get("decay", True),
-            backreaction=self.dust_config.get("backreaction", True))
+            backreaction=self.dust_config.get("backreaction", True),
+            charge_to_mass=self.dust_config.get("charge_to_mass", 0.0))
         for source, target in (("Q_mean", "drag_heat_mean"), ("Q_rand", "drag_heat_random"),
                                ("L_dust", "dust_work"), ("L_decay", "sgs_decay"),
                                ("Q_projection", "projection_heat")):
             self.ledger[target] += self._integral(ledger[source])
+
+    def _default_d_model(self):
+        return "mt25"
 
     def compute_dt(self):
         self._validate_state()
@@ -223,9 +239,9 @@ class DustyHydroSolver:
         if self.sgs_enabled:
             if self.sgs_config.get("production", "filter_drain") == "filter_drain":
                 production = sgs.drain_production(
-                    drop, self.dxs, self.Delta, self.U_gas[-1] - self._kinetic(self.U_gas),
+                    drop, self.dxs, self.Delta, self._internal_energy(self.U_gas),
                     c_ell=self.sgs_config.get("c_ell", 1.0), f_cap=self.sgs_config.get("f_cap", 0.5))
-                self.U_gas[-1] -= production
+                self.U_gas[self.energy_index] -= production
                 self.e_s += production
                 self.ledger["production"] += self._integral(production)
             velocity = 0.5*(velocity_before + self.U_gas[1:1+self.ndim]/self.U_gas[0])
@@ -236,7 +252,7 @@ class DustyHydroSolver:
             compressed = self.e_s*sgs.compression_factor(divu, dt)
             change = compressed - self.e_s
             self.e_s = compressed
-            self.U_gas[-1] -= change
+            self.U_gas[self.energy_index] -= change
             self.ledger["compression_to_sgs"] += self._integral(change)
             diffusion = self.sgs_config.get("diffusion", {})
             if diffusion.get("enabled", False):
@@ -252,12 +268,12 @@ class DustyHydroSolver:
                 self.transport_stats[key] = self.transport_stats.get(key, 0) + stats[key]
             # Vacuum/round-off regularisation keeps mass and momentum; its tiny
             # energy change is returned to the gas so the total stays exact.
-            self.U_gas[-1] -= stats["regularization_dE"]
+            self.U_gas[self.energy_index] -= stats["regularization_dE"]
             self.transport_stats["max_doublings"] = max(self.transport_stats["max_doublings"], stats["max_doublings"])
             diffusion = self.dust_config.get("eddy_diffusion", {})
             if self.sgs_enabled and diffusion.get("enabled", False) and np.any(self.e_s > 0):
                 coeff = sgs.sgs_coefficients(self.e_s, self.U_gas[0], self._nu(), self.Delta,
-                                             self.sgs_config.get("d_model", "mt25"))
+                                             self.sgs_config.get("d_model", self._default_d_model()))
                 # x/(1+x) evaluated without inf/inf at zero SGS energy.
                 fraction = np.divide(coeff["x"], 1 + coeff["x"],
                                      out=np.ones_like(coeff["x"]), where=np.isfinite(coeff["x"]))
@@ -272,7 +288,7 @@ class DustyHydroSolver:
     def diagnostics(self, dt=0.0):
         mean = self._integral(self.closure.mean_kinetic_energy(self.U_dust))
         random = self._integral(self.closure.random_energy(self.U_dust))
-        gas, es = self._integral(self.U_gas[-1]), self._integral(self.e_s)
+        gas, es = self._integral(self.U_gas[self.energy_index]), self._integral(self.e_s)
         mass_dust = self._integral(self.U_dust[0])
         result = dict(time=self.t, dt=dt, E_gas=gas, E_sgs=es, E_dust_mean=mean,
                       E_dust_random=random, E_total=gas+es+mean+random,
@@ -281,7 +297,7 @@ class DustyHydroSolver:
                       e_s_mean=float(np.mean(self.e_s)), positivity_cells=self.positivity.cells,
                       positivity_events=self.positivity.events, **self.ledger, **self.transport_stats)
         momentum = self.U_dust[1:4] if self.closure.name == "gaussian" else self.U_dust[[1, 5, 6]]
-        for d, axis in enumerate("xyz"[:self.ndim]):
+        for d, axis in enumerate("xyz"[:self.nmom]):
             result[f"momentum_{axis}"] = self._integral(self.U_gas[1+d] + momentum[d])
         return result
 

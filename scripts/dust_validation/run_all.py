@@ -3,13 +3,15 @@ import argparse
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
 TESTS = ('mt25_gaussianisation', 'ou_box', 'drag_decay', 'dustywave', 'beams_free_streaming',
-         'sgs_acoustic', 'turb_energy_ledger', 'particle_reference_2d', 'long_turbulence')
+         'sgs_acoustic', 'turb_energy_ledger', 'particle_reference_2d', 'charged_gyration',
+         'dusty_alfven', 'dusty_orszag_tang', 'long_turbulence')
 # long_turbulence takes ~40 min: it is rerun only with --long; otherwise its last
 # full result is reported (its metrics record the source hashes it ran on).
 LONG = {'long_turbulence'}
@@ -34,6 +36,8 @@ def summarize(executions):
                                threshold=0, op='==', passed=False))
         if result is None:
             checks.append(dict(name='metrics.json produced',value=0,threshold=1,op='==',passed=False))
+        elif not result.get('complete', True):
+            checks.append(dict(name='campaign completed', value=0, threshold=1, op='==', passed=False))
         passed = sum(c['passed'] for c in checks)
         total_failed += len(checks)-passed
         runtime = execution.get('runtime_seconds', result.get('runtime_seconds',0) if result else 0)
@@ -77,9 +81,20 @@ def main():
             (out/'metrics.json').unlink(missing_ok=True)
             with (out/'run.log').open('w') as log:
                 try:
-                    proc = subprocess.run([sys.executable, str(Path(__file__).with_name(name+'.py'))],
-                                          cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
-                                          timeout=3600 if name in LONG else 180)
+                    proc = subprocess.Popen([sys.executable, str(Path(__file__).with_name(name+'.py'))],
+                                            cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                            start_new_session=True)
+                    try:
+                        proc.wait(timeout=3600 if name in LONG else 180)
+                    except subprocess.TimeoutExpired:
+                        # Magnetic campaigns have bounded worker pools. Terminate
+                        # their entire group so a timeout leaves no orphan work.
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        proc.wait()
+                        raise
                     status = 'completed' if proc.returncode in (0,1) and (out/'metrics.json').exists() else 'process failed'
                     executions[name] = dict(status=status, returncode=proc.returncode,
                                             runtime_seconds=time.perf_counter()-start)

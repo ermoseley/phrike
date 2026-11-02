@@ -209,7 +209,8 @@ class GaussianClosure:
         # Warm or rough cells keep the conserved Zhang-Shu faces, whose update
         # is realizable by convexity and conserves every moment exactly.
         use = subcell_eligible(U, self)
-        cons_plus, cons_minus, cons_scale = _reconstruct_conserved(U, self, axis, first)
+        # Conserved faces are discarded in primitive cells; do not limit them.
+        cons_plus, cons_minus, cons_scale = _reconstruct_conserved(U, self, axis, first | use)
         pick = lambda a, b: np.where(use, a, b)
         return (pick(build(1.0), cons_plus), pick(build(-1.0), cons_minus),
                 pick(np.where(flat, 0.0, 1.0), cons_scale))
@@ -526,19 +527,25 @@ def _reconstruct_conserved(U: np.ndarray, closure: Closure, axis: int,
     span = np.where(finite, 0.5*(hi - lo) + TOL*(np.abs(hi) + np.abs(lo)), 0.0)
     scale = np.where(light, 0.0, 1.0)
 
-    def bounded(face: np.ndarray) -> np.ndarray:
+    def bounded(face: np.ndarray, live: np.ndarray) -> np.ndarray:
         fmin, fmax = closure.velocity_range(face)
-        ok = (fmin >= lo - span) & (fmax <= hi + span)
+        ok = (fmin >= (lo - span)[:, live]) & (fmax <= (hi + span)[:, live])
         return np.all(ok | (face[0] <= 0), axis=0)
 
+    valid = np.ones(U.shape[1:], dtype=bool)
     for _ in range(31):
-        minus, plus = U - 0.5*slope*scale, U + 0.5*slope*scale
-        # Reconstructed vacuum faces must carry exactly zero raw moments.
-        valid = (closure.realizable(minus, strict=True) & closure.realizable(plus, strict=True)
-                 & ((minus[0] > 0) | np.all(minus == 0, axis=0))
-                 & ((plus[0] > 0) | np.all(plus == 0, axis=0)))
-        valid &= bounded(minus) & bounded(plus)
-        if np.all(valid | (scale == 0)):
+        live = scale != 0
+        if not np.any(live):
+            break
+        minus = (U - 0.5*slope*scale)[:, live]
+        plus = (U + 0.5*slope*scale)[:, live]
+        # Zero-slope cells are already final; test only the active faces.
+        valid[:] = True
+        valid[live] = (closure.realizable(minus, strict=True) & closure.realizable(plus, strict=True)
+                       & ((minus[0] > 0) | np.all(minus == 0, axis=0))
+                       & ((plus[0] > 0) | np.all(plus == 0, axis=0))
+                       & bounded(minus, live) & bounded(plus, live))
+        if np.all(valid):
             break
         scale = np.where(valid, scale, scale * 0.5)
     scale = np.where(valid, scale, 0.0)
