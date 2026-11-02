@@ -192,15 +192,16 @@ class Euler3DSpectral:
         self.p_floor = float(p_floor)
         self.shape = self._grid_shape(grid)
         self._dims = tuple(range(-len(self.shape), 0))
-        self._kshape = self.shape if len(self.shape) == 3 else (1,) + self.shape
+        self._kshape = (1,) * (3 - len(self.shape)) + self.shape
         self._fn = self._pointwise()
         self._torch = bool(getattr(grid, "_use_torch", False))
 
         Nz, Ny, Nx = self._kshape
         Xh = Nx // 2 + 1
+        nd = len(self.shape)
         kx = 2.0 * np.pi * np.fft.rfftfreq(Nx, d=grid.dx)
-        ky = 2.0 * np.pi * np.fft.fftfreq(Ny, d=grid.dy)
-        kz = 2.0 * np.pi * np.fft.fftfreq(Nz, d=grid.dz) if len(self.shape) == 3 else np.zeros(1)
+        ky = 2.0 * np.pi * np.fft.fftfreq(Ny, d=grid.dy) if nd >= 2 else np.zeros(1)
+        kz = 2.0 * np.pi * np.fft.fftfreq(Nz, d=grid.dz) if nd == 3 else np.zeros(1)
         # The Nyquist mode has no real-valued derivative; zeroing it matches the
         # complex-FFT path, which drops that contribution when taking .real.
         if Nx % 2 == 0:
@@ -213,12 +214,14 @@ class Euler3DSpectral:
         mask = np.ascontiguousarray(np.asarray(_to_numpy(grid.dealias_mask))[..., :Xh])
         self.dissipation = bool(getattr(grid, "spectral_dissipation_enabled", False))
         lam = np.ascontiguousarray(np.asarray(_to_numpy(grid.filter_rate))[..., :Xh])
-        bshape = ((1, 1, Xh), (1, Ny, 1), (Nz, 1, 1)) if len(self.shape) == 3 else ((1, Xh), (Ny, 1), (1, 1))
+        bshape = {3: ((1, 1, Xh), (1, Ny, 1), (Nz, 1, 1)), 2: ((1, Xh), (Ny, 1), (1, 1)),
+                  1: ((Xh,), (1,), (1,))}[len(self.shape)]
         kx3, ky3, kz3 = (a.reshape(sh) for a, sh in zip((kx, ky, kz), bshape))
 
         if self._torch:
-            dev = grid.kx.device
-            rdt = grid.kx.dtype
+            ref = _ref_tensor(grid)
+            dev = ref.device
+            rdt = ref.dtype
             cdt = torch.complex64 if rdt == torch.float32 else torch.complex128
             self.device = str(dev)
             self.rdtype = rdt
@@ -312,8 +315,10 @@ class Euler3DSpectral:
             lx = lx[:Xh]
         else:
             lz, ly, lx = np.zeros(Nz), np.zeros(Ny), np.zeros(Xh)
-        if len(self.shape) == 2:  # no z axis: unit mask, zero decay rate
+        if len(self.shape) <= 2:  # no z axis: unit mask, zero decay rate
             mz, lz = np.ones(1), np.zeros(1)
+        if len(self.shape) == 1:  # no y axis
+            my, ly = np.ones(1), np.zeros(1)
         rtol = 1e-5 if self.rdtype == torch.float32 else 1e-12
         lam_scale = max(float(np.max(np.abs(lam))), 1.0)
         prod = (mz[:, None, None] * my[None, :, None] * mx[None, None, :]).reshape(mask.shape)
@@ -336,7 +341,8 @@ class Euler3DSpectral:
 
     def _k(self, X):
         """Spectral array in the kernels' (C, Nz, Ny, Xh) layout (a view)."""
-        return X if len(self.shape) == 3 else X.unsqueeze(1)
+        nd = len(self.shape)
+        return X if nd == 3 else (X[:, None] if nd == 2 else X[:, None, None])
 
     def _launch_stage(self, Fh, Sin, Sout, U0, acc, w, ia, inx, modes, first, final, high, factors):
         k = self._k
@@ -355,7 +361,9 @@ class Euler3DSpectral:
         fx, fy, fz = factors
         if len(self.shape) == 3:
             return fz[:, None, None] * fy[None, :, None] * fx[None, None, :]
-        return fy[:, None] * fx[None, :]
+        if len(self.shape) == 2:
+            return fy[:, None] * fx[None, :]
+        return fx * fy[0] * fz[0]
 
     def _guard(self, fn, *args):
         """Run a compiled kernel; on toolchain failure fall back to eager for good."""
@@ -778,6 +786,89 @@ class Euler2DSpectral(Euler3DSpectral):
 
     def _launch_rhs(self, Fh, S, K, w, modes):
         self._triton.euler2d_rhs(self._k(Fh), self._k(S), K, w, self._waves, modes)
+
+
+# --- 1D Euler -------------------------------------------------------------------
+
+
+def _primitive1d(U, gamma):
+    rho, m, E = U[0], U[1], U[2]
+    u = m / rho
+    # Same expression order as EulerEquations1D.primitive.
+    p = (gamma - 1.0) * (E - 0.5 * rho * u * u)
+    return rho, m, E, u, p
+
+
+def euler1d_fluxes(U: Array, gamma: float) -> Array:
+    """The 2 independent 1D Euler flux fields [m u + p, (E + p) u]."""
+    rho, m, E, u, p = _primitive1d(U, gamma)
+    return _stack([m * u + p, (E + p) * u])
+
+
+def _count_below1d(U, gamma, rho_min, p_min):
+    rho, _, _, _, p = _primitive1d(U, gamma)
+    if _is_torch(rho):
+        return (rho < rho_min).sum() + (p < p_min).sum()
+    return int(np.count_nonzero(rho < rho_min) + np.count_nonzero(p < p_min))
+
+
+def _fluxes_and_count1d(U, gamma, rho_min, p_min):
+    return euler1d_fluxes(U, gamma), _count_below1d(U, gamma, rho_min, p_min)
+
+
+def _embedded_checks1d(U_high, E, gamma, rho_min, p_min):
+    count = _count_below1d(U_high, gamma, rho_min, p_min) + _count_below1d(
+        U_high - E, gamma, rho_min, p_min
+    )
+    return count, torch.max(torch.abs(E))
+
+
+def _finite_and_speed1d(U, gamma):
+    rho, _, _, u, p = _primitive1d(U, gamma)
+    return torch.isfinite(U).all(), torch.max(torch.abs(u) + torch.sqrt(gamma * p / rho))
+
+
+class Euler1DSpectral(Euler3DSpectral):
+    """``Euler3DSpectral`` for periodic Fourier ``Grid1D`` + ``EulerEquations1D``.
+
+    Two flux transforms per stage; on small grids the gain is fewer kernel
+    launches and host synchronizations rather than bandwidth.
+    """
+
+    NVAR = 3
+    MOM = slice(1, 2)
+    FLUX_KIND = "euler1d"
+
+    @staticmethod
+    def _grid_shape(grid):
+        return (grid.N,)
+
+    def _pointwise(self):
+        return dict(fluxes=euler1d_fluxes, fluxes_count=_fluxes_and_count1d,
+                    count=_count_below1d, checks=_embedded_checks1d, speed=_finite_and_speed1d,
+                    rhs_real=None)
+
+    def _rhs_hat_generic(self, Fh, Mh):
+        d = lambda a: -self.M * (self.ikx * a)
+        return _stack([d(Mh[0]), d(Fh[0]), d(Fh[1])])
+
+    def _launch_stage(self, Fh, Sin, Sout, U0, acc, w, ia, inx, modes, first, final, high, factors):
+        k = self._k
+        self._triton.euler1d_stage(k(Fh), k(Sin), k(Sout), k(U0), acc if acc.dim() == 2 else k(acc),
+                                   w, ia, inx, self._waves, modes, first=first, final=final,
+                                   high=k(high), final_factors=factors)
+
+    def _launch_rhs(self, Fh, S, K, w, modes):
+        self._triton.euler1d_rhs(self._k(Fh), self._k(S), K, w, self._waves, modes)
+
+
+def _ref_tensor(grid):
+    """A real tensor of the grid's Torch device and dtype."""
+    for name in ("kx", "k", "x"):
+        ref = getattr(grid, name, None)
+        if _is_torch(ref):
+            return ref
+    raise ValueError("Torch grid has no wavenumber or coordinate tensor")
 
 
 def _to_numpy(a: Any) -> np.ndarray:
