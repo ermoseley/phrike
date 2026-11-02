@@ -11,7 +11,7 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 TESTS = ('mt25_gaussianisation', 'ou_box', 'drag_decay', 'dustywave', 'beams_free_streaming',
          'sgs_acoustic', 'turb_energy_ledger', 'particle_reference_2d', 'charged_gyration',
-         'dusty_alfven', 'dusty_orszag_tang', 'long_turbulence')
+         'dusty_alfven', 'dusty_orszag_tang', 'ap_integrator_study', 'long_turbulence')
 # long_turbulence takes ~40 min: it is rerun only with --long; otherwise its last
 # full result is reported (its metrics record the source hashes it ran on).
 LONG = {'long_turbulence'}
