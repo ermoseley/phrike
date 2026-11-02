@@ -32,7 +32,7 @@ def summarize(executions):
         status = execution.get('status', 'existing results')
         checks = list(result.get('checks', [])) if result else []
         if status not in ('completed', 'existing results'):
-            checks.append(dict(name='process completed within 180 seconds', value=execution.get('returncode', -1),
+            checks.append(dict(name=f'process completed within {7200 if name in LONG else 180} seconds', value=execution.get('returncode', -1),
                                threshold=0, op='==', passed=False))
         if result is None:
             checks.append(dict(name='metrics.json produced',value=0,threshold=1,op='==',passed=False))
@@ -56,7 +56,7 @@ def summarize(executions):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--report-only', action='store_true', help='Summarize existing metrics without rerunning')
-    parser.add_argument('--long', action='store_true', help='Also rerun the ~40 min long_turbulence test')
+    parser.add_argument('--long', action='store_true', help='Also rerun the ~1 h long_turbulence test')
     args = parser.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
     executions = {}
@@ -85,7 +85,7 @@ def main():
                                             cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
                                             start_new_session=True)
                     try:
-                        proc.wait(timeout=3600 if name in LONG else 180)
+                        proc.wait(timeout=7200 if name in LONG else 180)
                     except subprocess.TimeoutExpired:
                         # Magnetic campaigns have bounded worker pools. Terminate
                         # their entire group so a timeout leaves no orphan work.

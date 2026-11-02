@@ -319,13 +319,18 @@ def _hyqmom_from_raw(raw):
 def test_hyqmom_smooth_packet_is_second_order_and_smooth():
     # Raw-component reconstruction made the face skewness/kurtosis noisy here
     # (error stalled, grid-scale roughness grew with N); the interior
-    # primitive-space reconstruction must converge and get smoother.
+    # primitive-space reconstruction must converge and get smoother.  The
+    # discretisation error is now below the closure's own error against the
+    # kinetic solution (~2.5e-4), so convergence is measured against a
+    # fine-grid HyQMOM solution.
+    closure, U = _hyqmom_from_raw(_blob_moments(512, 0.0))
+    fine = transport(U, closure, 0.3, (1/512,))[0][0]
     errors, roughness = [], []
     for n in (64, 128, 256):
         closure, U = _hyqmom_from_raw(_blob_moments(n, 0.0))
         out, stats = transport(U, closure, 0.3, (1/n,))
-        ref = _blob_moments(n, 0.3)
-        errors.append(np.mean(np.abs(out[0] - ref[0]))/np.mean(ref[0]))
+        ref = fine.reshape(n, -1).mean(axis=1)
+        errors.append(np.mean(np.abs(out[0] - ref))/np.mean(ref))
         v = closure.primitives(out)["v"]
         roughness.append(np.std(np.diff(v, 2)))
         assert stats["mood_cells"] == 0
