@@ -102,6 +102,14 @@ def _euler3d_stage_kernel(
     total, Kx, Kyr, Kzr, cy, cz, Ny, Nz,
     FIRST: tl.constexpr, FINAL: tl.constexpr, ACC_FULL: tl.constexpr, BLOCK: tl.constexpr,
 ):
+    # int32 scalar arguments: multiples of them overflow past 2**31 elements.
+    sFc = sFc.to(tl.int64)
+    sFz = sFz.to(tl.int64)
+    sFy = sFy.to(tl.int64)
+    sSc = sSc.to(tl.int64)
+    sSz = sSz.to(tl.int64)
+    sSy = sSy.to(tl.int64)
+    sAc = sAc.to(tl.int64)
     offs, mask, ix, iy, iz = _mode_index(BLOCK, total, Kx, Kyr, Kzr, cy, cz, Ny, Nz)
     kx, ky, kz, m = _waves(kx_ptr, ky_ptr, kz_ptr, mx_ptr, my_ptr, mz_ptr, ix, iy, iz, mask)
     inv_n = tl.load(w_ptr)
@@ -160,6 +168,14 @@ def _euler3d_rhs_kernel(
     BLOCK: tl.constexpr,
 ):
     """Compact spectral RHS k (5, total) from flux spectra and stage-state momentum."""
+    # int32 scalar arguments: multiples of them overflow past 2**31 elements.
+    sFc = sFc.to(tl.int64)
+    sFz = sFz.to(tl.int64)
+    sFy = sFy.to(tl.int64)
+    sSc = sSc.to(tl.int64)
+    sSz = sSz.to(tl.int64)
+    sSy = sSy.to(tl.int64)
+    sKc = sKc.to(tl.int64)
     offs, mask, ix, iy, iz = _mode_index(BLOCK, total, Kx, Kyr, Kzr, cy, cz, Ny, Nz)
     kx, ky, kz, m = _waves(kx_ptr, ky_ptr, kz_ptr, mx_ptr, my_ptr, mz_ptr, ix, iy, iz, mask)
     mf = m * tl.load(w_ptr)
@@ -205,6 +221,12 @@ def _combine_kernel(
     HAS_BASE: tl.constexpr, MASK: tl.constexpr, NC: tl.constexpr, BLOCK: tl.constexpr,
 ):
     """O = [f *] ([B +] sum_j w[w0 + j] * K[j]) over the visited modes, NC components."""
+    # int32 scalar arguments: multiples of them overflow past 2**31 elements.
+    sSc = sSc.to(tl.int64)
+    sSz = sSz.to(tl.int64)
+    sSy = sSy.to(tl.int64)
+    sKc = sKc.to(tl.int64)
+    sKj = sKj.to(tl.int64)
     offs, mask, ix, iy, iz = _mode_index(BLOCK, total, Kx, Kyr, Kzr, cy, cz, Ny, Nz)
     if MASK:
         m = _factor(fx_ptr, fy_ptr, fz_ptr, ix, iy, iz, mask)
@@ -364,6 +386,14 @@ def _mhd3d_stage_kernel(
     w = [1/N, eta, nu, ...]; the final stage writes the pre-projection state to
     H and f * (Leray-projected state) to Sout.
     """
+    # int32 scalar arguments: multiples of them overflow past 2**31 elements.
+    sFc = sFc.to(tl.int64)
+    sFz = sFz.to(tl.int64)
+    sFy = sFy.to(tl.int64)
+    sSc = sSc.to(tl.int64)
+    sSz = sSz.to(tl.int64)
+    sSy = sSy.to(tl.int64)
+    sAc = sAc.to(tl.int64)
     offs, mask, ix, iy, iz = _mode_index(BLOCK, total, Kx, Kyr, Kzr, cy, cz, Ny, Nz)
     kx, ky, kz, m = _waves(kx_ptr, ky_ptr, kz_ptr, mx_ptr, my_ptr, mz_ptr, ix, iy, iz, mask)
     inv_n = tl.load(w_ptr)
@@ -471,6 +501,10 @@ def _leray_scale_kernel(
     total, Kx, Kyr, Kzr, cy, cz, Ny, Nz, BLOCK: tl.constexpr,
 ):
     """In place: X = f * X for all 8 components, with B Leray-projected first."""
+    # int32 scalar arguments: multiples of them overflow past 2**31 elements.
+    sSc = sSc.to(tl.int64)
+    sSz = sSz.to(tl.int64)
+    sSy = sSy.to(tl.int64)
     offs, mask, ix, iy, iz = _mode_index(BLOCK, total, Kx, Kyr, Kzr, cy, cz, Ny, Nz)
     kx, ky, kz, m = _waves(kx_ptr, ky_ptr, kz_ptr, mx_ptr, my_ptr, mz_ptr, ix, iy, iz, mask)
     f = _factor(fx_ptr, fy_ptr, fz_ptr, ix, iy, iz, mask)
@@ -547,6 +581,14 @@ def _euler2d_stage_kernel(
     BLOCK: tl.constexpr,
 ):
     """2D Euler RK stage (MODE 0) or compact spectral RHS into A (MODE 1)."""
+    # int32 scalar arguments: multiples of them overflow past 2**31 elements.
+    sFc = sFc.to(tl.int64)
+    sFz = sFz.to(tl.int64)
+    sFy = sFy.to(tl.int64)
+    sSc = sSc.to(tl.int64)
+    sSz = sSz.to(tl.int64)
+    sSy = sSy.to(tl.int64)
+    sAc = sAc.to(tl.int64)
     offs, mask, ix, iy, iz = _mode_index(BLOCK, total, Kx, Kyr, Kzr, cy, cz, Ny, Nz)
     kx, ky, kz, m = _waves(kx_ptr, ky_ptr, kz_ptr, mx_ptr, my_ptr, mz_ptr, ix, iy, iz, mask)
     inv_n = tl.load(w_ptr)
@@ -637,6 +679,8 @@ def _count_store(cnt_ptr, rho, p, rho_min, p_min, mask, COUNT: tl.constexpr):
 @triton.jit
 def _euler2d_flux_kernel(U_ptr, F_ptr, cnt_ptr, n, P_ptr,
                          COUNT: tl.constexpr, BLOCK: tl.constexpr):
+    # int32 scalar arguments: multiples of them overflow past 2**31 elements.
+    n = n.to(tl.int64)
     offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n
     gamma = tl.load(P_ptr)
@@ -661,6 +705,8 @@ def _euler2d_flux_kernel(U_ptr, F_ptr, cnt_ptr, n, P_ptr,
 @triton.jit
 def _euler3d_flux_kernel(U_ptr, F_ptr, cnt_ptr, n, P_ptr,
                          COUNT: tl.constexpr, BLOCK: tl.constexpr):
+    # int32 scalar arguments: multiples of them overflow past 2**31 elements.
+    n = n.to(tl.int64)
     offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n
     gamma = tl.load(P_ptr)
@@ -691,6 +737,8 @@ def _euler3d_flux_kernel(U_ptr, F_ptr, cnt_ptr, n, P_ptr,
 @triton.jit
 def _mhd3d_flux_kernel(U_ptr, F_ptr, cnt_ptr, n, P_ptr,
                        COUNT: tl.constexpr, BLOCK: tl.constexpr):
+    # int32 scalar arguments: multiples of them overflow past 2**31 elements.
+    n = n.to(tl.int64)
     offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n
     gamma = tl.load(P_ptr)
@@ -762,6 +810,14 @@ def _euler1d_stage_kernel(
     BLOCK: tl.constexpr,
 ):
     """1D Euler RK stage (MODE 0) or compact spectral RHS into A (MODE 1)."""
+    # int32 scalar arguments: multiples of them overflow past 2**31 elements.
+    sFc = sFc.to(tl.int64)
+    sFz = sFz.to(tl.int64)
+    sFy = sFy.to(tl.int64)
+    sSc = sSc.to(tl.int64)
+    sSz = sSz.to(tl.int64)
+    sSy = sSy.to(tl.int64)
+    sAc = sAc.to(tl.int64)
     offs, mask, ix, iy, iz = _mode_index(BLOCK, total, Kx, Kyr, Kzr, cy, cz, Ny, Nz)
     kx, ky, kz, m = _waves(kx_ptr, ky_ptr, kz_ptr, mx_ptr, my_ptr, mz_ptr, ix, iy, iz, mask)
     inv_n = tl.load(w_ptr)
@@ -797,6 +853,8 @@ def _euler1d_stage_kernel(
 @triton.jit
 def _euler1d_flux_kernel(U_ptr, F_ptr, cnt_ptr, n, P_ptr,
                          COUNT: tl.constexpr, BLOCK: tl.constexpr):
+    # int32 scalar arguments: multiples of them overflow past 2**31 elements.
+    n = n.to(tl.int64)
     offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n
     gamma = tl.load(P_ptr)
