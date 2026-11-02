@@ -1,8 +1,8 @@
 GPU performance
 ===============
 
-This page records how the 3D Euler and 3D MHD solvers were profiled and sped
-up on GPUs.
+This page records how the 3D Euler, 3D MHD and 2D Euler solvers were profiled
+and sped up on GPUs.
 The benchmark is ``scripts/bench_hydro3d.py``: a Taylor-Green vortex with
 dealiasing on, spectral dissipation (``p = 8``, ``rate = 40``), and the step
 capped at CFL 0.2, run through the same loop body as ``SpectralSolver3D.run``.
@@ -207,6 +207,54 @@ resistivity and viscosity, and ``project_each_substage`` off, at 1e-11 in fp64
 and 1e-5 in fp32 on Torch CPU and CUDA. It also covers whole adaptive runs
 (the same accept and reject sequence), the embedded step at fixed ``dt``, the
 clamp fallback, and div B.
+
+2D hydro
+--------
+
+``SpectralSolver2D`` uses the same machinery through ``Euler2DSpectral`` on
+periodic Fourier Torch grids. The 2D spectra are viewed as 3D spectra with a
+single z mode, so the stage, combination and caching logic is shared. Each
+stage transforms 5 flux fields (``Txx``, ``Tyy``, ``Txy``, ``Hx``, ``Hy``)
+instead of 8. ``scripts/bench_problem.py`` builds a registered problem from its
+YAML file. With ``configs/khi2d_4k.yaml`` (adaptive rk78, spectral dissipation
+of order 2) on the A100, in Mzups per accepted step:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Grid
+     - Precision
+     - Reference
+     - Fast
+   * - 3840 x 2160
+     - fp32
+     - 38
+     - 198 (5.1x)
+   * - 2048 x 2048
+     - fp64
+     - 22
+     - 126 (5.6x)
+   * - 1024 x 1024
+     - fp64
+     - 21
+     - 75 (3.6x)
+
+The gain is smaller than in 3D for two reasons. The reference 2D right-hand
+side is relatively cheaper (16 complex transforms against 30 in 3D), and a
+13-stage embedded method spends more of its time combining stored stage
+right-hand sides.
+
+Physical-space fluxes are computed by hand-written Triton kernels on CUDA
+(``spectral3d_triton.fluxes``). Each value is loaded once and every flux field
+is written in a single pass, with the floor-violation count reduced in the
+same kernel. The Inductor kernel for 2D lowered ``torch.stack`` into one select
+chain per output and reached only about a third of DRAM bandwidth in fp32. In
+3D the two kernels perform the same.
+
+``tests/test_spectral2d.py`` checks RK2/RK4 with dissipation on and off and
+with dealiasing off, on odd grids, NumPy, Torch CPU and CUDA (fp64 and fp32).
+It also covers adaptive rk45 and rk78 runs, the embedded step and the clamp
+fallback.
 
 Remaining headroom
 ------------------

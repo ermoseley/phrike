@@ -25,7 +25,7 @@ from .equations import (
     MHDEquations3D,
 )
 from .adaptive import AdaptiveTimeStepper, create_adaptive_stepper
-from .spectral3d import Euler3DSpectral
+from .spectral3d import Euler2DSpectral, Euler3DSpectral
 from .spectral_mhd3d import MHD3DSpectral
 from .artificial_viscosity import SpectralArtificialViscosity, ArtificialViscosityConfig
 
@@ -694,6 +694,68 @@ def _rk4_step(grid: Grid1D, eqs: EulerEquations1D, U: Array, dt: float,
     return _positivity_clamp(Unew, eqs, monitor=monitor)
 
 
+class _SpectralFastPathMixin:
+    """Bookkeeping shared by the Euler solvers that carry a ``spectral`` fast path."""
+
+    spectral = None
+    _speed_cache = None  # (U, U._version, max wave speed)
+
+    def _note_accepted_state(self) -> None:
+        """``_note_accepted`` with the finite check fused into the wave-speed pass."""
+        if self.spectral is None or not self.spectral._torch:
+            _note_accepted(self)
+            return
+        finite, speed = self.spectral.finite_and_speed(self.U)
+        if not finite:
+            _note_accepted(self)  # raises with the reference message
+        self._accepted_steps = int(getattr(self, "_accepted_steps", 0)) + 1
+        self._speed_cache = (self.U, self.U._version, speed)
+
+    def _wave_speed(self, U) -> float:
+        """Validated maximum wave speed, from the accepted-step pass when possible."""
+        cache = self._speed_cache
+        if cache is not None and cache[0] is U and cache[1] == U._version:
+            return _checked_wave_speed(self, U, cache[2])
+        if self.spectral is not None and self.spectral._torch:
+            finite, speed = self.spectral.finite_and_speed(U)
+            if not finite:
+                _require_finite_state(self, "while computing the time step", U)
+            return _checked_wave_speed(self, U, speed)
+        return _checked_wave_speed(self, U)
+
+    def _embedded_attempt(self, fast, U_split, dt, solution_scale):
+        """Spectral embedded step; ``None`` means the stage limiter would act."""
+        stepper = self.adaptive_stepper
+        method = getattr(stepper, "method", None)
+        if not isinstance(stepper, AdaptiveTimeStepper) or method is None:
+            return None  # duck-typed steppers keep their own step
+
+        def embedded(U_in, dt_in):
+            out = fast.embedded_step(
+                U_in, dt_in, method.a, method.b_high, method.b_low, 0.5 * dt
+            )
+            if out is None:
+                raise _UseReferenceStep
+            return out[0], None, out[1]
+
+        try:
+            return stepper.step(None, U_split, dt, solution_scale, embedded=embedded)
+        except _UseReferenceStep:
+            return None
+        except FloatingPointError as exc:
+            message = str(exc)
+            if "t=" in message:
+                raise
+            raise FloatingPointError(
+                f"{message} At step {int(getattr(self, '_accepted_steps', 0))}, t={self.t}."
+            ) from exc
+        except Exception as exc:  # pragma: no cover - depends on toolchain
+            if isinstance(exc, RuntimeError) and "Adaptive" in str(exc):
+                raise
+            fast.disable_triton(exc)
+            return None
+
+
 def _apply_accepted_state_stabilization(
     grid: Grid1D,
     U: Array,
@@ -1120,7 +1182,7 @@ def _apply_accepted_state_stabilization_2d(
 
 
 @dataclass
-class SpectralSolver2D:
+class SpectralSolver2D(_SpectralFastPathMixin):
     grid: Grid2D
     equations: EulerEquations2D
     scheme: str = "rk4"
@@ -1140,7 +1202,8 @@ class SpectralSolver2D:
 
     def __init__(self, grid: Grid2D, equations: EulerEquations2D, U0: Optional[Array] = None, 
                  scheme: str = "rk4", cfl: float = 0.3, adaptive_config: Optional[Dict] = None,
-                 artificial_viscosity_config: Optional[Dict] = None, gravity_config: Optional[Dict] = None):
+                 artificial_viscosity_config: Optional[Dict] = None, gravity_config: Optional[Dict] = None,
+                 spectral_fast_path: Optional[bool] = None):
         """Initialize the 2D spectral solver.
         
         Args:
@@ -1151,6 +1214,10 @@ class SpectralSolver2D:
             cfl: CFL number
             adaptive_config: Configuration for adaptive time-stepping
             gravity_config: Configuration for gravity
+            spectral_fast_path: Step periodic Fourier runs with ``Euler2DSpectral``
+                (the same step to round-off with far less memory traffic).
+                ``None`` enables it on Torch grids; plain ``EulerEquations2D``
+                without artificial viscosity or gravity is accelerated.
         """
         self.grid = grid
         self.equations = equations
@@ -1171,8 +1238,29 @@ class SpectralSolver2D:
         # Setup gravity if configured
         self.gravity_config = gravity_config
 
+        if spectral_fast_path is None:
+            spectral_fast_path = bool(getattr(grid, "_use_torch", False))
+        periodic = (
+            getattr(grid, "basis_x", "fourier") == "fourier"
+            and getattr(grid, "basis_y", "fourier") == "fourier"
+            and getattr(grid, "_legendre_basis", None) is None
+            and not getattr(grid, "_mixed_open_y", False)
+        )
+        self.spectral = (
+            Euler2DSpectral(grid, equations, self.rho_floor, self.p_floor)
+            if spectral_fast_path and periodic and type(equations) is EulerEquations2D
+            else None
+        )
+        self._speed_cache = None
+
+    def _fast(self) -> Optional[Euler2DSpectral]:
+        gravity = self.gravity_config and self.gravity_config.get("enabled", False)
+        if gravity or self.artificial_viscosity is not None:
+            return None
+        return self.spectral
+
     def _stability_limit(self, U: Array) -> float:
-        speed = _checked_wave_speed(self, U)
+        speed = self._wave_speed(U)
         bounds = [
             _hyperbolic_dt(self.cfl, _min_spacing(self.grid), speed),
             _artificial_viscosity_dt(self.grid, self.artificial_viscosity),
@@ -1205,6 +1293,13 @@ class SpectralSolver2D:
     
     def _fixed_step(self, U: Array, dt: float) -> Array:
         """Perform one fixed time step."""
+        fast = self._fast()
+        if fast is not None:
+            U_split = fast.dissipate(U, 0.5 * dt)
+            Un = fast.rk_step(U_split, dt, self.scheme.lower(), 0.5 * dt)
+            if Un is not None:
+                return Un
+            # A positivity clamp would act: repeat the step on the reference path.
         U_split = self.grid.apply_spectral_dissipation(U, 0.5 * dt)
         if self.scheme.lower() == "rk2":
             Un = _rk2_step_2d(self.grid, self.equations, U_split, dt, self.artificial_viscosity, self.gravity_config, self.positivity)
@@ -1214,76 +1309,65 @@ class SpectralSolver2D:
             self.grid, Un, self.equations, dt=0.5 * dt
         )
     
-    def _adaptive_step(self, U: Array, dt: float) -> Array:
-        """Perform one adaptive time step."""
+    def _adaptive_attempt(self, U: Array, dt: float):
+        """One embedded-RK attempt; returns (result, accepted state or None)."""
         def rhs_func(U_current: Array) -> Array:
-            """RHS function for adaptive stepper."""
-            return _compute_rhs_2d(self.grid, self.equations, U_current, self.artificial_viscosity, self.gravity_config)
-        
-        U_split = self.grid.apply_spectral_dissipation(U, 0.5 * dt)
+            return _compute_rhs_2d(self.grid, self.equations, U_current,
+                                   self.artificial_viscosity, self.gravity_config)
 
-        # Compute solution scale for relative error
+        fast = self._fast()
+        U_split = (
+            fast.dissipate(U, 0.5 * dt) if fast is not None
+            else self.grid.apply_spectral_dissipation(U, 0.5 * dt)
+        )
         if _TORCH_AVAILABLE and isinstance(U_split, torch.Tensor):
             solution_scale = float(torch.max(torch.abs(U_split)).item())
         else:
             solution_scale = float(np.max(np.abs(U_split)))
-        
+
+        if fast is not None and fast.embedded_ready(U_split):
+            result = self._embedded_attempt(fast, U_split, dt, solution_scale)
+            if result is not None:
+                if not result.accepted:
+                    return result, None
+                fast.commit(result.U_new)
+                return result, result.U_new
+
         result = _call_adaptive_step(
             self, self.adaptive_stepper, rhs_func, U_split, dt, solution_scale,
             limit_state=lambda state: _limit_euler_stage(self, state),
         )
-        
-        if result.accepted:
-            Un = _apply_accepted_state_stabilization_2d(
-                self.grid, result.U_new, self.equations, dt=0.5 * dt
-            )
-        else:
-            Un = U
-            
-        return Un
+        if not result.accepted:
+            return result, None
+        if fast is not None:
+            return result, fast.dissipate(result.U_new, 0.5 * dt, project=True)
+        return result, _apply_accepted_state_stabilization_2d(
+            self.grid, result.U_new, self.equations, dt=0.5 * dt
+        )
+
+    def _adaptive_step(self, U: Array, dt: float) -> Array:
+        """Perform one adaptive time step."""
+        result, Un = self._adaptive_attempt(U, dt)
+        return Un if result.accepted else U
 
     def _adaptive_run_step(self, dt: float, step_count: int, 
                           on_step: Optional[Callable[[int, float, Array], None]]) -> float:
         """Perform one step in adaptive run loop."""
-        def rhs_func(U_current: Array) -> Array:
-            return _compute_rhs_2d(
-                self.grid,
-                self.equations,
-                U_current,
-                self.artificial_viscosity,
-                self.gravity_config,
-            )
-        
-        U_split = self.grid.apply_spectral_dissipation(self.U, 0.5 * dt)
-
-        if _TORCH_AVAILABLE and isinstance(U_split, torch.Tensor):
-            solution_scale = float(torch.max(torch.abs(U_split)).item())
-        else:
-            solution_scale = float(np.max(np.abs(U_split)))
-        
-        result = _call_adaptive_step(
-            self, self.adaptive_stepper, rhs_func, U_split, dt, solution_scale,
-            limit_state=lambda state: _limit_euler_stage(self, state),
-        )
-        
+        result, Un = self._adaptive_attempt(self.U, dt)
         if result.accepted:
-            self.U = _apply_accepted_state_stabilization_2d(
-                self.grid, result.U_new, self.equations, dt=0.5 * dt
-            )
+            self.U = Un
             self.t += dt
-            _note_accepted(self)
+            self._note_accepted_state()
             if on_step is not None:
                 on_step(step_count, dt, self.U)
-            return result.dt_next
-        else:
-            return result.dt_next
+        return result.dt_next
     
     def _fixed_run_step(self, dt: float, step_count: int,
                        on_step: Optional[Callable[[int, float, Array], None]]) -> float:
         """Perform one step in fixed run loop."""
         self.U = self.step(self.U, dt)
         self.t += dt
-        _note_accepted(self)
+        self._note_accepted_state()
         
         # Call monitoring callback
         if on_step is not None:
@@ -2119,7 +2203,7 @@ def _apply_accepted_state_stabilization_3d(
 
 
 @dataclass
-class SpectralSolver3D:
+class SpectralSolver3D(_SpectralFastPathMixin):
     grid: Grid3D
     equations: EulerEquations3D
     scheme: str = "rk4"
@@ -2187,28 +2271,8 @@ class SpectralSolver3D:
         gravity = self.gravity_config and self.gravity_config.get("enabled", False)
         return None if gravity else self.spectral
 
-    def _note_accepted_state(self) -> None:
-        """``_note_accepted`` with the finite check fused into the wave-speed pass."""
-        if self.spectral is None or not self.spectral._torch:
-            _note_accepted(self)
-            return
-        finite, speed = self.spectral.finite_and_speed(self.U)
-        if not finite:
-            _note_accepted(self)  # raises with the reference message
-        self._accepted_steps = int(getattr(self, "_accepted_steps", 0)) + 1
-        self._speed_cache = (self.U, self.U._version, speed)
-
     def _stability_limit(self, U: Array) -> float:
-        cache = self._speed_cache
-        if cache is not None and cache[0] is U and cache[1] == U._version:
-            speed = _checked_wave_speed(self, U, cache[2])
-        elif self.spectral is not None and self.spectral._torch:
-            finite, speed = self.spectral.finite_and_speed(U)
-            if not finite:
-                _require_finite_state(self, "while computing the time step", U)
-            speed = _checked_wave_speed(self, U, speed)
-        else:
-            speed = _checked_wave_speed(self, U)
+        speed = self._wave_speed(U)
         return _smallest_finite((
             _hyperbolic_dt(self.cfl, _min_spacing(self.grid), speed),
         ))
@@ -2294,38 +2358,6 @@ class SpectralSolver3D:
             else (lambda V: _apply_accepted_state_stabilization_3d(self.grid, V, dt=0.5 * dt))
         )
         return result, stabilize(result.U_new)
-
-    def _embedded_attempt(self, fast, U_split, dt, solution_scale):
-        """Spectral embedded step; ``None`` means the stage limiter would act."""
-        stepper = self.adaptive_stepper
-        method = getattr(stepper, "method", None)
-        if not isinstance(stepper, AdaptiveTimeStepper) or method is None:
-            return None  # duck-typed steppers keep their own step
-
-        def embedded(U_in, dt_in):
-            out = fast.embedded_step(
-                U_in, dt_in, method.a, method.b_high, method.b_low, 0.5 * dt
-            )
-            if out is None:
-                raise _UseReferenceStep
-            return out[0], None, out[1]
-
-        try:
-            return stepper.step(None, U_split, dt, solution_scale, embedded=embedded)
-        except _UseReferenceStep:
-            return None
-        except FloatingPointError as exc:
-            message = str(exc)
-            if "t=" in message:
-                raise
-            raise FloatingPointError(
-                f"{message} At step {int(getattr(self, '_accepted_steps', 0))}, t={self.t}."
-            ) from exc
-        except Exception as exc:  # pragma: no cover - depends on toolchain
-            if isinstance(exc, (RuntimeError,)) and "Adaptive" in str(exc):
-                raise
-            fast.disable_triton(exc)
-            return None
 
     def _adaptive_step(self, U: Array, dt: float) -> Array:
         """Perform one adaptive time step."""
