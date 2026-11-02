@@ -81,8 +81,8 @@ regime (design note §6).
 
 Errors are spatial L1 norms divided by the initial mode amplitude. Per field:
 
-* L1 order ≥ 1.5 on the finest pair (limited second order; minmod clips smooth
-  extrema), unless the field is already at the floor, L1 ≤ 10⁻⁵ of the initial
+* L1 order ≥ 1.5 on the finest pair (the coupled scheme is second order in time and the
+  limiters clip smooth extrema locally), unless the field is already at the floor, L1 ≤ 10⁻⁵ of the initial
   amplitude at the finest `N` (spectral gas at weak coupling, dust velocity when
   drag is negligible);
 * energy drift ≤ 10⁻¹², zero repairs, every state realizable.
@@ -188,75 +188,59 @@ only with `--long` and otherwise keeps its last recorded result.
 ## Measured results
 
 <!-- RESULTS_START -->
-Final campaign on 2026-11-01 (local Apple M3, NumPy float64): **856/856 checks
-pass**, with zero repaired cells in every physical run.
+Campaign of 2026-11-02 on the WENO5-Z / SSP-RK3 transport (local Apple M3, NumPy
+float64): **852/852 checks pass**, with zero repaired cells in every physical run.
+`long_turbulence` was run on the preceding minmod/SSP-RK2 transport (its metrics
+record those source hashes); the other eight tests ran on the current sources.
 
-| Test | Passed / total |
-|---|---:|
-| [ou_box](../outputs/dust_validation/ou_box/metrics.json) | 139/139 |
-| [drag_decay](../outputs/dust_validation/drag_decay/metrics.json) | 241/241 |
-| [dustywave](../outputs/dust_validation/dustywave/metrics.json) | 133/133 |
-| [beams_free_streaming](../outputs/dust_validation/beams_free_streaming/metrics.json) | 230/230 |
-| [sgs_acoustic](../outputs/dust_validation/sgs_acoustic/metrics.json) | 13/13 |
-| [turb_energy_ledger](../outputs/dust_validation/turb_energy_ledger/metrics.json) | 81/81 |
-| [particle_reference_2d](../outputs/dust_validation/particle_reference_2d/metrics.json) | 19/19 |
+| Test | Passed / total | Runtime |
+|---|---:|---:|
+| [mt25_gaussianisation](../outputs/dust_validation/mt25_gaussianisation/metrics.json) | 16/16 | 42 s |
+| [ou_box](../outputs/dust_validation/ou_box/metrics.json) | 139/139 | 21 s |
+| [drag_decay](../outputs/dust_validation/drag_decay/metrics.json) | 241/241 | 3 s |
+| [dustywave](../outputs/dust_validation/dustywave/metrics.json) | 97/97 | 122 s |
+| [beams_free_streaming](../outputs/dust_validation/beams_free_streaming/metrics.json) | 230/230 | 121 s |
+| [sgs_acoustic](../outputs/dust_validation/sgs_acoustic/metrics.json) | 13/13 | 3 s |
+| [turb_energy_ledger](../outputs/dust_validation/turb_energy_ledger/metrics.json) | 81/81 | 44 s |
+| [particle_reference_2d](../outputs/dust_validation/particle_reference_2d/metrics.json) | 10/10 | 29 s |
+| [long_turbulence](../outputs/dust_validation/long_turbulence/metrics.json) | 25/25 | 65 min |
 
-The first pass of this campaign reported 69 failures and four reproducers. The
-architect resolved them as follows. The reproducer scripts are kept as
-regression probes.
-
-1. **Under-resolved SGS decay in the source step**
-   ([repro](../scripts/dust_validation/repro_ou_budget_freeze.py)). With `dt` of
-   one turnover time or more, the frozen-rate (and then midpoint-rate) reservoir
-   update was wrong by up to 100%: `e_s = 1.5` against Radau `2.8×10⁻⁶`. The
-   local step now sub-cycles whenever the reservoir loss rate × `dt` exceeds 0.25,
-   and uses midpoint rates with ETD2 linear-in-time forcing. Result: `e_s`
-   matches Radau to `2.83096×10⁻⁶` against `2.83091×10⁻⁶`. The worst box errors
-   over the whole sweep are now 6×10⁻⁴ (`e_s`), 1.8×10⁻³ (variance) and
-   8×10⁻⁴ (heat). Energy is exact to 4×10⁻¹⁵, and coarse steps are second order.
-2. **Cold-drag self-rejection**
-   ([repro](../scripts/dust_validation/repro_cold_drag_source.py)). After drag
-   decelerated the dust from u ≈ 0.7 to 0.0075, round-off left in `M2` from the
-   early speed was 10⁻¹² of the current `u²`. The source step now projects
-   round-off cone violations of its input and output (its exact maps preserve
-   the cone), returns the energy to the gas, and reports it as
-   `projection_heat`.
-3. **Dusty-wave orders** ([repro](../scripts/dust_validation/repro_dustywave_density.py)).
-   The first-order behaviour is the cold-dust property described above, not a
-   defect. Measured dust-density L1 orders (N = 64–128) are 0.98–1.43. The
-   L2 orders are 0.56–1.05, limited by the stagnation cell.
-4. **HyQMOM variance bound**
-   ([repro](../scripts/dust_validation/repro_hyqmom_kinetic_bound.py)). The excess
-   of 2.3×10⁻¹⁰ is the raw-moment round-off floor; the allowance is now 10⁻⁹.
-5. **Turbulence OU prediction.** The 3D short-stopping run's 15.8% deviation is
-   the transport-mixing term: it accounts for 37% of that run's random-energy
-   change. In every intermediate and long run the prediction matches to
-   ≤ 3×10⁻⁴.
-6. **HyQMOM smooth-packet noise** (found by this campaign, fixed afterwards).
-   Limiting raw moments one component at a time made the face skewness and
-   kurtosis noisy, because `q` and `r` are small differences of O(m³) and
-   O(m⁴) raw terms. Interior cells now reconstruct in
-   `(ρ, m, v, S3, H4, u_⊥, σ_⊥²)`, where realizability is a box; cells near the
-   boundary keep the conserved Zhang–Shu reconstruction. Both packets now
-   converge at about second order. The smooth packet's L1 errors are
-   2.1×10⁻², 5.2×10⁻³, 1.4×10⁻³ and 4.7×10⁻⁴ (N = 64–512) with decreasing
-   roughness; the crossing streams' are 1.1×10⁻¹ → 2.7×10⁻³.
-   `tests/test_dust_moments.py::test_hyqmom_smooth_packet_is_second_order_and_smooth`
-   guards the fix.
-
-Other results:
-
-* **SGS acoustic speed.** Relative errors are 6×10⁻⁹ to 5.5×10⁻⁴ against
+* **MT25 heating.** Over `x = 10⁻²…10²` the initial heating rate matches
+  `2ε_Δ arctan x` and the plateau matches `D/ν` to the reservoir-drain floor
+  (≤ 10⁻⁷), for the Gaussian closure in 1D, 2D and 3D and HyQMOM in 1D. HyQMOM
+  relaxes to kurtosis 3 from skewed, platykurtic and leptokurtic starts.
+* **Dusty wave.** Energy drift ≤ 9×10⁻¹⁵. Finest-pair L1 orders: about 2 for every
+  field not at the floor when `t_s/T ≥ 0.3` (cold dust density 2.13–2.18); 1.56–1.60
+  at `ε = 1`, `t_s/T = 10⁻³`, the stiff-splitting regime (design note §6).
+* **Free streaming.** HyQMOM density errors against the kinetic solution at
+  N = 64…512: 6.3×10⁻⁴ → 2.4×10⁻⁴ (smooth packet) and 2.8×10⁻³ → 8.4×10⁻⁴ (crossing
+  streams). Both flatten from N ≈ 128: that floor is the closure's error against
+  the kinetic solution, not discretisation error. The crossing-stream variance
+  stays within 2×10⁻¹⁰ of the kinetic bound. The Gaussian closure thermalises
+  the crossing streams, as expected.
+* **SGS acoustic speed.** Relative errors 6×10⁻⁹ to 5.5×10⁻⁴ against
   `c_eff² = γp/ρ + (10/9)e_s/ρ`.
-* **Crossing streams.** HyQMOM keeps the variance within the kinetic bound and
-  tracks the kinetic density. The Gaussian closure thermalises the streams and
-  shock-heats the tails, as expected for a single-Gaussian closure.
-* **Particle reference.** Density agrees to 1.4–3.4% and mean velocity to
-  2.5–6.3% of `v_rms`. Variance agrees to 6% at intermediate and long `t_s`. At
-  short `t_s` the variance differs by 43% after matching the CIC window: the
-  physical variance `D/ν` is tiny there, and both descriptions are dominated by
-  unresolved shear within a cell and numerical mixing. Local velocity PDFs are
-  Gaussian within sampling noise (kurtosis 2.6–3.1).
+* **Turbulent energy ledger.** Total energy drift ≤ 4×10⁻¹⁶ and SGS ledger closure
+  ≤ 3.5×10⁻¹⁶ in 2D and 3D at both loadings.
+* **Particle reference.** Global dispersion within 4.1% (`t_s/τ_Δ = 1`) and 0.4%
+  (`t_s/τ_Δ = 20`) of 256 particles per cell; stacked kurtosis 3.29 and 3.00. At
+  `t_s/τ_Δ = 0.05` the dispersion differs by 31% and the particle kurtosis is 6.05:
+  the single-Gaussian closure cannot hold that mixture (design note §6).
+* **Long decaying turbulence.** Energy and SGS-ledger closure at round-off over
+  about three large-eddy times from an empty reservoir; in 3D heavy loading ends
+  with 0.28× the resolved and 0.16× the SGS energy of light loading.
+
+Earlier campaigns found and fixed: under-resolved SGS decay in the source step
+(now sub-cycled with midpoint rates and ETD2 forcing,
+[repro](../scripts/dust_validation/repro_ou_budget_freeze.py)); cold-drag
+self-rejection from round-off history (now regularised at source entry and exit,
+[repro](../scripts/dust_validation/repro_cold_drag_source.py)); first-order cold dust
+(now primitive faces with sub-cell projection,
+[repro](../scripts/dust_validation/repro_dustywave_density.py)); the HyQMOM
+round-off floor ([repro](../scripts/dust_validation/repro_hyqmom_kinetic_bound.py));
+and noisy HyQMOM skewness from raw-component limiting (now primitive interior faces).
+An MC-limited intermediate violated the crossing-stream kinetic variance bound by
+up to 2.7×10⁻⁷ and was not adopted.
 
 For all check values, thresholds, outcomes and figure links, use
 [the complete generated table](../outputs/dust_validation/summary.md).

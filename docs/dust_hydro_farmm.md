@@ -81,21 +81,25 @@ cold, fast dust, so the dust runs in float64 with explicit round-off tolerances 
 
 The dust points are PHRIKE's collocation points, treated as cell centres.
 
-* Piecewise-linear, minmod-limited faces. Each cell picks one of two
-  reconstructions:
-  * **Conserved (Zhang–Shu).** Limited slopes of the raw moments, scaled toward
+* **WENO5-Z faces** (Borges et al. 2008) of the reconstructed variables, with a
+  fall-back to MC-limited linear faces wherever a WENO face leaves a positivity
+  box (`ρ`, `v`, `H4`, `σ_⊥² ≥ 0`). Against the kinetic free-streaming
+  references WENO5-Z is 6× (smooth packet) to 38× (crossing streams) more
+  accurate than MC at 64 cells; from about 128 cells the remaining error is the
+  closure's own, not the discretisation's. A kinetic flux with HLL in place of
+  the node-wise upwinding changed nothing measurable on these tests, and for a
+  stationary contact HLL is three times more dissipative: it upwinds every node
+  with the outermost wave speeds. Each cell picks one of two reconstructions:
+  * **Conserved (Zhang–Shu).** Face increments of the raw moments, scaled toward
     the cell average by powers of ½ until both faces are strictly realizable and
     their quadrature-node velocities lie within the neighbours' node range plus
     half its span. That is a relaxed kinetic maximum principle: it keeps second
     order at smooth extrema but stops light extrapolated faces from carrying
-    spuriously fast nodes. The reconstruction is linear in the conserved
-    variables, so the cell average is the mean of its faces and the update is
-    realizable by convexity. Used for warm cells near the cone boundary
+    spuriously fast nodes. Used for warm cells near the cone boundary
     (two-point mixtures, crossing streams) and for rough data.
-  * **Primitive.** Gaussian: `(ρ, u, C)`, with the `C` slope halved until both
-    faces are positive semi-definite. HyQMOM: `(ρ, u_x, v, S3, H4, u_y, u_z,
-    σ_⊥²)`, where realizability is the box `v, H4, σ_⊥² ≥ 0` and minmod keeps
-    each face inside its neighbours' range. HyQMOM uses this in the cone interior
+  * **Primitive.** Gaussian: `(ρ, u, C)`, with the `C` increment halved until
+    both faces are positive semi-definite. HyQMOM: `(ρ, u_x, v, S3, H4, u_y, u_z,
+    σ_⊥²)`, where realizability is the box `v, H4, σ_⊥² ≥ 0`. HyQMOM uses this in the cone interior
     (`H4 ≥ ½` in the cell and both neighbours; a Gaussian has `H4 = 2`): `q, r`
     are small differences of `O(m³)` and `O(m⁴)` raw terms, and limiting raw
     components separately makes the face skewness and kurtosis noisy. Both
@@ -155,7 +159,9 @@ The dust points are PHRIKE's collocation points, treated as cell centres.
   bound: in the crossing-stream test it stalled the scheme at 3500 substeps per
   0.01 time. The kinetic flux only ever subtracts a cell's own outflow from
   itself.
-* SSP-RK2 in time, with `dt` chosen from `C = 0.8` of the bound. A stage that
+* SSP-RK3 (Shu–Osher) in time, with `dt` chosen from `C = 0.8` of the bound;
+  each stage's projection energy enters the gas with the weight that stage
+  carries in the final state (1/6, 2/3, 1). A stage that
   violates the bound or leaves the cone halves and redoes the substep. Dust
   transport is sub-cycled within the gas step.
 * At the start of each substep, states that pass the round-off-tolerant cone
@@ -237,7 +243,7 @@ total energy conserved to 10⁻¹⁵.
   renormalise to the global `∫ΔK`, and cap each cell at `f_cap ρ e_int`. That
   amount is transferred pointwise from `E` to `e_s`. This is the "spectral code
   knows exactly what its filter removes" advantage.
-* **Transport and compression.** Conservative MUSCL/minmod advection with the
+* **Transport and compression.** Conservative minmod-limited advection with the
   time-centred gas velocity, which is positive for `Σ_d (dt/dx_d)|u_d| ≤ ½`. The
   compression factor `exp(−(2/3)∇·u dt)` uses the spectral divergence, and its
   energy is exchanged pointwise with the gas `E`. The gas fluxes already did the
@@ -277,14 +283,16 @@ exchanges are exact, so they do not enter `dt`.
   about 0.6% of the mode amplitude at `N = 512` (order 1.6 on the finest pair).
   Mixture-inertia (asymptotic-preserving) transport of the coupled pair would
   remove this; it is not implemented.
-* **Cold dust order.** With primitive faces and sub-cell projection, smooth cold
-  dust converges at about order 1.5 in L1 (minmod clips smooth extrema); without
-  them it was first order.
+* **Cold dust order.** With primitive faces, sub-cell projection and WENO5-Z,
+  smooth cold dust converges at about order 2 in L1 in the dusty wave (1.5 with
+  minmod faces; first order with conserved faces only).
 * **Velocity tails.** A single Gaussian per cell cannot hold the heavy tails of
   short-`t_s` dust in turbulence, where a cell mixes grains that still carry
   neighbouring cells' velocities. Against 256 particles per cell, the stacked
   kurtosis is about 6 at `t_s/τ_Δ = 0.05` and the dispersion differs by about
-  20%. At `t_s/τ_Δ = 1` the dispersion agrees within 5% and the kurtosis is 3.3;
+  30% (20% with minmod faces, whose extra numerical mixing happened to mimic
+  the particles' nearest-grid-point spreading). At `t_s/τ_Δ = 1` the dispersion
+  agrees within 5% and the kurtosis is 3.3;
   at `t_s/τ_Δ = 20`, within 0.4% and 3.0.
   HyQMOM carries the fourth moment and represents these tails in 1D; a
   multi-dimensional quadrature closure would be needed in 2D/3D.
