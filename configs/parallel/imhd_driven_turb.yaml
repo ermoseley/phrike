@@ -1,0 +1,76 @@
+# Driven incompressible visco-resistive MHD turbulence, super-Alfvenic.
+#
+#   srun -n 8 python -m phrike.parallel imhd_turb --config configs/parallel/imhd_driven_turb.yaml
+#   python -m phrike.parallel imhd_turb --config configs/parallel/imhd_driven_turb.yaml   # one device
+#
+# Units: density 1, b in velocity units (b = B / sqrt(mu0 rho)), so the Alfven
+# Mach number is u_rms / b_rms.  The run starts from a weak seed field
+# (M_A = 1000) and no mean field; the forcing sustains u_rms of order one and
+# the field grows by the small-scale dynamo.  For a weak guide field instead,
+# set initial_conditions.b0, e.g. [0, 0, 0.1] for a mean-field M_A near 10.
+#
+# Resolution: history.csv reports kmax_eta = k_max * (nu^3 / eps)^(1/4), which
+# should stay above about 1.5 for a resolved DNS.  nu = 3e-3 does that at
+# 256^3 for these forcing parameters; scale nu like N^(-4/3) when refining
+# (512^3: 1.2e-3, 1024^3: 4.7e-4, 2048^3: 1.9e-4).  With Pm != 1 the smaller
+# of the viscous and resistive scales has to be resolved.
+problem: imhd_turb
+
+grid:
+  Nx: 256
+  Ny: 256
+  Nz: 256
+  Lx: 6.283185307179586
+  Ly: 6.283185307179586
+  Lz: 6.283185307179586
+  precision: single
+
+physics:
+  viscosity: 3.0e-3
+  magnetic_prandtl: 1.0        # eta = viscosity / Pm; or give resistivity directly
+  spherical_truncation: false  # true keeps |k| <= k_max instead of the full 2/3 box
+
+integration:
+  t0: 0.0
+  t_end: 40.0
+  cfl: 0.6                     # RK4 is stable to 1.35 in this norm; see docs/parallel.rst
+  scheme: rk4                  # rk2, rk3 or rk4 (integrating factor for nu and eta)
+  output_interval: 1.0
+  checkpoint_interval: 5.0
+
+forcing:
+  type: ou                     # ou, white or constant_power
+  kmin: 1.0                    # forced shell, in cycles per box
+  kmax: 2.5
+  amplitude: 1.0               # rms acceleration (ou)
+  correlation_time: 1.0
+  # power: 0.3                 # energy injection rate (white, constant_power)
+  seed: 1
+
+initial_conditions:
+  vrms: 1.0
+  kmin: 1.0
+  kmax: 4.0
+  spectrum_type: parabolic
+  seed: 42
+  b_rms: 1.0e-3
+  b_kmin: 1.0
+  b_kmax: 4.0
+  b_seed: 123
+  b0: [0.0, 0.0, 0.0]
+
+io:
+  outdir: outputs/imhd_driven_turb
+  snapshots: true              # spectral snapshot at every output
+  slices: true
+  spectra: true
+  keep_checkpoints: 2
+
+monitoring:
+  enabled: true
+  step_interval: 20
+
+parallel:
+  gpu_aware_mpi: false         # true once `python -m scripts.check_gpu_aware_mpi` passes
+  transpose: alltoallv         # or p2p
+  fft_batch: 4                 # fields per transform pass; lower it to save memory

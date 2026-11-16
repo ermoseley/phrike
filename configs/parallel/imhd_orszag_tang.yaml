@@ -1,0 +1,34 @@
+# Incompressible 3D Orszag-Tang vortex (Politano, Pouquet & Sulem 1995): decaying,
+# a standard check of the dissipation rates and the current-sheet formation.
+#   mpirun -n 4 python -m phrike.parallel imhd_orszag_tang --config configs/parallel/imhd_orszag_tang.yaml
+problem: imhd_orszag_tang
+
+grid:
+  Nx: 128
+  Ny: 128
+  Nz: 128
+  Lx: 6.283185307179586
+  Ly: 6.283185307179586
+  Lz: 6.283185307179586
+  precision: double
+
+physics:
+  viscosity: 0.01
+  resistivity: 0.01
+
+integration:
+  t0: 0.0
+  t_end: 4.0
+  cfl: 0.6
+  scheme: rk4
+  output_interval: 0.25
+
+initial_conditions:
+  beta: 0.8
+
+io:
+  outdir: outputs/imhd_orszag_tang
+
+monitoring:
+  enabled: true
+  step_interval: 20

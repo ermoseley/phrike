@@ -5,6 +5,24 @@ All notable changes to PHRIKE are recorded here. The format follows
 
 ## Unreleased
 
+### Added
+
+- `phrike.parallel`: the 3D Euler and MHD spectral fast path on many GPUs
+  (MPI slab decomposition, one rank per GPU, truncated distributed FFT), run
+  with `python -m phrike.parallel`. With one rank the step equals the
+  reference solver to round-off; any rank count gives the one-rank result.
+  Fixed and embedded Runge-Kutta, the positivity limiter, per-rank spectral
+  snapshots, and restart on a different rank count or resolution.
+- Incompressible visco-resistive MHD and Navier-Stokes solvers on the same
+  decomposition (`imhd_turb`, `imhd_orszag_tang`, `imhd_alfven`, `ins_turb`,
+  `ins_taylor_green`): exact integrating factor for viscosity and
+  resistivity, RK2/RK3/RK4, 14 transforms per stage for MHD.
+- Large-scale forcing for driven turbulence (`forcing.type`: `ou`, `white`,
+  `constant_power`) and random initial fields that do not depend on the rank
+  count.
+- `python -m phrike.parallel.selftest`, `scripts/bench_parallel.py`,
+  `scripts/check_gpu_aware_mpi.py` and a Slurm template.
+
 ### Fixed
 
 - 1D `outflow` and `wall` boundaries on Chebyshev/Legendre grids are now
