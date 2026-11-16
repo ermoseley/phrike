@@ -14,4 +14,5 @@ the workflows that are maintained in this repository.
    configuration
    validation
    performance
+   parallel
    development

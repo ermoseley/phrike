@@ -49,3 +49,17 @@ python -m scripts.validate_alfven1d
 
 The benchmark intentionally calls an internal solver step and is therefore a
 developer measurement, not part of the stable public API or test suite.
+
+## Multi-GPU runs
+
+```bash
+# Is the MPI library GPU-aware? Decides parallel.gpu_aware_mpi.
+srun -n 2 python -m scripts.check_gpu_aware_mpi
+
+# Throughput and weak scaling: constant Mzc/s/rank as the rank count grows.
+srun -n 8 python -m scripts.bench_parallel --problem imhd_turb --points-per-rank 256
+```
+
+`scripts/slurm/phrike_parallel.sbatch` is a job template (one rank per GPU,
+self-test, then the run with a wall-clock limit and a checkpoint). See
+`docs/parallel.rst`.

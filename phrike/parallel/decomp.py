@@ -1,0 +1,145 @@
+"""Slab decomposition of a periodic 3D Fourier grid and its retained modes.
+
+Physical space is cut into z slabs: rank ``r`` owns ``nz`` consecutive planes
+of the ``(Nz, Ny, Nx)`` grid.  Spectral space holds only the modes kept by the
+2/3 rule, ``|n_i| <= (N_i - 1) // 3`` on every axis, in ``rfftn`` order: the
+compact array is ``(Kz, Ky, Kx)`` with ``Kx = cx + 1`` and ``K = 2 c + 1`` on
+the other two axes, and it is cut into ky slabs.  Each rank therefore owns
+complete z columns in spectral space and complete (y, x) planes in physical
+space, which is what one transpose per 3D transform needs.
+
+Both cuts are balanced (sizes differ by at most one), so every pack and unpack
+is a constant number of strided copies however many ranks there are.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import List, Tuple
+
+import numpy as np
+
+
+def balanced_counts(n: int, parts: int) -> List[int]:
+    """Split ``n`` items into ``parts`` consecutive blocks whose sizes differ by at most one."""
+    if parts < 1:
+        raise ValueError("parts must be positive")
+    base, extra = divmod(int(n), int(parts))
+    return [base + 1] * extra + [base] * (parts - extra)
+
+
+def uniform_groups(counts: List[int]) -> List[Tuple[int, int, int, int]]:
+    """Runs of equal block size as ``(first_block, n_blocks, size, first_item)``."""
+    groups: List[Tuple[int, int, int, int]] = []
+    item = 0
+    i = 0
+    while i < len(counts):
+        j = i
+        while j < len(counts) and counts[j] == counts[i]:
+            j += 1
+        if counts[i] > 0:
+            groups.append((i, j - i, counts[i], item))
+        item += counts[i] * (j - i)
+        i = j
+    return groups
+
+
+def cutoff(n: int) -> int:
+    """Largest retained integer mode of the 2/3 rule, as ``grid._build_filter_mask``."""
+    return (int(n) - 1) // 3
+
+
+def compact_modes(n: int) -> np.ndarray:
+    """Integer wavenumbers of the retained modes of a full axis, in FFT order."""
+    c = cutoff(n)
+    return np.concatenate((np.arange(0, c + 1), np.arange(-c, 0))).astype(np.int64)
+
+
+@dataclass
+class SlabDecomposition:
+    """Global sizes, retained-mode sizes and this rank's two slabs."""
+
+    Nx: int
+    Ny: int
+    Nz: int
+    nprocs: int = 1
+    rank: int = 0
+    z_counts: List[int] = field(init=False)
+    ky_counts: List[int] = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.Nx, self.Ny, self.Nz = int(self.Nx), int(self.Ny), int(self.Nz)
+        self.nprocs, self.rank = int(self.nprocs), int(self.rank)
+        if min(self.Nx, self.Ny, self.Nz) < 1:
+            raise ValueError("grid sizes must be positive")
+        if not 0 <= self.rank < self.nprocs:
+            raise ValueError("rank must lie in [0, nprocs)")
+        self.cx, self.cy, self.cz = cutoff(self.Nx), cutoff(self.Ny), cutoff(self.Nz)
+        self.Kx, self.Ky, self.Kz = self.cx + 1, 2 * self.cy + 1, 2 * self.cz + 1
+        self.Xh = self.Nx // 2 + 1
+        if self.nprocs > self.Nz or self.nprocs > self.Ky:
+            raise ValueError(
+                f"A slab decomposition needs at most min(Nz, Ky) = "
+                f"{min(self.Nz, self.Ky)} ranks for this grid (got {self.nprocs}); "
+                f"Ky = 2*((Ny - 1)//3) + 1 is the number of retained y modes."
+            )
+        self.z_counts = balanced_counts(self.Nz, self.nprocs)
+        self.ky_counts = balanced_counts(self.Ky, self.nprocs)
+        self.z_starts = [int(v) for v in np.concatenate(([0], np.cumsum(self.z_counts)[:-1]))]
+        self.ky_starts = [int(v) for v in np.concatenate(([0], np.cumsum(self.ky_counts)[:-1]))]
+
+    # --- this rank ----------------------------------------------------------
+
+    @property
+    def nz(self) -> int:
+        """Number of z planes this rank owns in physical space."""
+        return self.z_counts[self.rank]
+
+    @property
+    def z0(self) -> int:
+        return self.z_starts[self.rank]
+
+    @property
+    def nky(self) -> int:
+        """Number of retained ky rows this rank owns in spectral space."""
+        return self.ky_counts[self.rank]
+
+    @property
+    def ky0(self) -> int:
+        return self.ky_starts[self.rank]
+
+    @property
+    def physical_shape(self) -> Tuple[int, int, int]:
+        return (self.nz, self.Ny, self.Nx)
+
+    @property
+    def spectral_shape(self) -> Tuple[int, int, int]:
+        return (self.Kz, self.nky, self.Kx)
+
+    @property
+    def n_points(self) -> int:
+        return self.Nx * self.Ny * self.Nz
+
+    @property
+    def n_modes(self) -> int:
+        return self.Kx * self.Ky * self.Kz
+
+    # --- integer wavenumbers ------------------------------------------------
+
+    def modes_x(self) -> np.ndarray:
+        return np.arange(self.Kx, dtype=np.int64)
+
+    def modes_y(self) -> np.ndarray:
+        """Integer ky of every retained row (global compact order)."""
+        return compact_modes(self.Ny)
+
+    def modes_y_local(self) -> np.ndarray:
+        return self.modes_y()[self.ky0:self.ky0 + self.nky]
+
+    def modes_z(self) -> np.ndarray:
+        return compact_modes(self.Nz)
+
+    def describe(self) -> str:
+        return (f"{self.Nx}x{self.Ny}x{self.Nz} grid, {self.Kx}x{self.Ky}x{self.Kz} retained modes, "
+                f"{self.nprocs} slab(s): {min(self.z_counts)}-{max(self.z_counts)} z planes and "
+                f"{min(self.ky_counts)}-{max(self.ky_counts)} ky rows per rank")

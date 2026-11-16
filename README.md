@@ -23,6 +23,10 @@ portable NumPy/PyTorch backends—not a production CFD package.
 - NumPy CPU execution plus optional PyTorch CPU, CUDA, and Apple Metal/MPS
   backends.
 - Lagrangian tracer particles with tracer-density reconstruction.
+- Multi-GPU 3D runs over MPI (`phrike.parallel`, one rank per GPU), and
+  incompressible visco-resistive MHD with large-scale forcing for driven
+  turbulence. See [docs/parallel.rst](docs/parallel.rst):
+  `mpirun -n 8 python -m phrike.parallel imhd_turb --config configs/parallel/imhd_driven_turb.yaml`.
 
 ## Quick start
 
