@@ -19,8 +19,10 @@ All notable changes to PHRIKE are recorded here. The format follows
   resistivity, RK2/RK3/RK4, 14 transforms per stage for MHD.
 - Large-scale forcing for driven turbulence (`forcing.type`: `ou`, `white`,
   `constant_power`) and random initial fields that do not depend on the rank
-  count.
-- `python -m phrike.parallel.selftest`, `scripts/bench_parallel.py`,
+  count. The compressible acceleration is synthesized on the device from the
+  modes each rank owns; the band respects the spherical truncation.
+- `python -m phrike.parallel.selftest`, `scripts/bench_parallel.py` (with
+  `--forcing`),
   `scripts/check_gpu_aware_mpi.py` and a Slurm template.
 
 ### Fixed

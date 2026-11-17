@@ -216,7 +216,18 @@ class IncompressibleSlabStepper:
         """Mask of the evolved modes (None for the full 2/3 box)."""
         if not self.spherical:
             return None
-        return (self.grid.k2() <= self.kcut2).to(self.grid.rdtype)
+        mask = getattr(self, "_keep_mask", None)
+        if mask is None:
+            # In float64 on the host, as the forcing band's mask: a float32 k^2
+            # could put a mode on the cutoff on the other side.
+            g = self.grid
+            kx = 2.0 * np.pi * np.asarray(g.nx_modes, dtype=np.float64) / g.Lx
+            ky = 2.0 * np.pi * np.asarray(g.ny_modes, dtype=np.float64) / g.Ly
+            kz = 2.0 * np.pi * np.asarray(g.nz_modes, dtype=np.float64) / g.Lz
+            k2 = kz[:, None, None] ** 2 + ky[None, :, None] ** 2 + kx[None, None, :] ** 2
+            mask = torch.as_tensor(k2 <= self.kcut2, device=g.device).to(g.rdtype)
+            self._keep_mask = mask
+        return mask
 
     def _project_(self, X: torch.Tensor) -> None:
         """Leray-project a 3-vector spectrum in place."""
