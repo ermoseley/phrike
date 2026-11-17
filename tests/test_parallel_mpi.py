@@ -52,7 +52,7 @@ def _env():
     return env
 
 
-@pytest.mark.parametrize("ranks", [2, 3, 5])
+@pytest.mark.parametrize("ranks", [2, 3, 5, 7])
 def test_distributed_suite_under_mpi(ranks):
     done = subprocess.run(LAUNCHER + ["-n", str(ranks), sys.executable, "-m", "pytest", "-q", "-x",
                                       "-p", "no:cacheprovider"] + SUITE,

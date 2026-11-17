@@ -5,6 +5,8 @@ A snapshot is a directory::
     snap_000012/
         meta.json            global sizes, time, physics, forcing state, config
         spec.00000.npy ...   one file per rank: its retained spectrum (C, Kz, nky, Kx)
+        resid.00000.npy ...  only after an MHD accepted-state clamp: one file per rank,
+                             its z slab of the out-of-band residual (5, nz, Ny, Nx)
 
 The state is stored as the retained Fourier modes divided by N.  That is the
 solver's own representation, it is exact for the band-limited fields the
@@ -17,6 +19,14 @@ the rank count may differ and so may the resolution (modes are matched by
 integer wavenumber; new modes start at zero and modes that no longer fit are
 dropped), which is how a run is restarted on more GPUs or refined.
 
+The residual is the content above the dealias cutoff that the MHD
+accepted-state limiter leaves in a clamped state; the next step needs it (see
+``compressible.py``).  It lives in physical space on the writer's z slabs, so
+``read_residual`` returns it only for a restart with the same grid and rank
+count, which then reproduces the uninterrupted run; otherwise it is dropped
+with a ``RuntimeWarning`` and the first step after the restart differs from the
+uninterrupted run by the clamp's out-of-band part.
+
 ``load_snapshot`` assembles a whole snapshot in one process for analysis.
 """
 
@@ -24,6 +34,7 @@ from __future__ import annotations
 
 import json
 import os
+import warnings
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -66,9 +77,18 @@ def rank_file(path: str, rank: int) -> str:
     return os.path.join(path, f"spec.{rank:05d}.npy")
 
 
+def residual_file(path: str, rank: int) -> str:
+    return os.path.join(path, f"resid.{rank:05d}.npy")
+
+
 def write_snapshot(path: str, grid: SlabGrid3D, system: str, spectrum: torch.Tensor,
-                   t: float, step: int, extra: Optional[Dict[str, Any]] = None) -> str:
-    """Write this rank's part of a snapshot (collective: call on every rank)."""
+                   t: float, step: int, extra: Optional[Dict[str, Any]] = None,
+                   residual: Optional[torch.Tensor] = None) -> str:
+    """Write this rank's part of a snapshot (collective: call on every rank).
+
+    ``residual`` is the stepper's out-of-band residual (``None`` while the
+    state is band-limited); every rank passes its own slab or all pass ``None``.
+    """
     comm = grid.comm
     if comm.is_root:
         os.makedirs(path, exist_ok=True)
@@ -81,6 +101,13 @@ def write_snapshot(path: str, grid: SlabGrid3D, system: str, spectrum: torch.Ten
     with open(tmp, "wb") as handle:
         np.save(handle, spectrum.detach().cpu().numpy())
     os.replace(tmp, target)
+    extra_file = residual_file(path, comm.rank)
+    if residual is not None:
+        with open(extra_file + ".tmp", "wb") as handle:
+            np.save(handle, residual.detach().cpu().numpy())
+        os.replace(extra_file + ".tmp", extra_file)
+    elif os.path.exists(extra_file):
+        os.remove(extra_file)  # left by an earlier snapshot written to this directory
     comm.barrier()
     if comm.is_root:
         d = grid.decomp
@@ -92,6 +119,9 @@ def write_snapshot(path: str, grid: SlabGrid3D, system: str, spectrum: torch.Ten
             "ky_counts": [int(c) for c in d.ky_counts], "precision": grid.precision,
             "normalization": "retained rfftn modes divided by Nx*Ny*Nz; kx >= 0 half",
         }
+        if residual is not None:
+            meta["residual"] = {"ncomp": int(residual.shape[0]), "nprocs": d.nprocs,
+                                "z_counts": [int(c) for c in d.z_counts]}
         meta.update(_json_ready(extra or {}))
         tmp = os.path.join(path, "meta.json.tmp")
         with open(tmp, "w", encoding="utf-8") as handle:
@@ -148,11 +178,41 @@ def read_spectrum(path: str, grid: SlabGrid3D, system: str, meta: Optional[Dict[
     return torch.as_tensor(out, dtype=grid.cdtype, device=grid.device)
 
 
+def read_residual(path: str, grid: SlabGrid3D, system: str,
+                  meta: Optional[Dict[str, Any]] = None) -> Optional[torch.Tensor]:
+    """This rank's out-of-band residual, or ``None`` if the snapshot has none or it cannot be reused.
+
+    The residual is stored in physical space per writer rank, so it is read
+    back only when the grid sizes and the rank count match the snapshot's;
+    otherwise it is dropped with a ``RuntimeWarning`` (rank 0 only).
+    """
+    meta = meta or read_meta(path)
+    info = meta.get("residual")
+    if info is None:
+        return None
+    d = grid.decomp
+    same = ((int(meta["Nx"]), int(meta["Ny"]), int(meta["Nz"])) == (d.Nx, d.Ny, d.Nz)
+            and int(info["nprocs"]) == d.nprocs and list(info["z_counts"]) == [int(c) for c in d.z_counts])
+    if not same:
+        if grid.comm.is_root:
+            warnings.warn(
+                f"{path} holds the out-of-band part of a limiter-clamped state, written on "
+                f"{info['nprocs']} rank(s) for a {meta['Nx']}x{meta['Ny']}x{meta['Nz']} grid; "
+                f"this run uses {d.nprocs} rank(s) and {d.Nx}x{d.Ny}x{d.Nz}, so it is dropped "
+                "and the first step after the restart differs from the uninterrupted run.",
+                RuntimeWarning, stacklevel=2)
+        return None
+    data = np.load(residual_file(path, grid.comm.rank))
+    return torch.as_tensor(data, dtype=grid.rdtype, device=grid.device)
+
+
 def load_snapshot(path: str, physical: bool = False) -> Dict[str, Any]:
     """Assemble a snapshot in this process: ``spectrum`` (C, Kz, Ky, Kx), optionally ``fields``.
 
     ``fields`` is the real-space state ``(C, Nz, Ny, Nx)``; it needs the
-    memory of the full grid, so use it for moderate sizes or cut it up.
+    memory of the full grid, so use it for moderate sizes or cut it up.  When the
+    snapshot has an out-of-band residual it is returned as ``residual``
+    ``(5, Nz, Ny, Nx)`` and added to the first five ``fields``.
     """
     meta = read_meta(path)
     parts = [np.load(rank_file(path, r)) for r in range(int(meta["nprocs"]))]
@@ -167,6 +227,11 @@ def load_snapshot(path: str, physical: bool = False) -> Dict[str, Any]:
         padded = np.zeros((spectrum.shape[0], Nz, Ny, Nx // 2 + 1), dtype=np.complex128)
         padded[np.ix_(range(spectrum.shape[0]), iz, iy, range(meta["Kx"]))] = spectrum
         out["fields"] = np.fft.irfftn(padded, s=(Nz, Ny, Nx), axes=(-3, -2, -1)) * (Nx * Ny * Nz)
+    if "residual" in meta:
+        out["residual"] = np.concatenate(
+            [np.load(residual_file(path, r)) for r in range(int(meta["nprocs"]))], axis=1)
+        if physical:
+            out["fields"][:out["residual"].shape[0]] += out["residual"]
     return out
 
 

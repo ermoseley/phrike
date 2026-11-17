@@ -24,7 +24,8 @@ def _make(shape, lengths=CUBE, nu=0.0, eta=0.0, mhd=True, scheme="rk4", comm=Non
     Nx, Ny, Nz = shape
     grid = SlabGrid3D(Nx, Ny, Nz, *lengths, comm=comm or COMM, device="cpu", precision="double", fft_batch=3)
     if isinstance(forcing, dict):
-        forcing = BandForcing(grid, forcing, incompressible=True)
+        forcing = BandForcing(grid, forcing, incompressible=True,
+                              spherical_truncation=kwargs.get("spherical_truncation", False))
     return grid, IncompressibleSlabStepper(grid, nu, eta, mhd=mhd, scheme=scheme, forcing=forcing, **kwargs)
 
 

@@ -132,8 +132,8 @@ def test_embedded_triton_tier_matches_torch_tier(system, dissipation):
     (e1, s1, r1, U1, S1), (e2, s2, r2, U2, S2) = results
     assert e1 == pytest.approx(e2, rel=1e-9, abs=1e-15) and s1 == pytest.approx(s2, rel=1e-13)
     assert r1 == pytest.approx(r2, rel=1e-9, abs=1e-15)
-    assert gmax((U1 - U2).abs().max().item()) < 1e-12 * float(U2.abs().max())
-    assert gmax((S1 - S2).abs().max().item()) < 1e-12 * float(S2.abs().max())
+    assert gmax((U1 - U2).abs().max().item()) < 1e-12 * gmax(float(U2.abs().max()))
+    assert gmax((S1 - S2).abs().max().item()) < 1e-12 * gmax(float(S2.abs().max()))
 
 
 def test_limiter_fallback_from_the_triton_tier():
@@ -175,4 +175,4 @@ def test_driver_runs_on_the_triton_tier(tmp_path, problem):
         sim.run()
         assert (sim.stepper._triton is not None) == bool(tier)
         finals.append(sim.stepper.uhat.clone())
-    assert gmax((finals[0] - finals[1]).abs().max().item()) < 1e-12 * float(finals[1].abs().max())
+    assert gmax((finals[0] - finals[1]).abs().max().item()) < 1e-12 * gmax(float(finals[1].abs().max()))

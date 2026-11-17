@@ -99,7 +99,7 @@ def test_restart_reproduces_the_uninterrupted_run(tmp_path, problem, forcing):
     resumed, summary = _run(problem, _config(os.path.join(outdir, "resumed"), **extra),
                             restart=os.path.join(outdir, "half", "snapshots", "snap_000001"))
     assert resumed.t == pytest.approx(full.t, rel=1e-13) and resumed.step_count == full.step_count
-    scale = float(full.stepper.uhat.abs().max())
+    scale = gmax(float(full.stepper.uhat.abs().max()))
     assert gmax((resumed.stepper.uhat - full.stepper.uhat).abs().max().item()) < 1e-12 * scale
     # The restarted run continues the numbering and does not rewrite the state it started from.
     assert _snapshots(os.path.join(outdir, "resumed")) == ["snap_000002"]
@@ -178,6 +178,41 @@ def test_configuration_is_checked(tmp_path):
         Simulation("nonexistent", _config(outdir), comm=COMM, backend="cpu", quiet=True)
     with pytest.raises(ValueError):
         Simulation("turb3d", _config(outdir, grid={"dealias": False}), comm=COMM, backend="cpu", quiet=True)
+
+
+def test_compressible_forcing_costs_transforms_not_host_work(tmp_path):
+    """The acceleration is one 3-field inverse transform; the kick adds 4 forward + 4 inverse fields."""
+    outdir = shared_dir(tmp_path)
+    quiet_io = {"snapshots": False, "slices": False, "spectra": False}
+    kw = dict(io=quiet_io, integration={"dt": 1e-3, "t_end": 0.01})
+    _, plain = _run("mhd_turb3d", _config(os.path.join(outdir, "a"), **kw))
+    for kind, extra in (("ou", {}), ("white", {"power": 0.5})):
+        forced = dict(OU, type=kind, **extra)
+        sim, summary = _run("mhd_turb3d", _config(os.path.join(outdir, kind), forcing=forced, **kw))
+        assert summary["steps"] == plain["steps"] == 10
+        assert summary["fft_fields_per_step"] - plain["fft_fields_per_step"] == pytest.approx(3 + 8)
+        assert "forcing" in summary["timers_max_seconds"] and "forcing_kick" in summary["timers_max_seconds"]
+        assert gmax(float(sim.stepper.physical()[1:4].abs().max())) > 0.0
+
+
+def test_forcing_respects_an_anisotropic_spherical_truncation(tmp_path):
+    outdir = shared_dir(tmp_path)
+    # kz = 2 nz here and kcut = 6: the integer-mode band 3.5 <= |n| <= 4.5 reaches modes outside the ball.
+    sections = {"grid": {"Lz": np.pi}, "physics": {"spherical_truncation": True},
+                "forcing": dict(OU, kmin=3.5, kmax=4.5)}
+    sim, _ = _run("imhd_turb", _config(outdir, **sections))
+    assert sim.forcing.n_truncated > 0 and sim.forcing.k2.max() <= sim.stepper.kcut2
+    outside = (sim.grid.k2() > sim.stepper.kcut2).expand_as(sim.stepper.uhat.real)
+    assert gmax(sim.stepper.uhat.abs()[outside].max().item()) == 0.0
+    # A band with no kept mode is refused up front (|n| = sqrt(3) needs kz = 16 here).
+    empty = {"grid": {"Lz": TWO_PI / 16.0}, "physics": {"spherical_truncation": True},
+             "forcing": dict(OU, kmin=1.6, kmax=1.8)}
+    with pytest.raises(ValueError, match="no modes inside the spherical truncation"):
+        Simulation("imhd_turb", _config(os.path.join(outdir, "empty"), **empty), comm=COMM, backend="cpu",
+                   quiet=True)
+    # The compressible solvers have no truncation: the same band is forced in full.
+    sim, _ = _run("mhd_turb3d", _config(os.path.join(outdir, "c"), **sections, integration={"t_end": 0.01}))
+    assert sim.forcing.n_truncated == 0
 
 
 def test_magnetic_prandtl_and_max_steps(tmp_path):

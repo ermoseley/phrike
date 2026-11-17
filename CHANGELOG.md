@@ -25,6 +25,16 @@ All notable changes to PHRIKE are recorded here. The format follows
 
 ### Fixed
 
+- `phrike.parallel` compressible MHD: after the accepted-state positivity
+  limiter clamps, the next step now follows the reference (the clamped state's
+  out-of-band content is damped, enters every stage and is removed at the end
+  of that step) instead of deviating by percent-level errors. The content is
+  saved in snapshots and restored on a restart with the same grid and rank
+  count. `strict_clamp` now defaults to true, so floor violations before the
+  final dissipation are counted as in the serial solver.
+- `phrike.parallel` Triton tier: warm-up exercises the kernels on each rank's
+  real local shapes, and a kernel failure after warm-up aborts the job instead
+  of leaving one rank on a different collective sequence (a hang).
 - 1D `outflow` and `wall` boundaries on Chebyshev/Legendre grids are now
   imposed weakly with an SBP/Rusanov boundary flux (far-field and mirror
   exterior states), consistent with the overintegrated flux and with a
