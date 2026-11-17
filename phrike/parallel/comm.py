@@ -182,11 +182,21 @@ class Comm:
         cuda = torch is not None and torch.cuda.is_available()
         if backend in ("cuda", "torch", "auto") and cuda:
             count = torch.cuda.device_count()
-            local = self.node_rank()
-            if local >= count and self.is_root:
-                print(f"[phrike.parallel] warning: more ranks than GPUs on a node "
-                      f"({count} visible); ranks share devices.", flush=True)
-            return f"cuda:{local % count}"
+            index = self.node_rank() % count
+            if self.mpi is not None:
+                # With one GPU bound per task every rank sees "cuda:0", so
+                # compare physical devices rather than local indices.
+                host = self.MPI.Get_processor_name()
+                try:
+                    uuid = str(torch.cuda.get_device_properties(index).uuid)
+                except Exception:  # pragma: no cover - older torch
+                    uuid = f"{host}:{index}"
+                devices = self.mpi.allgather((host, uuid))
+                distinct = len(set(devices))
+                if self.is_root and distinct < len(devices):
+                    print(f"[phrike.parallel] warning: {len(devices)} ranks share {distinct} GPUs; "
+                          f"run one rank per GPU for full speed.", flush=True)
+            return f"cuda:{index}"
         if backend == "cuda":
             raise RuntimeError("CUDA was requested but is not available")
         return "cpu"
