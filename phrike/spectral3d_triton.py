@@ -15,8 +15,13 @@ mode from 1D factors.
 from __future__ import annotations
 
 import torch
-import triton
-import triton.language as tl
+
+from ._triton_cc import ensure_triton_compiler
+
+ensure_triton_compiler()  # before Triton reads CC
+
+import triton  # noqa: E402
+import triton.language as tl  # noqa: E402
 
 
 @triton.jit
