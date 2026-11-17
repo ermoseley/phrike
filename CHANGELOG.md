@@ -21,6 +21,13 @@ All notable changes to PHRIKE are recorded here. The format follows
   `constant_power`) and random initial fields that do not depend on the rank
   count. The compressible acceleration is synthesized on the device from the
   modes each rank owns; the band respects the spherical truncation.
+- `phrike.parallel`: `parallel.transpose: nccl` (or `PHRIKE_MPI_TRANSPOSE=nccl`,
+  `--transpose nccl`) exchanges the FFT transposes with `torch.distributed`
+  (NCCL on CUDA, Gloo on CPU), rendezvousing through MPI and needing neither a
+  CUDA-aware MPI nor host staging. If the group cannot start on any rank, all
+  ranks fall back to `alltoallv` together. The benchmark reports the effective
+  exchange bandwidth per rank, and the self-test compares the transport with
+  `alltoallv` bit for bit.
 - `python -m phrike.parallel.selftest`, `scripts/bench_parallel.py` (with
   `--forcing`),
   `scripts/check_gpu_aware_mpi.py` and a Slurm template.

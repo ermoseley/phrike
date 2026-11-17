@@ -9,7 +9,9 @@ the default is to stage through pinned host memory.  This script tries the
 direct path on a small buffer and then times both paths.  If it prints
 "device buffers work", turn the option on; if it dies after "trying device
 buffers", leave it off (and see docs/parallel.rst for how to get a
-GPU-aware MPI).
+GPU-aware MPI).  If neither path is usable or fast, ``parallel.transpose: nccl``
+(``PHRIKE_MPI_TRANSPOSE=nccl``) exchanges device buffers with NCCL and needs no
+MPI CUDA support.
 """
 
 import sys
@@ -69,6 +71,8 @@ def main() -> int:
             print(f"  {label:15s} {64.0 / elapsed:8.0f} MB/s per rank", flush=True)
     if rank == 0:
         print("set parallel.gpu_aware_mpi: true (or PHRIKE_GPU_AWARE_MPI=1) to use device buffers", flush=True)
+        print("or use parallel.transpose: nccl (PHRIKE_MPI_TRANSPOSE=nccl), which needs no MPI CUDA support;"
+              " compare with python -m scripts.bench_parallel --transpose nccl", flush=True)
     return 0
 
 

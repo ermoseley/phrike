@@ -64,7 +64,7 @@ def test_transforms_match_numpy(shape, dtype, tol, batch):
 
 
 def test_exchange_modes_agree():
-    """The point-to-point transpose is the same exchange as Alltoallv."""
+    """The point-to-point and torch.distributed transposes are the same exchange as Alltoallv."""
     if COMM.size == 1:
         pytest.skip("needs more than one rank")
     from phrike.parallel import Comm
@@ -76,10 +76,10 @@ def test_exchange_modes_agree():
     f = np.random.default_rng(2).standard_normal((2, 10, 12, 16))
     local = torch.as_tensor(f[:, d.z0:d.z0 + d.nz])
     results = []
-    for mode in ("alltoallv", "p2p"):
+    for mode in ("alltoallv", "p2p", "nccl"):
         comm = Comm(COMM.mpi, transpose=mode)
         results.append(SlabFFT(d, comm, "cpu", torch.float64).forward(local))
-    assert torch.equal(results[0], results[1])
+    assert torch.equal(results[0], results[1]) and torch.equal(results[0], results[2])
 
 
 FULL_SHAPES = [(16, 12, 10), (15, 9, 11), (20, 18, 14), (8, 8, 8), (9, 8, 7), (7, 10, 9), (6, 7, 8)]

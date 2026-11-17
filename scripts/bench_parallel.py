@@ -10,7 +10,12 @@ whose side is the FFT-friendly even number nearest to
 scaling is a constant "Mzc/s/rank" (10^6 zone-cycles per second per rank) as P
 grows, apart from the log N factor of the transforms.  The timer breakdown
 separates the local transforms (``fft_xy``, ``fft_z``), packing (``fft_pack``)
-and MPI (``mpi_exchange``, plus ``mpi_stage`` when device buffers are off).
+and the exchange (``mpi_exchange``, plus ``mpi_stage`` when MPI is given host
+copies of device buffers).  ``--transpose nccl`` moves device buffers with
+NCCL (Gloo on the CPU); the header names the transport in use and the
+"exchange" line gives the effective bandwidth per rank (bytes sent per step
+over the exchange time per step).  Under about 1 GB/s/rank the transport is
+badly configured (see docs/parallel.rst).
 ``--forcing ou|white|constant_power`` adds large-scale forcing to the timed
 steps (constant_power is incompressible only); its cost is reported as
 ``forcing`` (and ``forcing_kick`` for the compressible momentum/energy update).
@@ -65,7 +70,8 @@ def main() -> int:
     parser.add_argument("--scheme", default="rk4")
     parser.add_argument("--backend", default="auto")
     parser.add_argument("--fft-batch", type=int, default=4)
-    parser.add_argument("--transpose", choices=["alltoallv", "p2p"], default=None)
+    parser.add_argument("--transpose", choices=["alltoallv", "p2p", "nccl"], default=None,
+                        help="exchange transport (default: PHRIKE_MPI_TRANSPOSE or alltoallv)")
     parser.add_argument("--gpu-aware-mpi", choices=["0", "1"], default=None)
     parser.add_argument("--no-triton", action="store_true", help="use the torch tier")
     parser.add_argument("--forcing", choices=["none", "ou", "white", "constant_power"], default="none",
@@ -97,6 +103,7 @@ def main() -> int:
     if args.forcing != "none":
         config["forcing"] = {"type": args.forcing, "kmin": 1.0, "kmax": 2.5, "amplitude": 0.1,
                              "power": 1e-3, "correlation_time": 1.0, "seed": 1}
+    # The Simulation binds this rank's CUDA device and then starts the transport.
     sim = Simulation(args.problem, config, comm=comm, backend=args.backend, quiet=True, profile=True)
     st, grid = sim.stepper, sim.grid
 
@@ -129,17 +136,24 @@ def main() -> int:
 
     names = sorted(sim.timers.total)
     worst = comm.allreduce([sim.timers.total[n] for n in names], "max")
+    sections = dict(zip(names, worst))
+    # Bytes this rank sent over the time it spent in the exchange itself (staging copies excluded).
+    exchange_seconds = sections.get("mpi_exchange", 0.0) / args.steps
+    sent_per_step = comm.sum(comm.bytes_sent) / comm.size / args.steps
+    exchange_gbs = sent_per_step / exchange_seconds / 1e9 if exchange_seconds > 0 else float("nan")
     peak = comm.max(torch.cuda.max_memory_allocated() / 2 ** 30 if grid.device.type == "cuda" else 0.0)
     per_rank = grid.n_points / comm.size
     result = {
         "problem": args.problem, "system": system, "ranks": comm.size, "grid": [Nx, Ny, Nz],
         "precision": args.precision, "scheme": args.scheme, "forcing": args.forcing, "device": str(grid.device),
         "tier": "triton" if getattr(st, "_triton", None) is not None else "torch",
-        "gpu_aware_mpi": comm.gpu_aware, "transpose": comm.transpose, "fft_batch": args.fft_batch,
+        "gpu_aware_mpi": comm.gpu_aware, "transpose": comm.transpose,
+        "transpose_requested": comm.transpose_requested, "fft_batch": args.fft_batch,
         "steps": args.steps, "seconds_per_step": wall / args.steps,
         "mzc_per_second_per_rank": per_rank * args.steps / wall / 1e6,
         "fft_fields_per_step": (grid.fft.forward_fields + grid.fft.inverse_fields) / args.steps,
         "megabytes_sent_per_step_per_rank": comm.sum(comm.bytes_sent) / comm.size / args.steps / 1e6,
+        "exchange_gb_per_second_per_rank": exchange_gbs,
         "peak_gpu_memory_gib": peak,
         "seconds_per_step_by_section": {n: float(v) / args.steps for n, v in zip(names, worst)},
     }
@@ -151,6 +165,10 @@ def main() -> int:
         print(f"  {result['seconds_per_step']:.4f} s/step   {result['mzc_per_second_per_rank']:.2f} Mzc/s/rank   "
               f"{result['megabytes_sent_per_step_per_rank']:.0f} MB sent/step/rank   "
               f"peak GPU memory {peak:.2f} GiB")
+        if comm.size > 1:
+            slow = "" if not exchange_gbs < 1.0 else "   <-- under 1 GB/s: the transport is misconfigured"
+            print(f"  exchange [{comm.transpose}]: {exchange_gbs:.2f} GB/s per rank "
+                  f"({sent_per_step / 1e6:.0f} MB sent in {exchange_seconds:.4f} s per step){slow}")
         if args.forcing != "none":
             print(f"  {args.forcing} forcing: {result['forcing_seconds_per_step']:.4f} s/step "
                   f"({100 * result['forcing_seconds_per_step'] / result['seconds_per_step']:.1f}% of the step)")
@@ -159,6 +177,7 @@ def main() -> int:
             print(f"    {name:14s} {result['seconds_per_step_by_section'][name]:9.4f} s/step  {100 * share:5.1f}%")
         with open(args.out, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(result) + "\n")
+    comm.close()
     return 0
 
 

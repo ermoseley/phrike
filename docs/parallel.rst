@@ -71,7 +71,8 @@ What that implies for scaling:
 Use FFT-friendly sizes (products of 2, 3, 5, 7).  ``timing.json`` in the output
 directory and ``python -m scripts.bench_parallel`` report seconds per step,
 zone-cycles per second per rank, megabytes sent per step and the time in the
-local transforms, packing and MPI.
+local transforms, packing and the exchange; the benchmark also gives the
+exchange bandwidth per rank (see "Checking the transport").
 
 MPI and GPUs
 ------------
@@ -81,12 +82,77 @@ mpi4py`` with that MPI's ``mpicc`` on the path).  Launch one rank per GPU; a
 rank takes device ``node_rank % visible_devices``, so both ``srun
 --gpus-per-task=1`` and several ranks sharing a node's device list work.
 
-By default the exchange buffers are staged through pinned host memory, which
-works with any MPI.  With a CUDA-aware MPI the device buffers go to MPI
-directly: run ``srun -n 2 python -m scripts.check_gpu_aware_mpi``, and if it
-reports that device buffers work set ``parallel.gpu_aware_mpi: true`` or
-``PHRIKE_GPU_AWARE_MPI=1``.  Do this before a large run; staging costs two
-extra copies of everything communicated.
+Transports
+~~~~~~~~~~
+
+Every distributed transform does one all-to-all, so the transport decides the
+scaling.  ``parallel.transpose`` (or ``PHRIKE_MPI_TRANSPOSE``, or ``--transpose``
+in ``scripts/bench_parallel.py`` and the self-test) selects one of three:
+
+``nccl``
+   Moves the device buffers with ``torch.distributed``: NCCL for CUDA tensors
+   (NVLink and InfiniBand), Gloo for CPU tensors.  There is no host staging and
+   no dependence on MPI's CUDA support; MPI is only used to start the group and
+   to check that it works.  **Use this on GPU clusters.**  On first use rank 0
+   picks a free TCP port on its host and broadcasts the address; set
+   ``MASTER_ADDR`` (and ``MASTER_PORT``) to choose it yourself, for example when
+   the compute nodes' host names do not resolve from each other.  The CUDA
+   device is bound before the group starts, and the group is destroyed at exit.
+   If the group cannot start on any rank, all ranks switch to ``alltoallv``
+   together, with one warning on rank 0, and the run continues; the run header,
+   ``run_info.json`` and the benchmark report the transport in use.  The
+   timeout of the group (10 minutes by default) can be changed with
+   ``PHRIKE_NCCL_TIMEOUT`` in seconds.  Ranks must be MPI ``COMM_WORLD``
+   ranks, one per GPU.
+
+``alltoallv`` (default)
+   One ``MPI_Alltoallv``.  Device buffers are staged through pinned host memory
+   (two extra copies of everything communicated), or passed to MPI directly with
+   ``gpu_aware_mpi``.  Use it for CPU runs and when ``nccl`` is unavailable.
+
+``p2p``
+   The same exchange as one nonblocking send and receive per peer.  Some MPI
+   libraries are faster this way when ranks are many and blocks are small.
+
+Install ``mpi4py`` against the cluster's MPI (``pip install --no-binary=mpi4py
+mpi4py`` with that MPI's ``mpicc`` on the path).  Launch one rank per GPU; a
+rank takes device ``node_rank % visible_devices``, so both ``srun
+--gpus-per-task=1`` and several ranks sharing a node's device list work.
+
+With ``alltoallv`` or ``p2p``, device buffers are staged through pinned host
+memory by default, which works with any MPI.  With a CUDA-aware MPI they go to
+MPI directly: run ``srun -n 2 python -m scripts.check_gpu_aware_mpi``, and if
+it reports that device buffers work set ``parallel.gpu_aware_mpi: true`` or
+``PHRIKE_GPU_AWARE_MPI=1``.  Do this before a large run.  Device buffers in MPI
+can crash (a segmentation fault in the CUDA IPC path) on a library that is not
+configured for them; ``nccl`` avoids the question.
+
+Checking the transport
+~~~~~~~~~~~~~~~~~~~~~~
+
+``python -m scripts.bench_parallel`` prints the effective exchange bandwidth per
+rank: the bytes a rank sends per step over the time it spends in the exchange
+itself (``mpi_exchange``; host copies are timed separately as ``mpi_stage``).
+Host staging itself is fast (47 to 56 GB/s on four H200 GPUs); the transport
+is what to look at.  If the bench shows ``alltoallv`` on host buffers under
+about 1 GB/s per rank, the MPI transport is misconfigured, not slow by nature.
+Measured on four H200 GPUs on S3DF, the CUDA-aware path segfaulted and the
+default UCX path ran at about 45 MB/s per rank, while forcing the plain shared
+memory transport on one node,
+
+.. code-block:: bash
+
+   OMPI_MCA_pml=ob1 OMPI_MCA_btl=self,vader srun ...
+
+restored 5.5 GB/s per rank, which is about what host MPI can do there.  Rather
+than tune MPI, use ``nccl``, which exchanges device buffers over NVLink and
+InfiniBand.  Compare the transports on the machine you will run on:
+
+.. code-block:: bash
+
+   for t in alltoallv nccl; do
+     srun -n 4 python -m scripts.bench_parallel --transpose $t --points-per-rank 256
+   done
 
 ``python -m phrike.parallel.selftest`` (serially or under ``srun``) checks the
 distributed FFT, every Triton kernel against its Torch counterpart, both
@@ -106,7 +172,8 @@ Parallel options
    * - ``parallel.gpu_aware_mpi``
      - pass device memory to MPI (default: host staging; ``PHRIKE_GPU_AWARE_MPI``)
    * - ``parallel.transpose``
-     - ``alltoallv`` (default) or ``p2p`` (nonblocking point-to-point; ``PHRIKE_MPI_TRANSPOSE``)
+     - ``alltoallv`` (default), ``p2p`` (nonblocking point-to-point) or ``nccl``
+       (torch.distributed; recommended on GPU clusters); ``PHRIKE_MPI_TRANSPOSE``
    * - ``parallel.fft_batch``
      - fields transformed and exchanged per pass (default 4).  Lower values cut
        the transient memory of a transform; ``0`` takes all fields at once
@@ -125,7 +192,8 @@ Memory per grid point is about 27 real fields for incompressible MHD and 44
 for compressible MHD at ``fft_batch: 4``, that is roughly 110 and 180 bytes
 in single precision: an 80 GB device holds about :math:`900^3` and
 :math:`760^3` points.  Set ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True``
-for large grids.
+for large grids (unverified with a CUDA-aware MPI, whose CUDA IPC may not work
+with expandable segments; ``nccl`` is not affected as far as is known).
 
 Incompressible MHD
 ------------------

@@ -105,6 +105,7 @@ class Simulation:
             torch.cuda.set_device(torch.device(device))
         elif comm.size > 1 and "OMP_NUM_THREADS" not in os.environ:
             torch.set_num_threads(1)  # one core per rank unless told otherwise
+        comm.init_transport(torch.device(device))  # collective; only transpose "nccl" does anything
         profile = bool(par.get("profile", False)) if profile is None else bool(profile)
         self.timers = Timers(enabled=True, sync=profile)
 
