@@ -206,10 +206,18 @@ from a counter-based stream keyed by ``seed`` and the update index.  A forced
 run is therefore the same for any rank count, and it restarts exactly.  In
 the incompressible solvers the acceleration is a term of every Runge-Kutta
 stage and costs no transform.  In the compressible solvers it is a velocity
-kick after each step, at fixed density and internal energy, synthesized on
-each slab by separable Fourier sums; it costs eight transforms per step.
+kick after each step, at fixed density and internal energy: each rank puts the
+band on the retained modes it owns and one distributed inverse transform of
+three fields gives the acceleration on the device, so the cost follows the
+local data and weak scaling is kept.  With the kick's projection back onto
+the retained modes it costs eleven field transforms per step.
 ``compressive_fraction`` (compressible only) mixes compressive and solenoidal
 forcing.
+
+With ``physics.spherical_truncation: true`` (incompressible solvers) the band
+is restricted to the modes the solver keeps; in an anisotropic box modes with
+:math:`|k| > k_\mathrm{cut}` are dropped and reported, a band left empty is an
+error, and ``constant_power`` still injects exactly ``power``.
 
 Random initial fields (``turb3d``, ``mhd_turb3d``, ``imhd_turb``, ``ins_turb``)
 are also counter-based per Fourier mode: they do not depend on the rank count
