@@ -298,6 +298,19 @@ class Comm:
             return
         if len(scounts) != self.size or len(rcounts) != self.size:
             raise ValueError("exchange counts must have one entry per rank")
+        me = self.rank
+        scounts = np.asarray(scounts, dtype=np.int64)
+        rcounts = np.asarray(rcounts, dtype=np.int64)
+        if scounts[me] != rcounts[me]:
+            raise ValueError("a rank's block to itself must have matching counts")
+        sdispls = np.concatenate(([0], np.cumsum(scounts)[:-1]))
+        rdispls = np.concatenate(([0], np.cumsum(rcounts)[:-1]))
+        # This rank's block to itself never goes through MPI or the host.
+        s0, r0, n0 = int(sdispls[me]) * unit, int(rdispls[me]) * unit, int(scounts[me]) * unit
+        if n0:
+            recv[r0:r0 + n0].copy_(send[s0:s0 + n0])
+        if self.size == 1:
+            return
         on_device = send.device.type != "cpu"
         if send.device.type == "cuda":
             # MPI reads the buffer now; every kernel that writes it must be done.
@@ -306,28 +319,32 @@ class Comm:
         if staged:
             with self.timers("mpi_stage"):
                 hsend = self._host_buffer("s", nsend, send.dtype)
-                hsend[:nsend].copy_(send[:nsend])
+                if s0:
+                    hsend[:s0].copy_(send[:s0])
+                if nsend > s0 + n0:
+                    hsend[s0 + n0:nsend].copy_(send[s0 + n0:nsend])
                 hrecv = self._host_buffer("r", nrecv, recv.dtype)
             sbuf_t, rbuf_t = hsend, hrecv
         else:
             sbuf_t, rbuf_t = send, recv
         row = self._row_type(send.dtype, unit)
-        scounts = np.asarray(scounts, dtype=np.int64)
-        rcounts = np.asarray(rcounts, dtype=np.int64)
-        sdispls = np.concatenate(([0], np.cumsum(scounts)[:-1]))
-        rdispls = np.concatenate(([0], np.cumsum(rcounts)[:-1]))
-        self.bytes_sent += (nsend - int(scounts[self.rank]) * unit) * send.element_size()
+        sc, rc = scounts.copy(), rcounts.copy()
+        sc[me] = rc[me] = 0
+        self.bytes_sent += (nsend - n0) * send.element_size()
         with self.timers("mpi_exchange"):
             if self.transpose == "alltoallv":
                 self.mpi.Alltoallv(
-                    [self._mpi_buffer(sbuf_t), (scounts.tolist(), sdispls.tolist()), row],
-                    [self._mpi_buffer(rbuf_t), (rcounts.tolist(), rdispls.tolist()), row],
+                    [self._mpi_buffer(sbuf_t), (sc.tolist(), sdispls.tolist()), row],
+                    [self._mpi_buffer(rbuf_t), (rc.tolist(), rdispls.tolist()), row],
                 )
             else:
-                self._exchange_p2p(sbuf_t, scounts, sdispls, rbuf_t, rcounts, rdispls, row, unit)
+                self._exchange_p2p(sbuf_t, sc, sdispls, rbuf_t, rc, rdispls, row, unit)
         if staged:
             with self.timers("mpi_stage"):
-                recv[:nrecv].copy_(hrecv[:nrecv])
+                if r0:
+                    recv[:r0].copy_(hrecv[:r0])
+                if nrecv > r0 + n0:
+                    recv[r0 + n0:nrecv].copy_(hrecv[r0 + n0:nrecv])
 
     def _exchange_p2p(self, send, scounts, sdispls, recv, rcounts, rdispls, row, unit) -> None:
         """The same exchange with one nonblocking message per peer."""
@@ -348,11 +365,6 @@ class Comm:
             buf = self._mpi_buffer(piece)
             keep.append((piece, buf))
             requests.append(self.mpi.Isend([buf, int(scounts[q]), row], dest=q, tag=77))
-        if scounts[me] != rcounts[me]:
-            raise ValueError("a rank's block to itself must have matching counts")
-        if scounts[me]:
-            recv[rdispls[me] * unit:(rdispls[me] + rcounts[me]) * unit].copy_(
-                send[sdispls[me] * unit:(sdispls[me] + scounts[me]) * unit])
         self.MPI.Request.Waitall(requests)
         del keep
 
