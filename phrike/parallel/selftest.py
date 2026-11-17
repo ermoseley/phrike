@@ -7,6 +7,9 @@ It reports the environment (Torch, CUDA, Triton, MPI, device buffers or host
 staging) and checks, on the device the solvers will use:
 
 * the distributed FFT against a round trip and Parseval's identity;
+* the NCCL transport (``PHRIKE_MPI_TRANSPOSE=nccl`` or ``--transpose nccl``)
+  against ``alltoallv`` on random data, bit for bit, when more than one rank
+  runs and torch.distributed is available;
 * every Triton kernel against its Torch counterpart (CUDA only);
 * one compressible and one incompressible step, Triton tier against Torch tier;
 * an exact solution of the incompressible equations across all ranks.
@@ -27,7 +30,7 @@ import traceback
 import numpy as np
 import torch
 
-from .comm import Comm
+from .comm import Comm, TRANSPORTS
 from .compressible import CompressibleSlabStepper
 from .fields import random_vector_spectrum
 from .grid import SlabGrid3D
@@ -104,6 +107,39 @@ def check_fft(report: Report, grid: SlabGrid3D, tight: float) -> None:
     parseval = grid.spectral_sum((S.real ** 2 + S.imag ** 2).sum(dim=0))
     mean_square = comm.sum(float((smooth.double() ** 2).sum().item())) / grid.n_points
     report.check("fft: Parseval", abs(parseval - mean_square) / mean_square, tight)
+
+
+def check_nccl_exchange(report: Report, grid: SlabGrid3D) -> None:
+    """The torch.distributed transpose equals the MPI ``alltoallv`` exchange exactly."""
+    comm = grid.comm
+    if comm.size == 1:
+        report.say("  SKIP  nccl exchange: one rank, nothing is exchanged")
+        return
+    nccl = Comm(comm.mpi, transpose="nccl")
+    nccl.init_transport(grid.device)  # collective; falls back together on failure
+    if nccl.transpose != "nccl":
+        report.say(f"  SKIP  nccl exchange: torch.distributed/NCCL is unavailable ({nccl.transport_note})")
+        return
+    reference = Comm(comm.mpi, gpu_aware=comm.gpu_aware, transpose="alltoallv")
+    unit = 6
+    rng = np.random.default_rng(99 + comm.rank)
+    # Uneven counts, including empty blocks, with every rank's receive counts
+    # equal to the matching sender's send counts.
+    table = np.random.default_rng(7).integers(0, 5, size=(comm.size, comm.size))
+    table[np.arange(comm.size), np.arange(comm.size)] += 1
+    scounts, rcounts = table[comm.rank].tolist(), table[:, comm.rank].tolist()
+    for dtype in (torch.float32, torch.float64):
+        send = torch.as_tensor(rng.standard_normal(sum(scounts) * unit + 3), dtype=dtype, device=grid.device)
+        got = torch.full((sum(rcounts) * unit + 3,), -7.0, dtype=dtype, device=grid.device)
+        want = got.clone()
+        nccl.exchange(send, scounts, got, rcounts, unit)
+        reference.exchange(send, scounts, want, rcounts, unit)
+        report.check(f"nccl exchange ({_backend_name(grid)}, {str(dtype)[6:]}): equals alltoallv",
+                     float(not torch.equal(got, want)), 0.0)
+
+
+def _backend_name(grid: SlabGrid3D) -> str:
+    return "nccl" if grid.device.type == "cuda" else "gloo"
 
 
 def check_triton_kernels(report: Report, grid: SlabGrid3D, tight: float) -> None:
@@ -232,13 +268,16 @@ def main(argv=None) -> int:
     parser.add_argument("--backend", default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument("--size", type=int, default=48, help="grid points per side (default 48)")
     parser.add_argument("--precision", choices=["single", "double", "both"], default="both")
+    parser.add_argument("--transpose", choices=list(TRANSPORTS), default=None,
+                        help="exchange transport (default: PHRIKE_MPI_TRANSPOSE or alltoallv)")
     args = parser.parse_args(argv)
 
-    comm = Comm.auto()
+    comm = Comm.auto(transpose=args.transpose)
     comm.install_abort_hook()
     device = comm.pick_device(args.backend)
     if device.startswith("cuda"):
-        torch.cuda.set_device(torch.device(device))
+        torch.cuda.set_device(torch.device(device))  # before torch.distributed starts
+    comm.init_transport(torch.device(device))
     report = Report(comm)
     report.say(f"phrike.parallel self-test: torch {torch.__version__}, device {device}")
     report.say(f"  MPI: {comm.describe()}")
@@ -262,12 +301,14 @@ def main(argv=None) -> int:
         report.say(f"[{precision} precision, {args.size}^3]")
         grid = _grid(comm, device, precision, args.size)
         report.attempt("fft", lambda: check_fft(report, grid, tight))
+        report.attempt("nccl exchange", lambda: check_nccl_exchange(report, grid))
         if cuda and triton_ok:
             report.attempt("Triton kernels", lambda: check_triton_kernels(report, grid, tight))
             report.attempt("Triton vs Torch steps", lambda: check_tiers(report, grid, tight, loose))
         report.attempt("exact solution", lambda: check_exact_solution(report, grid, loose))
     report.say(f"{report.checks - report.failures} of {report.checks} checks passed "
                f"in {time.perf_counter() - start:.1f} s")
+    comm.close()
     return report.failures
 
 

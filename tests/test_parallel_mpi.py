@@ -60,6 +60,15 @@ def test_distributed_suite_under_mpi(ranks):
     assert done.returncode == 0, done.stdout[-4000:] + done.stderr[-2000:]
 
 
+def test_distributed_suite_under_mpi_nccl_transport():
+    """The same suite with the transpose on torch.distributed (Gloo on the CPU)."""
+    env = dict(_env(), PHRIKE_MPI_TRANSPOSE="nccl")
+    done = subprocess.run(LAUNCHER + ["-n", "3", sys.executable, "-m", "pytest", "-q", "-x",
+                                      "-p", "no:cacheprovider"] + SUITE,
+                          cwd=ROOT, env=env, capture_output=True, text=True, timeout=1800)
+    assert done.returncode == 0, done.stdout[-4000:] + done.stderr[-2000:]
+
+
 def _write_config(path, outdir, t_end):
     config = {
         "problem": "imhd_turb",

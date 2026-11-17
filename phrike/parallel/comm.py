@@ -7,18 +7,24 @@ one GPU and under ``mpirun``/``srun`` with one rank per GPU.
 Only three kinds of traffic exist:
 
 * ``exchange``: the all-to-all of a distributed FFT transpose.  Buffers are
-  1-D real Torch tensors.  They are handed to MPI by address, so a
+  1-D real Torch tensors.  Three transports exist (``transpose``):
+  ``alltoallv`` and ``p2p`` hand the buffers to MPI by address, so a
   CUDA-aware MPI moves device memory directly; otherwise the data is staged
   through pinned host memory.  Counts are given in rows of ``unit`` reals and
   sent with a contiguous derived datatype, which keeps every count and
-  displacement far below 2**31 for any grid.
+  displacement far below 2**31 for any grid.  ``nccl`` moves the device
+  buffers with ``torch.distributed`` (NCCL on CUDA tensors, Gloo on CPU
+  tensors), which needs neither a CUDA-aware MPI nor host staging; MPI is
+  used only to start it and to agree that it works.
 * ``allreduce``: a handful of float64 scalars per step (wave speed, counts).
 * ``bcast``/``gather`` of small Python objects on the output path.
 """
 
 from __future__ import annotations
 
+import atexit
 import os
+import socket
 import sys
 import time
 import traceback
@@ -79,6 +85,55 @@ def _env_flag(name: str) -> Optional[bool]:
     return value.strip().lower() not in ("0", "false", "no", "off")
 
 
+TRANSPORTS = ("alltoallv", "p2p", "nccl")
+
+
+class _TorchDistributed:
+    """The process-wide ``torch.distributed`` group behind the ``nccl`` transport.
+
+    One default group exists per process, so it is shared by every ``Comm``
+    and created on the first exchange (or by ``Comm.init_transport``).  A
+    failed start is remembered, so that every later ``Comm`` falls back
+    without trying again.
+    """
+
+    backend: Optional[str] = None  # "nccl" or "gloo" once the group is up
+    owned = False                  # we created it, so we destroy it
+    failed: Optional[str] = None   # why the transport is unavailable
+    warned = False
+    atexit_registered = False
+
+
+_TD = _TorchDistributed
+
+
+def _destroy_group() -> None:
+    """Destroy the process group this module created (idempotent)."""
+    if _TD.owned:
+        _TD.owned = False
+        try:
+            import torch.distributed as dist
+
+            if dist.is_available() and dist.is_initialized():
+                dist.destroy_process_group()
+        except Exception:  # noqa: BLE001 - exit-time cleanup must not raise
+            pass
+    _TD.backend = None
+
+
+def _free_port(host: str) -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((host if host in ("127.0.0.1", "localhost") else "", 0))
+        return int(sock.getsockname()[1])
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return float(default)
+
+
 class Timers:
     """Accumulated wall-clock sections; ``sync`` makes GPU sections honest."""
 
@@ -131,9 +186,11 @@ class Comm:
             gpu_aware = os.environ.get("MPICH_GPU_SUPPORT_ENABLED", "0").strip() == "1"
         self.gpu_aware = bool(gpu_aware)
         transpose = (transpose or os.environ.get("PHRIKE_MPI_TRANSPOSE") or "alltoallv").lower()
-        if transpose not in ("alltoallv", "p2p"):
-            raise ValueError("MPI transpose must be 'alltoallv' or 'p2p'")
+        if transpose not in TRANSPORTS:
+            raise ValueError("transpose must be 'alltoallv', 'p2p' or 'nccl'")
         self.transpose = transpose
+        self.transpose_requested = transpose
+        self.transport_note = ""  # why a requested transport is not in use
         self.timers = Timers(enabled=False)
         self._row_types: Dict[Any, Any] = {}
         self._host: Dict[Any, Any] = {}
@@ -252,6 +309,155 @@ class Comm:
 
         sys.excepthook = hook
 
+    # --- the NCCL transport -------------------------------------------------
+
+    def _fall_back(self, reason: str) -> None:
+        self.transpose = "alltoallv"
+        self.transport_note = reason
+        if self.is_root and not _TD.warned:
+            _TD.warned = True
+            print(f"[phrike.parallel] warning: transpose 'nccl' is unavailable ({reason}); "
+                  f"using 'alltoallv' on every rank.", flush=True)
+
+    def _preflight(self, kind: str) -> Optional[str]:
+        """Rank-local reason why torch.distributed cannot be started, or None."""
+        fail_rank = os.environ.get("PHRIKE_NCCL_TEST_FAIL_RANK", "")  # tests only
+        if fail_rank.strip() and int(fail_rank.split(":")[0]) == self.rank \
+                and not fail_rank.endswith(":init"):
+            return "forced failure (PHRIKE_NCCL_TEST_FAIL_RANK)"
+        try:
+            import torch.distributed as dist
+        except Exception as exc:  # noqa: BLE001
+            return f"torch.distributed cannot be imported ({exc})"
+        if not dist.is_available():
+            return "this torch has no torch.distributed"
+        if kind == "cuda":
+            if not torch.cuda.is_available() or not dist.is_nccl_available():
+                return "this torch has no NCCL or no CUDA device"
+        elif kind != "cpu":
+            return f"no torch.distributed backend for {kind} tensors"
+        elif not dist.is_gloo_available():
+            return "this torch has no Gloo backend"
+        if dist.is_initialized():
+            if dist.get_rank() != self.rank or dist.get_world_size() != self.size:
+                return "a torch.distributed group with different ranks already exists"
+        elif self.MPI.Comm.Compare(self.mpi, self.MPI.COMM_WORLD) not in (self.MPI.IDENT, self.MPI.CONGRUENT):
+            return "the MPI communicator is not COMM_WORLD, so torch ranks would differ"
+        return None
+
+    def init_transport(self, device) -> None:
+        """Start the ``nccl`` transport for tensors on ``device``; collective.
+
+        Does nothing for the other transports, on one rank, or when the group
+        is already up.  Every rank must call it (``exchange`` does so on its
+        first use).  If the group cannot start on any rank, all ranks switch
+        to ``alltoallv`` together.
+        """
+        if self.transpose != "nccl" or self.mpi is None or self.size == 1:
+            return
+        if _TD.failed is not None:
+            self._fall_back(_TD.failed)
+            return
+        if _TD.backend is not None:
+            return
+        import datetime
+
+        device = torch.device(device)
+        kind = device.type
+        backend = "nccl" if kind == "cuda" else "gloo"
+        # Rank-local checks first and an MPI agreement before any torch call:
+        # init_process_group blocks until every rank joins, so a rank that
+        # cannot start must be known to all before they enter it.
+        problem = self._preflight(kind)
+        votes = self.mpi.allgather((problem, self.MPI.Get_processor_name(), kind))
+        problems = [f"rank {r}: {v[0]}" for r, v in enumerate(votes) if v[0] is not None]
+        if not problems and len({v[2] for v in votes}) > 1:
+            problems = ["ranks use different device kinds"]
+        if problems:
+            _TD.failed = problems[0]
+            self._fall_back(_TD.failed)
+            return
+        init_method = None
+        if self.is_root:
+            try:
+                master = os.environ.get("MASTER_ADDR")
+                same_node = len({v[1] for v in votes}) == 1
+                host = master or ("127.0.0.1" if same_node else votes[0][1])
+                port = os.environ.get("MASTER_PORT") or _free_port(host)
+                init_method = f"tcp://{host}:{int(port)}"
+            except Exception:  # noqa: BLE001 - reported as an init failure below
+                init_method = None
+        init_method = self.mpi.bcast(init_method, root=0)
+        import torch.distributed as dist
+
+        error = None
+        if init_method is None:
+            error = "rank 0 could not choose a rendezvous address"
+        elif dist.is_initialized():
+            _TD.owned = False  # someone else's group: use it, never destroy it
+        else:
+            fail_rank = os.environ.get("PHRIKE_NCCL_TEST_FAIL_RANK", "")
+            try:
+                if fail_rank.endswith(":init") and int(fail_rank.split(":")[0]) == self.rank:
+                    raise RuntimeError("forced init failure (PHRIKE_NCCL_TEST_FAIL_RANK)")
+                options = {"backend": backend, "init_method": init_method, "rank": self.rank,
+                           "world_size": self.size,
+                           "timeout": datetime.timedelta(seconds=_env_float("PHRIKE_NCCL_TIMEOUT", 600.0))}
+                if kind == "cuda":
+                    try:
+                        dist.init_process_group(device_id=device, **options)
+                    except TypeError:  # older torch without device_id
+                        dist.init_process_group(**options)
+                else:
+                    dist.init_process_group(**options)
+                _TD.owned = True
+            except Exception as exc:  # noqa: BLE001
+                error = f"init_process_group({backend}) failed: {type(exc).__name__}: {exc}"
+        if error is None:
+            try:
+                # One small collective now, so that a broken NCCL shows up here.
+                probe = torch.arange(self.size, dtype=torch.float32, device=device) + self.rank * self.size
+                out = torch.empty_like(probe)
+                dist.all_to_all_single(out, probe)
+                if kind == "cuda":
+                    torch.cuda.synchronize(device)
+                expected = torch.arange(self.size, dtype=torch.float32) * self.size + self.rank
+                if not torch.equal(out.cpu(), expected):
+                    error = "the NCCL probe exchange returned wrong data"
+            except Exception as exc:  # noqa: BLE001
+                error = f"probe exchange failed: {type(exc).__name__}: {exc}"
+        verdicts = self.mpi.allgather(error)
+        bad = [f"rank {r}: {e}" for r, e in enumerate(verdicts) if e is not None]
+        if bad:
+            _destroy_group()
+            _TD.failed = bad[0]
+            self._fall_back(_TD.failed)
+            return
+        _TD.backend = backend
+        if _TD.owned and not _TD.atexit_registered:
+            _TD.atexit_registered = True
+            atexit.register(_destroy_group)  # runs before mpi4py finalizes MPI
+
+    def _use_torch_distributed(self, device) -> bool:
+        """Whether this exchange goes through the process group (may start it)."""
+        if self.transpose != "nccl" or self.mpi is None or self.size == 1:
+            return False
+        if _TD.backend is None:
+            self.init_transport(device)
+            if self.transpose != "nccl":
+                return False
+        return _TD.backend == {"cuda": "nccl", "cpu": "gloo"}.get(device.type)
+
+    def close(self) -> None:
+        """Free the derived datatypes and destroy the torch.distributed group."""
+        for datatype in self._row_types.values():
+            try:
+                datatype.Free()
+            except Exception:  # noqa: BLE001
+                pass
+        self._row_types.clear()
+        _destroy_group()
+
     # --- the transpose ------------------------------------------------------
 
     def _row_type(self, dtype, unit: int):
@@ -305,8 +511,21 @@ class Comm:
             raise ValueError("a rank's block to itself must have matching counts")
         sdispls = np.concatenate(([0], np.cumsum(scounts)[:-1]))
         rdispls = np.concatenate(([0], np.cumsum(rcounts)[:-1]))
-        # This rank's block to itself never goes through MPI or the host.
         s0, r0, n0 = int(sdispls[me]) * unit, int(rdispls[me]) * unit, int(scounts[me]) * unit
+        if self._use_torch_distributed(send.device):
+            # The group's all-to-all takes one contiguous buffer per side, and
+            # the self block sits inside it, so the group copies that block on
+            # the device itself (a local copy, no extra buffer).  The call is
+            # ordered on the current stream: ``recv`` is valid when it returns.
+            import torch.distributed as dist
+
+            self.bytes_sent += (nsend - n0) * send.element_size()
+            with self.timers("mpi_exchange"):
+                dist.all_to_all_single(recv[:nrecv], send[:nsend],
+                                       output_split_sizes=(rcounts * unit).tolist(),
+                                       input_split_sizes=(scounts * unit).tolist())
+            return
+        # This rank's block to itself never goes through MPI or the host.
         if n0:
             recv[r0:r0 + n0].copy_(send[s0:s0 + n0])
         if self.size == 1:
@@ -332,7 +551,7 @@ class Comm:
         sc[me] = rc[me] = 0
         self.bytes_sent += (nsend - n0) * send.element_size()
         with self.timers("mpi_exchange"):
-            if self.transpose == "alltoallv":
+            if self.transpose != "p2p":  # also nccl on a tensor the group cannot carry
                 self.mpi.Alltoallv(
                     [self._mpi_buffer(sbuf_t), (sc.tolist(), sdispls.tolist()), row],
                     [self._mpi_buffer(rbuf_t), (rc.tolist(), rdispls.tolist()), row],
@@ -374,5 +593,14 @@ class Comm:
         if self.mpi is None:
             return "serial (no MPI)"
         library = self.MPI.Get_library_version().splitlines()[0][:70]
+        if self.transpose == "nccl":
+            if _TD.backend is not None:
+                detail = f"torch.distributed {_TD.backend}, no host staging"
+            elif self.size == 1:
+                detail = "unused on one rank"
+            else:
+                detail = "torch.distributed starts on the first exchange"
+            return f"{self.size} ranks, nccl ({detail}); {library}"
         mode = "device buffers (GPU-aware MPI)" if self.gpu_aware else "host staging"
-        return f"{self.size} ranks, {self.transpose}, {mode}; {library}"
+        note = f" [nccl requested but unavailable: {self.transport_note}]" if self.transport_note else ""
+        return f"{self.size} ranks, {self.transpose}, {mode}{note}; {library}"
