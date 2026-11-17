@@ -7,6 +7,8 @@ compiler itself is exercised by ``tests/test_parallel_cuda.py`` and
 ``python -m phrike.parallel.selftest`` on a CUDA machine.
 """
 
+import os
+
 import numpy as np
 import pytest
 
@@ -176,3 +178,26 @@ def test_driver_runs_on_the_triton_tier(tmp_path, problem):
         assert (sim.stepper._triton is not None) == bool(tier)
         finals.append(sim.stepper.uhat.clone())
     assert gmax((finals[0] - finals[1]).abs().max().item()) < 1e-12 * gmax(float(finals[1].abs().max()))
+
+
+def test_triton_compiler_guard(monkeypatch):
+    """NVHPC modules set CC=nvc, which cannot build Triton's helper."""
+    import shutil
+
+    from phrike._triton_cc import ensure_triton_compiler
+
+    usable = shutil.which("gcc") or shutil.which("clang")
+    monkeypatch.delenv("PHRIKE_TRITON_CC", raising=False)
+    monkeypatch.setenv("CC", "/opt/nvidia/hpc_sdk/Linux_x86_64/25.5/compilers/bin/nvc")
+    ensure_triton_compiler()
+    if usable:
+        assert os.environ["CC"] == usable
+    monkeypatch.setenv("CC", "/usr/bin/gcc-13")
+    ensure_triton_compiler()
+    assert os.environ["CC"] == "/usr/bin/gcc-13"  # a usable compiler is left alone
+    monkeypatch.delenv("CC")
+    ensure_triton_compiler()
+    assert "CC" not in os.environ
+    monkeypatch.setenv("PHRIKE_TRITON_CC", "my-cc")
+    ensure_triton_compiler()
+    assert os.environ["CC"] == "my-cc"

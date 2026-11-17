@@ -327,9 +327,16 @@ the output numbering and keeps the outputs on ``t0 + n * output_interval``.
 Differences from the serial solvers
 -----------------------------------
 
-* The explicit diffusive limit of the compressible MHD stepper uses the
-  largest retained wavenumber, not the grid's Nyquist wavenumber, so it is
-  2.25 times larger.
+* The explicit diffusive limit of the compressible MHD stepper,
+  ``cfl_diff / (max(nu, eta) k_max^2)``, takes :math:`k_\mathrm{max}` from the
+  largest retained mode, :math:`(N - 1) // 3`, not from the grid's Nyquist mode
+  :math:`N/2` as the serial solver does.  The retained modes are the only ones
+  the Laplacian acts on, so this is the limit that applies.  The step it
+  allows is larger by :math:`(N/2)^2 / ((N - 1)//3)^2`: 2.25 for large grids,
+  up to 3 for small ones.  A diffusion-limited run therefore takes fewer,
+  larger steps than the serial solver and its results agree with it to the
+  time-stepping error, not to round-off; set ``cfl_diff`` 2.25 times smaller
+  to reproduce the serial step.
 * When the MHD accepted-state limiter clamps, the clamped state has content
   above the cutoff.  The reference keeps it through the next step: the
   dissipation half-step damps the whole spectrum, every stage is evaluated on
