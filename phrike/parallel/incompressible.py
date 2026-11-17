@@ -44,7 +44,7 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import torch
 
-from .forcing import BandForcing
+from .forcing import BandForcing, spherical_kcut2
 from .grid import SlabGrid3D
 
 # (w_acc, w_next) per stage, as ``spectral3d._RK_TABLES``: stage i is evaluated
@@ -108,15 +108,15 @@ class IncompressibleSlabStepper:
         self.forcing = forcing
         self.inv_n = grid.inv_n
         self.inv_spacing = (1.0 / grid.dx, 1.0 / grid.dy, 1.0 / grid.dz)
-        d = grid.decomp
         # Optional isotropic truncation at the smallest per-axis cutoff.
         self.spherical = bool(spherical_truncation)
         if self.spherical:
-            kcut = min(2.0 * np.pi * d.cx / grid.Lx, 2.0 * np.pi * d.cy / grid.Ly,
-                       2.0 * np.pi * d.cz / grid.Lz)
-            self.kcut2 = float(kcut * kcut) * (1.0 + 1e-12)
+            self.kcut2 = spherical_kcut2(grid)
         else:
             self.kcut2 = float("inf")
+        if forcing is not None and forcing.kcut2 != self.kcut2:
+            # The forcing restricts its band to the kept modes when it is built.
+            raise ValueError("build the BandForcing with the stepper's spherical_truncation setting")
 
         self.uhat = grid.zeros_spectral(self.ncomp)
         self.shat = grid.zeros_spectral(self.ncomp)
@@ -398,7 +398,10 @@ class IncompressibleSlabStepper:
                 "vanish and no output or end time bounds the step.")
 
         forcing = self.forcing
-        frozen = forcing.frozen(self.uhat) if forcing is not None else None
+        frozen = None
+        if forcing is not None:
+            with g.timers("forcing"):
+                frozen = forcing.frozen(self.uhat)
         coefs = lawson_coefficients(self.table, dt)
         last = len(coefs) - 1
         for i, coef in enumerate(coefs):
@@ -410,7 +413,8 @@ class IncompressibleSlabStepper:
             del G
             self._add_forcing(frozen, coef, i == last)
         if forcing is not None:
-            kick = forcing.kick(dt)
+            with g.timers("forcing"):
+                kick = forcing.kick(dt)
             if kick is not None:
                 flat = self.uhat.reshape(self.ncomp, -1)
                 u = flat[:3, forcing.index]

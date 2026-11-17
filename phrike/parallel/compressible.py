@@ -22,10 +22,22 @@ to round-off (see ``tests/test_parallel_compressible.py``).
 Positivity: stages run without the limiter while floor violations are counted;
 when the count over all ranks is non-zero the step is repeated with the
 reference limiter acting stage by stage (``_rk_step_limited``).
+
+The MHD accepted-state limiter acts after the 2/3 projection, so a state it
+clamps carries content above the cutoff.  The reference keeps that content
+for exactly one more step: the next step dissipates the whole spectrum of the
+clamped state, evaluates every stage on the full physical state and removes
+the out-of-band part again with the accepted-state projection.  The stepper
+keeps it as ``residual`` ``R`` (physical space, this rank's slab, ``None``
+while the state is band-limited) next to the retained spectrum: ``R`` is damped
+with the full-spectrum factors by a full distributed transform that is built
+only then, every stage state is ``inverse(stage spectrum) + R``, and ``R`` is
+dropped when the step is accepted (unless the limiter clamps again).
 """
 
 from __future__ import annotations
 
+import copy
 import math
 import os
 import warnings
@@ -37,6 +49,7 @@ import torch
 from ..spectral3d import _RK_TABLES, euler3d_symmetric_fluxes
 from ..spectral3d import _count_below as _euler_count_below
 from ..spectral_mhd3d import _mhd_count_below, mhd3d_fluxes
+from .comm import Comm
 from .grid import SlabGrid3D
 
 
@@ -84,22 +97,57 @@ def euler_clamp(U: torch.Tensor, gamma: float, rho_min: float, p_min: float) -> 
     return torch.stack([rho_c, rho_c * ux, rho_c * uy, rho_c * uz, E])
 
 
+class _ScratchFFT:
+    """Shape-correct stand-in for ``SlabFFT`` with no communication (warm-up only).
+
+    ``forward`` returns zeros and ``inverse`` a fixed positive state, so a
+    scratch stepper runs its kernels on this rank's real local shapes, strides
+    and totals without touching MPI.
+    """
+
+    def __init__(self, grid: SlabGrid3D, nvar: int, gamma: float):
+        d = grid.decomp
+        self.d, self.cdtype, self.device = d, grid.cdtype, grid.device
+        U = torch.zeros((nvar,) + d.physical_shape, dtype=grid.rdtype, device=grid.device)
+        U[0] = 1.0
+        U[4] = 1.0 / (gamma - 1.0)
+        if nvar == 8:
+            U[5:8] = 0.1
+            U[4] += 0.5 * 3 * 0.1 ** 2
+        self.state = U
+
+    def forward(self, f, normalized=False, out=None):
+        if out is None:
+            return torch.zeros((f.shape[0],) + self.d.spectral_shape, dtype=self.cdtype, device=self.device)
+        out.zero_()
+        return out
+
+    def inverse(self, S, out=None):
+        if out is None:
+            return self.state[:S.shape[0]]
+        out.copy_(self.state[:S.shape[0]])
+        return out
+
+
 class CompressibleSlabStepper:
     """Distributed spectral RK stepping of ``EulerEquations3D`` or ``MHDEquations3D``.
 
     The state is the pair ``(U, uhat)``: this rank's slab of the conserved
     variables and the retained spectrum of the whole state divided by N (the
-    ``norm="forward"`` convention), with ``U == inverse(uhat)``.
+    ``norm="forward"`` convention), with ``U == inverse(uhat) + R``, where the
+    out-of-band residual ``R`` (``self.residual``) exists only on the step
+    after the MHD accepted-state limiter has clamped (see the module notes).
     """
 
     def __init__(self, grid: SlabGrid3D, system: str, gamma: float, rho_min: float,
                  p_min: float, eta: float = 0.0, nu: float = 0.0,
-                 triton: Optional[bool] = None, strict_clamp: bool = False):
+                 triton: Optional[bool] = None, strict_clamp: bool = True):
         """``strict_clamp``: also count floor violations of the final state
-        before the modal dissipation, as the reference limiter does.  It costs
-        one more inverse transform of the state per step and only matters when
-        split-step dissipation is on and the undissipated state dips below a
-        floor that the dissipated one stays above."""
+        before the modal dissipation, as the reference limiter does (the default).
+        It costs one more inverse transform of the state per step and only
+        matters when split-step dissipation is on and the undissipated state
+        dips below a floor that the dissipated one stays above.  ``False``
+        skips that count: faster, but a step the reference would limit can pass."""
         if system not in ("euler", "mhd"):
             raise ValueError("system must be 'euler' or 'mhd'")
         self.grid = grid
@@ -122,7 +170,7 @@ class CompressibleSlabStepper:
         self.unew = grid.zeros_spectral(self.nvar)
         self.U: Optional[torch.Tensor] = None
         self.speed: Optional[float] = None  # global max wave speed of the current state
-        self.band_limited = True  # False after the accepted-state limiter acted
+        self._residual: Optional[torch.Tensor] = None  # out-of-band part after a clamp (5, nz, Ny, Nx)
         self.events = 0  # limiter calls that raised at least one value
         self.cells = 0  # density and pressure values raised, over all ranks
         self._warned = False
@@ -133,7 +181,7 @@ class CompressibleSlabStepper:
 
         self._triton = None
         self._stats_kernel = None
-        self._strict_kernels = False  # raise on a kernel failure instead of falling back
+        self._strict_kernels = False  # raise on a kernel failure instead of falling back (set by warm_up)
         if triton is None:
             triton = _triton_default()
         # "force" skips the device test (the test suite runs the kernels on an emulator).
@@ -161,10 +209,14 @@ class CompressibleSlabStepper:
 
         A kernel that failed on one rank in the middle of a distributed step
         would leave the ranks out of step with each other.  So every kernel
-        variant is run here on a tiny serial problem, with no MPI inside:
-        rank 0 first, which also fills Triton's on-disk cache for the others,
-        then the rest.  The Triton tier is kept only if it works on every
-        rank.  Returns whether it is in use.
+        variant is run here, with no MPI inside, on a tiny serial problem and
+        then on scratch buffers of this rank's real local shapes (Triton
+        specializes on sizes such as a row count of 1 or a multiple of 16, and
+        slabs differ between ranks): rank 0 first, which also fills Triton's
+        on-disk cache for the others, then the rest.  The Triton tier is kept
+        only if it works on every rank, and from then on a kernel failure
+        raises (the driver aborts all ranks) instead of switching one rank to
+        torch ops.  Returns whether the Triton tier is in use.
         """
         if self._triton is None and self._stats_kernel is None:
             return False
@@ -194,11 +246,47 @@ class CompressibleSlabStepper:
             self._stats_kernel = None
             self._acc = None
             self._kbuf = None
+        elif self._triton is not None or self._stats_kernel is not None:
+            self._strict_kernels = True
         return self._triton is not None
 
     def _warm_up_local(self, embedded: bool) -> None:
-        from .comm import Comm
+        self._warm_up_tiny(embedded)
+        self._warm_up_shapes(embedded)
 
+    def _warm_up_shapes(self, embedded: bool) -> None:
+        """Run the kernels on this rank's real local shapes without any communication.
+
+        A scratch stepper over a copy of the grid whose transforms are
+        ``_ScratchFFT`` takes the same RK steps as the real one, so the kernels
+        see the real (Kz, nky, Kx) spectra, (C, nz, Ny, Nx) fields, totals and
+        strides.  Nothing of this stepper is touched.
+        """
+        g = self.grid
+        shim = copy.copy(g)
+        shim.comm = Comm.serial()
+        shim.fft = _ScratchFFT(g, self.nvar, self.gamma)
+        st = CompressibleSlabStepper(shim, self.system, self.gamma, self.rho_min, self.p_min,
+                                     eta=self.eta, nu=self.nu, triton="force",
+                                     strict_clamp=self.strict_clamp)
+        if (st._triton is None) != (self._triton is None) or (st._stats_kernel is None) != (
+                self._stats_kernel is None):
+            raise RuntimeError("the Triton kernel modules could not be imported")
+        st._strict_kernels = True
+        st.set_spectrum(st.uhat)
+        dt = 1e-3 * g.min_spacing
+        for scheme in ("rk2", "rk4"):
+            st.step(dt, scheme)
+        if embedded:
+            from ..adaptive import create_adaptive_method
+
+            method = create_adaptive_method("rk23")
+            st.attempt(dt, method.a, method.b_high, method.b_low)
+            st.commit()
+        if st.events:
+            raise RuntimeError("the shape warm-up state needed the positivity limiter")
+
+    def _warm_up_tiny(self, embedded: bool) -> None:
         g = self.grid
         tiny = SlabGrid3D(8, 8, 8, g.Lx, g.Ly, g.Lz, comm=Comm.serial(), device=g.device,
                           precision=g.precision, filter_params=g.filter_params, fft_batch=g.fft.batch)
@@ -410,14 +498,64 @@ class CompressibleSlabStepper:
         return self.set_spectrum(self.uhat)
 
     def set_spectrum(self, uhat: torch.Tensor) -> torch.Tensor:
-        """Adopt a retained spectrum (normalized by 1/N) as the state."""
+        """Adopt a retained spectrum (normalized by 1/N) as the band-limited state."""
         if uhat is not self.uhat:
             self.uhat.copy_(uhat)
+        self._drop_residual()
         self.U = self.grid.inverse(self.uhat)
-        self.band_limited = True
         self._pending = None
         self._refresh_stats("in the initial state")
         return self.U
+
+    # --- out-of-band residual of a clamped state ------------------------------
+
+    @property
+    def residual(self) -> Optional[torch.Tensor]:
+        """Part of the physical state above the dealias cutoff (rho, momentum, E), or ``None``."""
+        return self._residual
+
+    @property
+    def band_limited(self) -> bool:
+        """False while the state carries ``residual`` (the step after an accepted-state clamp)."""
+        return self._residual is None
+
+    def _drop_residual(self) -> None:
+        self._residual = None
+        self.grid.release_full()
+
+    def _add_residual(self, U: torch.Tensor) -> torch.Tensor:
+        """Add the residual to a physical state that was just transformed (in place)."""
+        R = self._residual
+        if R is not None:
+            U[:R.shape[0]] += R
+        return U
+
+    def _inverse_full(self, S: torch.Tensor) -> torch.Tensor:
+        """Physical state of a stage spectrum: ``inverse(S) + R``."""
+        return self._add_residual(self.grid.inverse(S))
+
+    def set_residual(self, residual: Optional[torch.Tensor]) -> None:
+        """Adopt the out-of-band residual of a restart (after ``set_spectrum``); ``None`` clears it."""
+        if residual is None:
+            if self._residual is not None:
+                self._drop_residual()
+                self.U = None
+                self._refresh_stats("after clearing the residual")
+            return
+        if tuple(residual.shape) != (5,) + self.grid.decomp.physical_shape:
+            raise ValueError(f"residual must be {(5,) + self.grid.decomp.physical_shape}, "
+                             f"got {tuple(residual.shape)}")
+        if not self.mhd:
+            raise ValueError("only the MHD accepted-state limiter leaves a residual")
+        self._residual = residual.to(dtype=self.grid.rdtype, device=self.grid.device)
+        self._pending = None
+        self.U = None
+        self.physical()
+        self._refresh_stats("after restoring the residual")
+
+    def _new_residual(self, Un: torch.Tensor, new: torch.Tensor) -> torch.Tensor:
+        """``Un - inverse(forward(Un))`` for a clamped state: its content above the cutoff."""
+        return Un[:5] - self.grid.inverse(new[:5])
 
     def _refresh_stats(self, where: str) -> None:
         count, bad, speed = self._reduce_stats(*self._local_stats(self.U))
@@ -427,7 +565,7 @@ class CompressibleSlabStepper:
     def physical(self) -> torch.Tensor:
         """This rank's slab of the conserved variables."""
         if self.U is None:
-            self.U = self.grid.inverse(self.uhat)
+            self.U = self._inverse_full(self.uhat)
         return self.U
 
     def max_div_b(self) -> float:
@@ -447,6 +585,8 @@ class CompressibleSlabStepper:
         g = self.grid
         factors = g.decay_factors(h)
         self._pending = None
+        if self._residual is not None:  # the reference damps the whole spectrum of a clamped state
+            self._residual = g.dissipate_out_of_band(self._residual, h)
         st = self._triton
         if st is not None:
             try:
@@ -458,7 +598,7 @@ class CompressibleSlabStepper:
                 self.uhat.mul_(g.product3(factors))
         else:
             self.uhat.mul_(g.product3(factors))
-        self.U = g.inverse(self.uhat)
+        self.U = self._inverse_full(self.uhat)
 
     # --- fixed RK step ------------------------------------------------------
 
@@ -486,7 +626,7 @@ class CompressibleSlabStepper:
             self.uhat.copy_(new_spec)
         self.U = Un
         self.speed = speed
-        self.band_limited = True
+        self._drop_residual()
         self._pending = None
 
     def _judge(self, new_spec: torch.Tensor, stage_count, high: Optional[torch.Tensor]) -> bool:
@@ -495,8 +635,10 @@ class CompressibleSlabStepper:
         Un = g.inverse(new_spec)
         count, bad, unusable, speed = self._local_stats(Un)
         count += float(stage_count)
-        if self.strict_clamp and self.dissipation and high is not None:
-            count += float(self._count(g.inverse(high)))
+        if high is not None and (self._residual is not None or (self.strict_clamp and self.dissipation)):
+            # The reference clamps the final substage before projection and
+            # dissipation; the residual of a clamped state is still part of it.
+            count += float(self._count(self._inverse_full(high)))
         count, bad, speed = self._reduce_stats(count, bad, unusable, speed)
         if count > 0:
             return False
@@ -531,7 +673,7 @@ class CompressibleSlabStepper:
             if wa != 0.0:
                 acc = (wa * dt) * k if acc is None else acc + (wa * dt) * k
             Sh = U0h + (wn * dt) * k
-            Us = g.inverse(Sh)
+            Us = self._inverse_full(Sh)
         return self._judge(self._stabilize(high, h), int(count.item()), high)
 
     def _rk_step_triton(self, dt: float, table, h: float) -> bool:
@@ -567,7 +709,7 @@ class CompressibleSlabStepper:
             if final:
                 break
             Sin = shat
-            Us = g.inverse(shat)
+            Us = self._inverse_full(shat)
         # shat: state before projection and dissipation; unew: the candidate.
         return self._judge(unew, int(count.item()), shat)
 
@@ -603,8 +745,8 @@ class CompressibleSlabStepper:
                 break
             acc = acc + (wa * dt) * k
             Sh = U0h + (wn * dt) * k
-            Us, Sh, _ = self._limit(g.inverse(Sh), Sh)
-        _, high, _ = self._limit(g.inverse(high), high)
+            Us, Sh, _ = self._limit(self._inverse_full(Sh), Sh)
+        _, high, _ = self._limit(self._inverse_full(high), high)
         self._finish_limited(high, h)
 
     def _fluxes_torch(self, U: torch.Tensor) -> torch.Tensor:
@@ -619,7 +761,10 @@ class CompressibleSlabStepper:
             Un, new, clamped = self._limit(Un, new)
         self.uhat.copy_(new)
         self.U = Un
-        self.band_limited = not clamped
+        if clamped:  # Un is the clamped full state; keep what the retained modes cannot hold
+            self._residual = self._new_residual(Un, new)
+        else:
+            self._drop_residual()
         self._pending = None
         self._refresh_stats("after a limited step")
 
@@ -633,7 +778,7 @@ class CompressibleSlabStepper:
         ``commit`` to accept the candidate or ``reject`` to restore the state.
         """
         h = 0.5 * float(dt)
-        self._backup = self.uhat.clone() if self.dissipation else None
+        self._backup = (self.uhat.clone(), self._residual) if self.dissipation else None
         self.dissipate(h)
         scale = self.comm.max(float(self.physical().abs().max().item()))
         return self.embedded_step(dt, a, b_high, b_low, h), scale
@@ -643,8 +788,9 @@ class CompressibleSlabStepper:
         self._pending = None
         backup = getattr(self, "_backup", None)
         if backup is not None:
-            self.uhat.copy_(backup)
-            self.U = None  # rebuilt from the restored spectrum on demand
+            self.uhat.copy_(backup[0])
+            self._residual = backup[1]
+            self.U = None  # rebuilt from the restored spectrum and residual on demand
         self._backup = None
 
     def embedded_step(self, dt: float, a, b_high, b_low, h: float) -> float:
@@ -670,13 +816,16 @@ class CompressibleSlabStepper:
         """Adopt the candidate of the last ``embedded_step``."""
         if self._pending is None:
             raise RuntimeError("no embedded step is pending")
-        spec, Un, speed, band_limited = self._pending
+        spec, Un, speed, residual = self._pending
         if spec is self.shat:
             self.uhat, self.shat = self.shat, self.uhat
         else:
             self.uhat.copy_(spec)
         self.U, self.speed = Un, speed
-        self.band_limited = band_limited
+        if residual is None:
+            self._drop_residual()
+        else:
+            self._residual = residual
         self._pending = None
         self._backup = None
 
@@ -691,7 +840,7 @@ class CompressibleSlabStepper:
             return None
         if bad > 0:
             error = float("nan")  # the controller rejects and shrinks the step
-        self._pending = (spec, Un, speed, True)
+        self._pending = (spec, Un, speed, None)
         return error
 
     def _embedded_generic(self, dt, a, b_high, b_low, h):
@@ -704,7 +853,7 @@ class CompressibleSlabStepper:
         for i in range(s):
             if i > 0:
                 Sh = U0h + sum(dt * float(a[i][j]) * ks[j] for j in range(i) if a[i][j] != 0.0)
-                Us = g.inverse(Sh)
+                Us = self._inverse_full(Sh)
                 if not self.mhd:  # Euler stages are limited in the reference; MHD ones are not
                     count = count + self._count(Us)
             ks.append(self._rhs_hat(g.forward(self._fluxes(Us, False), normalized=True), Sh))
@@ -712,7 +861,7 @@ class CompressibleSlabStepper:
         high = U0h + sum(dt * float(b_high[i]) * ks[i] for i in range(s) if b_high[i] != 0.0)
         del ks
         E = g.inverse(Eh)
-        U_high = g.inverse(high)
+        U_high = self._inverse_full(high)
         err = float(E.abs().max().item())
         count = float(count.item()) + float(self._count(U_high).item())
         if not self.mhd:
@@ -750,7 +899,7 @@ class CompressibleSlabStepper:
             if i > 0:
                 st.combine(K, i, uhat, shat, w, offsets[i], None, modes, masked=False)
                 S = shat
-                Us = g.inverse(shat)
+                Us = self._inverse_full(shat)
             if i > 0 and not self.mhd:
                 F, c = self._fluxes(Us, True)
                 count += c
@@ -768,7 +917,7 @@ class CompressibleSlabStepper:
         st.combine(K, s, None, shat, w, off_err, None, modes, masked=False)
         E = g.inverse(shat)
         st.combine(K, s, uhat, shat, w, off_new, None, modes, masked=False)
-        U_high = g.inverse(shat)
+        U_high = self._inverse_full(shat)
         err = float(E.abs().max().item())
         total = float(count.item()) + float(self._count(U_high).item())
         if not self.mhd:
@@ -797,7 +946,7 @@ class CompressibleSlabStepper:
         for i in range(s):
             if i > 0:
                 Sh = U0h + sum(dt * float(a[i][j]) * ks[j] for j in range(i) if a[i][j] != 0.0)
-                Us = g.inverse(Sh)
+                Us = self._inverse_full(Sh)
                 if not self.mhd:
                     Us, Sh, _ = self._limit(Us, Sh)
             ks.append(self._rhs_hat(g.forward(self._fluxes_torch(Us), normalized=True), Sh))
@@ -805,7 +954,7 @@ class CompressibleSlabStepper:
         if self.mhd:
             Eh = sum(dt * float(b_high[i] - b_low[i]) * ks[i] for i in range(s) if b_high[i] != b_low[i])
             err = float(g.inverse(Eh).abs().max().item())
-            _, high, _ = self._limit(g.inverse(high), high)
+            _, high, _ = self._limit(self._inverse_full(high), high)
         else:
             low = U0h + sum(dt * float(b_low[i]) * ks[i] for i in range(s) if b_low[i] != 0.0)
             U_high, high, _ = self._limit(g.inverse(high), high)
@@ -822,7 +971,7 @@ class CompressibleSlabStepper:
         error = self.comm.max(err if np.isfinite(err) else float("inf"))
         if bad > 0:
             error = float("nan")
-        self._pending = (new, Un, speed, not clamped)
+        self._pending = (new, Un, speed, self._new_residual(Un, new) if clamped else None)
         return error
 
     # --- forcing ------------------------------------------------------------
@@ -844,6 +993,8 @@ class CompressibleSlabStepper:
         U[1:4] += rho * dv
         g.forward(U[1:5], normalized=True, out=self.uhat[1:5])
         g.inverse(self.uhat[1:5], out=U[1:5])
+        if self._residual is not None:  # the out-of-band part rides along unchanged
+            U[1:5] += self._residual[1:5]
         self._pending = None
         self._refresh_stats("after a forcing kick")
 

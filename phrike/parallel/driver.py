@@ -29,7 +29,8 @@ from .compressible import CompressibleSlabStepper
 from .forcing import BandForcing
 from .grid import SlabGrid3D
 from .incompressible import LAWSON_TABLES, IncompressibleSlabStepper
-from .io import History, field_names, read_meta, read_spectrum, write_slice, write_snapshot
+from .io import (History, field_names, read_meta, read_residual, read_spectrum, write_slice,
+                 write_snapshot)
 from .problems import COMPRESSIBLE, get_problem
 
 _ALLOWED = {
@@ -149,7 +150,10 @@ class Simulation:
         fcfg = config.get("forcing") or {}
         self.forcing = None
         if fcfg and fcfg.get("enabled", True) and str(fcfg.get("type", "none")).lower() != "none":
-            self.forcing = BandForcing(self.grid, fcfg, incompressible=not self.compressible)
+            # The compressible solvers have no spherical truncation to respect.
+            spherical = bool((config.get("physics") or {}).get("spherical_truncation", False))
+            self.forcing = BandForcing(self.grid, fcfg, incompressible=not self.compressible,
+                                       spherical_truncation=spherical and not self.compressible)
 
         triton = par.get("triton")
         if self.compressible:
@@ -210,7 +214,7 @@ class Simulation:
         self.eta, self.nu = eta, nu
         self.stepper = CompressibleSlabStepper(
             self.grid, self.system, self.gamma, rho_min, p_min, eta=eta, nu=nu,
-            triton=triton, strict_clamp=bool(par.get("strict_clamp", False)))
+            triton=triton, strict_clamp=bool(par.get("strict_clamp", True)))
         nested, top = integ.get("adaptive"), config.get("adaptive")
         if nested is not None and top is not None:
             raise ValueError("Both integration.adaptive and top-level adaptive are set. Keep only one of them.")
@@ -272,6 +276,8 @@ class Simulation:
         meta = self.comm.bcast(read_meta(path) if self.comm.is_root else None)
         spectrum = read_spectrum(path, self.grid, self.system, meta)
         self.stepper.set_spectrum(spectrum)
+        if self.compressible:  # the out-of-band part of a limiter-clamped state, if the snapshot has it
+            self.stepper.set_residual(read_residual(path, self.grid, self.system, meta))
         self.t = float(meta["t"])
         self.step_count = int(meta.get("step", 0))
         self.out_index = int(meta.get("output_index", 0))
@@ -316,7 +322,8 @@ class Simulation:
             self._last_output_time = self.t
             if self.write_snapshots:
                 write_snapshot(os.path.join(self.outdir, "snapshots", f"snap_{index:06d}"), self.grid,
-                               self.system, self.stepper.uhat, self.t, self.step_count, self._extra_meta())
+                               self.system, self.stepper.uhat, self.t, self.step_count, self._extra_meta(),
+                               residual=getattr(self.stepper, "residual", None))
             if self.write_spectra:
                 spectra = self.stepper.spectra()
                 if self.comm.is_root:
@@ -339,7 +346,8 @@ class Simulation:
             self.chk_index += 1
             root = os.path.join(self.outdir, "checkpoints")
             write_snapshot(os.path.join(root, f"chk_{index:06d}"), self.grid, self.system,
-                           self.stepper.uhat, self.t, self.step_count, self._extra_meta())
+                           self.stepper.uhat, self.t, self.step_count, self._extra_meta(),
+                           residual=getattr(self.stepper, "residual", None))
             old = index - self.keep_checkpoints
             if self.comm.is_root and self.keep_checkpoints > 0 and old >= 0:
                 shutil.rmtree(os.path.join(root, f"chk_{old:06d}"), ignore_errors=True)
@@ -394,12 +402,13 @@ class Simulation:
         f = self.forcing
         if f is None:
             return
-        with self.timers("forcing"):
+        with self.timers("forcing"):  # synthesis of the acceleration on this rank's slab
             if f.kind == "ou":
-                dv = f.acceleration() * dt
+                dv = f.acceleration(f.f * dt)  # the band is small: scale it, not the field
                 f.advance(dt)
             else:
                 dv = f.acceleration(f._sample() * math.sqrt(dt))
+        with self.timers("forcing_kick"):  # momentum and energy update, band-limiting projection
             self.stepper.kick(dv)
 
     def _advance_compressible(self, proposal: float, horizon: float):

@@ -4,7 +4,10 @@
 solvers.  It carries the global sizes under the usual names (``Nx``, ``Lx``,
 ``dx``, ...), this rank's coordinates, the wavenumbers of the retained modes
 it owns and the distributed transform.  Dealiasing by the 2/3 rule is built
-in: spectral arrays only ever hold retained modes.
+in: spectral arrays only ever hold retained modes.  The one exception is
+``dissipate_out_of_band``: content above the cutoff (which only the accepted-state
+positivity limiter can create) is damped through a full-spectrum transform that
+is built on first use and dropped by ``release_full``.
 """
 
 from __future__ import annotations
@@ -47,7 +50,9 @@ class SlabGrid3D:
         self.comm.timers = self.timers
 
         d = self.decomp = SlabDecomposition(self.Nx, self.Ny, self.Nz, self.comm.size, self.comm.rank)
+        self._fft_batch = fft_batch
         self.fft = SlabFFT(d, self.comm, self.device, self.rdtype, batch=fft_batch, timers=self.timers)
+        self._full = None  # (decomposition, transform, per-axis rates, in-band masks), built on demand
         self.n_points = d.n_points
         self.inv_n = 1.0 / float(d.n_points)
 
@@ -79,6 +84,7 @@ class SlabGrid3D:
         # per-axis ramps, so exp(-h*lambda) is a product of 1D factors.
         enabled, p, rate, onset = _spectral_dissipation_settings(filter_params)
         self.spectral_dissipation_enabled = bool(enabled)
+        self._dissipation = (p, rate, onset)
         if enabled:
             lx = _build_exponential_filter_rate(self.Nx, p, rate, True, onset)[self.nx_modes]
             ly = _build_exponential_filter_rate(self.Ny, p, rate, True, onset)[
@@ -130,6 +136,49 @@ class SlabGrid3D:
     def product3(self, factors) -> torch.Tensor:
         fx, fy, fz = factors
         return fz[:, None, None] * fy[None, :, None] * fx[None, None, :]
+
+    # --- the whole spectrum (out-of-band content) ---------------------------
+
+    def _full_transform(self):
+        if self._full is None:
+            d = SlabDecomposition(self.Nx, self.Ny, self.Nz, self.comm.size, self.comm.rank, full=True)
+            fft = SlabFFT(d, self.comm, self.device, self.rdtype, batch=self._fft_batch, timers=self.timers)
+            to = self._to_device
+            mx, my, mz = d.modes_x(), d.modes_y_local(), d.modes_z()
+            rates = None
+            if self.spectral_dissipation_enabled:
+                p, rate, onset = self._dissipation
+                fy_index = np.arange(d.ky0, d.ky0 + d.nky)  # a full axis is in FFT order
+                rates = (to(_build_exponential_filter_rate(self.Nx, p, rate, True, onset)[mx]),
+                         to(_build_exponential_filter_rate(self.Ny, p, rate, True, onset)[fy_index]),
+                         to(_build_exponential_filter_rate(self.Nz, p, rate, True, onset)[
+                             _full_index(mz, self.Nz)]))
+            outside = ~((np.abs(mz)[:, None, None] <= d.cz) & (np.abs(my)[None, :, None] <= d.cy)
+                        & (mx[None, None, :] <= d.cx))
+            self._full = (d, fft, rates, torch.as_tensor(outside, device=self.device))
+        return self._full
+
+    def dissipate_out_of_band(self, R: torch.Tensor, h: float) -> torch.Tensor:
+        """``exp(-h * lambda)`` applied to the whole spectrum of the real field ``R`` (new tensor).
+
+        ``R`` is a physical-space field with no content inside the retained
+        box.  Its transform is multiplied by the factor of every mode, and the
+        modes inside the box (round-off in ``R``) are zeroed.  With the
+        dissipation off the field is returned unchanged and nothing is built.
+        """
+        if not self.spectral_dissipation_enabled:
+            return R
+        _, fft, rates, outside = self._full_transform()
+        Rh = fft.forward(R, normalized=True)
+        fx, fy, fz = (torch.exp(-float(h) * lam) for lam in rates)
+        Rh *= self.product3((fx, fy, fz)) * outside
+        return fft.inverse(Rh)
+
+    def release_full(self) -> None:
+        """Drop the full-spectrum transform and its buffers (rebuilt on demand)."""
+        if self._full is not None:
+            self._full[1].release_buffers()
+        self._full = None
 
     # --- transforms ---------------------------------------------------------
 

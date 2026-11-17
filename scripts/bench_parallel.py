@@ -11,6 +11,9 @@ scaling is a constant "Mzc/s/rank" (10^6 zone-cycles per second per rank) as P
 grows, apart from the log N factor of the transforms.  The timer breakdown
 separates the local transforms (``fft_xy``, ``fft_z``), packing (``fft_pack``)
 and MPI (``mpi_exchange``, plus ``mpi_stage`` when device buffers are off).
+``--forcing ou|white|constant_power`` adds large-scale forcing to the timed
+steps (constant_power is incompressible only); its cost is reported as
+``forcing`` (and ``forcing_kick`` for the compressible momentum/energy update).
 
 One JSON line per run is appended to ``--out`` for plotting.
 """
@@ -65,6 +68,8 @@ def main() -> int:
     parser.add_argument("--transpose", choices=["alltoallv", "p2p"], default=None)
     parser.add_argument("--gpu-aware-mpi", choices=["0", "1"], default=None)
     parser.add_argument("--no-triton", action="store_true", help="use the torch tier")
+    parser.add_argument("--forcing", choices=["none", "ou", "white", "constant_power"], default="none",
+                        help="large-scale forcing on 1 <= |n| <= 2.5 included in the timed steps")
     parser.add_argument("--out", default="bench_parallel.jsonl")
     args = parser.parse_args()
 
@@ -76,6 +81,8 @@ def main() -> int:
     else:
         Nx = Ny = Nz = friendly(args.points_per_rank * comm.size ** (1.0 / 3.0))
     system = get_problem(args.problem).system
+    if args.forcing == "constant_power" and system in COMPRESSIBLE:
+        parser.error("--forcing constant_power needs an incompressible problem")
     config = {
         "grid": {"Nx": Nx, "Ny": Ny, "Nz": Nz, "Lx": TWO_PI, "Ly": TWO_PI, "Lz": TWO_PI,
                  "precision": args.precision},
@@ -87,12 +94,17 @@ def main() -> int:
         "monitoring": {"enabled": False},
         "parallel": {"fft_batch": args.fft_batch, "triton": not args.no_triton},
     }
+    if args.forcing != "none":
+        config["forcing"] = {"type": args.forcing, "kmin": 1.0, "kmax": 2.5, "amplitude": 0.1,
+                             "power": 1e-3, "correlation_time": 1.0, "seed": 1}
     sim = Simulation(args.problem, config, comm=comm, backend=args.backend, quiet=True, profile=True)
     st, grid = sim.stepper, sim.grid
 
     def step():
         if sim.compressible:
-            st.step(sim._compressible_limit(), args.scheme)
+            dt = sim._compressible_limit()
+            st.step(dt, args.scheme)
+            sim._compressible_kick(dt)  # no-op without forcing
         else:
             st.step()
 
@@ -121,7 +133,7 @@ def main() -> int:
     per_rank = grid.n_points / comm.size
     result = {
         "problem": args.problem, "system": system, "ranks": comm.size, "grid": [Nx, Ny, Nz],
-        "precision": args.precision, "scheme": args.scheme, "device": str(grid.device),
+        "precision": args.precision, "scheme": args.scheme, "forcing": args.forcing, "device": str(grid.device),
         "tier": "triton" if getattr(st, "_triton", None) is not None else "torch",
         "gpu_aware_mpi": comm.gpu_aware, "transpose": comm.transpose, "fft_batch": args.fft_batch,
         "steps": args.steps, "seconds_per_step": wall / args.steps,
@@ -131,12 +143,17 @@ def main() -> int:
         "peak_gpu_memory_gib": peak,
         "seconds_per_step_by_section": {n: float(v) / args.steps for n, v in zip(names, worst)},
     }
+    result["forcing_seconds_per_step"] = sum(v for n, v in result["seconds_per_step_by_section"].items()
+                                             if n.startswith("forcing"))
     if comm.is_root:
         print(f"{args.problem} [{system}] {Nx}x{Ny}x{Nz} on {comm.size} rank(s), {args.precision}, "
               f"{result['tier']} tier, {comm.describe()}")
         print(f"  {result['seconds_per_step']:.4f} s/step   {result['mzc_per_second_per_rank']:.2f} Mzc/s/rank   "
               f"{result['megabytes_sent_per_step_per_rank']:.0f} MB sent/step/rank   "
               f"peak GPU memory {peak:.2f} GiB")
+        if args.forcing != "none":
+            print(f"  {args.forcing} forcing: {result['forcing_seconds_per_step']:.4f} s/step "
+                  f"({100 * result['forcing_seconds_per_step'] / result['seconds_per_step']:.1f}% of the step)")
         for name in names:
             share = result["seconds_per_step_by_section"][name] / result["seconds_per_step"]
             print(f"    {name:14s} {result['seconds_per_step_by_section'][name]:9.4f} s/step  {100 * share:5.1f}%")

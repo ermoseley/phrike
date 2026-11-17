@@ -113,9 +113,11 @@ Parallel options
    * - ``parallel.triton``
      - ``false`` forces the Torch tier (``PHRIKE_TRITON=0``)
    * - ``parallel.strict_clamp``
-     - compressible only: also count floor violations before the final modal
-       dissipation, as the reference limiter does (one more inverse transform
-       of the state per step)
+     - compressible only, default ``true``: also count floor violations before
+       the final modal dissipation, as the reference limiter does (one more
+       inverse transform of the state per step when the dissipation is on).
+       ``false`` skips that count: faster, but a step the reference would limit
+       can pass unlimited
    * - ``parallel.profile``
      - synchronize the device around timed sections (``--profile``)
 
@@ -230,10 +232,18 @@ Output and restart
 Snapshots hold the retained spectrum divided by :math:`N`, the solver's own
 state: 0.3 of a real field per component.  ``phrike.parallel.io.load_snapshot``
 assembles one in a single process and can return the fields in real space.
+A compressible MHD snapshot written right after the accepted-state limiter
+clamped also holds that state's out-of-band residual (``resid.*.npy``, physical
+space, five components per rank); see below.
 
 ``--restart DIR`` accepts any snapshot or checkpoint of the same system.  The
 rank count may differ, and so may the resolution: modes are matched by integer
-wavenumber, so a run can be spun up coarse and refined.  A restart continues
+wavenumber, so a run can be spun up coarse and refined.  The out-of-band
+residual of a clamped state is stored per rank in physical space, so it is read
+back only when the grid and the rank count are unchanged, and then the restart
+reproduces the uninterrupted run exactly.  After a restart on another rank
+count or resolution it is dropped with a ``RuntimeWarning`` and the first step
+differs from the uninterrupted run by that residual.  A restart continues
 the output numbering and keeps the outputs on ``t0 + n * output_interval``.
 ``--max-wall-minutes`` (or ``integration.max_wall_minutes``) and
 ``--max-steps`` stop with a checkpoint instead of an output.
@@ -244,9 +254,21 @@ Differences from the serial solvers
 * The explicit diffusive limit of the compressible MHD stepper uses the
   largest retained wavenumber, not the grid's Nyquist wavenumber, so it is
   2.25 times larger.
-* A state that the positivity limiter changed is stored as its retained
-  modes; the content above the cutoff that the limiter created is dropped at
-  the start of the next step rather than at its end.
+* When the MHD accepted-state limiter clamps, the clamped state has content
+  above the cutoff.  The reference keeps it through the next step: the
+  dissipation half-step damps the whole spectrum, every stage is evaluated on
+  the full physical state, and the accepted-state projection removes it at the
+  end.  The stepper keeps that content as a residual (physical space) next to
+  the retained spectrum and does the same, using a full-spectrum distributed
+  transform that is built only while a residual exists (the retained-mode
+  decomposition allows ``min(Nz, Ky)`` ranks, the full one ``min(Nz, Ny)``).
+  The residual is saved in snapshots (see Output and restart); a forcing kick
+  carries it along unchanged.
+* With the Triton tier, ``warm_up`` also runs every kernel variant on this
+  rank's real local shapes (Triton specializes on sizes such as a row count of
+  1) and then makes later kernel failures fatal: the driver aborts all ranks
+  instead of one rank falling back to Torch ops in the middle of a collective
+  step.
 * The initial projection of :math:`\mathbf{B}` holds the thermal pressure
   fixed against the dealiased, projected field; the serial ``run`` projects
   before it dealiases.  The two agree when the initial field is band-limited.

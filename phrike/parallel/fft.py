@@ -2,7 +2,9 @@
 
 ``forward`` maps a real field on this rank's z slab, ``(C, nz, Ny, Nx)``, to
 the retained Fourier modes of this rank's ky slab, ``(C, Kz, nky, Kx)``;
-``inverse`` goes back.  The transforms act on the retained modes only:
+``inverse`` goes back.  The transforms act on the retained modes only (a
+decomposition built with ``full=True`` keeps every mode instead, which makes
+this the plain distributed ``rfftn``/``irfftn``):
 
 * forward: 2D r2c in (y, x) per plane, drop the modes outside the 2/3 box in
   x and y, transpose, 1D FFT in z, drop the z modes outside the box;
@@ -115,10 +117,12 @@ class SlabFFT:
         with self.timers("fft_xy"):
             X = torch.fft.rfft2(f)  # (C, nz, Ny, Xh)
         with self.timers("fft_pack"):
-            if d.cy > 0:
-                T = torch.cat((X[:, :, :d.cy + 1, :d.Kx], X[:, :, d.Ny - d.cy:, :d.Kx]), dim=2)
+            if d.Ky == d.Ny and d.Kx == d.Xh:
+                T = X  # nothing to drop
+            elif d.ty > 0:
+                T = torch.cat((X[:, :, :d.hy, :d.Kx], X[:, :, d.Ny - d.ty:, :d.Kx]), dim=2)
             else:
-                T = X[:, :, :1, :d.Kx].contiguous()
+                T = X[:, :, :d.hy, :d.Kx].contiguous()
             del X
             # Block for rank q, laid out (z, c, ky, kx): the receiver's blocks
             # then concatenate along z into (Nz, C, nky, Kx).
@@ -137,9 +141,9 @@ class SlabFFT:
         with self.timers("fft_z"):
             Y = torch.fft.fft(recv.view(d.Nz, C, d.nky, d.Kx), dim=0)
         with self.timers("fft_pack"):
-            out[:, :d.cz + 1].copy_(Y[:d.cz + 1].permute(1, 0, 2, 3))
-            if d.cz > 0:
-                out[:, d.cz + 1:].copy_(Y[d.Nz - d.cz:].permute(1, 0, 2, 3))
+            out[:, :d.hz].copy_(Y[:d.hz].permute(1, 0, 2, 3))
+            if d.tz > 0:
+                out[:, d.hz:].copy_(Y[d.Nz - d.tz:].permute(1, 0, 2, 3))
 
     def _inverse(self, S: torch.Tensor, out: torch.Tensor) -> None:
         d = self.d
@@ -147,9 +151,9 @@ class SlabFFT:
         with self.timers("fft_pack"):
             padded = torch.zeros((C, nky, d.Kx, d.Nz), dtype=self.cdtype, device=self.device)
             Sz = S.permute(0, 2, 3, 1)  # (C, nky, Kx, Kz)
-            padded[..., :d.cz + 1] = Sz[..., :d.cz + 1]
-            if d.cz > 0:
-                padded[..., d.Nz - d.cz:] = Sz[..., d.cz + 1:]
+            padded[..., :d.hz] = Sz[..., :d.hz]
+            if d.tz > 0:
+                padded[..., d.Nz - d.tz:] = Sz[..., d.hz:]
         with self.timers("fft_z"):
             Q = torch.fft.ifft(padded, dim=-1, norm="forward")  # (C, nky, Kx, Nz), no 1/N
             del padded
@@ -171,8 +175,8 @@ class SlabFFT:
         with self.timers("fft_pack"):
             R = recv.view(d.Ky, C, d.nz, d.Kx).permute(1, 2, 0, 3)  # (C, nz, Ky, Kx)
             W = torch.zeros((C, d.nz, d.Ny, d.Xh), dtype=self.cdtype, device=self.device)
-            W[:, :, :d.cy + 1, :d.Kx] = R[:, :, :d.cy + 1]
-            if d.cy > 0:
-                W[:, :, d.Ny - d.cy:, :d.Kx] = R[:, :, d.cy + 1:]
+            W[:, :, :d.hy, :d.Kx] = R[:, :, :d.hy]
+            if d.ty > 0:
+                W[:, :, d.Ny - d.ty:, :d.Kx] = R[:, :, d.hy:]
         with self.timers("fft_xy"):
             out.copy_(torch.fft.irfft2(W, s=(d.Ny, d.Nx), norm="forward"))

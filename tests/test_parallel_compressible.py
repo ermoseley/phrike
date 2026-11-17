@@ -5,6 +5,7 @@ With one rank this compares the compact-spectrum stepper with
 rank compares its slab with the same single-process reference.
 """
 
+import os
 import warnings
 
 import numpy as np
@@ -249,3 +250,256 @@ def test_kick_adds_the_kinetic_energy_change():
     assert (after["kinetic_energy"] - before["kinetic_energy"]) == pytest.approx(expected, rel=1e-3)
     # The state stays band-limited and equal to its stored spectrum.
     assert _rel(grid.inverse(st.uhat), st.physical()) < 1e-13
+
+
+# --- the state after an accepted-state clamp ------------------------------------
+
+
+def _clamped_start(dissipation, scheme, patch=0.0, extent=3):
+    """Reference solver, its start state and a stepper seeded with it; a hot-spot of low pressure
+    makes the limiter act."""
+    shape = (16, 12, 10)
+    ref_grid, eqs, ref, U0 = _reference("mhd", shape, dissipation, noise=0.0, scheme=scheme)
+    U0 = U0.clone()
+    p = (eqs.gamma - 1.0) * (U0[4] - 0.5 * (U0[1:4] ** 2).sum(0) / U0[0] - 0.5 * (U0[5:8] ** 2).sum(0))
+    e = extent
+    U0[4, :e, :e, :e] -= (p[:e, :e, :e] - patch) / (eqs.gamma - 1.0)
+    U_in = ref_grid.project_dealiased(ref._project_B(U0))
+    grid, st = _distributed("mhd", shape, eqs, dissipation)
+    st.set_spectrum(grid.forward(_local(U_in, grid).clone(), normalized=True))
+    return ref_grid, eqs, ref, U_in, grid, st
+
+
+@pytest.mark.parametrize("scheme", ["rk2", "rk4"])
+@pytest.mark.parametrize("dissipation", [False, True])
+def test_steps_after_an_accepted_state_clamp_match_reference(scheme, dissipation):
+    """The clamped state keeps its out-of-band part for one more step, as in the reference."""
+    if not fits((16, 12, 10)):
+        pytest.skip("grid too small for this rank count")
+    _, _, ref, Ur, grid, st = _clamped_start(dissipation, scheme)
+    worst, residual_steps = 0.0, 0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        for _ in range(10):
+            Ur = ref.step(Ur, 3e-3)
+            st.step(3e-3, scheme)
+            worst = max(worst, _rel(st.physical(), _local(Ur, grid)))
+            residual_steps += not st.band_limited
+    assert residual_steps > 0 and worst < 1e-12
+    assert st.events == ref.positivity.events and st.cells == ref.positivity.cells
+    if not st.band_limited:  # the residual is exactly what the retained modes cannot hold
+        assert _rel(grid.inverse(st.uhat) + torch.nn.functional.pad(st.residual, (0, 0, 0, 0, 0, 0, 0, 3)),
+                    st.physical()) < 1e-13
+
+
+def test_residual_is_dropped_once_the_limiter_stops_acting():
+    if not fits((16, 12, 10)):
+        pytest.skip("grid too small for this rank count")
+    _, _, _, _, grid, st = _clamped_start(True, "rk4")
+    seen = []
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        for _ in range(10):
+            st.step(3e-3, "rk4")
+            seen.append(st.band_limited)
+    assert not seen[0] and seen[-1]  # clamps at first, recovers (dissipation smooths the hot-spot)
+    assert grid._full is None  # the full-spectrum transform is freed with the residual
+
+
+def _reference_embedded(ref, U, dt, method):
+    """The reference's slow-path adaptive attempt at a fixed dt (``_adaptive_attempt``)."""
+    h = 0.5 * dt
+    Us = ref.grid.apply_spectral_dissipation(U, h)
+    ks = []
+    for i in range(len(method.b_high)):
+        S = Us + sum(dt * float(method.a[i][j]) * ks[j] for j in range(i) if method.a[i][j] != 0.0) if i else Us
+        ks.append(ref._compute_rhs(S))
+    high = Us + sum(dt * float(method.b_high[i]) * ks[i] for i in range(len(ks)) if method.b_high[i] != 0.0)
+    Un = ref._project_B(ref._clamp(high))
+    return ref._limit_accepted(ref.grid.apply_accepted_state_stabilization(Un, h))
+
+
+@pytest.mark.parametrize("dissipation", [False, True])
+def test_embedded_steps_and_rejects_after_a_clamp_match_reference(dissipation):
+    if not fits((16, 12, 10)):
+        pytest.skip("grid too small for this rank count")
+    from phrike.adaptive import create_adaptive_method
+
+    method = create_adaptive_method("rk45")
+    _, _, ref, Ur, grid, st = _clamped_start(dissipation, "rk4")
+    worst, residual_steps = 0.0, 0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        for n in range(8):
+            if n >= 1 and not st.band_limited:  # reject an attempt made on a state that has a residual
+                before, U_before, R_before = st.uhat.clone(), st.physical().clone(), st.residual.clone()
+                st.attempt(7e-3, method.a, method.b_high, method.b_low)
+                st.reject()
+                assert torch.equal(st.uhat, before) and torch.equal(st.residual, R_before)
+                assert _rel(st.physical(), U_before) < 1e-13
+            Ur = _reference_embedded(ref, Ur, 3e-3, method)
+            st.attempt(3e-3, method.a, method.b_high, method.b_low)
+            st.commit()
+            worst = max(worst, _rel(st.physical(), _local(Ur, grid)))
+            residual_steps += not st.band_limited
+    assert residual_steps > 0 and worst < 1e-12
+
+
+def test_forcing_kick_carries_the_residual():
+    if not fits((16, 12, 10)):
+        pytest.skip("grid too small for this rank count")
+    _, _, _, _, grid, st = _clamped_start(False, "rk4")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        st.step(3e-3, "rk4")
+    assert not st.band_limited
+    R = st.residual.clone()
+    X, Y, Z = grid.xyz_mesh()
+    st.kick(0.01 * torch.stack([torch.sin(2 * np.pi * Y), torch.sin(2 * np.pi * Z), torch.sin(2 * np.pi * X)]))
+    assert torch.equal(st.residual, R)
+    full = grid.inverse(st.uhat)
+    full[:5] += R
+    assert _rel(st.physical()[:5], full[:5]) < 1e-13
+
+
+def test_restart_after_a_clamp_reproduces_the_run(tmp_path):
+    """A snapshot with the residual restarts exactly on the same rank count; otherwise it is dropped."""
+    from phrike.parallel.io import read_meta, read_residual, read_spectrum, write_snapshot
+
+    if not fits((16, 12, 10)):
+        pytest.skip("grid too small for this rank count")
+    _, eqs, _, _, grid, st = _clamped_start(True, "rk4")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        st.step(3e-3, "rk4")
+        assert not st.band_limited
+        path = os.path.join(shared_dir(tmp_path), "snap")
+        write_snapshot(path, grid, "mhd", st.uhat, 0.003, 1, residual=st.residual)
+        meta = COMM.bcast(read_meta(path) if COMM.is_root else None)  # rank 0 writes meta.json last
+        grid2, st2 = _distributed("mhd", (16, 12, 10), eqs, True)
+        st2.set_spectrum(read_spectrum(path, grid2, "mhd", meta))
+        st2.set_residual(read_residual(path, grid2, "mhd", meta))
+        assert not st2.band_limited and st2.speed == pytest.approx(st.speed, rel=1e-13)
+        for _ in range(3):
+            st.step(3e-3, "rk4")
+            st2.step(3e-3, "rk4")
+        assert _rel(st2.physical(), st.physical()) < 1e-12
+        assert gmax((st2.uhat - st.uhat).abs().max().item()) < 1e-12 * gmax(float(st.uhat.abs().max()))
+        # Another rank count (or grid): the residual is dropped with a warning.
+        changed = dict(meta, residual=dict(meta["residual"], nprocs=COMM.size + 1))
+        with pytest.warns(RuntimeWarning, match="dropped") if COMM.is_root else warnings.catch_warnings():
+            assert read_residual(path, grid2, "mhd", changed) is None
+        # A snapshot written without a residual has none to read.
+        write_snapshot(path, grid, "mhd", st.uhat, 0.01, 2)
+        COMM.barrier()  # rank 0 writes meta.json after the others have returned
+        assert read_residual(path, grid2, "mhd") is None
+        assert not os.path.exists(os.path.join(path, f"resid.{COMM.rank:05d}.npy"))
+
+
+def test_strict_clamp_is_the_default():
+    shape = (16, 12, 10)
+    _, eqs, _, _ = _reference("mhd", shape, True)
+    _, st = _distributed("mhd", shape, eqs, True)
+    assert st.strict_clamp is True
+
+
+# --- a Triton failure in the middle of a step must not hang the job -------------
+
+
+def _mpi_launcher():
+    import shutil
+    import subprocess
+    import sys
+
+    from phrike.parallel.comm import launched_under_mpi
+
+    if launched_under_mpi():
+        return None
+    exe = shutil.which("mpirun") or shutil.which("mpiexec")
+    if exe is None:
+        return None
+    try:
+        version = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=30).stdout
+        base = [exe] + (["--oversubscribe"] if "Open MPI" in version or "OpenRTE" in version else [])
+        probe = subprocess.run(base + ["-n", "2", sys.executable, "-c",
+                                       "from mpi4py import MPI; assert MPI.COMM_WORLD.Get_size() == 2"],
+                               capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return base if probe.returncode == 0 else None
+
+
+_FAILING_KERNEL_JOB = '''
+import sys, types
+sys.path.insert(0, {root!r}); sys.path.insert(0, {tests!r})
+import numpy as np, torch
+torch.set_num_threads(1)
+from _triton_emulator import installed
+from phrike.parallel import Comm
+from phrike.parallel.grid import SlabGrid3D
+from phrike.parallel.compressible import CompressibleSlabStepper
+comm = Comm.auto()
+comm.install_abort_hook()
+with installed():
+    g = SlabGrid3D(12, 12, 12, 2 * np.pi, 2 * np.pi, 2 * np.pi, comm=comm)
+    st = CompressibleSlabStepper(g, "mhd", 5 / 3, 1e-10, 1e-12, triton="force")
+    X, Y, Z = g.xyz_mesh()
+    rho = 1 + 0.1 * torch.cos(X); B = [0.1 * torch.cos(Y), 0.1 * torch.cos(Z), 0.1 * torch.cos(X)]
+    E = 1 / (2 / 3) + 0.5 * sum(b * b for b in B)
+    st.seed(torch.stack([rho, 0 * X, 0 * X, 0 * X, E] + B))
+    assert st.warm_up() and st._strict_kernels
+    orig = st._triton.mhd_stage
+    calls = [0]
+    def flaky(*a, **k):
+        calls[0] += 1
+        if comm.rank == 1 and calls[0] == 2:
+            raise RuntimeError("simulated kernel failure on rank 1, stage 2")
+        return orig(*a, **k)
+    mod = types.SimpleNamespace(**{{n: getattr(st._triton, n) for n in dir(st._triton) if not n.startswith("__")}})
+    mod.mhd_stage = flaky
+    st._triton = mod
+    st.step(1e-3, "rk4")
+    print("STEP RETURNED", flush=True)
+'''
+
+
+def test_kernel_failure_after_warm_up_aborts_instead_of_hanging(tmp_path):
+    import subprocess
+    import sys
+
+    launcher = _mpi_launcher() if COMM.size == 1 else None
+    if launcher is None:
+        pytest.skip("needs mpirun and mpi4py, outside an MPI launch")
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    script = tmp_path / "failing_kernel_job.py"
+    script.write_text(_FAILING_KERNEL_JOB.format(root=root, tests=os.path.join(root, "tests")))
+    env = dict(os.environ, PHRIKE_MPI="1", OMP_NUM_THREADS="1")
+    done = subprocess.run(launcher + ["-n", "2", sys.executable, str(script)], env=env, cwd=root,
+                          capture_output=True, text=True, timeout=180)  # a hang raises TimeoutExpired
+    assert done.returncode != 0
+    assert "simulated kernel failure" in done.stderr and "STEP RETURNED" not in done.stdout
+
+
+def test_warm_up_runs_on_the_real_shapes_and_makes_kernels_strict():
+    """Warm-up leaves the stepper's state alone and later kernel failures are not swallowed."""
+    from _triton_emulator import installed
+
+    shape = (16, 12, 10)
+    if not fits(shape):
+        pytest.skip("grid too small for this rank count")
+    with installed():
+        _, eqs, _, U0 = _reference("mhd", shape, True)
+        grid, st = _distributed("mhd", shape, eqs, True, triton="force")
+        assert not st._strict_kernels
+        st.seed(_local(U0, grid).clone())
+        before, U_before = st.uhat.clone(), st.physical().clone()
+        events, counters = st.events, (grid.fft.forward_fields, grid.fft.inverse_fields)
+        assert st.warm_up(embedded=True)
+        assert st._strict_kernels
+        assert torch.equal(st.uhat, before) and torch.equal(st.physical(), U_before)
+        assert st.events == events and st._acc is None and st._kbuf is None
+        assert (grid.fft.forward_fields, grid.fft.inverse_fields) == counters
+        boom = RuntimeError("kernel failed")
+        with pytest.raises(RuntimeError, match="kernel failed"):
+            st._disable_triton(boom)
+        assert st._triton is not None

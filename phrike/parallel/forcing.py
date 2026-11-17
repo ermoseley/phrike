@@ -4,8 +4,10 @@ The forced band holds a few hundred modes at most, so every rank carries the
 whole band: the coefficients are generated from a counter-based stream keyed
 by ``(seed, update index)`` and evolve identically everywhere, with no
 communication.  A rank then applies the modes it owns (spectral solvers) or
-synthesizes the acceleration on its slab by three separable Fourier sums
-(physical-space kick of the compressible solvers).
+places them on the retained modes of its ky slab and takes one distributed
+inverse transform of the three components (physical-space kick of the
+compressible solvers), so the work per step is proportional to the data the
+rank holds.
 
 Types
 -----
@@ -23,7 +25,9 @@ Types
     the incompressible solver only.
 
 ``kmin`` and ``kmax`` are integer mode magnitudes (cycles per box), as in the
-turbulence initial conditions.  ``compressive_fraction`` mixes the compressive
+turbulence initial conditions.  With a spherical truncation (anisotropic
+boxes) only the modes of the band the solver keeps are forced.
+``compressive_fraction`` mixes the compressive
 and solenoidal projections of the random vector (0 is purely solenoidal).
 """
 
@@ -39,11 +43,24 @@ from .grid import SlabGrid3D
 _TYPES = ("ou", "white", "constant_power")
 
 
+def spherical_kcut2(grid: SlabGrid3D) -> float:
+    """Squared radius of the spherical truncation: the smallest per-axis retained wavenumber, squared.
+
+    The one definition shared by the incompressible solver (which truncates its
+    state there) and the forcing (which must not drive modes beyond it).
+    """
+    d = grid.decomp
+    kcut = min(2.0 * np.pi * d.cx / grid.Lx, 2.0 * np.pi * d.cy / grid.Ly, 2.0 * np.pi * d.cz / grid.Lz)
+    return float(kcut * kcut) * (1.0 + 1e-12)
+
+
 class BandForcing:
     """Forcing of the velocity on ``kmin <= |n| <= kmax``."""
 
-    def __init__(self, grid: SlabGrid3D, config: Dict[str, Any], incompressible: bool):
+    def __init__(self, grid: SlabGrid3D, config: Dict[str, Any], incompressible: bool,
+                 spherical_truncation: bool = False):
         self.grid = grid
+        self.kcut2 = spherical_kcut2(grid) if spherical_truncation else float("inf")
         self.kind = str(config.get("type", "ou")).lower()
         if self.kind not in _TYPES:
             raise ValueError(f"forcing.type must be one of {_TYPES}, got {self.kind!r}")
@@ -77,10 +94,19 @@ class BandForcing:
         mag = np.sqrt(nz * nz + ny * ny + nx * nx)
         band = (mag >= self.kmin) & (mag <= self.kmax)
         canonical = (nx > 0) | (ny > 0) | ((ny == 0) & (nz > 0))
-        keep = band & canonical
+        # Modes beyond the solver's spherical truncation would be driven but never coupled.
+        k2_box = ((2.0 * np.pi * nx / grid.Lx) ** 2 + (2.0 * np.pi * ny / grid.Ly) ** 2
+                  + (2.0 * np.pi * nz / grid.Lz) ** 2)
+        inside = k2_box <= self.kcut2
+        keep = band & canonical & inside
+        self.n_truncated = int((band & canonical & ~inside).sum())
         self.n = np.stack([nz[keep], ny[keep], nx[keep]], axis=1).astype(np.int64)  # (M, 3)
         self.M = int(self.n.shape[0])
         if self.M == 0:
+            if self.n_truncated:
+                raise ValueError(
+                    f"the forcing band {self.kmin:g} <= |n| <= {self.kmax:g} contains no modes inside the "
+                    f"spherical truncation |k| <= {np.sqrt(self.kcut2):.6g} ({self.n_truncated} lie outside)")
             raise ValueError("the forcing band contains no modes")
         mag = mag[keep]
         self.k = np.stack([2.0 * np.pi * self.n[:, 2] / grid.Lx, 2.0 * np.pi * self.n[:, 1] / grid.Ly,
@@ -199,28 +225,18 @@ class BandForcing:
     # --- physical-space synthesis (compressible solvers) --------------------
 
     def acceleration(self, band: Optional[np.ndarray] = None) -> torch.Tensor:
-        """Real field (3, nz, Ny, Nx) on this rank's slab from band values (default: ``f``)."""
+        """Real field (3, nz, Ny, Nx) on this rank's slab from band values (default: ``f``).
+
+        The band goes onto the retained modes this rank owns (a small scatter,
+        the same placement as the spectral solvers) and one distributed inverse
+        transform of the three components returns the physical field; no
+        rank synthesizes more than its own slab.
+        """
         g = self.grid
-        band = self.f if band is None else band
-        m = int(np.floor(self.kmax))
-        cube = np.zeros((3, 2 * m + 1, 2 * m + 1, m + 1), dtype=np.complex128)
-        nz, ny, nx = self.n[:, 0], self.n[:, 1], self.n[:, 2]
-        # kx > 0 modes stand for themselves and their conjugates (weight 2 on
-        # the real part); the kx = 0 plane is filled on both halves.
-        scale = np.where(nx > 0, 2.0, 1.0)
-        for c in range(3):
-            cube[c, nz + m, ny + m, nx] = band[:, c] * scale
-            plane = nx == 0
-            cube[c, -nz[plane] + m, -ny[plane] + m, 0] = np.conj(band[plane, c])
-        modes = np.arange(-m, m + 1)
-        ex = np.exp(1j * np.outer(np.arange(m + 1) * (2.0 * np.pi / g.Lx), g._x))  # (m+1, Nx)
-        ey = np.exp(1j * np.outer(modes * (2.0 * np.pi / g.Ly), g._y))  # (2m+1, Ny)
-        ez = np.exp(1j * np.outer(modes * (2.0 * np.pi / g.Lz), g._z))  # (2m+1, nz)
-        planes = np.einsum("cijk,kx->cijx", cube, ex)
-        planes = np.einsum("cijx,jy->ciyx", planes, ey)  # (3, 2m+1, Ny, Nx)
-        to = lambda a: torch.as_tensor(np.ascontiguousarray(a), dtype=g.rdtype, device=g.device)
-        pr, pi, cz, sz = to(planes.real), to(planes.imag), to(ez.real), to(ez.imag)
-        return torch.einsum("ciyx,iz->czyx", pr, cz) - torch.einsum("ciyx,iz->czyx", pi, sz)
+        S = g.zeros_spectral(3)
+        if self.n_local:
+            S.reshape(3, -1)[:, self.index] = self._to_local(self.f if band is None else band)
+        return g.inverse(S)
 
     # --- restart ------------------------------------------------------------
 
@@ -239,4 +255,6 @@ class BandForcing:
                   "white": f"power {self.power:g}",
                   "constant_power": f"power {self.power:g}"}[self.kind]
         return (f"{self.kind} forcing on {self.kmin:g} <= |n| <= {self.kmax:g} "
-                f"({self.M} independent modes), {detail}")
+                f"({self.M} independent modes"
+                + (f", {self.n_truncated} beyond the truncation dropped" if self.n_truncated else "")
+                + f"), {detail}")
