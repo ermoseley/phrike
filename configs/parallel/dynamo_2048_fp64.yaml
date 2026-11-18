@@ -1,0 +1,67 @@
+# 2048^3 fluctuation dynamo in double precision, one node with eight GPUs.
+# Relative to the 288^3 reference, the box side is larger by 2048/288.
+# Cell width, physical driving scale, and diffusion coefficients are the same.
+problem: imhd_turb
+
+grid:
+  Nx: 2048
+  Ny: 2048
+  Nz: 2048
+  Lx: 44.680428851054835
+  Ly: 44.680428851054835
+  Lz: 44.680428851054835
+  precision: double
+
+physics:
+  viscosity: 0.0
+  resistivity: 0.0
+  hyperviscosity: 3.666e-11
+  hyperresistivity: 3.666e-11
+  hyper_order: 6
+  spherical_truncation: false
+
+integration:
+  t0: 0.0
+  t_end: 35.0                 # First look for saturation here.
+  cfl: 0.6
+  scheme: rk4
+  output_interval: 2.0
+  checkpoint_interval: 5.0
+
+forcing:
+  type: ou
+  kmin: 14.222222222222221
+  kmax: 28.444444444444443
+  profile: power_law
+  spectral_index: -1.6666666666666667
+  amplitude: 1.36
+  correlation_time: 1.0
+  seed: 1
+
+initial_conditions:
+  vrms: 1.0
+  kmin: 14.222222222222221
+  kmax: 28.444444444444443
+  spectrum_type: parabolic
+  seed: 42
+  b_rms: 0.001
+  b_kmin: 14.222222222222221
+  b_kmax: 56.888888888888886
+  b_seed: 123
+  b0: [0.0, 0.0, 0.0]
+
+io:
+  outdir: run
+  snapshots: false            # Checkpoints still save the full state.
+  slices: true
+  spectra: true
+  keep_checkpoints: 2
+
+monitoring:
+  enabled: true
+  step_interval: 50
+
+parallel:
+  transpose: nccl
+  fft_batch: 1
+  overlap: true
