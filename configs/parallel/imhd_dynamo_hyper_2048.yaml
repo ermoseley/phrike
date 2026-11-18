@@ -61,6 +61,17 @@ io:
   slices: true
   spectra: true
   keep_checkpoints: 2
+  format: auto                 # hdf5 if h5py imports, else npy
+  fields:                      # physical-space output for analysis and ParaView
+    enabled: true
+    every: 1                   # every output (integration.output_interval)
+    precision: single
+    coarsen: 512               # spectral low-pass onto 512^3: 0.54 GB per component
+    variables: default         # u and b
+  diagnostics:
+    enabled: true
+    every: 1
+    transfer: {enabled: true, every: 5}
 
 monitoring:
   enabled: true

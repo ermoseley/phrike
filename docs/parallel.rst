@@ -350,10 +350,199 @@ Output and restart
 
    outdir/
      run_info.json  history.csv  timing.json
-     snapshots/snap_000012/meta.json, spec.00000.npy, ...   one file per rank
+     snapshots/snap_000012/meta.json, spec.00000.npy, ...   restart format, one file per rank
      checkpoints/chk_000003/...                             same format
-     spectra/spectra_000012.npz                             shell-summed E(k)
-     slices/slice_000012.npz                                the z mid-plane
+     spectra/spectra_000012.h5                              shell-summed E(k)
+     slices/slice_000012.h5                                 the z mid-plane
+     fields/fields_000012.h5, fields_000012.xmf, fields.xmf physical-space fields (io.fields)
+     diagnostics/spectral_000012.h5, transfer_000012.h5     analysis module (io.diagnostics)
+
+Every file except the snapshots and checkpoints is analysis output.  The
+restart format below is always written at full precision whatever the options.
+
+.. code-block:: yaml
+
+   io:
+     format: auto        # auto | hdf5 | npy: fields, slices, spectra, diagnostics
+     snapshots: true     # restart-format spectral snapshots at every output
+     slices: true
+     spectra: true
+     fields:
+       enabled: false
+       every: 1          # every n-th output (integration.output_interval)
+       precision: single # double | single | half
+       coarsen: null     # null | N_out | [Nx_out, Ny_out, Nz_out] | {factor: 4}
+       variables: default
+     diagnostics:
+       enabled: true
+       every: 1
+       transfer: {enabled: false, every: 5}
+
+Formats
+~~~~~~~
+
+``io.format: auto`` is HDF5 when ``h5py`` imports and ``npy`` otherwise; slices,
+spectra and diagnostics are then ``.h5`` or ``.npz`` files written by rank 0.
+A field output is a set of ``(Nz, Ny, Nx)`` datasets, one per scalar
+component, named ``u_x, u_y, u_z, b_x, ..., rho, p``.  The file attributes
+hold ``t``, ``step``, the grid sizes and box lengths (of the output grid and
+of the simulation), the system, the precision, the coarsening, the code
+commit, and a note on units: magnetic fields carry no :math:`4\pi` or
+:math:`\mu_0`, and nodes sit at :math:`i L/N` without the periodic image.
+
+HDF5 field files come in two layouts that a reader cannot tell apart.  With an
+``h5py`` built against MPI (and more than one rank) every rank writes its z
+slab into the one ``fields_NNNNNN.h5``: the file and datasets are created
+collectively and the writes are independent, so ranks with an empty slab do
+nothing.  With serial ``h5py`` each rank writes
+``fields_NNNNNN.parts/part.RRRRR.h5`` and rank 0 writes ``fields_NNNNNN.h5``
+holding one virtual dataset per component that stitches the parts; keep the
+``.parts`` directory with the file.  One rank always writes one plain file.
+``npy`` writes ``fields_NNNNNN/<name>.RRRRR.npy`` per rank and a ``meta.json``
+(written last: a directory that has it is complete).
+
+``phrike.parallel.output.load_fields`` assembles either format in one process::
+
+   from phrike.parallel.output import load_fields
+   out = load_fields("outputs/run/fields/fields_000012.h5", ["u", "omega_z"])
+   out["t"], out["attrs"], out["fields"]["u_x"]      # (Nz, Ny, Nx) array
+
+``variables`` takes dataset names or whole vectors and limits the memory used
+to what is asked for; the result also holds the coordinates ``x, y, z``.
+
+ParaView
+~~~~~~~~
+
+Each HDF5 field output gets a ``fields_NNNNNN.xmf`` (XDMF 3, ``3DCoRectMesh``
+with ``ORIGIN_DXDYDZ``): every dataset is a scalar attribute, and ``u``, ``b``,
+``B``, ``omega``, ``j`` (and ``m``) are also vector attributes joined from
+their three components.  ``fields/fields.xmf`` is a temporal collection of all
+of them; rank 0 rewrites it at each field output and rebuilds it from the
+files that exist after a restart, so open ``fields.xmf`` to see the series.
+The XDMF reader needs ``float32`` or ``float64``: with ``precision: half`` the
+HDF5 files hold NumPy ``float16`` (readable with h5py), no ``.xmf`` is written
+and one warning says so.
+
+Precision
+~~~~~~~~~
+
+The cast to ``double``, ``single`` or ``half`` happens on the device, before the
+copy to the host, so a lower precision also shrinks the host and I/O traffic.
+``half`` keeps about three significant digits and a range of
+:math:`6\times10^{-8}` to 65504: values above that are stored as ``inf`` (the
+run warns) and values below lose digits, so normalise or use ``single`` for
+fields with a wide dynamic range, such as a weak seed magnetic field next to
+the velocity.
+
+Coarsening
+~~~~~~~~~~
+
+``coarsen`` writes the fields on a coarser grid of ``N_out`` points per axis:
+an integer for all axes, ``[Nx_out, Ny_out, Nz_out]``, or ``{factor: f}``
+(every size divided by ``f``, which must divide it).  Each size must lie
+between 4 and the simulation's.  This is the exact spectral low-pass, not
+point sampling and not averaging: the output is the field summed from the
+modes with :math:`|n_i| \le (N_{\mathrm{out},i} - 1)//2` that the solver also
+retains, evaluated on the coarse grid (the coarse Nyquist modes are zero).
+Nothing aliases, and the coarse field equals the coarse samples of the fine
+one whenever the fine field has no content above the coarse cutoff.
+
+The ky rows of the retained spectrum of one variable are sent from their
+owners to the owners of the coarse decomposition in one all-to-all, and the
+coarse inverse transform runs on ``min(ranks, Nz_out, Ny_out)`` ranks (a
+sub-communicator, so it uses ``alltoallv`` even with ``transpose: nccl``); the
+remaining ranks take part in the exchange and write nothing.  Only the kept
+modes move (at most one variable's retained spectrum, much less for a strong
+coarsening), and one variable is in flight at a time.  Incompressible fields and their spectral
+curls come straight from ``uhat``.  The compressible ``rho``, ``m``, ``E`` and
+``B`` come from the spectrum too; the primitives ``u = m / rho`` and ``p`` are
+formed in physical space on the fine slabs, forward-transformed with the
+truncated transform and then coarsened.  Without ``coarsen`` each variable is
+inverse-transformed (or, compressible, taken from the resident state) and
+written on the simulation grid.
+
+``variables`` is ``default`` (incompressible ``u`` and ``b``; compressible
+``rho``, ``u``, ``p`` and ``B``) or a list: ``u``, ``b``, ``omega`` (curl of
+``u``), ``j`` (curl of ``b``) for the incompressible systems, and ``rho``,
+``u``, ``p``, ``m``, ``E``, ``B``, ``omega`` and ``j`` for the compressible
+ones.  Curls are spectral.
+
+Sizes at :math:`2048^3` single precision: a full-resolution output is 4.3 GB per
+field and rank on 8 ranks, 34 GB per scalar component and 0.2 TB for the six
+components of ``u`` and ``b``, so write it rarely.  For routine output use
+``coarsen: 512`` (0.54 GB per component, 3.2 GB for ``u`` and ``b``) or
+``1024`` (4.3 GB per component), and ``half`` halves either.  Writing is
+timed under ``out_fields`` in ``timing.json``.  Each rank holds one component
+(4.3 GB at full resolution) plus the transform's workspace while it writes,
+and a coarsened output needs far less.
+
+Diagnostics
+~~~~~~~~~~~
+
+``phrike.parallel.analysis`` computes spectral turbulence diagnostics from the
+retained modes, on the device, followed by one small ``allreduce``; the
+binning runs over chunks of kz planes of at most ``io.diagnostics.chunk_modes``
+modes (default ``2**23``).  Shells are those of ``stepper.spectra()`` (unit
+width in :math:`|k| L_\mathrm{max}/2\pi`, centred on integers) and every
+spectrum sums over shells to the volume mean quoted.
+
+``spectral_diagnostics`` (no transform for the incompressible solvers):
+
+* ``kinetic``, ``magnetic``: :math:`\langle|u|^2\rangle/2`, :math:`\langle|b|^2\rangle/2`;
+  ``kinetic_helicity`` (:math:`\langle u\cdot\omega\rangle`), ``cross_helicity``
+  (:math:`\langle u\cdot b\rangle`), ``magnetic_helicity`` (:math:`\langle a\cdot b\rangle`,
+  Coulomb gauge) and, with ``current_helicity: true``, :math:`\langle j\cdot b\rangle`;
+* ``dissipation_kinetic``, ``dissipation_magnetic``: :math:`D(k^2)|\hat u_k|^2`
+  with :math:`D = \nu k^2 + \nu_h k^{2p}` (``eta`` for b), summing to the
+  dissipation rates in ``history.csv``;
+* anisotropy about an axis :math:`\hat e` (``anisotropy.axis``: ``auto`` is the
+  mean magnetic field when :math:`|\langle b\rangle| > 10^{-8} b_\mathrm{rms}`
+  and z otherwise; or ``x``, ``y``, ``z``, a 3-vector; ``anisotropy: false``
+  disables it): ``kinetic_2d`` and ``magnetic_2d`` in
+  :math:`(k_\parallel, k_\perp)` on unit bins, their reductions ``*_par`` and
+  ``*_perp``, the component anisotropy :math:`\langle(u\cdot\hat e)^2\rangle/\langle|u_\perp|^2\rangle`
+  and the gradient anisotropy :math:`\langle|(\hat e\cdot\nabla)u|^2\rangle/\langle|\nabla_\perp u|^2\rangle`
+  (and for b); the axis used is in ``attrs``;
+* compressible runs: spectra of :math:`u = m/\rho`, of :math:`\sqrt\rho\,u`
+  (``kinetic_density_weighted``), of the density and of B, with the same
+  anisotropy outputs (six forward transforms).
+
+``transfer_diagnostics`` (incompressible only) uses the solver's equations,
+:math:`\partial_t u = -(u\cdot\nabla)u + (b\cdot\nabla)b - \nabla P` and
+:math:`\partial_t b = (b\cdot\nabla)u - (u\cdot\nabla)b`, with :math:`X_K` the
+field filtered to shell K::
+
+    T_uu(K,Q) = -<u_K . (u.grad) u_Q>     T_bb(K,Q) = -<b_K . (u.grad) b_Q>
+    T_ub(K,Q) =  <u_K . (b.grad) b_Q>     T_bu(K,Q) =  <b_K . (b.grad) u_Q>
+
+``T_ub`` is the Lorentz-force transfer from magnetic shell Q to kinetic shell
+K and ``T_bu`` the stretching of :math:`b_Q` into magnetic shell K.
+
+* Always: the shell transfers ``T_uu``, ``T_bb``, ``T_ub``, ``T_bu`` (unfiltered
+  field in the Q slot) and the fluxes :math:`\Pi_X(k) = -\sum_{K\le k} T_X(K)`
+  on the unit shells, for 9 inverse and 21 forward transforms (3 and 6 without
+  b), about two steps' worth.  ``T_uu + T_ub`` and ``T_bb + T_bu`` are the
+  nonlinear rates of change of the shell energies.
+* ``transfer.matrix: true`` adds ``T_X_matrix[K, Q]`` and ``shell_edges``
+  (default logarithmic in base 2: ``[0,1), [1,2), [2,4), ...``; or
+  ``transfer.shells``).  Each non-empty Q shell costs 36 forward and 24 inverse
+  transforms with about 6 physical fields alive, or 36 forward and 6 inverse
+  with ``transfer.cache_fields: true`` (about 10 fields).  The matrices are
+  antisymmetric (``T_ub(K,Q) = -T_bu(Q,K)``) and each row sums to the shell
+  transfer.  At 2048³ use them sparingly (every several outputs).
+
+The driver calls ``spectral_diagnostics(stepper, config)`` every
+``io.diagnostics.every`` outputs and, when ``transfer.enabled``,
+``transfer_diagnostics(stepper, config)`` every ``transfer.every`` outputs, with
+the ``io.diagnostics`` block as ``config``.  Both are collective and return
+the same small arrays on every rank; rank 0 writes them to
+``diagnostics/spectral_NNNNNN`` and ``diagnostics/transfer_NNNNNN`` (time in
+``out_diag``).  A missing analysis module disables diagnostics with one
+warning, and ``NotImplementedError`` from the transfer diagnostics (for the
+compressible systems) disables only the transfer.
+
+Restart snapshots
+~~~~~~~~~~~~~~~~~
 
 Snapshots hold the retained spectrum divided by :math:`N`, the solver's own
 state: 0.3 of a real field per component.  ``phrike.parallel.io.load_snapshot``
@@ -370,7 +559,9 @@ back only when the grid and the rank count are unchanged, and then the restart
 reproduces the uninterrupted run exactly.  After a restart on another rank
 count or resolution it is dropped with a ``RuntimeWarning`` and the first step
 differs from the uninterrupted run by that residual.  A restart continues
-the output numbering and keeps the outputs on ``t0 + n * output_interval``.
+the output numbering (fields, slices, spectra and diagnostics included) and
+keeps the outputs on ``t0 + n * output_interval``; ``fields.xmf`` is rebuilt
+from the field outputs up to the restart point.
 ``--max-wall-minutes`` (or ``integration.max_wall_minutes``) and
 ``--max-steps`` stop with a checkpoint instead of an output.
 

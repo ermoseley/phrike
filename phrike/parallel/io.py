@@ -28,6 +28,11 @@ with a ``RuntimeWarning`` and the first step after the restart differs from the
 uninterrupted run by the clamp's out-of-band part.
 
 ``load_snapshot`` assembles a whole snapshot in one process for analysis.
+
+Small analysis files (slices, shell spectra, diagnostics) are written by rank 0
+as ``.h5`` (``io.format`` ``hdf5``) or ``.npz`` (``npy``) through ``write_arrays``;
+``resolve_format`` turns ``auto`` into the first of the two that can be used.
+The physical-space field output lives in ``output.py``.
 """
 
 from __future__ import annotations
@@ -51,6 +56,28 @@ _FIELD_NAMES = {
     "ins": ["ux", "uy", "uz"],
     "imhd": ["ux", "uy", "uz", "bx", "by", "bz"],
 }
+
+
+def get_h5py():
+    """The ``h5py`` module, or ``None`` when it cannot be imported."""
+    try:
+        import h5py
+    except ImportError:
+        return None
+    return h5py
+
+
+def resolve_format(fmt: Optional[str] = "auto") -> str:
+    """``io.format`` as ``"hdf5"`` or ``"npy"``; ``auto`` is HDF5 when h5py imports."""
+    fmt = str(fmt or "auto").lower()
+    if fmt not in ("auto", "hdf5", "npy"):
+        raise ValueError(f"io.format must be 'auto', 'hdf5' or 'npy', got {fmt!r}")
+    have = get_h5py() is not None
+    if fmt == "auto":
+        return "hdf5" if have else "npy"
+    if fmt == "hdf5" and not have:
+        raise ImportError("io.format 'hdf5' needs h5py (or use 'auto' or 'npy')")
+    return fmt
 
 
 def field_names(system: str) -> List[str]:
@@ -263,16 +290,55 @@ class History:
             handle.write(",".join(repr(float(row.get(c, float("nan")))) for c in self.columns) + "\n")
 
 
+def h5_attr(value: Any) -> Any:
+    """An HDF5-attribute-safe form of ``value`` (None, dicts and lists of strings become text)."""
+    if value is None:
+        return "none"
+    if isinstance(value, dict) or (isinstance(value, (list, tuple)) and any(
+            isinstance(v, (str, dict, list, tuple, type(None))) for v in value)):
+        return json.dumps(_json_ready(value))
+    if isinstance(value, (list, tuple)):
+        return np.asarray(value)
+    return value
+
+
+def write_arrays(stem: str, arrays: Dict[str, Any], attrs: Optional[Dict[str, Any]] = None,
+                 fmt: str = "npy") -> str:
+    """Write named arrays and scalar attributes to ``stem.h5`` or ``stem.npz`` (one process).
+
+    In ``.npz`` the attributes are stored as 0-d entries next to the arrays;
+    in ``.h5`` they are file attributes.  The file appears complete (written
+    under a temporary name and renamed).  Returns the path.
+    """
+    attrs = dict(attrs or {})
+    os.makedirs(os.path.dirname(os.path.abspath(stem)), exist_ok=True)
+    if resolve_format(fmt) == "hdf5":
+        h5py = get_h5py()
+        path, tmp = stem + ".h5", stem + ".tmp.h5"
+        with h5py.File(tmp, "w") as handle:
+            for name, value in arrays.items():
+                handle.create_dataset(name, data=np.asarray(value))
+            for name, value in attrs.items():
+                handle.attrs[name] = h5_attr(value)
+    else:
+        path, tmp = stem + ".npz", stem + ".tmp.npz"
+        np.savez(tmp, **{k: np.asarray(v) for k, v in arrays.items()},
+                 **{k: np.asarray(v) for k, v in attrs.items() if k not in arrays})
+    os.replace(tmp, path)
+    return path
+
+
 def write_slice(path: str, grid: SlabGrid3D, fields: torch.Tensor, names: List[str],
-                t: float, z_index: Optional[int] = None) -> None:
-    """Save the xy plane at ``z_index`` (default mid-box); the owning rank writes it."""
+                t: float, z_index: Optional[int] = None, fmt: str = "npy") -> None:
+    """Save the xy plane at ``z_index`` (default mid-box) of resident fields; the owning rank writes it.
+
+    ``path`` is the file stem or a name ending in ``.npz``/``.h5``.
+    """
     d = grid.decomp
     z_index = d.Nz // 2 if z_index is None else int(z_index)
     if not d.z0 <= z_index < d.z0 + d.nz:
         return
     plane = fields[:, z_index - d.z0].detach().cpu().numpy()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp.npz"
-    np.savez(tmp, t=float(t), z_index=z_index, z=z_index * grid.dz, x=grid._x, y=grid._y,
-             **{name: plane[i] for i, name in enumerate(names)})
-    os.replace(tmp, path)
+    stem = os.path.splitext(path)[0] if path.endswith((".npz", ".h5")) else path
+    arrays = {"x": grid._x, "y": grid._y, **{name: plane[i] for i, name in enumerate(names)}}
+    write_arrays(stem, arrays, {"t": float(t), "z_index": z_index, "z": z_index * grid.dz}, fmt)
