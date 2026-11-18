@@ -122,6 +122,26 @@ def _destroy_group() -> None:
     _TD.backend = None
 
 
+def _gpu_uuid(index: int) -> str:
+    uuid = torch.cuda.get_device_properties(index).uuid
+    text = str(uuid)
+    if "object at" in text:  # a torch without a readable UUID: fall back to its bytes
+        text = bytes(getattr(uuid, "bytes", b"")).hex() or text
+    return text
+
+
+def _gpu_placement(device) -> Optional[tuple]:
+    """(UUID of this rank's GPU, UUIDs of every GPU it can see), or None off CUDA."""
+    try:
+        device = torch.device(device)
+        if device.type != "cuda" or not torch.cuda.is_available():
+            return None
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        return _gpu_uuid(index), tuple(_gpu_uuid(i) for i in range(torch.cuda.device_count()))
+    except Exception:  # noqa: BLE001 - the placement check is then skipped
+        return None
+
+
 def _free_port(host: str) -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind((host if host in ("127.0.0.1", "localhost") else "", 0))
@@ -305,7 +325,7 @@ class Comm:
                 # compare physical devices rather than local indices.
                 host = self.MPI.Get_processor_name()
                 try:
-                    uuid = str(torch.cuda.get_device_properties(index).uuid)
+                    uuid = _gpu_uuid(index)
                 except Exception:  # pragma: no cover - older torch
                     uuid = f"{host}:{index}"
                 devices = self.mpi.allgather((host, uuid))
@@ -345,6 +365,17 @@ class Comm:
 
     def gather(self, obj: Any, root: int = 0) -> Optional[List[Any]]:
         return [obj] if self.mpi is None else self.mpi.gather(obj, root=root)
+
+    def union_names(self, names: Sequence[str]) -> List[str]:
+        """The sorted union of every rank's ``names`` (collective): a common list to reduce over.
+
+        Timer sections differ between ranks (idle ranks of a sub-communicator skip
+        some), and a reduction over arrays of different lengths would hang.
+        """
+        names = sorted(set(names))
+        if self.mpi is None or self.size == 1:
+            return names
+        return sorted(set().union(*self.mpi.allgather(names)))
 
     def barrier(self) -> None:
         if self.mpi is not None:
@@ -405,6 +436,39 @@ class Comm:
             return "the MPI communicator is not COMM_WORLD, so torch ranks would differ"
         return None
 
+    def _check_placement(self, votes) -> List[str]:
+        """Agree on whether NCCL can run on these GPUs (same answer on every rank).
+
+        NCCL refuses two ranks on one GPU, so that falls back at once.  When a
+        rank cannot see the GPUs of its node peers (one GPU bound per task, as
+        ``srun --gpu-bind=single:1`` does), NCCL's peer-to-peer copies fail at
+        start-up; it is then run through host shared memory (``NCCL_P2P_DISABLE=1``)
+        unless the user set that variable.
+        """
+        places = [v[3] for v in votes]
+        if any(p is None for p in places):
+            return []
+        hosts: Dict[str, List[int]] = {}
+        for r, v in enumerate(votes):
+            hosts.setdefault(v[1], []).append(r)
+        isolated = False
+        for host, ranks in hosts.items():
+            owner: Dict[str, int] = {}
+            for r in ranks:
+                mine = places[r][0]
+                if mine in owner:
+                    return [f"ranks {owner[mine]} and {r} share GPU {mine} on {host}; NCCL needs one GPU per rank"]
+                owner[mine] = r
+            used = set(owner)
+            isolated = isolated or any(not used <= set(places[r][1]) for r in ranks)
+        if isolated and "NCCL_P2P_DISABLE" not in os.environ:
+            os.environ["NCCL_P2P_DISABLE"] = "1"
+            if self.is_root:
+                print("[phrike.parallel] each rank sees only its own GPU, so NCCL runs without peer-to-peer "
+                      "(NCCL_P2P_DISABLE=1); launch with every GPU visible to every rank "
+                      "(e.g. srun --gpu-bind=none) for NVLink speed.", flush=True)
+        return []
+
     def resolve_transport(self, device) -> str:
         """Turn the ``auto`` transport into a concrete one for tensors on ``device``.
 
@@ -444,10 +508,12 @@ class Comm:
         # init_process_group blocks until every rank joins, so a rank that
         # cannot start must be known to all before they enter it.
         problem = self._preflight(kind)
-        votes = self.mpi.allgather((problem, self.MPI.Get_processor_name(), kind))
+        votes = self.mpi.allgather((problem, self.MPI.Get_processor_name(), kind, _gpu_placement(device)))
         problems = [f"rank {r}: {v[0]}" for r, v in enumerate(votes) if v[0] is not None]
         if not problems and len({v[2] for v in votes}) > 1:
             problems = ["ranks use different device kinds"]
+        if not problems and kind == "cuda":
+            problems = self._check_placement(votes)
         if problems:
             _TD.failed = problems[0]
             self._fall_back(_TD.failed)

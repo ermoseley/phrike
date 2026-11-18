@@ -274,6 +274,7 @@ class _NpyFields:
             with open(tmp, "w", encoding="utf-8") as handle:
                 json.dump(_json_ready(meta), handle, indent=1, sort_keys=True)
             os.replace(tmp, os.path.join(self.dir, "meta.json"))
+        self.comm.barrier()  # complete on return, on every rank
         return self.dir
 
 
@@ -375,7 +376,9 @@ def xdmf_grid(h5name: str, label: str, shape: Tuple[int, int, int], spacing: Tup
 
     Every dataset is a scalar attribute; each complete ``_x, _y, _z`` triple of a
     vector variable also becomes a vector attribute (``JOIN``, components x, y, z).
-    ``spacing`` is ``(dx, dy, dz)``; the origin is zero.
+    ``spacing`` is ``(dx, dy, dz)``; the origin is zero.  ORIGIN_DXDYDZ is written
+    in the order of ``Dimensions`` (Z Y X), which is how ParaView's Xdmf readers
+    map it onto the x, y, z axes.
     """
     dims = " ".join(str(n) for n in shape)  # XDMF lists the slowest axis first: Z Y X
     grid = ET.Element("Grid", Name=label, GridType="Uniform")
@@ -383,7 +386,8 @@ def xdmf_grid(h5name: str, label: str, shape: Tuple[int, int, int], spacing: Tup
     ET.SubElement(grid, "Topology", TopologyType="3DCoRectMesh", Dimensions=dims)
     geometry = ET.SubElement(grid, "Geometry", GeometryType="ORIGIN_DXDYDZ")
     ET.SubElement(geometry, "DataItem", Format="XML", Dimensions="3").text = "0 0 0"
-    ET.SubElement(geometry, "DataItem", Format="XML", Dimensions="3").text = " ".join(repr(float(v)) for v in spacing)
+    ET.SubElement(geometry, "DataItem", Format="XML", Dimensions="3").text = " ".join(
+        repr(float(v)) for v in tuple(spacing)[::-1])  # dz dy dx
 
     def item(parent: ET.Element, name: str) -> None:
         ET.SubElement(parent, "DataItem", Format="HDF", NumberType="Float", Precision=str(width),
@@ -414,18 +418,47 @@ def write_xdmf(path: str, grid: ET.Element) -> None:
 _INDEXED = re.compile(r"fields_(\d{6})\.xmf$")
 
 
-def write_series(fields_dir: str, upto: Optional[int] = None) -> Optional[str]:
-    """(Re)write ``fields.xmf``, a temporal collection of the per-output ``.xmf`` files that exist.
+_MANIFEST = "series.json"
 
-    Only outputs with an index up to ``upto`` and an existing ``.h5`` are
-    included, so after a restart the series is rebuilt from the files of the run
-    so far and leaves out those of an abandoned continuation.
+
+def _series_indices(fields_dir: str, upto: Optional[int] = None) -> List[int]:
+    """Indices of the outputs in the series: the manifest's, else every ``.xmf`` with its ``.h5``."""
+    try:
+        with open(os.path.join(fields_dir, _MANIFEST), "r", encoding="utf-8") as handle:
+            indices = [int(i) for i in json.load(handle)]
+    except (OSError, ValueError):
+        indices = []
+        for path in glob.glob(os.path.join(fields_dir, "fields_??????.xmf")):
+            match = _INDEXED.search(os.path.basename(path))
+            if match:
+                indices.append(int(match.group(1)))
+    return sorted({i for i in indices if upto is None or i <= upto})
+
+
+def _write_manifest(fields_dir: str, indices: List[int]) -> None:
+    tmp = os.path.join(fields_dir, _MANIFEST + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(sorted(set(int(i) for i in indices)), handle)
+    os.replace(tmp, os.path.join(fields_dir, _MANIFEST))
+
+
+def write_series(fields_dir: str, upto: Optional[int] = None,
+                 indices: Optional[List[int]] = None) -> Optional[str]:
+    """(Re)write ``fields.xmf``, a temporal collection of the per-output ``.xmf`` files.
+
+    The outputs are those listed in ``series.json`` (kept by the writer: an
+    index is added when it is written and a restart truncates the list at the
+    restart point), so frames of an abandoned continuation never come back,
+    whatever the field cadence of the restarted run.  Only frames whose
+    ``.xmf`` and ``.h5`` exist are included.
     """
+    if indices is None:
+        indices = _series_indices(fields_dir, upto)
     entries = []
-    for path in glob.glob(os.path.join(fields_dir, "fields_??????.xmf")):
-        match = _INDEXED.search(os.path.basename(path))
-        if match and os.path.exists(path[:-4] + ".h5") and (upto is None or int(match.group(1)) <= upto):
-            entries.append((int(match.group(1)), path))
+    for i in indices:
+        path = os.path.join(fields_dir, f"fields_{int(i):06d}.xmf")
+        if (upto is None or i <= upto) and os.path.exists(path) and os.path.exists(path[:-4] + ".h5"):
+            entries.append((int(i), path))
     if not entries:
         return None
     root = ET.Element("Xdmf", Version="3.0")
@@ -475,7 +508,8 @@ class OutputWriter:
         block = io.get("fields") or {}
         if isinstance(block, bool):
             block = {"enabled": block}
-        self.fields_enabled = bool(block.get("enabled", False))
+        # A fields block that is given is on unless it says otherwise (``fields: false`` is off).
+        self.fields_enabled = bool(block.get("enabled", bool(block)))
         self.fields_every = max(1, int(block.get("every", 1)))
         self.coarsener: Optional[SpectralCoarsener] = None
         self.commit = "unknown"
@@ -656,6 +690,11 @@ class OutputWriter:
         stem = os.path.join(self.fields_dir, f"fields_{index:06d}")
         if self.comm.is_root:
             os.makedirs(self.fields_dir, exist_ok=True)
+            # A rewrite of this index (restart from an older snapshot) must not leave the old
+            # main file or sidecar behind if it is interrupted: the series skips a missing index.
+            for stale in (stem + ".h5", stem + ".xmf", os.path.join(stem, "meta.json")):
+                if os.path.exists(stale):
+                    os.remove(stale)
         self.comm.barrier()
         if self.format == "npy":
             handle = _NpyFields(stem, self.comm, layout, ndtype)
@@ -697,14 +736,18 @@ class OutputWriter:
             grid = xdmf_grid(os.path.basename(stem) + ".h5", os.path.basename(stem), layout.shape,
                              (attrs["dx"], attrs["dy"], attrs["dz"]), t, names, np.dtype(ndtype).itemsize)
             write_xdmf(stem + ".xmf", grid)
-            write_series(self.fields_dir, upto=index)
+            indices = [i for i in _series_indices(self.fields_dir) if i < index] + [index]
+            _write_manifest(self.fields_dir, indices)
+            write_series(self.fields_dir, indices=indices)
         return path
 
     def rebuild_series(self, upto: int) -> None:
         """Rebuild ``fields.xmf`` from the outputs up to index ``upto`` that exist (rank 0; after a restart)."""
         if self.comm.is_root and self.fields_enabled and self.format == "hdf5" and upto >= 0 \
                 and os.path.isdir(self.fields_dir):
-            write_series(self.fields_dir, upto=upto)
+            indices = _series_indices(self.fields_dir, upto)  # drops an abandoned continuation's frames
+            _write_manifest(self.fields_dir, indices)
+            write_series(self.fields_dir, indices=indices)
 
 
 # --- reading --------------------------------------------------------------------------

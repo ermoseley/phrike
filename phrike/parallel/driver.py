@@ -52,6 +52,9 @@ _ALLOWED = {
                  "max_dt_factor", "max_rejections", "fallback_scheme", "dt_min"},
 }
 _FIELDS_ALLOWED = {"enabled", "every", "precision", "coarsen", "variables"}
+_DIAG_ALLOWED = {"enabled", "every", "chunk_modes", "current_helicity", "anisotropy", "transfer"}
+_ANISO_ALLOWED = {"enabled", "axis"}
+_TRANSFER_ALLOWED = {"enabled", "every", "matrix", "shells", "cache_fields", "batch"}
 _MHD_ALLOWED = {"resistivity", "viscosity", "project_each_substage", "divergence_clean", "rho_min",
                 "p_min", "resistivity_max", "cfl_diff", "ambipolar", "hall", "shearing_sheet"}
 _TOP_LEVEL = set(_ALLOWED) | {"problem", "initial_conditions", "runtime", "video", "tracers",
@@ -70,9 +73,18 @@ def _warn_unknown_keys(config: Dict[str, Any]) -> None:
             for key in sorted(set(block) - allowed):
                 note(f"{section}.{key}")
     fields = (config.get("io") or {}).get("fields")
-    if isinstance(fields, dict):  # io.diagnostics is handed to the analysis module as it is
+    if isinstance(fields, dict):
         for key in sorted(set(fields) - _FIELDS_ALLOWED):
             note(f"io.fields.{key}")
+    diag = (config.get("io") or {}).get("diagnostics")
+    if isinstance(diag, dict):  # a typo such as transfer: {enable: true} would silently do nothing
+        for key in sorted(set(diag) - _DIAG_ALLOWED):
+            note(f"io.diagnostics.{key}")
+        for sub, allowed in (("anisotropy", _ANISO_ALLOWED), ("transfer", _TRANSFER_ALLOWED)):
+            block = diag.get(sub)
+            if isinstance(block, dict):
+                for key in sorted(set(block) - allowed):
+                    note(f"io.diagnostics.{sub}.{key}")
     mhd = (config.get("physics") or {}).get("mhd")
     if isinstance(mhd, dict):
         for key in sorted(set(mhd) - _MHD_ALLOWED):
@@ -366,14 +378,17 @@ class Simulation:
 
     def _write_diagnostics(self, index: int) -> None:
         """Spectral (and, less often, transfer) diagnostics of the analysis module (collective)."""
-        if not self.diag_enabled or index % self.diag_every:
+        spectral = self.diag_enabled and index % self.diag_every == 0
+        transfer = self.diag_enabled and self.transfer_enabled and index % self.transfer_every == 0
+        if not (spectral or transfer):
             return
         with self.timers("out_diag"):
             module = self._analysis_module()
             if module is None:
                 return
-            self._write_diagnostic("spectral", module[0], index)
-            if self.transfer_enabled and index % self.transfer_every == 0:
+            if spectral:
+                self._write_diagnostic("spectral", module[0], index)
+            if transfer:
                 try:
                     self._write_diagnostic("transfer", module[1], index)
                 except NotImplementedError as exc:
@@ -382,8 +397,10 @@ class Simulation:
 
     def _write_diagnostic(self, kind: str, function, index: int) -> None:
         result = dict(function(self.stepper, self.diag_config))  # collective; every rank gets the same arrays
-        attrs = {"t": self.t, "step": self.step_count, "system": self.system}
-        attrs.update(result.pop("attrs", None) or {})
+        attrs = dict(result.pop("attrs", None) or {})
+        if "system" in attrs:
+            attrs["diagnostics_system"] = attrs.pop("system")
+        attrs.update({"t": self.t, "step": self.step_count, "system": self.system})
         self.writer.write_small(os.path.join(self.outdir, "diagnostics", f"{kind}_{index:06d}"), result, attrs)
 
     def _output(self) -> None:
@@ -602,8 +619,8 @@ class Simulation:
 
     def _summary(self, wall: float, steps: int, last_dt: float) -> Dict[str, Any]:
         comm = self.comm
-        names = sorted(self.timers.total)
-        totals = np.asarray([self.timers.total[n] for n in names])
+        names = comm.union_names(self.timers.total)
+        totals = np.asarray([self.timers.total.get(n, 0.0) for n in names])
         mean = comm.allreduce(totals, "sum") / comm.size if names else totals
         worst = comm.allreduce(totals, "max") if names else totals
         per_rank = self.grid.n_points / comm.size

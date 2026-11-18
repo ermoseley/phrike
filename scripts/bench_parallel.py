@@ -132,8 +132,8 @@ def transform_only(args, comm, shape) -> int:
         S = grid.forward(grid.inverse(S), normalized=True)
     sync()
     wall = comm.max(time.perf_counter() - start)
-    names = sorted(timers.total)
-    sections = dict(zip(names, comm.allreduce([timers.total[n] for n in names], "max")))
+    names = comm.union_names(timers.total)
+    sections = dict(zip(names, comm.allreduce([timers.total.get(n, 0.0) for n in names], "max")))
     sent = comm.sum(comm.bytes_sent) / comm.size / args.steps
     exchange = sections.get("mpi_exchange", 0.0) / args.steps
     exchange_gbs = sent / exchange / 1e9 if exchange > 0 else float("nan")
@@ -269,8 +269,8 @@ def main() -> int:
     sync()
     wall = comm.max(time.perf_counter() - start)
 
-    names = sorted(sim.timers.total)
-    worst = comm.allreduce([sim.timers.total[n] for n in names], "max")
+    names = comm.union_names(sim.timers.total)
+    worst = comm.allreduce([sim.timers.total.get(n, 0.0) for n in names], "max")
     sections = dict(zip(names, worst))
     # Bytes this rank sent over the time it spent in the exchange itself (staging copies excluded).
     exchange_seconds = sections.get("mpi_exchange", 0.0) / args.steps

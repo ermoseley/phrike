@@ -91,3 +91,18 @@ def test_auto_transport_resolves_by_device():
     comm.exchange(torch.arange(4.0), [2], recv, [2], 2)
     assert torch.equal(recv, torch.arange(4.0))
     assert Comm(None, transpose="p2p").resolve_transport(torch.device("cuda:0")) == "p2p"
+
+
+def test_gpu_placement_check_refuses_shared_gpus_and_disables_p2p_when_isolated(monkeypatch):
+    from phrike.parallel.comm import Comm
+
+    comm = Comm.serial()
+    shared = [(None, "n1", "cuda", ("A", ("A", "B"))), (None, "n1", "cuda", ("A", ("A", "B")))]
+    assert "share GPU A" in comm._check_placement(shared)[0]
+    monkeypatch.delenv("NCCL_P2P_DISABLE", raising=False)
+    visible = [(None, "n1", "cuda", ("A", ("A", "B"))), (None, "n1", "cuda", ("B", ("A", "B")))]
+    assert comm._check_placement(visible) == [] and "NCCL_P2P_DISABLE" not in os.environ
+    isolated = [(None, "n1", "cuda", ("A", ("A",))), (None, "n1", "cuda", ("B", ("B",))),
+                (None, "n2", "cuda", ("A", ("A",)))]
+    assert comm._check_placement(isolated) == [] and os.environ.get("NCCL_P2P_DISABLE") == "1"
+    monkeypatch.delenv("NCCL_P2P_DISABLE", raising=False)
