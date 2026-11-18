@@ -9,7 +9,7 @@ Python scalars and strings::
     transfer_diagnostics(stepper, config)   # every few outputs; incompressible only
 
 All sums run over the local retained modes and are reduced with one
-``comm.allreduce`` of a small float64 array.  Binning is ``torch.bincount`` on
+``comm.allreduce`` of a small float64 array.  Binning is ``scatter_add_`` (no host synchronisation) on
 the device, in chunks of whole kz planes (``chunk_modes`` modes at most, default
 2**23), so no per-mode host loop and no field-sized host copy exists.
 
@@ -166,7 +166,10 @@ def _unit_index(grid: SlabGrid3D, sl: slice, dk: float, nbins: int) -> torch.Ten
 
 
 def _bin(idx: torch.Tensor, weights: torch.Tensor, nbins: int) -> torch.Tensor:
-    return torch.bincount(idx.reshape(-1), weights=weights.reshape(-1).to(_F64), minlength=nbins)
+    # scatter_add into a fixed-size array: unlike CUDA bincount it never reads the
+    # index range back to the host, so binning adds no device synchronisation.
+    out = torch.zeros(nbins, dtype=_F64, device=weights.device)
+    return out.scatter_add_(0, idx.reshape(-1).to(torch.int64), weights.reshape(-1).to(_F64))
 
 
 def _reduce(comm, parts: Dict[str, torch.Tensor]) -> Dict[str, np.ndarray]:
@@ -522,7 +525,7 @@ def _transfer_shells(st: IncompressibleSlabStepper, chunk: int, batch: int) -> D
             tag = [("uu", U[a], b, 1.0)] + ([("uu", U[b], a, 1.0)] if a != b else [])
             jobs.append((u[a], u[b], tuple(tag)))
     _run_products(g, pbuf, jobs, handler)
-    del u
+    del jobs, u  # the job list holds views of u
     if st.mhd:
         # T_ub(k) = -sum_ij w k_j Im(u_i^* [b_j b_i]); symmetric product, 6 transforms.
         b = g.inverse(uh[3:6])
@@ -532,12 +535,13 @@ def _transfer_shells(st: IncompressibleSlabStepper, chunk: int, batch: int) -> D
                 tag = [("ub", U[a], c, -1.0)] + ([("ub", U[c], a, -1.0)] if a != c else [])
                 jobs.append((b[a], b[c], tuple(tag)))
         _run_products(g, pbuf, jobs, handler)
+        del jobs
         # M_ac = u_a b_c: T_bb(k) += w k_a Im(b_c^* M_ac), T_bu(k) -= w k_c Im(b_a^* M_ac); 9 transforms.
         for a in range(3):
             ua = g.inverse(uh[a:a + 1])[0]
             jobs = [(ua, b[c], (("bb", B[c], a, 1.0), ("bu", B[a], c, -1.0))) for c in range(3)]
             _run_products(g, pbuf, jobs, handler)
-            del ua
+            del jobs, ua
         del b
     del pbuf
     red = _reduce(st.comm, {ch: v for ch, v in acc.items()})
@@ -584,7 +588,8 @@ def _transfer_matrix(st: IncompressibleSlabStepper, shells, chunk: int, batch: i
     con = _Contraction(g, idx, ns + 1, chunk)
     count = torch.zeros(ns + 1, dtype=_F64, device=g.device)
     for sl in _z_chunks(g, chunk):
-        count += torch.bincount(idx[sl].long().reshape(-1), minlength=ns + 1).to(_F64)
+        flat = idx[sl].reshape(-1).to(torch.int64)
+        count.scatter_add_(0, flat, torch.ones(flat.numel(), dtype=_F64, device=g.device))
     present = _reduce(comm, {"count": count})["count"][:ns] > 0  # global: every rank skips the same shells
     channels = ["uu", "bb", "ub", "bu"] if st.mhd else ["uu"]
     matrix = {ch: torch.zeros((ns, ns), dtype=_F64, device=g.device) for ch in channels}
@@ -622,7 +627,7 @@ def _transfer_matrix(st: IncompressibleSlabStepper, shells, chunk: int, batch: i
                              (M[1], Q[1], (("ub", Xu, j, -1.0),)),
                              (M[1], Q[0], (("bu", Xb, j, -1.0),))]
                 _run_products(g, pbuf, jobs, handler)
-                del M
+                del jobs, M
             del Q
         for ch in channels:
             matrix[ch][:, q] = col[ch][:ns]

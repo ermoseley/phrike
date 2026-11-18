@@ -368,7 +368,7 @@ def test_xdmf_describes_the_datasets_and_the_series(tmp_path):
         assert geo.get("GeometryType") == "ORIGIN_DXDYDZ"
         items = [i.text.split() for i in geo.findall("DataItem")]
         assert items[0] == ["0", "0", "0"]
-        assert [float(v) for v in items[1]] == pytest.approx([LENGTHS[0] / 12, LENGTHS[1] / 10, LENGTHS[2] / 8])
+        assert [float(v) for v in items[1]] == pytest.approx([LENGTHS[2] / 8, LENGTHS[1] / 10, LENGTHS[0] / 12])  # dz dy dx
         attributes = grid_xml.findall("Attribute")
         scalars = [a for a in attributes if a.get("AttributeType") == "Scalar"]
         vectors = [a for a in attributes if a.get("AttributeType") == "Vector"]
@@ -612,3 +612,34 @@ def test_npy_format_driver_run(tmp_path, monkeypatch):
 def test_serial_communicator_handles_a_coarse_request():
     grid = SlabGrid3D(*SHAPE, *LENGTHS, comm=Comm.serial(), device="cpu")
     assert SpectralCoarsener(grid, (6, 5, 4)).sub is grid.comm
+
+
+def test_series_after_a_restart_leaves_out_an_abandoned_continuation(tmp_path):
+    """Frames written after the restart point by an abandoned run never re-enter fields.xmf."""
+    from phrike.parallel.output import _series_indices, _write_manifest, write_series, xdmf_grid, write_xdmf
+
+    if not COMM.is_root:
+        return
+    d = str(tmp_path)
+    for i in range(5):  # outputs 0..4 of the first run
+        stem = os.path.join(d, f"fields_{i:06d}")
+        open(stem + ".h5", "wb").close()
+        write_xdmf(stem + ".xmf", xdmf_grid(os.path.basename(stem) + ".h5", os.path.basename(stem),
+                                            (4, 4, 4), (1.0, 1.0, 1.0), float(i), ["u_x"], 4))
+    _write_manifest(d, [0, 1, 2, 3, 4])
+    # restart from output 1, with fields every second output: the new run writes output 4 only
+    _write_manifest(d, _series_indices(d, upto=1))
+    indices = [i for i in _series_indices(d) if i < 4] + [4]
+    _write_manifest(d, indices)
+    write_series(d, indices=indices)
+    import xml.etree.ElementTree as ET
+    times = [float(g.find("Time").get("Value"))
+             for g in ET.parse(os.path.join(d, "fields.xmf")).getroot().find("Domain/Grid").findall("Grid")]
+    assert times == [0.0, 1.0, 4.0]
+
+
+def test_union_names_gives_every_rank_the_same_list():
+    mine = ["step", f"only_on_{COMM.rank % 2}"]
+    names = COMM.union_names(mine)
+    assert names == sorted(set(["step"] + [f"only_on_{r % 2}" for r in range(COMM.size)]))
+    assert COMM.bcast(names) == names

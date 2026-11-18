@@ -449,9 +449,10 @@ one whenever the fine field has no content above the coarse cutoff.
 
 The ky rows of the retained spectrum of one variable are sent from their
 owners to the owners of the coarse decomposition in one all-to-all, and the
-coarse inverse transform runs on ``min(ranks, Nz_out, Ny_out)`` ranks (a
-sub-communicator, so it uses ``alltoallv`` even with ``transpose: nccl``); the
-remaining ranks take part in the exchange and write nothing.  Only the kept
+coarse inverse transform runs on ``min(ranks, Nz_out, Ny_out)`` ranks (on
+fewer ranks than the run this is a sub-communicator using ``alltoallv``;
+otherwise the run's own transport); the remaining ranks take part in the
+exchange and write nothing.  Only the kept
 modes move (at most one variable's retained spectrum, much less for a strong
 coarsening), and one variable is in flight at a time.  Incompressible fields and their spectral
 curls come straight from ``uhat``.  The compressible ``rho``, ``m``, ``E`` and
@@ -521,7 +522,7 @@ K and ``T_bu`` the stretching of :math:`b_Q` into magnetic shell K.
 * Always: the shell transfers ``T_uu``, ``T_bb``, ``T_ub``, ``T_bu`` (unfiltered
   field in the Q slot) and the fluxes :math:`\Pi_X(k) = -\sum_{K\le k} T_X(K)`
   on the unit shells, for 9 inverse and 21 forward transforms (3 and 6 without
-  b), about two steps' worth.  ``T_uu + T_ub`` and ``T_bb + T_bu`` are the
+  b), about half a step.  ``T_uu + T_ub`` and ``T_bb + T_bu`` are the
   nonlinear rates of change of the shell energies.
 * ``transfer.matrix: true`` adds ``T_X_matrix[K, Q]`` and ``shell_edges``
   (default logarithmic in base 2: ``[0,1), [1,2), [2,4), ...``; or
