@@ -5,7 +5,7 @@
 # The 288^3 reference and this higher-resolution comparison use identical
 # physical coefficients, forcing and initial conditions. The forcing amplitude
 # was calibrated at 288^3. Check the saturated energies at this resolution.
-# FFT batches of three reduce the peak memory on each GPU.
+# Transform one field at a time with overlapping NCCL exchanges.
 problem: imhd_turb
 
 grid:
@@ -68,4 +68,4 @@ monitoring:
 
 parallel:
   transpose: auto              # nccl on several GPUs, alltoallv otherwise
-  fft_batch: 3
+  fft_batch: 1

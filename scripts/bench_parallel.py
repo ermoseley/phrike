@@ -182,7 +182,7 @@ def main() -> int:
     parser.add_argument("--precision", choices=["single", "double"], default="single")
     parser.add_argument("--scheme", default="rk4")
     parser.add_argument("--backend", default="auto")
-    parser.add_argument("--fft-batch", type=int, default=4)
+    parser.add_argument("--fft-batch", type=int, default=1)
     parser.add_argument("--transpose", choices=["auto", "alltoallv", "p2p", "nccl"], default=None,
                         help="exchange transport (default: PHRIKE_MPI_TRANSPOSE, or auto: nccl on "
                              "several CUDA ranks, alltoallv otherwise)")

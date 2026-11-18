@@ -33,7 +33,7 @@ class SlabGrid3D:
 
     def __init__(self, Nx: int, Ny: int, Nz: int, Lx: float, Ly: float, Lz: float,
                  comm: Optional[Comm] = None, device: str = "cpu", precision: str = "double",
-                 filter_params: Optional[Dict[str, Any]] = None, fft_batch: Optional[int] = 4,
+                 filter_params: Optional[Dict[str, Any]] = None, fft_batch: Optional[int] = 1,
                  timers: Optional[Timers] = None, fft_overlap: Optional[bool] = None):
         self.comm = comm if comm is not None else Comm.serial()
         self.Nx, self.Ny, self.Nz = int(Nx), int(Ny), int(Nz)

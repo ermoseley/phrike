@@ -118,7 +118,7 @@ class Simulation:
         if _enabled(filter_params["spectral_dissipation"]) and not self.compressible:
             raise ValueError("integration.spectral_dissipation applies to the compressible solvers; "
                              "the incompressible solver has physical viscosity and resistivity")
-        fft_batch = par.get("fft_batch", 4)
+        fft_batch = par.get("fft_batch", 1)
         self.grid = SlabGrid3D(
             int(gcfg["Nx"]), int(gcfg["Ny"]), int(gcfg["Nz"]),
             float(gcfg.get("Lx", 2.0 * np.pi)), float(gcfg.get("Ly", 2.0 * np.pi)),

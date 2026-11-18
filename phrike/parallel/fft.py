@@ -48,7 +48,7 @@ class SlabFFT:
     """Distributed truncated rfftn/irfftn for one ``SlabDecomposition``."""
 
     def __init__(self, decomp: SlabDecomposition, comm: Comm, device="cpu",
-                 rdtype=None, batch: Optional[int] = 4, timers: Optional[Timers] = None,
+                 rdtype=None, batch: Optional[int] = 1, timers: Optional[Timers] = None,
                  overlap: Optional[bool] = None):
         """``batch``: fields transformed (and exchanged) per pass; ``0`` or
         ``None`` takes all of them at once.  Smaller batches cap the transient
