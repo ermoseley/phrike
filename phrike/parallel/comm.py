@@ -464,9 +464,9 @@ class Comm:
         if isolated and "NCCL_P2P_DISABLE" not in os.environ:
             os.environ["NCCL_P2P_DISABLE"] = "1"
             if self.is_root:
-                print("[phrike.parallel] each rank sees only its own GPU, so NCCL runs without peer-to-peer "
-                      "(NCCL_P2P_DISABLE=1); launch with every GPU visible to every rank "
-                      "(e.g. srun --gpu-bind=none) for NVLink speed.", flush=True)
+                print("[phrike.parallel] each rank sees only its own GPU: trying NCCL without peer-to-peer "
+                      "(NCCL_P2P_DISABLE=1). For NVLink speed launch with every GPU of a node visible to "
+                      "every rank on it (e.g. srun --gpu-bind=none with all GPUs in the step).", flush=True)
         return []
 
     def resolve_transport(self, device) -> str:
