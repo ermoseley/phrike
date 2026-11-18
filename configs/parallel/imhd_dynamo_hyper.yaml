@@ -1,0 +1,81 @@
+# Fluctuation (small-scale) dynamo: forced incompressible MHD with sixth-order
+# hyperdissipation, Pm = 1, no mean field.
+#
+#   srun -n 8 python -m phrike.parallel imhd_turb --config configs/parallel/imhd_dynamo_hyper.yaml
+#   python -m phrike.parallel imhd_turb --config configs/parallel/imhd_dynamo_hyper.yaml   # one device
+#
+# Units: density 1, b in velocity units (b = B / sqrt(mu0 rho)), box 2 pi.
+# The velocity is driven by a solenoidal Ornstein-Uhlenbeck acceleration on
+# 2 <= |n| <= 4 with a Kolmogorov band, k^(-5/3).  The magnetic field starts
+# from a weak seed and grows by the dynamo until it saturates.
+#
+# Both fields use -nu_h (-lap)^3 with nu_h = eta_h approximately 1 / 2.728e10.
+# The retained per-axis cutoff is k_max = 95. This run averaged kmax_eta_hyper
+# = 1.12 over t = 40 to 60. At fixed dissipation rate, keeping that estimate
+# constant under refinement gives nu_h proportional to N^(-16/3).
+#
+# With these seeds, RMS acceleration 1.36 gave time-averaged kinetic energy
+# 0.982 over t = 40 to 60 (target 1, temporal standard deviation 0.108).
+problem: imhd_turb
+
+grid:
+  Nx: 288
+  Ny: 288
+  Nz: 288
+  Lx: 6.283185307179586
+  Ly: 6.283185307179586
+  Lz: 6.283185307179586
+  precision: single
+
+physics:
+  viscosity: 0.0
+  resistivity: 0.0
+  hyperviscosity: 3.666e-11    # 1 / 2.728e10
+  hyperresistivity: 3.666e-11
+  hyper_order: 6               # nu_h k^6
+  spherical_truncation: false
+
+integration:
+  t0: 0.0
+  t_end: 60.0
+  cfl: 0.6
+  scheme: rk4
+  output_interval: 2.0
+  checkpoint_interval: 10.0
+
+forcing:
+  type: ou
+  kmin: 2.0
+  kmax: 4.0
+  profile: power_law
+  spectral_index: -1.6666666666666667
+  amplitude: 1.36
+  correlation_time: 1.0
+  seed: 1
+
+initial_conditions:
+  vrms: 1.0
+  kmin: 2.0
+  kmax: 4.0
+  spectrum_type: parabolic
+  seed: 42
+  b_rms: 1.0e-3
+  b_kmin: 2.0
+  b_kmax: 8.0
+  b_seed: 123
+  b0: [0.0, 0.0, 0.0]
+
+io:
+  outdir: outputs/imhd_dynamo_hyper
+  snapshots: true
+  slices: true
+  spectra: true
+  keep_checkpoints: 2
+
+monitoring:
+  enabled: true
+  step_interval: 50
+
+parallel:
+  transpose: auto              # nccl on several GPUs, alltoallv otherwise
+  fft_batch: 4

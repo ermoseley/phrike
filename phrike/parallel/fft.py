@@ -24,11 +24,19 @@ Packing and unpacking are a fixed number of strided copies: the balanced slab
 sizes form at most two uniform groups (``decomp.uniform_groups``), and each
 block is laid out so that the receiver's buffer is already the array the next
 1D or 2D transform needs.
+
+Fields are transformed in batches, and with a transport that runs in the
+background (``nccl``) the batches are pipelined: while one batch is on the
+wire the device packs the next one and finishes the previous one, so the
+exchange hides behind the transforms instead of adding to them.  Two batches
+are in flight at most, each with its own pair of exchange buffers.
 """
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+import os
+from itertools import groupby
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -40,10 +48,14 @@ class SlabFFT:
     """Distributed truncated rfftn/irfftn for one ``SlabDecomposition``."""
 
     def __init__(self, decomp: SlabDecomposition, comm: Comm, device="cpu",
-                 rdtype=None, batch: Optional[int] = 4, timers: Optional[Timers] = None):
+                 rdtype=None, batch: Optional[int] = 4, timers: Optional[Timers] = None,
+                 overlap: Optional[bool] = None):
         """``batch``: fields transformed (and exchanged) per pass; ``0`` or
         ``None`` takes all of them at once.  Smaller batches cap the transient
-        memory of a transform at the cost of more, smaller MPI calls."""
+        memory of a transform at the cost of more, smaller exchanges, and give
+        the pipeline more to overlap.  ``overlap``: run the exchange of a batch
+        behind the transforms of its neighbours (default: whenever the
+        transport allows it; ``PHRIKE_FFT_OVERLAP=0`` turns it off)."""
         if decomp.nprocs != comm.size or decomp.rank != comm.rank:
             raise ValueError("decomposition and communicator disagree on rank or size")
         self.d = decomp
@@ -52,9 +64,13 @@ class SlabFFT:
         self.rdtype = rdtype or torch.float64
         self.cdtype = torch.complex64 if self.rdtype == torch.float32 else torch.complex128
         self.batch = int(batch) if batch else 0
+        if overlap is None:
+            flag = os.environ.get("PHRIKE_FFT_OVERLAP", "").strip().lower()
+            overlap = None if flag in ("", "auto") else flag not in ("0", "false", "no", "off")
+        self.overlap = overlap  # None: decided by the transport on first use
         self.timers = timers if timers is not None else Timers(enabled=False)
         self.norm = 1.0 / float(decomp.n_points)
-        self._ky_groups = uniform_groups(decomp.ky_counts)
+        self._ky_copies = self._ky_pack_plan(decomp)
         self._z_groups = uniform_groups(decomp.z_counts)
         self._bufs: Dict[str, torch.Tensor] = {}
         self.forward_fields = 0
@@ -72,8 +88,14 @@ class SlabFFT:
         if out is None:
             out = torch.empty((C,) + d.spectral_shape, dtype=self.cdtype, device=self.device)
         step = self.batch or C
-        for c0 in range(0, C, step):
-            self._forward(f[c0:c0 + step], out[c0:c0 + step])
+        depth = self._depth()
+        flying: List[Tuple] = []
+        for i, c0 in enumerate(range(0, C, step)):
+            flying.append(self._forward_begin(f[c0:c0 + step], i % depth) + (out[c0:c0 + step],))
+            if len(flying) == depth:
+                self._forward_end(*flying.pop(0))
+        while flying:
+            self._forward_end(*flying.pop(0))
         if normalized:
             out.mul_(self.norm)
         self.forward_fields += C
@@ -85,15 +107,41 @@ class SlabFFT:
         if S.dim() != 4 or tuple(S.shape[1:]) != d.spectral_shape:
             raise ValueError(f"inverse expects (C, {d.Kz}, {d.nky}, {d.Kx}), got {tuple(S.shape)}")
         C = S.shape[0]
+        step = self.batch or C
+        self.inverse_fields += C
+        if out is None and C <= step:
+            return self._inverse_end(*self._inverse_begin(S, 0), None)  # the transform's own output
         if out is None:
             out = torch.empty((C,) + d.physical_shape, dtype=self.rdtype, device=self.device)
-        step = self.batch or C
-        for c0 in range(0, C, step):
-            self._inverse(S[c0:c0 + step], out[c0:c0 + step])
-        self.inverse_fields += C
+        depth = self._depth()
+        flying: List[Tuple] = []
+        for i, c0 in enumerate(range(0, C, step)):
+            flying.append(self._inverse_begin(S[c0:c0 + step], i % depth) + (out[c0:c0 + step],))
+            if len(flying) == depth:
+                self._inverse_end(*flying.pop(0))
+        while flying:
+            self._inverse_end(*flying.pop(0))
         return out
 
     # --- internals ----------------------------------------------------------
+
+    @staticmethod
+    def _ky_pack_plan(d):
+        """Strided copies from the two retained FFT bands directly into peer blocks."""
+        bands = [(0, d.Ky, 0)] if d.Ky == d.Ny else [(0, d.hy, 0), (d.hy, d.Ky, d.Ny - d.Ky)]
+        plan = []
+        for lo, hi, shift in bands:
+            spans = []
+            for row, size in zip(d.ky_starts, d.ky_counts):
+                start, end = max(row, lo), min(row + size, hi)
+                if start < end:
+                    spans.append((row, size, start - row, end - start))
+            # Adjacent peers with the same layout share one copy. Only a peer
+            # straddling the gap in the full FFT needs two partial writes.
+            for (size, offset, width), peers in groupby(spans, key=lambda span: span[1:]):
+                rows = [span[0] for span in peers]
+                plan.append((rows[0], len(rows), size, offset, width, rows[0] + offset + shift))
+        return plan
 
     def _buffer(self, key: str, n: int) -> torch.Tensor:
         buf = self._bufs.get(key)
@@ -106,38 +154,43 @@ class SlabFFT:
         """Drop the cached exchange buffers (they are reallocated on demand)."""
         self._bufs.clear()
 
-    def _exchange(self, send, scounts, recv, rcounts) -> None:
-        # One row is a full kx line: Kx complex values.
-        self.comm.exchange(torch.view_as_real(send).reshape(-1), scounts,
-                           torch.view_as_real(recv).reshape(-1), rcounts, unit=2 * self.d.Kx)
+    def _depth(self) -> int:
+        """Batches in flight at once: 2 when the exchange runs in the background, else 1."""
+        if self.overlap is False or self.comm.size == 1:
+            return 1
+        return 2 if self.comm.can_overlap(self.device) else 1
 
-    def _forward(self, f: torch.Tensor, out: torch.Tensor) -> None:
+    def _exchange(self, send, scounts, recv, rcounts):
+        # One row is a full kx line: Kx complex values.
+        return self.comm.exchange_begin(torch.view_as_real(send).reshape(-1), scounts,
+                                        torch.view_as_real(recv).reshape(-1), rcounts,
+                                        unit=2 * self.d.Kx, overlap=self.overlap is not False)
+
+    def _forward_begin(self, f: torch.Tensor, slot: int):
+        """2D transform, truncation and packing of one batch; starts its exchange."""
         d = self.d
         C, nz = f.shape[0], d.nz
         with self.timers("fft_xy"):
             X = torch.fft.rfft2(f)  # (C, nz, Ny, Xh)
         with self.timers("fft_pack"):
-            if d.Ky == d.Ny and d.Kx == d.Xh:
-                T = X  # nothing to drop
-            elif d.ty > 0:
-                T = torch.cat((X[:, :, :d.hy, :d.Kx], X[:, :, d.Ny - d.ty:, :d.Kx]), dim=2)
-            else:
-                T = X[:, :, :d.hy, :d.Kx].contiguous()
-            del X
             # Block for rank q, laid out (z, c, ky, kx): the receiver's blocks
             # then concatenate along z into (Nz, C, nky, Kx).
-            send = self._buffer("send", C * nz * d.Ky * d.Kx)
-            offset = 0
-            for _, nblocks, size, row0 in self._ky_groups:
-                n = nblocks * nz * C * size * d.Kx
-                block = T[:, :, row0:row0 + nblocks * size, :].reshape(C, nz, nblocks, size, d.Kx)
-                send[offset:offset + n].view(nblocks, nz, C, size, d.Kx).copy_(
-                    block.permute(2, 1, 0, 3, 4))
-                offset += n
-            del T
-            recv = self._buffer("recv", d.Nz * C * d.nky * d.Kx)
-        self._exchange(send, [nz * C * c for c in d.ky_counts],
-                       recv, [zc * C * d.nky for zc in d.z_counts])
+            send = self._buffer(f"send{slot}", C * nz * d.Ky * d.Kx)
+            rows = send.view(d.Ky, nz * C * d.Kx)
+            for row, nblocks, size, offset, width, source in self._ky_copies:
+                target = rows[row:row + nblocks * size].view(nblocks, nz, C, size, d.Kx)
+                band = X[:, :, source:source + nblocks * width, :d.Kx].view(C, nz, nblocks, width, d.Kx)
+                target[:, :, :, offset:offset + width].copy_(band.permute(2, 1, 0, 3, 4))
+            del band, X
+            recv = self._buffer(f"recv{slot}", d.Nz * C * d.nky * d.Kx)
+        handle = self._exchange(send, [nz * C * c for c in d.ky_counts],
+                                recv, [zc * C * d.nky for zc in d.z_counts])
+        return handle, recv, C
+
+    def _forward_end(self, handle, recv: torch.Tensor, C: int, out: torch.Tensor) -> None:
+        """After the exchange of a batch: 1D transform in z and truncation into ``out``."""
+        d = self.d
+        handle.wait()
         with self.timers("fft_z"):
             Y = torch.fft.fft(recv.view(d.Nz, C, d.nky, d.Kx), dim=0)
         with self.timers("fft_pack"):
@@ -145,7 +198,8 @@ class SlabFFT:
             if d.tz > 0:
                 out[:, d.hz:].copy_(Y[d.Nz - d.tz:].permute(1, 0, 2, 3))
 
-    def _inverse(self, S: torch.Tensor, out: torch.Tensor) -> None:
+    def _inverse_begin(self, S: torch.Tensor, slot: int):
+        """Padding and inverse transform in z of one batch, packing; starts its exchange."""
         d = self.d
         C, nky = S.shape[0], d.nky
         with self.timers("fft_pack"):
@@ -160,7 +214,7 @@ class SlabFFT:
         with self.timers("fft_pack"):
             # Block for rank q, laid out (ky, c, z, kx): the receiver's blocks
             # then concatenate along ky into (Ky, C, nz, Kx).
-            send = self._buffer("send", C * nky * d.Kx * d.Nz)
+            send = self._buffer(f"send{slot}", C * nky * d.Kx * d.Nz)
             offset = 0
             for _, nblocks, size, z0 in self._z_groups:
                 n = nblocks * nky * C * size * d.Kx
@@ -169,9 +223,16 @@ class SlabFFT:
                     block.permute(3, 1, 0, 4, 2))
                 offset += n
             del Q
-            recv = self._buffer("recv", d.Ky * C * d.nz * d.Kx)
-        self._exchange(send, [nky * C * zc for zc in d.z_counts],
-                       recv, [kc * C * d.nz for kc in d.ky_counts])
+            recv = self._buffer(f"recv{slot}", d.Ky * C * d.nz * d.Kx)
+        handle = self._exchange(send, [nky * C * zc for zc in d.z_counts],
+                                recv, [kc * C * d.nz for kc in d.ky_counts])
+        return handle, recv, C
+
+    def _inverse_end(self, handle, recv: torch.Tensor, C: int,
+                     out: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """After the exchange of a batch: padding and 2D transform into ``out`` (or returned)."""
+        d = self.d
+        handle.wait()
         with self.timers("fft_pack"):
             R = recv.view(d.Ky, C, d.nz, d.Kx).permute(1, 2, 0, 3)  # (C, nz, Ky, Kx)
             W = torch.zeros((C, d.nz, d.Ny, d.Xh), dtype=self.cdtype, device=self.device)
@@ -179,4 +240,8 @@ class SlabFFT:
             if d.ty > 0:
                 W[:, :, d.Ny - d.ty:, :d.Kx] = R[:, :, d.hy:]
         with self.timers("fft_xy"):
-            out.copy_(torch.fft.irfft2(W, s=(d.Ny, d.Nx), norm="forward"))
+            result = torch.fft.irfft2(W, s=(d.Ny, d.Nx), norm="forward")
+            if out is None:
+                return result
+            out.copy_(result)
+        return None

@@ -34,7 +34,7 @@ class SlabGrid3D:
     def __init__(self, Nx: int, Ny: int, Nz: int, Lx: float, Ly: float, Lz: float,
                  comm: Optional[Comm] = None, device: str = "cpu", precision: str = "double",
                  filter_params: Optional[Dict[str, Any]] = None, fft_batch: Optional[int] = 4,
-                 timers: Optional[Timers] = None):
+                 timers: Optional[Timers] = None, fft_overlap: Optional[bool] = None):
         self.comm = comm if comm is not None else Comm.serial()
         self.Nx, self.Ny, self.Nz = int(Nx), int(Ny), int(Nz)
         self.Lx, self.Ly, self.Lz = float(Lx), float(Ly), float(Lz)
@@ -51,7 +51,9 @@ class SlabGrid3D:
 
         d = self.decomp = SlabDecomposition(self.Nx, self.Ny, self.Nz, self.comm.size, self.comm.rank)
         self._fft_batch = fft_batch
-        self.fft = SlabFFT(d, self.comm, self.device, self.rdtype, batch=fft_batch, timers=self.timers)
+        self._fft_overlap = fft_overlap
+        self.fft = SlabFFT(d, self.comm, self.device, self.rdtype, batch=fft_batch, timers=self.timers,
+                           overlap=fft_overlap)
         self._full = None  # (decomposition, transform, per-axis rates, in-band masks), built on demand
         self.n_points = d.n_points
         self.inv_n = 1.0 / float(d.n_points)
@@ -142,7 +144,8 @@ class SlabGrid3D:
     def _full_transform(self):
         if self._full is None:
             d = SlabDecomposition(self.Nx, self.Ny, self.Nz, self.comm.size, self.comm.rank, full=True)
-            fft = SlabFFT(d, self.comm, self.device, self.rdtype, batch=self._fft_batch, timers=self.timers)
+            fft = SlabFFT(d, self.comm, self.device, self.rdtype, batch=self._fft_batch, timers=self.timers,
+                          overlap=self._fft_overlap)
             to = self._to_device
             mx, my, mz = d.modes_x(), d.modes_y_local(), d.modes_z()
             rates = None

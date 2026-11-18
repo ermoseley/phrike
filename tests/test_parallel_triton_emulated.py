@@ -55,7 +55,27 @@ def test_triton_tier_matches_torch_tier(precision, tight, loose):
     report = _report()
     grid = SlabGrid3D(16, 16, 16, TWO_PI, TWO_PI, TWO_PI, comm=COMM, device="cpu", precision=precision)
     check_tiers(report, grid, tight, loose, triton="force")
-    assert report.failures == 0 and report.checks == 8
+    assert report.failures == 0 and report.checks == 10
+
+
+def test_spherical_truncation_evolves_the_single_precision_boundary_mode():
+    from phrike.parallel.incompressible import IncompressibleSlabStepper
+
+    # The (5, 0, 0) mode is exactly on the spherical cutoff on this anisotropic box.
+    # Computing kx**2 in float32 rounds it outside the float64-defined cutoff.
+    grid = SlabGrid3D(16, 16, 16, 5.0, 4.0, 4.0, comm=COMM, device="cpu", precision="single")
+    X, _, _ = grid.xyz_mesh()
+    V = torch.stack((torch.ones_like(X), torch.cos(TWO_PI * X), torch.zeros_like(X)))
+    ref = IncompressibleSlabStepper(grid, 0.0, mhd=False, spherical_truncation=True, triton=False)
+    dev = IncompressibleSlabStepper(grid, 0.0, mhd=False, spherical_truncation=True, triton="force")
+    ref.seed(V)
+    dev.seed(V)
+    start = ref.uhat.clone()
+    ref.step(dt=0.05)
+    dev.step(dt=0.05)
+    assert dev._triton is not None
+    assert gmax((ref.uhat - start).abs().max().item()) > 0.1
+    assert gmax((dev.uhat - ref.uhat).abs().max().item()) < 2e-6
 
 
 def _reference(system, dissipation, eta=0.0, nu=0.0, scheme="rk4"):

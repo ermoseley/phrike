@@ -24,8 +24,12 @@ Types
     ``power``.  Needs the band of the velocity spectrum, so it is available to
     the incompressible solver only.
 
-``kmin`` and ``kmax`` are integer mode magnitudes (cycles per box), as in the
-turbulence initial conditions.  With a spherical truncation (anisotropic
+``kmin`` and ``kmax`` are mode magnitudes (cycles per box), as in the
+turbulence initial conditions.  ``profile`` shapes the band: ``parabolic``
+(zero at both edges), ``flat`` (equal variance per mode) or ``power_law``,
+whose shell-integrated spectrum of the forcing follows ``k^spectral_index``
+(default -5/3, a Kolmogorov band), i.e. a variance per mode of
+``k^(spectral_index - 2)``.  With a spherical truncation (anisotropic
 boxes) only the modes of the band the solver keeps are forced.
 ``compressive_fraction`` mixes the compressive
 and solenoidal projections of the random vector (0 is purely solenoidal).
@@ -77,8 +81,12 @@ class BandForcing:
             raise ValueError("forcing.compressive_fraction must lie in [0, 1]")
         self.zeta = zeta
         profile = str(config.get("profile", "parabolic")).lower()
-        if profile not in ("parabolic", "flat"):
-            raise ValueError("forcing.profile must be 'parabolic' or 'flat'")
+        if profile == "kolmogorov":
+            profile = "power_law"
+        if profile not in ("parabolic", "flat", "power_law"):
+            raise ValueError("forcing.profile must be 'parabolic', 'flat' or 'power_law'")
+        self.profile = profile
+        self.spectral_index = float(config.get("spectral_index", -5.0 / 3.0))
         if self.kind == "ou" and not (np.isfinite(self.tau) and self.tau > 0.0):
             raise ValueError("forcing.correlation_time must be positive")
         if self.kind in ("white", "constant_power") and self.power <= 0.0:
@@ -116,6 +124,9 @@ class BandForcing:
             envelope = np.sqrt(np.clip((mag - self.kmin) * (self.kmax - mag), 0.0, None))
             if not np.any(envelope > 0.0):
                 envelope = np.ones_like(mag)
+        elif profile == "power_law":
+            # Modes per unit |n| grow as |n|^2, so E(k) ~ k^s needs |f_k|^2 ~ k^(s - 2).
+            envelope = mag ** (0.5 * (self.spectral_index - 2.0))
         else:
             envelope = np.ones_like(mag)
         # A unit complex Gaussian vector keeps variance 2 in the solenoidal
@@ -254,7 +265,8 @@ class BandForcing:
         detail = {"ou": f"rms acceleration {self.amplitude:g}, correlation time {self.tau:g}",
                   "white": f"power {self.power:g}",
                   "constant_power": f"power {self.power:g}"}[self.kind]
-        return (f"{self.kind} forcing on {self.kmin:g} <= |n| <= {self.kmax:g} "
+        shape = f"k^{self.spectral_index:.4g} spectrum" if self.profile == "power_law" else self.profile
+        return (f"{self.kind} forcing on {self.kmin:g} <= |n| <= {self.kmax:g}, {shape} "
                 f"({self.M} independent modes"
                 + (f", {self.n_truncated} beyond the truncation dropped" if self.n_truncated else "")
                 + f"), {detail}")

@@ -3,12 +3,15 @@
     mpirun -n 3 python tests/_parallel_nccl_worker.py equal|fallback
 
 ``equal``: with the nccl transport (Gloo on the CPU) the distributed FFT and a
-few solver steps equal the ``alltoallv`` result bit for bit.  ``fallback``:
+few solver steps equal the ``alltoallv`` result bit for bit, with the batches
+pipelined behind the exchange (the default) and with ``PHRIKE_FFT_OVERLAP=0``;
+``PHRIKE_TEST_FFT_BATCH`` sets the fields per batch.  ``fallback``:
 with the group forced to fail on one rank every rank ends up on ``alltoallv``,
 warns once on the root, and still computes the same answer.  Prints ``OK`` on
 the root when every check passed; any failure raises, which aborts the job.
 """
 
+import os
 import sys
 
 import numpy as np
@@ -23,10 +26,15 @@ from phrike.parallel.incompressible import IncompressibleSlabStepper
 
 TWO_PI = 2.0 * np.pi
 SHAPE = (24, 20, 16)
+BATCH = int(os.environ.get("PHRIKE_TEST_FFT_BATCH", "4"))
+DEPTHS = []  # pipeline depth of every grid built
 
 
 def _grid(comm, precision):
-    return SlabGrid3D(*SHAPE, TWO_PI, TWO_PI, TWO_PI, comm=comm, device="cpu", precision=precision)
+    grid = SlabGrid3D(*SHAPE, TWO_PI, TWO_PI, TWO_PI, comm=comm, device="cpu", precision=precision,
+                      fft_batch=BATCH)
+    DEPTHS.append(grid.fft._depth())
+    return grid
 
 
 def results(comm, precision):
@@ -77,6 +85,8 @@ def main(mode):
             assert comm.transpose_requested == "nccl", "run with PHRIKE_MPI_TRANSPOSE=nccl"
             got = results(comm, precision)
             agree(mpi, comm.transpose == "nccl", "nccl stayed active")
+            overlap = os.environ.get("PHRIKE_FFT_OVERLAP", "1") != "0"
+            agree(mpi, DEPTHS[-2:] == [1, 2 if overlap else 1], "the pipeline follows the transport")
             agree(mpi, same(want, got), f"nccl equals alltoallv ({precision})")
             agree(mpi, comm.bytes_sent > 0, "nccl counted its traffic")
         else:

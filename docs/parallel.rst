@@ -53,11 +53,10 @@ communicates 4/9 of the grid's data, once.
 
 What that implies for scaling:
 
-* Under weak scaling (fixed points per GPU) every rank does the same local
-  work and sends its whole truncated block once per transform, so the bytes
-  per rank per step are constant.  The step needs one small ``MPI_Allreduce``.
-  Throughput per GPU is then constant up to the :math:`\log N` factor of the
-  transforms, provided the network delivers a constant bandwidth per node.
+* At fixed points per GPU the total size of each rank's truncated block
+  stays nearly constant. With :math:`P` equal slabs, the fraction sent to
+  other ranks is :math:`1 - 1/P`. How much crosses the network depends on
+  rank placement. The adaptive step also needs a small CFL all-reduce.
 * The number of ranks is limited to ``min(Nz, Ky)`` with
   ``Ky = 2 ((Ny - 1) // 3) + 1``; keep at least 8 planes per rank.  For
   :math:`2048^3` that is a few hundred GPUs.  Beyond it a pencil (2D)
@@ -87,7 +86,9 @@ Transports
 
 Every distributed transform does one all-to-all, so the transport decides the
 scaling.  ``parallel.transpose`` (or ``PHRIKE_MPI_TRANSPOSE``, or ``--transpose``
-in ``scripts/bench_parallel.py`` and the self-test) selects one of three:
+in ``scripts/bench_parallel.py`` and the self-test) defaults to ``auto``. Multiple CUDA ranks use
+``nccl``. One rank, CPU runs, and explicit GPU-aware MPI use ``alltoallv``.
+The available transports are
 
 ``nccl``
    Moves the device buffers with ``torch.distributed``: NCCL for CUDA tensors
@@ -105,7 +106,7 @@ in ``scripts/bench_parallel.py`` and the self-test) selects one of three:
    ``PHRIKE_NCCL_TIMEOUT`` in seconds.  Ranks must be MPI ``COMM_WORLD``
    ranks, one per GPU.
 
-``alltoallv`` (default)
+``alltoallv``
    One ``MPI_Alltoallv``.  Device buffers are staged through pinned host memory
    (two extra copies of everything communicated), or passed to MPI directly with
    ``gpu_aware_mpi``.  Use it for CPU runs and when ``nccl`` is unavailable.
@@ -130,9 +131,11 @@ configured for them; ``nccl`` avoids the question.
 Checking the transport
 ~~~~~~~~~~~~~~~~~~~~~~
 
-``python -m scripts.bench_parallel`` prints the effective exchange bandwidth per
-rank: the bytes a rank sends per step over the time it spends in the exchange
-itself (``mpi_exchange``; host copies are timed separately as ``mpi_stage``).
+With ``--overlap 0``, ``python -m scripts.bench_parallel`` reports effective
+exchange bandwidth per rank from the off-rank bytes sent and the time in
+``mpi_exchange``. Host copies are timed separately in ``mpi_stage``. With two
+batches in flight the timer measures only exposed wait time, so the bandwidth
+field is null and throughput is measured from the complete step.
 Host staging itself is fast (47 to 56 GB/s on four H200 GPUs); the transport
 is what to look at.  If the bench shows ``alltoallv`` on host buffers under
 about 1 GB/s per rank, the MPI transport is misconfigured, not slow by nature.
@@ -172,11 +175,15 @@ Parallel options
    * - ``parallel.gpu_aware_mpi``
      - pass device memory to MPI (default: host staging; ``PHRIKE_GPU_AWARE_MPI``)
    * - ``parallel.transpose``
-     - ``alltoallv`` (default), ``p2p`` (nonblocking point-to-point) or ``nccl``
-       (torch.distributed; recommended on GPU clusters); ``PHRIKE_MPI_TRANSPOSE``
+     - ``auto`` (default), ``alltoallv``, ``p2p``, or ``nccl``
+       (``PHRIKE_MPI_TRANSPOSE``)
    * - ``parallel.fft_batch``
      - fields transformed and exchanged per pass (default 4).  Lower values cut
        the transient memory of a transform; ``0`` takes all fields at once
+   * - ``parallel.overlap``
+     - pipeline two field batches on the NCCL transport (default). Set
+       ``false`` or ``PHRIKE_FFT_OVERLAP=0`` to time the sequential exchange.
+       The pipeline uses a second pair of exchange buffers.
    * - ``parallel.triton``
      - ``false`` forces the Torch tier (``PHRIKE_TRITON=0``)
    * - ``parallel.strict_clamp``
@@ -243,10 +250,46 @@ Method:
 ``physics.viscosity`` is :math:`\nu`; :math:`\eta` is ``physics.resistivity``
 or ``viscosity / physics.magnetic_prandtl``.  ``physics.spherical_truncation``
 keeps :math:`|\mathbf{k}| \le k_\mathrm{max}` instead of the full 2/3 box.
-``history.csv`` reports the energies, both dissipation rates, the forcing
+``history.csv`` reports the energies, the dissipation rates, the forcing
 power, cross and magnetic helicity, the Taylor-scale Reynolds number and
 ``kmax_eta`` :math:`= k_\mathrm{max}(\nu^3/\varepsilon_\nu)^{1/4}`, which
 should stay above about 1.5 in a resolved run.
+
+Hyperdissipation
+~~~~~~~~~~~~~~~~
+
+``physics.hyperviscosity`` :math:`\nu_h` and ``physics.hyperresistivity``
+:math:`\eta_h` add :math:`-\nu_h(-\nabla^2)^p\mathbf{u}` and
+:math:`-\eta_h(-\nabla^2)^p\mathbf{b}` with :math:`2p =`
+``physics.hyper_order`` (an even integer of at least 4; the default 6 is
+sixth-order hyperdissipation, :math:`\nu_h k^6`).  A mode then decays at
+:math:`\nu k^2 + \nu_h k^{2p}`: the Laplacian terms may be zero or kept
+alongside.  Without ``hyperresistivity``, ``magnetic_prandtl`` sets
+:math:`\eta_h = \nu_h/\mathrm{Pm}` as it does for :math:`\eta`.  The
+integrating factor covers these terms too, so they never limit the step,
+whatever the order.  The Triton stage kernel has branches for orders 4 to 10;
+other orders run on the Torch tier.
+
+.. code-block:: yaml
+
+   physics:
+     viscosity: 0.0
+     hyperviscosity: 3.666e-11     # 1 / 2.728e10
+     hyperresistivity: 3.666e-11
+     hyper_order: 6
+
+``history.csv`` then also holds ``hyperviscous_dissipation``,
+``hyperresistive_dissipation``, their sum with the Laplacian rates
+(``dissipation``), ``hyper_magnetic_prandtl`` and ``kmax_eta_hyper``
+:math:`= k_\mathrm{max}(\nu_h^3/\varepsilon)^{1/(6p-2)}`, the analogue of
+``kmax_eta`` for the hyperviscous cutoff.  ``taylor_reynolds`` uses the
+viscosity that would dissipate at the measured rate,
+:math:`\varepsilon/\langle\omega^2\rangle`, which is :math:`\nu` itself
+without hyperviscosity.  ``configs/parallel/imhd_dynamo_hyper.yaml`` runs a
+:math:`288^3` fluctuation dynamo.  For a resolution comparison,
+``configs/parallel/imhd_dynamo_hyper_2048.yaml`` uses the same physical
+coefficients, forcing and seeds at :math:`2048^3`, with FFT batches of three
+for eight GPUs.  Hyperdissipation is available in the incompressible solvers.
 
 Forcing
 -------
@@ -268,6 +311,13 @@ The ``forcing`` block drives the velocity on a shell of low wavenumbers
    * - ``constant_power``
      - :math:`\hat{\mathbf{f}}_k = P\,\hat{\mathbf{u}}_k / (2 E_\mathrm{band})`:
        injects exactly ``power`` (incompressible solvers only)
+
+``profile`` shapes the band: ``parabolic`` (default, zero at both edges),
+``flat`` (the same variance for every mode) or ``power_law``, for which the
+shell-integrated spectrum of the forcing follows :math:`k^{s}` with
+:math:`s =` ``spectral_index`` (default :math:`-5/3`, a Kolmogorov band; the
+variance per mode is then :math:`k^{s-2}`).  ``amplitude`` and ``power`` keep
+their meaning for every profile.
 
 The band holds a few hundred modes at most, so every rank generates all of it
 from a counter-based stream keyed by ``seed`` and the update index.  A forced
