@@ -178,8 +178,8 @@ Parallel options
      - ``auto`` (default), ``alltoallv``, ``p2p``, or ``nccl``
        (``PHRIKE_MPI_TRANSPOSE``)
    * - ``parallel.fft_batch``
-     - fields transformed and exchanged per pass (default 4).  Lower values cut
-       the transient memory of a transform; ``0`` takes all fields at once
+     - fields transformed and exchanged per pass (default 1). Larger batches use more
+       temporary memory. ``0`` takes all fields at once
    * - ``parallel.overlap``
      - pipeline two field batches on the NCCL transport (default). Set
        ``false`` or ``PHRIKE_FFT_OVERLAP=0`` to time the sequential exchange.
@@ -288,8 +288,8 @@ viscosity that would dissipate at the measured rate,
 without hyperviscosity.  ``configs/parallel/imhd_dynamo_hyper.yaml`` runs a
 :math:`288^3` fluctuation dynamo.  For a resolution comparison,
 ``configs/parallel/imhd_dynamo_hyper_2048.yaml`` uses the same physical
-coefficients, forcing and seeds at :math:`2048^3`, with FFT batches of three
-for eight GPUs.  Hyperdissipation is available in the incompressible solvers.
+coefficients, forcing and seeds at :math:`2048^3`, with one field per FFT batch
+and overlapping NCCL exchanges on eight GPUs.  Hyperdissipation is available in the incompressible solvers.
 
 Forcing
 -------
