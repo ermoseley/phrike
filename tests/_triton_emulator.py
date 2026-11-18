@@ -90,6 +90,7 @@ def _language() -> types.ModuleType:
     tl = types.ModuleType("triton.language")
     tl.constexpr = object
     tl.int32, tl.int64 = np.int32, np.int64
+    tl.uint32 = np.uint32
     tl.float32, tl.float64 = np.float32, np.float64
     tl.program_id = lambda axis: Arr(np.int32(_state["pid"]))
     tl.arange = lambda start, stop: Arr(np.arange(start, stop, dtype=np.int32))

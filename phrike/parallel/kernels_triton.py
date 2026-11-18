@@ -188,7 +188,7 @@ def _imhd_products_kernel(V_ptr, G_ptr, rate_ptr, bad_ptr, n, P_ptr,
         tl.store(rate_ptr + pid, tl.max(tl.where(usable, rate, 0.0), axis=0))
 
 
-def imhd_products(V, inv_spacing, mhd, stats, block=1024, num_warps=8):
+def imhd_products(V, inv_spacing, mhd, stats, block=1024, num_warps=8, out=None):
     """Products ``G`` of ``V`` = [u (3), b (3)] and optional CFL statistics.
 
     ``inv_spacing`` is a three-element tensor on V's device with V's dtype.
@@ -197,7 +197,8 @@ def imhd_products(V, inv_spacing, mhd, stats, block=1024, num_warps=8):
     V = V.contiguous()
     n = V[0].numel()
     nblocks = triton.cdiv(n, block)
-    G = torch.empty((8 if mhd else 5,) + tuple(V.shape[1:]), dtype=V.dtype, device=V.device)
+    # Each lane reads all field components at its cell before overwriting that cell.
+    G = out if out is not None else V.new_empty((8 if mhd else 5,) + tuple(V.shape[1:]))
     rate = torch.zeros(nblocks if stats else 1, dtype=V.dtype, device=V.device)
     bad = torch.zeros(nblocks if stats else 1, dtype=torch.int32, device=V.device)
     _imhd_products_kernel[(nblocks,)](V, G, rate, bad, n, inv_spacing,
@@ -240,9 +241,9 @@ def _imhd_stage_kernel(
     U0_ptr, Sout_ptr, sSc,
     A_ptr, sAc,
     kx_ptr, ky_ptr, kz_ptr, P_ptr, Keep_ptr,
-    total, Kx, Ky,
+    total, Kx: tl.constexpr, Ky: tl.constexpr,
     MHD: tl.constexpr, FIRST: tl.constexpr, FINAL: tl.constexpr, HYPER: tl.constexpr,
-    SPHERICAL: tl.constexpr, BLOCK: tl.constexpr,
+    SPHERICAL: tl.constexpr, SHARED_DIFFUSION: tl.constexpr, NARROW_COORDS: tl.constexpr, BLOCK: tl.constexpr,
 ):
     # int32 scalar arguments: multiples of them overflow past 2**31 elements.
     sGc = sGc.to(tl.int64)
@@ -250,8 +251,10 @@ def _imhd_stage_kernel(
     sAc = sAc.to(tl.int64)
     offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < total
-    row = offs // Kx
-    ix = offs - row * Kx
+    # The component pointers still need 64-bit offsets even when the mode index fits in 32 bits.
+    mode = offs.to(tl.uint32) if NARROW_COORDS else offs
+    row = mode // Kx
+    ix = mode - row * Kx
     iz = row // Ky
     iy = row - iz * Ky
     kx = tl.load(kx_ptr + ix, mask=mask, other=0.0)
@@ -321,9 +324,12 @@ def _imhd_stage_kernel(
         byi = scale * (kz * ayzr - kx * axyr)
         bzr = scale * (kx * axzi + ky * ayzi)
         bzi = -scale * (kx * axzr + ky * ayzr)
-        f0 = tl.exp(-db * tau0)
-        fn = tl.exp(-db * taun)
-        fa = tl.exp(-db * taua)
+        if SHARED_DIFFUSION:
+            f0, fn, fa = e0, en, ea
+        else:
+            f0 = tl.exp(-db * tau0)
+            fn = tl.exp(-db * taun)
+            fa = tl.exp(-db * taua)
         _imhd_update(3, bxr, bxi, f0, fn, fa, U0_ptr, Sout_ptr, A_ptr, off, sSc, sAc, mask, wa, wn,
                      FIRST, FINAL)
         _imhd_update(4, byr, byi, f0, fn, fa, U0_ptr, Sout_ptr, A_ptr, off, sSc, sAc, mask, wa, wn,
@@ -335,7 +341,8 @@ def _imhd_stage_kernel(
 HYPER_POWERS = (2, 3, 4, 5)  # Laplacian powers the kernel has a branch for (orders 4 to 10)
 
 
-def imhd_stage(G, U0, Sout, acc, waves, params, mhd, first, final, hyper=0, block=256, num_warps=4, keep=None):
+def imhd_stage(G, U0, Sout, acc, waves, params, mhd, first, final, hyper=0, block=None, num_warps=4, keep=None,
+               shared_diffusion=False):
     """Launch one stage on compact contiguous spectra ``(C, Kz, nky, Kx)``.
 
     ``G`` holds the unnormalized product spectra, ``params`` the ten
@@ -351,6 +358,9 @@ def imhd_stage(G, U0, Sout, acc, waves, params, mhd, first, final, hyper=0, bloc
     assert G.is_contiguous() and U0.is_contiguous() and Sout.is_contiguous() and acc.is_contiguous()
     Kz, Ky, Kx = U0.shape[1:]
     total = Kz * Ky * Kx
+    if block is None:
+        b200_fp64 = U0.is_cuda and U0.dtype == torch.complex128 and torch.cuda.get_device_capability(U0.device) == (10, 0)
+        block = 128 if b200_fp64 else 256
     kx, ky, kz = waves
     _imhd_stage_kernel[(triton.cdiv(total, block),)](
         Gr, Gr.stride(0),
@@ -359,5 +369,6 @@ def imhd_stage(G, U0, Sout, acc, waves, params, mhd, first, final, hyper=0, bloc
         kx, ky, kz, params, keep if keep is not None else kx,
         total, Kx, Ky,
         MHD=bool(mhd), FIRST=bool(first), FINAL=bool(final), HYPER=int(hyper),
-        SPHERICAL=keep is not None, BLOCK=block, num_warps=num_warps,
+        SPHERICAL=keep is not None, SHARED_DIFFUSION=shared_diffusion,
+        NARROW_COORDS=total <= 2**32, BLOCK=block, num_warps=num_warps,
     )

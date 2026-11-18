@@ -328,14 +328,24 @@ class IncompressibleSlabStepper:
         bad = (~finite).sum()
         return G, torch.where(finite, rate, torch.zeros_like(rate)).max(), bad
 
-    def _products(self, V: torch.Tensor, stats: bool):
+    def _products(self, V: torch.Tensor, stats: bool, out=None):
         kt = self._triton
         if kt is not None:
             try:
-                return kt.imhd_products(V, self._triton_spacing, self.mhd, stats)
+                return kt.imhd_products(V, self._triton_spacing, self.mhd, stats, out=out)
             except Exception as exc:  # pragma: no cover - depends on toolchain
                 self._disable_triton(exc)
         return self._products_torch(V, stats)
+
+    def _inverse_products(self, spectrum: torch.Tensor, stats: bool):
+        grid = self.grid
+        if self._triton is not None and grid.fft.batch == 1:
+            # The products replace the physical fields after the inverse transform.
+            products = torch.empty((self.nprod,) + grid.decomp.physical_shape,
+                                   dtype=grid.rdtype, device=grid.device)
+            fields = grid.inverse(spectrum, out=products[:self.ncomp])
+            return self._products(fields, stats, out=products)
+        return self._products(grid.inverse(spectrum), stats)
 
     def nonlinear(self, Gh: torch.Tensor) -> torch.Tensor:
         """Projected nonlinear term from normalized product spectra ``Gh``."""
@@ -391,7 +401,8 @@ class IncompressibleSlabStepper:
             try:
                 kt.imhd_stage(Gh, self.uhat, self.uhat if final else self.shat, self.acc,
                               (g.kx, g.ky, g.kz), params, self.mhd, first, final,
-                              hyper=self.hyper_p, keep=self._keep())
+                              hyper=self.hyper_p, keep=self._keep(),
+                              shared_diffusion=(self.nu == self.eta and self.nu_h == self.eta_h))
                 return
             except Exception as exc:  # pragma: no cover - depends on toolchain
                 # A kernel variant that fails to build has written nothing.
@@ -424,9 +435,7 @@ class IncompressibleSlabStepper:
         output, say); pass ``dt`` to impose it instead.
         """
         g = self.grid
-        V = g.inverse(self.uhat)
-        G, rate, bad = self._products(V, True)
-        del V
+        G, rate, bad = self._inverse_products(self.uhat, True)
         values = torch.stack([rate.to(torch.float64), bad.to(torch.float64)]).tolist()
         rate, bad = self.comm.allreduce(values, "max")  # the one collective of a step
         if bad > 0:
@@ -452,9 +461,7 @@ class IncompressibleSlabStepper:
         last = len(coefs) - 1
         for i, (coef, stage_params) in enumerate(zip(coefs, params)):
             if i > 0:
-                V = g.inverse(self.shat)
-                G = self._products(V, False)
-                del V
+                G = self._inverse_products(self.shat, False)
             self._stage(G, coef, stage_params, i == 0, i == last)
             del G
             self._add_forcing(frozen, coef, i == last)
