@@ -29,7 +29,7 @@ def _config(outdir, **sections):
                     "mhd": {"resistivity": 1e-3, "viscosity": 2e-3}},
         "integration": {"t0": 0.0, "t_end": 0.06, "cfl": 0.3, "scheme": "rk4", "output_interval": 0.03},
         "initial_conditions": {"vrms": 0.3, "kmin": 1.0, "kmax": 4.0, "b_rms": 0.1, "b_kmax": 3.0},
-        "io": {"outdir": outdir},
+        "io": {"outdir": outdir, "format": "npy"},  # the tests read the .npz small files
         "monitoring": {"enabled": False},
     }
     for name, block in sections.items():

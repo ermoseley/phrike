@@ -57,6 +57,10 @@ initial_conditions:
 
 io:
   outdir: outputs/mhd_driven_turb
+  # Optional analysis output (see docs/parallel.rst, "Output and restart"):
+  # format: auto               # auto | hdf5 | npy
+  # fields: {enabled: true, every: 1, precision: single, coarsen: 128, variables: default}
+  # diagnostics: {enabled: true, every: 1, transfer: {enabled: false, every: 5}}
 
 monitoring:
   enabled: true

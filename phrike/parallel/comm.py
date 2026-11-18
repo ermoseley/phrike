@@ -255,6 +255,28 @@ class Comm:
     def is_root(self) -> bool:
         return self.rank == 0
 
+    def sub(self, size: int) -> Optional["Comm"]:
+        """Communicator over the first ``size`` ranks (collective); ``None`` on the others.
+
+        Returns ``self`` when ``size`` covers every rank.  A real sub-communicator
+        is not COMM_WORLD, so it never uses the ``nccl`` transport: it exchanges
+        with ``alltoallv`` (or ``p2p`` if that was requested) and shares this
+        communicator's timers.
+        """
+        size = int(size)
+        if size < 1:
+            raise ValueError("a sub-communicator needs at least one rank")
+        if self.mpi is None or size >= self.size:
+            return self
+        color = 0 if self.rank < size else self.MPI.UNDEFINED
+        mpi = self.mpi.Split(color, self.rank)
+        if color == self.MPI.UNDEFINED:
+            return None
+        child = Comm(mpi, gpu_aware=self.gpu_aware,
+                     transpose="p2p" if self.transpose == "p2p" else "alltoallv")
+        child.timers = self.timers
+        return child
+
     # --- devices ------------------------------------------------------------
 
     def node_rank(self) -> int:

@@ -20,6 +20,7 @@ pytest.importorskip("torch")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SUITE = ["tests/test_parallel_fft.py", "tests/test_parallel_compressible.py",
          "tests/test_parallel_incompressible.py", "tests/test_parallel_driver.py",
+         "tests/test_parallel_output.py", "tests/test_parallel_analysis.py",
          "tests/test_parallel_triton_emulated.py"]
 
 

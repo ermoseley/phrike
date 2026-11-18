@@ -7,7 +7,8 @@ compressible ones (``euler``, ``mhd``) step with ``CompressibleSlabStepper``,
 the incompressible ones (``ins``, ``imhd``) with ``IncompressibleSlabStepper``.
 
 Everything rank 0 prints or writes is a reduction over all ranks; state goes
-to disk as one file per rank (``parallel.io``).
+to disk as one file per rank (``parallel.io``).  Analysis output (physical-space
+fields, slices, spectra, diagnostics) is written by ``parallel.output``.
 """
 
 from __future__ import annotations
@@ -29,8 +30,8 @@ from .compressible import CompressibleSlabStepper
 from .forcing import BandForcing
 from .grid import SlabGrid3D
 from .incompressible import LAWSON_TABLES, IncompressibleSlabStepper
-from .io import (History, field_names, read_meta, read_residual, read_spectrum, write_slice,
-                 write_snapshot)
+from .io import History, read_meta, read_residual, read_spectrum, write_snapshot
+from .output import OutputWriter
 from .problems import COMPRESSIBLE, get_problem
 
 _ALLOWED = {
@@ -41,7 +42,7 @@ _ALLOWED = {
     "integration": {"t0", "t_end", "cfl", "scheme", "output_interval", "checkpoint_interval",
                     "spectral_dissipation", "modal_filter", "sbp_dissipation", "adaptive",
                     "max_steps", "max_wall_minutes", "dt", "dt_max"},
-    "io": {"outdir", "snapshots", "slices", "spectra", "keep_checkpoints"},
+    "io": {"outdir", "snapshots", "slices", "spectra", "keep_checkpoints", "format", "fields", "diagnostics"},
     "monitoring": {"enabled", "step_interval", "output_file", "include_conservation", "include_timestep",
                    "include_time", "include_velocity_stats", "include_density_stats"},
     "forcing": {"type", "kmin", "kmax", "amplitude", "power", "correlation_time",
@@ -50,6 +51,7 @@ _ALLOWED = {
     "adaptive": {"enabled", "scheme", "rtol", "atol", "safety_factor", "min_dt_factor",
                  "max_dt_factor", "max_rejections", "fallback_scheme", "dt_min"},
 }
+_FIELDS_ALLOWED = {"enabled", "every", "precision", "coarsen", "variables"}
 _MHD_ALLOWED = {"resistivity", "viscosity", "project_each_substage", "divergence_clean", "rho_min",
                 "p_min", "resistivity_max", "cfl_diff", "ambipolar", "hall", "shearing_sheet"}
 _TOP_LEVEL = set(_ALLOWED) | {"problem", "initial_conditions", "runtime", "video", "tracers",
@@ -67,6 +69,10 @@ def _warn_unknown_keys(config: Dict[str, Any]) -> None:
         if isinstance(block, dict):
             for key in sorted(set(block) - allowed):
                 note(f"{section}.{key}")
+    fields = (config.get("io") or {}).get("fields")
+    if isinstance(fields, dict):  # io.diagnostics is handed to the analysis module as it is
+        for key in sorted(set(fields) - _FIELDS_ALLOWED):
+            note(f"io.fields.{key}")
     mhd = (config.get("physics") or {}).get("mhd")
     if isinstance(mhd, dict):
         for key in sorted(set(mhd) - _MHD_ALLOWED):
@@ -146,6 +152,16 @@ class Simulation:
         self.write_slices = bool(iocfg.get("slices", True))
         self.write_spectra = bool(iocfg.get("spectra", True))
         self.keep_checkpoints = int(iocfg.get("keep_checkpoints", 2))
+        self.writer = OutputWriter(self.grid, comm, self.system, config, outdir=self.outdir)
+        diag = iocfg.get("diagnostics")
+        self.diag_config = {"enabled": bool(diag)} if isinstance(diag, bool) else dict(diag or {})
+        self.diag_enabled = bool(self.diag_config.get("enabled", True))
+        self.diag_every = max(1, int(self.diag_config.get("every", 1)))
+        transfer = self.diag_config.get("transfer")
+        transfer = {"enabled": bool(transfer)} if isinstance(transfer, bool) else dict(transfer or {})
+        self.transfer_enabled = bool(transfer.get("enabled", False))
+        self.transfer_every = max(1, int(transfer.get("every", 5)))
+        self._analysis = None  # (spectral_diagnostics, transfer_diagnostics), imported on first use
         mon = config.get("monitoring") or {}
         self.monitor_enabled = bool(mon.get("enabled", True))
         self.monitor_interval = max(1, int(mon.get("step_interval", 10)))
@@ -176,6 +192,7 @@ class Simulation:
         self.restarted = bool(restart)
         if restart:
             self._restart(restart)
+            self.writer.rebuild_series(self.out_index - 1)  # fields.xmf from the outputs that exist
         else:
             self._initialize()
         self.history = History(os.path.join(self.outdir, "history.csv"),
@@ -334,8 +351,43 @@ class Simulation:
         diag["step"] = float(self.step_count)
         return diag
 
+    def _analysis_module(self):
+        """``(spectral_diagnostics, transfer_diagnostics)``, or ``None`` after one warning if unavailable."""
+        if self._analysis is None:
+            try:
+                from .analysis import spectral_diagnostics, transfer_diagnostics
+                self._analysis = (spectral_diagnostics, transfer_diagnostics)
+            except ImportError as exc:
+                self.diag_enabled = False
+                if self.comm.is_root:
+                    warnings.warn(f"io.diagnostics is disabled: phrike.parallel.analysis is unavailable ({exc})",
+                                  RuntimeWarning, stacklevel=3)
+        return self._analysis
+
+    def _write_diagnostics(self, index: int) -> None:
+        """Spectral (and, less often, transfer) diagnostics of the analysis module (collective)."""
+        if not self.diag_enabled or index % self.diag_every:
+            return
+        with self.timers("out_diag"):
+            module = self._analysis_module()
+            if module is None:
+                return
+            self._write_diagnostic("spectral", module[0], index)
+            if self.transfer_enabled and index % self.transfer_every == 0:
+                try:
+                    self._write_diagnostic("transfer", module[1], index)
+                except NotImplementedError as exc:
+                    self.transfer_enabled = False
+                    self.log(f"[phrike.parallel] io.diagnostics.transfer is disabled: {exc}")
+
+    def _write_diagnostic(self, kind: str, function, index: int) -> None:
+        result = dict(function(self.stepper, self.diag_config))  # collective; every rank gets the same arrays
+        attrs = {"t": self.t, "step": self.step_count, "system": self.system}
+        attrs.update(result.pop("attrs", None) or {})
+        self.writer.write_small(os.path.join(self.outdir, "diagnostics", f"{kind}_{index:06d}"), result, attrs)
+
     def _output(self) -> None:
-        """Snapshot, spectra, slice and a history row at an output time."""
+        """Snapshot, spectra, slice, fields, diagnostics and a history row at an output time."""
         with self.timers("output"):
             index = self.out_index
             self.out_index += 1
@@ -345,14 +397,13 @@ class Simulation:
                                self.system, self.stepper.uhat, self.t, self.step_count, self._extra_meta(),
                                residual=getattr(self.stepper, "residual", None))
             if self.write_spectra:
-                spectra = self.stepper.spectra()
-                if self.comm.is_root:
-                    os.makedirs(os.path.join(self.outdir, "spectra"), exist_ok=True)
-                    np.savez(os.path.join(self.outdir, "spectra", f"spectra_{index:06d}.npz"),
-                             t=self.t, step=self.step_count, **spectra)
+                self.writer.write_spectra(self.stepper, index, self.t, self.step_count)
             if self.write_slices:
-                write_slice(os.path.join(self.outdir, "slices", f"slice_{index:06d}.npz"), self.grid,
-                            self.stepper.physical(), field_names(self.system), self.t)
+                self.writer.write_slice(self.stepper, index, self.t, self.step_count)
+            if self.writer.fields_due(index):
+                with self.timers("out_fields"):
+                    self.writer.write_fields(self.stepper, index, self.t, self.step_count)
+            self._write_diagnostics(index)
             diag = self._diagnostics()
             if self.compressible and self.system == "mhd":
                 diag["div_b_max"] = self.stepper.max_div_b()

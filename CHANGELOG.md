@@ -30,6 +30,20 @@ All notable changes to PHRIKE are recorded here. The format follows
   ranks fall back to `alltoallv` together. Multi-GPU runs select NCCL by default
   and overlap FFT batches. The benchmark reports exposed wait time with overlap
   and effective exchange bandwidth with overlap disabled.
+- `phrike.parallel`: selectable analysis output. `io.format` (`auto`, `hdf5`,
+  `npy`) sets the format of fields, slices, spectra and diagnostics, and the
+  new `io.fields` block writes physical-space fields (`u`, `b`, `omega`, `j`;
+  compressible `rho`, `u`, `p`, `B`, ...) in double, single or half precision,
+  one variable at a time. `io.fields.coarsen` writes them on a coarser grid as
+  the exact spectral low-pass of the field, redistributed from the fine to the
+  coarse decomposition with one all-to-all. HDF5 output is one file (parallel
+  h5py) or per-rank parts stitched by virtual datasets (serial h5py), with
+  per-output XDMF files and a `fields.xmf` time series that is rebuilt after a
+  restart; `phrike.parallel.output.load_fields` reads either format.
+  `io.diagnostics` calls the analysis module (`phrike.parallel.analysis`) at the
+  output times. Slices of incompressible runs no longer build the physical
+  state, and slices and spectra are `.h5` by default when h5py imports (set
+  `io.format: npy` for the previous `.npz` files). Restart snapshots are unchanged.
 - `python -m phrike.parallel.selftest`, `scripts/bench_parallel.py` (with
   `--forcing`),
   `scripts/check_gpu_aware_mpi.py` and a Slurm template.
