@@ -7,7 +7,8 @@ one GPU and under ``mpirun``/``srun`` with one rank per GPU.
 Only three kinds of traffic exist:
 
 * ``exchange``: the all-to-all of a distributed FFT transpose.  Buffers are
-  1-D real Torch tensors.  Three transports exist (``transpose``):
+  1-D real Torch tensors.  Three transports exist (``transpose``; the default
+  ``auto`` takes ``nccl`` for several CUDA ranks and ``alltoallv`` otherwise):
   ``alltoallv`` and ``p2p`` hand the buffers to MPI by address, so a
   CUDA-aware MPI moves device memory directly; otherwise the data is staged
   through pinned host memory.  Counts are given in rows of ``unit`` reals and
@@ -145,7 +146,9 @@ class Timers:
 
     def _now(self) -> float:
         if self.sync and torch is not None and torch.cuda.is_available():
-            torch.cuda.synchronize()
+            # The current stream only: an exchange in flight on NCCL's stream must
+            # not be waited for here, or timing a run would undo its overlap.
+            torch.cuda.current_stream().synchronize()
         return time.perf_counter()
 
     @contextmanager
@@ -163,6 +166,40 @@ class Timers:
     def reset(self) -> None:
         self.total.clear()
         self.calls.clear()
+
+
+class _Completed:
+    """Handle of an exchange that finished inside ``exchange_begin``."""
+
+    overlapped = False
+
+    def wait(self) -> None:
+        return None
+
+
+class _InFlight:
+    """Handle of an all-to-all running on the ``torch.distributed`` group.
+
+    Until ``wait`` returns, the send buffer must not be written and the
+    receive buffer must not be read.  On CUDA ``wait`` orders the current
+    stream after the exchange without blocking the host, so kernels issued
+    between ``exchange_begin`` and ``wait`` run while the data moves.
+    """
+
+    overlapped = True
+
+    def __init__(self, work, timers: "Timers"):
+        self._work = work
+        self._timers = timers
+
+    def wait(self) -> None:
+        work, self._work = self._work, None
+        if work is not None:
+            with self._timers("mpi_exchange"):  # with ``sync``: the time not hidden behind compute
+                work.wait()
+
+
+_DONE = _Completed()
 
 
 class Comm:
@@ -185,9 +222,10 @@ class Comm:
             # ``python -m scripts.check_gpu_aware_mpi``), so the default is host staging.
             gpu_aware = os.environ.get("MPICH_GPU_SUPPORT_ENABLED", "0").strip() == "1"
         self.gpu_aware = bool(gpu_aware)
-        transpose = (transpose or os.environ.get("PHRIKE_MPI_TRANSPOSE") or "alltoallv").lower()
-        if transpose not in TRANSPORTS:
-            raise ValueError("transpose must be 'alltoallv', 'p2p' or 'nccl'")
+        transpose = (transpose or os.environ.get("PHRIKE_MPI_TRANSPOSE") or "auto").lower()
+        if transpose != "auto" and transpose not in TRANSPORTS:
+            raise ValueError("transpose must be 'auto', 'alltoallv', 'p2p' or 'nccl'")
+        # "auto" becomes a transport once the device is known (``resolve_transport``).
         self.transpose = transpose
         self.transpose_requested = transpose
         self.transport_note = ""  # why a requested transport is not in use
@@ -345,6 +383,20 @@ class Comm:
             return "the MPI communicator is not COMM_WORLD, so torch ranks would differ"
         return None
 
+    def resolve_transport(self, device) -> str:
+        """Turn the ``auto`` transport into a concrete one for tensors on ``device``.
+
+        Several CUDA ranks use ``nccl``: on one node it measured 170 to 300
+        GB/s per rank against 5 to 8 GB/s for host-staged MPI, and it needs no
+        CUDA support in MPI.  CPU runs, a single rank, and runs that ask for
+        device buffers in MPI (``gpu_aware``) use ``alltoallv``.
+        """
+        if self.transpose == "auto":
+            cuda = torch.device(device).type == "cuda"
+            use_nccl = cuda and self.mpi is not None and self.size > 1 and not self.gpu_aware
+            self.transpose = "nccl" if use_nccl else "alltoallv"
+        return self.transpose
+
     def init_transport(self, device) -> None:
         """Start the ``nccl`` transport for tensors on ``device``; collective.
 
@@ -353,6 +405,7 @@ class Comm:
         first use).  If the group cannot start on any rank, all ranks switch
         to ``alltoallv`` together.
         """
+        self.resolve_transport(device)
         if self.transpose != "nccl" or self.mpi is None or self.size == 1:
             return
         if _TD.failed is not None:
@@ -440,6 +493,8 @@ class Comm:
 
     def _use_torch_distributed(self, device) -> bool:
         """Whether this exchange goes through the process group (may start it)."""
+        if self.transpose == "auto":
+            self.resolve_transport(device)
         if self.transpose != "nccl" or self.mpi is None or self.size == 1:
             return False
         if _TD.backend is None:
@@ -493,6 +548,21 @@ class Comm:
         ``scounts[q]`` rows go to rank ``q`` and ``rcounts[p]`` rows arrive from
         rank ``p``, consecutively in rank order; a row is ``unit`` reals.
         """
+        self.exchange_begin(send, scounts, recv, rcounts, unit).wait()
+
+    def can_overlap(self, device) -> bool:
+        """Whether ``exchange_begin`` returns before the data has moved (the nccl transport)."""
+        return self._use_torch_distributed(torch.device(device))
+
+    def exchange_begin(self, send, scounts: Sequence[int], recv, rcounts: Sequence[int],
+                       unit: int, overlap: bool = True):
+        """Start the exchange and return a handle whose ``wait`` completes it.
+
+        With the ``nccl`` transport (and ``overlap``) the exchange runs in the
+        background: work issued before ``wait`` overlaps with it, provided it
+        leaves ``send`` and ``recv`` alone.  The MPI transports finish here
+        and return a completed handle.
+        """
         nsend = int(sum(scounts)) * unit
         nrecv = int(sum(rcounts)) * unit
         if send.numel() < nsend or recv.numel() < nrecv:
@@ -501,7 +571,7 @@ class Comm:
             if nsend != nrecv:
                 raise ValueError("serial exchange needs matching send and receive sizes")
             recv[:nrecv].copy_(send[:nsend])
-            return
+            return _DONE
         if len(scounts) != self.size or len(rcounts) != self.size:
             raise ValueError("exchange counts must have one entry per rank")
         me = self.rank
@@ -515,21 +585,24 @@ class Comm:
         if self._use_torch_distributed(send.device):
             # The group's all-to-all takes one contiguous buffer per side, and
             # the self block sits inside it, so the group copies that block on
-            # the device itself (a local copy, no extra buffer).  The call is
-            # ordered on the current stream: ``recv`` is valid when it returns.
+            # the device itself (a local copy, no extra buffer).  The exchange
+            # is ordered after everything already issued on the current stream;
+            # ``wait`` orders the stream after it, so ``recv`` is valid from then on.
             import torch.distributed as dist
 
             self.bytes_sent += (nsend - n0) * send.element_size()
-            with self.timers("mpi_exchange"):
-                dist.all_to_all_single(recv[:nrecv], send[:nsend],
-                                       output_split_sizes=(rcounts * unit).tolist(),
-                                       input_split_sizes=(scounts * unit).tolist())
-            return
+            work = dist.all_to_all_single(recv[:nrecv], send[:nsend],
+                                          output_split_sizes=(rcounts * unit).tolist(),
+                                          input_split_sizes=(scounts * unit).tolist(), async_op=True)
+            handle = _InFlight(work, self.timers)
+            if not overlap:
+                handle.wait()
+            return handle
         # This rank's block to itself never goes through MPI or the host.
         if n0:
             recv[r0:r0 + n0].copy_(send[s0:s0 + n0])
         if self.size == 1:
-            return
+            return _DONE
         on_device = send.device.type != "cpu"
         if send.device.type == "cuda":
             # MPI reads the buffer now; every kernel that writes it must be done.
@@ -564,6 +637,7 @@ class Comm:
                     recv[:r0].copy_(hrecv[:r0])
                 if nrecv > r0 + n0:
                     recv[r0 + n0:nrecv].copy_(hrecv[r0 + n0:nrecv])
+        return _DONE
 
     def _exchange_p2p(self, send, scounts, sdispls, recv, rcounts, rdispls, row, unit) -> None:
         """The same exchange with one nonblocking message per peer."""
@@ -593,6 +667,8 @@ class Comm:
         if self.mpi is None:
             return "serial (no MPI)"
         library = self.MPI.Get_library_version().splitlines()[0][:70]
+        if self.transpose == "auto":
+            return f"{self.size} ranks, transport chosen on the first exchange (nccl on CUDA); {library}"
         if self.transpose == "nccl":
             if _TD.backend is not None:
                 detail = f"torch.distributed {_TD.backend}, no host staging"

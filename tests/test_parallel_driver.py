@@ -233,6 +233,33 @@ def test_magnetic_prandtl_and_max_steps(tmp_path):
     assert resumed.step_count == 5 and more["steps"] == 2
 
 
+def test_hyperdissipation_from_the_configuration(tmp_path):
+    outdir = shared_dir(tmp_path)
+    config = _config(outdir, integration={"max_steps": 3, "t_end": 10.0, "output_interval": 5.0},
+                     forcing={"type": "ou", "kmin": 2.0, "kmax": 4.0, "amplitude": 0.5,
+                              "profile": "power_law", "spectral_index": -5.0 / 3.0})
+    config["physics"] = {"viscosity": 0.0, "hyperviscosity": 1e-6, "magnetic_prandtl": 2.0, "hyper_order": 6}
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        sim, summary = _run("imhd_turb", config)
+    assert not any("physics.hyper" in str(w.message) or "forcing.spectral_index" in str(w.message) for w in caught)
+    st = sim.stepper
+    assert (st.nu_h, st.eta_h, st.hyper_order, st.nu, st.eta) == (1e-6, 5e-7, 6, 0.0, 0.0)
+    d = st.diagnostics()
+    assert d["hyperviscous_dissipation"] > 0.0 and d["hyper_magnetic_prandtl"] == pytest.approx(2.0)
+    assert d["viscous_dissipation"] == 0.0 and "kmax_eta_hyper" in d
+    meta = read_meta(os.path.join(outdir, "checkpoints", "chk_000000"))
+    assert meta["physics"]["hyperviscosity"] == 1e-6 and meta["physics"]["hyper_order"] == 6
+    explicit = _config(outdir + "_b", integration={"max_steps": 1, "t_end": 10.0, "output_interval": 5.0})
+    explicit["physics"] = {"viscosity": 0.01, "resistivity": 0.01, "hyperviscosity": 1e-6,
+                           "hyperresistivity": 3e-6, "hyper_order": 4}
+    sim, _ = _run("imhd_turb", explicit)
+    assert (sim.stepper.eta_h, sim.stepper.hyper_order) == (3e-6, 4)
+    with pytest.raises(NotImplementedError):
+        Simulation("mhd_turb3d", _config(outdir, physics={"hyperviscosity": 1e-6}),
+                   comm=COMM, backend="cpu", quiet=True)
+
+
 def test_wall_clock_limit_stops_with_a_checkpoint(tmp_path):
     outdir = shared_dir(tmp_path)
     sim, summary = _run("imhd_turb", _config(outdir, integration={"t_end": 1e9, "max_wall_minutes": 0.0}))

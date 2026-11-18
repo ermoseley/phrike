@@ -36,6 +36,12 @@ def test_nccl_transport_equals_alltoallv_bit_for_bit(ranks):
     assert f"{ranks} ranks, nccl (torch.distributed gloo" in out
 
 
+@pytest.mark.parametrize("batch,overlap", [("1", "1"), ("2", "1"), ("1", "0")])
+def test_pipelined_batches_equal_the_blocking_exchange(batch, overlap):
+    """Batches in flight behind the transforms give the same bits as one exchange at a time."""
+    _run(3, "equal", PHRIKE_MPI_TRANSPOSE="nccl", PHRIKE_TEST_FFT_BATCH=batch, PHRIKE_FFT_OVERLAP=overlap)
+
+
 def test_fallback_when_a_rank_cannot_start_the_group():
     out, _ = _run(3, "fallback", PHRIKE_NCCL_TEST_FAIL_RANK="1")
     assert out.count("warning: transpose 'nccl' is unavailable") == 1  # once, on the root
@@ -67,3 +73,21 @@ def test_unknown_transport_is_rejected():
 
     with pytest.raises(ValueError):
         Comm(None, transpose="rdma")
+
+
+def test_auto_transport_resolves_by_device():
+    """The default takes nccl only for several CUDA ranks; everything else is alltoallv."""
+    from phrike.parallel import Comm
+    import torch
+
+    comm = Comm.serial()
+    assert comm.transpose == "auto"
+    assert comm.resolve_transport(torch.device("cpu")) == "alltoallv"
+    comm = Comm.serial()
+    assert comm.resolve_transport(torch.device("cuda:0")) == "alltoallv"  # one rank exchanges nothing
+    # An exchange resolves it too.
+    comm = Comm.serial()
+    recv = torch.zeros(4)
+    comm.exchange(torch.arange(4.0), [2], recv, [2], 2)
+    assert torch.equal(recv, torch.arange(4.0))
+    assert Comm(None, transpose="p2p").resolve_transport(torch.device("cuda:0")) == "p2p"

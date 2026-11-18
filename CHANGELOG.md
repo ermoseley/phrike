@@ -16,7 +16,9 @@ All notable changes to PHRIKE are recorded here. The format follows
 - Incompressible visco-resistive MHD and Navier-Stokes solvers on the same
   decomposition (`imhd_turb`, `imhd_orszag_tang`, `imhd_alfven`, `ins_turb`,
   `ins_taylor_green`): exact integrating factor for viscosity and
-  resistivity, RK2/RK3/RK4, 14 transforms per stage for MHD.
+  resistivity, RK2/RK3/RK4, 14 transforms per stage for MHD. The solver
+  also supports even-order hyperdissipation and power-law OU forcing.
+  The 288³ and 2048³ fluctuation-dynamo examples use the same physical coefficients.
 - Large-scale forcing for driven turbulence (`forcing.type`: `ou`, `white`,
   `constant_power`) and random initial fields that do not depend on the rank
   count. The compressible acceleration is synthesized on the device from the
@@ -25,9 +27,9 @@ All notable changes to PHRIKE are recorded here. The format follows
   `--transpose nccl`) exchanges the FFT transposes with `torch.distributed`
   (NCCL on CUDA, Gloo on CPU), rendezvousing through MPI and needing neither a
   CUDA-aware MPI nor host staging. If the group cannot start on any rank, all
-  ranks fall back to `alltoallv` together. The benchmark reports the effective
-  exchange bandwidth per rank, and the self-test compares the transport with
-  `alltoallv` bit for bit.
+  ranks fall back to `alltoallv` together. Multi-GPU runs select NCCL by default
+  and overlap FFT batches. The benchmark reports exposed wait time with overlap
+  and effective exchange bandwidth with overlap disabled.
 - `python -m phrike.parallel.selftest`, `scripts/bench_parallel.py` (with
   `--forcing`),
   `scripts/check_gpu_aware_mpi.py` and a Slurm template.

@@ -35,7 +35,8 @@ from .problems import COMPRESSIBLE, get_problem
 
 _ALLOWED = {
     "grid": {"Nx", "Ny", "Nz", "Lx", "Ly", "Lz", "dealias", "precision", "fft_workers"},
-    "physics": {"gamma", "mhd", "viscosity", "resistivity", "magnetic_prandtl", "spherical_truncation"},
+    "physics": {"gamma", "mhd", "viscosity", "resistivity", "magnetic_prandtl", "spherical_truncation",
+                "hyperviscosity", "hyperresistivity", "hyper_order"},
     "equations": {"gamma"},
     "integration": {"t0", "t_end", "cfl", "scheme", "output_interval", "checkpoint_interval",
                     "spectral_dissipation", "modal_filter", "sbp_dissipation", "adaptive",
@@ -44,8 +45,8 @@ _ALLOWED = {
     "monitoring": {"enabled", "step_interval", "output_file", "include_conservation", "include_timestep",
                    "include_time", "include_velocity_stats", "include_density_stats"},
     "forcing": {"type", "kmin", "kmax", "amplitude", "power", "correlation_time",
-                "compressive_fraction", "seed", "profile", "enabled"},
-    "parallel": {"gpu_aware_mpi", "transpose", "fft_batch", "triton", "profile", "strict_clamp"},
+                "compressive_fraction", "seed", "profile", "spectral_index", "enabled"},
+    "parallel": {"gpu_aware_mpi", "transpose", "fft_batch", "overlap", "triton", "profile", "strict_clamp"},
     "adaptive": {"enabled", "scheme", "rtol", "atol", "safety_factor", "min_dt_factor",
                  "max_dt_factor", "max_rejections", "fallback_scheme", "dt_min"},
 }
@@ -124,6 +125,7 @@ class Simulation:
             float(gcfg.get("Lz", 2.0 * np.pi)), comm=comm, device=device,
             precision=str(precision or gcfg.get("precision", "double")),
             filter_params=filter_params, fft_batch=fft_batch, timers=self.timers,
+            fft_overlap=par.get("overlap"),
         )
 
         self.t0 = float(integ.get("t0", 0.0))
@@ -150,6 +152,7 @@ class Simulation:
 
         fcfg = config.get("forcing") or {}
         self.forcing = None
+        self.hyper: Dict[str, Any] = {}  # hyperdissipation in use (incompressible only)
         if fcfg and fcfg.get("enabled", True) and str(fcfg.get("type", "none")).lower() != "none":
             # The compressible solvers have no spherical truncation to respect.
             spherical = bool((config.get("physics") or {}).get("spherical_truncation", False))
@@ -193,6 +196,9 @@ class Simulation:
 
     def _setup_compressible(self, config, integ, par, triton) -> None:
         self.gamma = self._gamma(config)
+        for name in ("hyperviscosity", "hyperresistivity"):
+            if float((config.get("physics") or {}).get(name, 0.0)) != 0.0:
+                raise NotImplementedError(f"physics.{name} is available for the incompressible solvers only")
         mhd = (config.get("physics") or {}).get("mhd") or {}
         eta = nu = 0.0
         rho_min, p_min = 1e-10, 1e-12
@@ -247,6 +253,16 @@ class Simulation:
             eta = nu / float(phys["magnetic_prandtl"])
         else:
             eta = 0.0
+        # Hyperdissipation -nu_h (-lap)^(hyper_order / 2); the magnetic coefficient
+        # follows magnetic_prandtl when it is not given.
+        nu_h = float(phys.get("hyperviscosity", 0.0))
+        if "hyperresistivity" in phys:
+            eta_h = float(phys["hyperresistivity"])
+        elif "magnetic_prandtl" in phys:
+            eta_h = nu_h / float(phys["magnetic_prandtl"])
+        else:
+            eta_h = 0.0
+        hyper_order = phys.get("hyper_order", 6)
         if self.scheme not in LAWSON_TABLES:
             raise ValueError(f"Incompressible scheme must be one of {sorted(LAWSON_TABLES)}, got {self.scheme!r}")
         if _enabled((config.get("integration") or {}).get("adaptive")) or _enabled(config.get("adaptive")):
@@ -256,7 +272,10 @@ class Simulation:
         self.stepper = IncompressibleSlabStepper(
             self.grid, nu, eta, mhd=(self.system == "imhd"), scheme=self.scheme, cfl=self.cfl,
             triton=triton, spherical_truncation=bool(phys.get("spherical_truncation", False)),
-            forcing=self.forcing)
+            forcing=self.forcing, hyper_nu=nu_h, hyper_eta=eta_h, hyper_order=hyper_order)
+        if self.stepper.hyper_p:
+            self.hyper = {"hyperviscosity": self.stepper.nu_h, "hyperresistivity": self.stepper.eta_h,
+                          "hyper_order": self.stepper.hyper_order}
         with self.timers("kernel_warm_up"):
             self.stepper.warm_up()
 
@@ -301,7 +320,7 @@ class Simulation:
     def _extra_meta(self) -> Dict[str, Any]:
         extra = {"problem": self.problem.name, "output_index": self.out_index,
                  "checkpoint_index": self.chk_index, "config": self.config,
-                 "physics": {"viscosity": self.nu, "resistivity": self.eta}}
+                 "physics": dict({"viscosity": self.nu, "resistivity": self.eta}, **self.hyper)}
         if self.compressible:
             extra["physics"]["gamma"] = self.gamma
         if self.forcing is not None:
@@ -361,8 +380,10 @@ class Simulation:
         parts = [f"step {self.step_count}", f"t={self.t:.5g}", f"dt={dt:.3e}"]
         for key, label in (("kinetic_energy", "Ek"), ("magnetic_energy", "Em"), ("alfven_mach", "MA"),
                            ("sonic_mach", "Ms"), ("viscous_dissipation", "eps_nu"),
-                           ("resistive_dissipation", "eps_eta"), ("forcing_power", "P"),
-                           ("kmax_eta", "kmax*eta_K"), ("energy", "E")):
+                           ("resistive_dissipation", "eps_eta"),
+                           ("hyperviscous_dissipation", "eps_nu_h"), ("hyperresistive_dissipation", "eps_eta_h"),
+                           ("forcing_power", "P"),
+                           ("kmax_eta", "kmax*eta_K"), ("kmax_eta_hyper", "kmax*eta_h"), ("energy", "E")):
             if key in diag:
                 parts.append(f"{label}={diag[key]:.4g}")
         if wall > 0.0:

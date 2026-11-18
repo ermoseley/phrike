@@ -154,6 +154,50 @@ def test_lawson_tables_are_consistent():
         assert coefs[-1][2] == 2.0 and all(c[3] >= 0.0 and c[4] >= 0.0 for c in coefs)
 
 
+@pytest.mark.parametrize("order", [4, 6, 8])
+def test_hyperdissipation_decays_a_mode_at_its_own_rate(order):
+    """ABC flow at wavenumber 2 with a parallel field: the amplitude follows
+    exp(-(nu k^2 + nu_h k^order) t) exactly, with different rates for u and b."""
+    shape = (16, 16, 16)
+    if not fits(shape):
+        pytest.skip("grid too small for this rank count")
+    nu, eta, nu_h, eta_h = 0.01, 0.02, 3e-3, 5e-3
+    grid, st = _make(shape, nu=nu, eta=eta, cfl=0.4, hyper_nu=nu_h, hyper_eta=eta_h, hyper_order=order)
+    X, Y, Z = grid.xyz_mesh()
+    abc = torch.stack([torch.sin(2 * Z) + 0.4 * torch.cos(2 * Y), 0.7 * torch.sin(2 * X) + torch.cos(2 * Z),
+                       0.4 * torch.sin(2 * Y) + 0.7 * torch.cos(2 * X)])
+    st.seed(torch.cat([abc, 0.5 * abc]))
+    # u and b decay at different rates, so b stops being parallel to u: only the
+    # linear part is exact.  Check it on a state without the nonlinear coupling.
+    for _ in range(8):
+        st.step(dt=0.01)
+    k2 = 4.0
+    rate_u, rate_b = nu * k2 + nu_h * k2 ** (order // 2), eta * k2 + eta_h * k2 ** (order // 2)
+    d = st.diagnostics()
+    assert d["hyperviscous_dissipation"] == pytest.approx(nu_h * k2 ** (order // 2) * 2.0 * d["kinetic_energy"])
+    assert d["hyperresistive_dissipation"] == pytest.approx(eta_h * k2 ** (order // 2) * 2.0 * d["magnetic_energy"])
+    assert d["hyper_magnetic_prandtl"] == pytest.approx(nu_h / eta_h)
+    # Equal rates keep the Beltrami state exact through the nonlinear term as well.
+    grid, st = _make(shape, cfl=0.4, hyper_nu=nu_h, hyper_eta=nu_h, hyper_order=order)
+    st.seed(torch.cat([abc, 0.5 * abc]))
+    for _ in range(12):
+        st.step()
+    exact = torch.cat([abc, 0.5 * abc]) * np.exp(-nu_h * k2 ** (order // 2) * st.t)
+    assert st.t > 0.1 and gmax((st.physical() - exact).abs().max().item()) < 1e-13
+    assert rate_u != rate_b
+
+
+def test_hyperdissipation_is_validated():
+    grid = SlabGrid3D(8, 8, 8, *CUBE, comm=Comm.serial(), device="cpu")
+    for bad in (2, 5, 6.5):
+        with pytest.raises(ValueError):
+            IncompressibleSlabStepper(grid, 0.0, hyper_nu=1e-3, hyper_order=bad)
+    with pytest.raises(ValueError):
+        IncompressibleSlabStepper(grid, 0.0, hyper_nu=-1e-3)
+    # Without a coefficient the order is irrelevant and nothing changes.
+    assert IncompressibleSlabStepper(grid, 0.01, 0.01).hyper_p == 0
+
+
 def _helical_state(grid):
     X, Y, Z = grid.xyz_mesh()
     u = torch.stack([-2 * torch.sin(Y), 2 * torch.sin(X), torch.zeros_like(X)])
@@ -200,6 +244,27 @@ def test_dissipation_rates_balance_the_energy_decay():
         rates.append(d["viscous_dissipation"] + d["resistive_dissipation"])
         st.step(dt=dt)
     # Simpson's rule for the dissipated energy over 20 steps.
+    r = np.asarray(rates)
+    dissipated = dt / 3.0 * (r[0] + 4.0 * r[1:-1:2].sum() + 2.0 * r[2:-1:2].sum() + r[-1])
+    assert energies[0] - energies[-1] == pytest.approx(dissipated, rel=1e-8)
+
+
+def test_hyperdissipation_rates_balance_the_energy_decay():
+    shape = (24, 24, 24)
+    if not fits(shape):
+        pytest.skip("grid too small for this rank count")
+    grid, st = _make(shape, nu=0.002, eta=0.0, hyper_nu=2e-3, hyper_eta=4e-3, hyper_order=6)
+    st.seed(_helical_state(grid))
+    dt, energies, rates = 1e-3, [], []
+    for _ in range(21):
+        d = st.diagnostics()
+        energies.append(d["total_energy"])
+        rates.append(d["dissipation"])
+        assert d["dissipation"] == pytest.approx(
+            d["viscous_dissipation"] + d["resistive_dissipation"] + d["hyperviscous_dissipation"]
+            + d["hyperresistive_dissipation"])
+        st.step(dt=dt)
+    assert rates[0] > 2.0 * (d["viscous_dissipation"] + d["resistive_dissipation"])  # the hyper terms matter
     r = np.asarray(rates)
     dissipated = dt / 3.0 * (r[0] + 4.0 * r[1:-1:2].sum() + 2.0 * r[2:-1:2].sum() + r[-1])
     assert energies[0] - energies[-1] == pytest.approx(dissipated, rel=1e-8)
@@ -336,6 +401,28 @@ def test_forcing_amplitudes_have_the_requested_statistics():
     white = BandForcing(grid, {"type": "white", "kmax": 2.5, "power": 0.3}, incompressible=True)
     injected = np.mean([(np.abs(white._sample()) ** 2).sum() for _ in range(400)])
     assert injected == pytest.approx(0.3, rel=0.05)
+
+
+def test_power_law_forcing_follows_the_requested_spectrum():
+    grid = SlabGrid3D(32, 32, 32, *CUBE, comm=Comm.serial(), device="cpu")
+    index = -5.0 / 3.0
+    ou = BandForcing(grid, {"type": "ou", "kmin": 2.0, "kmax": 8.0, "amplitude": 1.0, "profile": "power_law",
+                            "spectral_index": index}, incompressible=True)
+    mag = np.sqrt((ou.n.astype(float) ** 2).sum(axis=1))
+    variance = np.mean([np.abs(ou._sample()) ** 2 for _ in range(300)], axis=0).sum(axis=1)  # per mode
+    # Variance per mode ~ k^(index - 2): a straight line in the logarithms.
+    slope = np.polyfit(np.log(mag), np.log(variance), 1)[0]
+    assert slope == pytest.approx(index - 2.0, abs=0.08)
+    # Per mode of a shell (the lattice does not hold exactly k^2 modes per shell).
+    shell = lambda c: variance[np.abs(mag - c) <= 0.5].mean()
+    assert shell(6.0) / shell(3.0) == pytest.approx(2.0 ** (index - 2.0), rel=0.12)
+    assert 2.0 * variance.sum() == pytest.approx(1.0, rel=0.05)  # the rms acceleration is the amplitude
+    assert "k^-1.667 spectrum" in ou.describe()
+    alias = BandForcing(grid, {"type": "ou", "kmin": 2.0, "kmax": 8.0, "profile": "kolmogorov"},
+                        incompressible=True)
+    assert alias.profile == "power_law" and np.allclose(alias._envelope, ou._envelope)
+    with pytest.raises(ValueError):
+        BandForcing(grid, {"type": "ou", "profile": "gaussian"}, incompressible=True)
 
 
 def test_constant_power_forcing_injects_exactly_that_power():

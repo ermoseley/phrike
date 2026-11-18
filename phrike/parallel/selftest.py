@@ -71,6 +71,10 @@ class Report:
             self.say(f"  FAIL  {name}: raised an exception (traceback on stderr)")
 
 
+# Sixth-order hyperdissipation used by the kernel and tier checks (a few percent per step at k = 5).
+HYPER = {"hyper_nu": 2e-4, "hyper_eta": 3e-4, "hyper_order": 6}
+
+
 def _tolerances(precision: str):
     """(tight, loose): round-off comparisons and accumulated round-off."""
     return (1e-11, 1e-9) if precision == "double" else (2e-4, 2e-3)
@@ -167,19 +171,23 @@ def check_triton_kernels(report: Report, grid: SlabGrid3D, tight: float) -> None
         V = torch.randn((st.ncomp,) + grid.decomp.physical_shape, generator=g, dtype=torch.float64).to(
             dtype=grid.rdtype, device=grid.device)
         G_ref, rate_ref, bad_ref = st._products_torch(V, True)
-        G, rate, bad = kt.imhd_products(V, st.inv_spacing, mhd, True)
+        inv_spacing = torch.tensor(st.inv_spacing, dtype=grid.rdtype, device=grid.device)
+        G, rate, bad = kt.imhd_products(V, inv_spacing, mhd, True)
         scale = G_ref.abs().max().item()
         label = "imhd" if mhd else "ins"
         report.check(f"kernel products[{label}]: fields", (G - G_ref).abs().max().item() / scale, tight)
         report.check(f"kernel products[{label}]: CFL rate", abs(rate.item() - rate_ref.item()) / rate_ref.item(), tight)
         report.check(f"kernel products[{label}]: finite flag", float(bad.item() + bad_ref.item()), 0.0)
-        G2 = kt.imhd_products(V, st.inv_spacing, mhd, False)
+        G2 = kt.imhd_products(V, inv_spacing, mhd, False)
         report.check(f"kernel products[{label}]: without statistics", (G2 - G_ref).abs().max().item() / scale, tight)
 
-        # Stage kernel: every (first, final) variant, with and without spherical truncation.
-        for spherical in (False, True):
-            ref = IncompressibleSlabStepper(grid, 0.03, 0.05, mhd=mhd, triton=False, spherical_truncation=spherical)
-            dev = IncompressibleSlabStepper(grid, 0.03, 0.05, mhd=mhd, triton=False, spherical_truncation=spherical)
+        # Stage kernel: every (first, final) variant, with and without spherical
+        # truncation, and with sixth-order hyperdissipation.
+        for spherical, hyper in ((False, {}), (True, {}), (False, HYPER)):
+            ref = IncompressibleSlabStepper(grid, 0.03, 0.05, mhd=mhd, triton=False,
+                                            spherical_truncation=spherical, **hyper)
+            dev = IncompressibleSlabStepper(grid, 0.03, 0.05, mhd=mhd, triton=False,
+                                            spherical_truncation=spherical, **hyper)
             spec = lambda seed, rms: random_vector_spectrum(grid, seed, 1.0, 6.0, rms, spectrum="flat")
             parts = [spec(1, 1.0)] + ([spec(2, 0.5)] if mhd else [])
             for s in (ref, dev):
@@ -188,15 +196,15 @@ def check_triton_kernels(report: Report, grid: SlabGrid3D, tight: float) -> None
                 s.shat.zero_()
             Gh = grid.forward(G_ref, normalized=False)
             coefs = lawson_coefficients(LAWSON_TABLES["rk4"], 0.01)
-            for first, final, coef in ((True, False, coefs[0]), (False, False, coefs[1]), (False, True, coefs[3])):
-                ref._stage_torch(Gh * grid.inv_n, coef, first, final)
-                huge = 1e300 if grid.rdtype == torch.float64 else 3e38
-                wa, wn, t0, tn, ta = coef
-                params = torch.tensor([grid.inv_n, 0.03, 0.05 if mhd else 0.0, min(dev.kcut2, huge),
-                                       wa, wn, t0, tn, ta], dtype=grid.rdtype, device=grid.device)
+            params = dev._triton_stage_params(coefs)
+            keep = dev._keep()
+            for i, first, final in ((0, True, False), (1, False, False), (3, False, True)):
+                ref._stage_torch(Gh * grid.inv_n, coefs[i], first, final)
                 kt.imhd_stage(Gh, dev.uhat, dev.uhat if final else dev.shat, dev.acc,
-                              (grid.kx, grid.ky, grid.kz), params, mhd, first, final)
-                name = f"kernel stage[{label}{', spherical' if spherical else ''}; first={first}, final={final}]"
+                              (grid.kx, grid.ky, grid.kz), params[i], mhd, first, final,
+                              hyper=dev.hyper_p, keep=keep)
+                variant = ", spherical" if spherical else (", hyper" if hyper else "")
+                name = f"kernel stage[{label}{variant}; first={first}, final={final}]"
                 scale = max(comm.max(ref.uhat.abs().max().item()), 1e-300)
                 error = max((dev.uhat - ref.uhat).abs().max().item(), (dev.shat - ref.shat).abs().max().item(),
                             (dev.acc - ref.acc).abs().max().item()) / scale
@@ -223,10 +231,11 @@ def check_tiers(report: Report, grid: SlabGrid3D, tight: float, loose: float, tr
         scale = comm.max(states[1].abs().max().item())
         report.check(f"step[{system}]: Triton vs Torch, 3 RK4 steps", (states[0] - states[1]).abs().max().item() / scale, loose)
 
-    for mhd in (True, False):
+    for mhd, hyper in ((True, {}), (False, {}), (True, HYPER)):
         spectra = []
+        label = ("imhd" if mhd else "ins") + (", hyper" if hyper else "")
         for tier in (triton, False):
-            st = IncompressibleSlabStepper(grid, 0.02, 0.03, mhd=mhd, triton=tier)
+            st = IncompressibleSlabStepper(grid, 0.02, 0.03, mhd=mhd, triton=tier, **hyper)
             if tier and st._triton is None:
                 report.check("step[incompressible]: Triton tier available", 1.0, 0.0)
                 return
@@ -237,11 +246,11 @@ def check_tiers(report: Report, grid: SlabGrid3D, tight: float, loose: float, tr
             for _ in range(3):
                 st.step(dt=2e-3)
             if tier:
-                report.check(f"step[{'imhd' if mhd else 'ins'}]: Triton tier stayed active",
+                report.check(f"step[{label}]: Triton tier stayed active",
                              0.0 if st._triton is not None else 1.0, 0.0)
             spectra.append(st.uhat.clone())
         scale = comm.max(spectra[1].abs().max().item())
-        report.check(f"step[{'imhd' if mhd else 'ins'}]: Triton vs Torch, 3 RK4 steps",
+        report.check(f"step[{label}]: Triton vs Torch, 3 RK4 steps",
                      (spectra[0] - spectra[1]).abs().max().item() / scale, loose)
 
 
@@ -260,6 +269,18 @@ def check_exact_solution(report: Report, grid: SlabGrid3D, loose: float) -> None
                  (st.physical() - exact).abs().max().item(), loose)
     d = st.diagnostics()
     report.check("incompressible MHD: div u, div b", max(d["max_div_u_hat"], d["max_div_b_hat"]), loose)
+    # The same flow at wavenumber 2 under sixth-order hyperdissipation decays at nu_h 2^6.
+    nu_h = 2e-3
+    st = IncompressibleSlabStepper(grid, 0.0, 0.0, mhd=True, scheme="rk4", cfl=0.5,
+                                   hyper_nu=nu_h, hyper_eta=nu_h, hyper_order=6)
+    abc2 = torch.stack([torch.sin(2 * Z) + 0.4 * torch.cos(2 * Y), 0.7 * torch.sin(2 * X) + torch.cos(2 * Z),
+                        0.4 * torch.sin(2 * Y) + 0.7 * torch.cos(2 * X)])
+    st.seed(torch.cat([abc2, 0.5 * abc2]))
+    for _ in range(10):
+        st.step()
+    exact = torch.cat([abc2, 0.5 * abc2]) * float(np.exp(-nu_h * 64.0 * st.t))
+    report.check("incompressible MHD: exact Beltrami decay under k^6 hyperdissipation, 10 steps",
+                 (st.physical() - exact).abs().max().item(), loose)
 
 
 def main(argv=None) -> int:
@@ -268,8 +289,8 @@ def main(argv=None) -> int:
     parser.add_argument("--backend", default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument("--size", type=int, default=48, help="grid points per side (default 48)")
     parser.add_argument("--precision", choices=["single", "double", "both"], default="both")
-    parser.add_argument("--transpose", choices=list(TRANSPORTS), default=None,
-                        help="exchange transport (default: PHRIKE_MPI_TRANSPOSE or alltoallv)")
+    parser.add_argument("--transpose", choices=["auto"] + list(TRANSPORTS), default=None,
+                        help="exchange transport (default: PHRIKE_MPI_TRANSPOSE, or auto)")
     args = parser.parse_args(argv)
 
     comm = Comm.auto(transpose=args.transpose)

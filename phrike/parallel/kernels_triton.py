@@ -189,16 +189,18 @@ def _imhd_products_kernel(V_ptr, G_ptr, rate_ptr, bad_ptr, n, P_ptr,
 
 
 def imhd_products(V, inv_spacing, mhd, stats, block=1024, num_warps=8):
-    """Products ``G`` of ``V`` = [u (3), b (3)]; with ``stats`` also
-    (max of sum_i (|u_i| + |b_i|) / dx_i, non-finite count) as device tensors."""
+    """Products ``G`` of ``V`` = [u (3), b (3)] and optional CFL statistics.
+
+    ``inv_spacing`` is a three-element tensor on V's device with V's dtype.
+    With ``stats``, also return the max rate and non-finite count as device tensors.
+    """
     V = V.contiguous()
     n = V[0].numel()
     nblocks = triton.cdiv(n, block)
     G = torch.empty((8 if mhd else 5,) + tuple(V.shape[1:]), dtype=V.dtype, device=V.device)
     rate = torch.zeros(nblocks if stats else 1, dtype=V.dtype, device=V.device)
     bad = torch.zeros(nblocks if stats else 1, dtype=torch.int32, device=V.device)
-    params = torch.tensor(list(inv_spacing), dtype=V.dtype, device=V.device)
-    _imhd_products_kernel[(nblocks,)](V, G, rate, bad, n, params,
+    _imhd_products_kernel[(nblocks,)](V, G, rate, bad, n, inv_spacing,
                                       MHD=bool(mhd), STATS=bool(stats), BLOCK=block,
                                       num_warps=num_warps)
     if stats:
@@ -208,12 +210,12 @@ def imhd_products(V, inv_spacing, mhd, stats, block=1024, num_warps=8):
 
 # --- incompressible MHD: spectral RHS and integrating-factor RK stage ----------
 #
-# P = [1/N, nu, eta, kcut^2, wa, wn, tau_0, tau_n, tau_a].  With E_D(t) =
-# exp(-D k^2 t), D = nu for u and eta for b, and N the projected nonlinear term:
+# P = [1/N, nu, eta, wa, wn, tau_0, tau_n, tau_a, nu_h, eta_h].  With
+# E_D(t) = exp(-D(k) t), D = nu k^2 + nu_h k^(2 HYPER) for u (eta, eta_h for b;
+# HYPER = 0 leaves the Laplacian alone), and N the projected nonlinear term:
 #   not FINAL:  acc  = [acc +] wa * E(tau_a) N,   Sout = E(tau_0) U0 + wn * E(tau_n) N
 #   FINAL:      Sout = E(tau_0) U0 + [acc +] wa * E(tau_a) N
-# Modes with k^2 > kcut^2 get N = 0 (spherical truncation; pass a huge kcut^2
-# to keep the full 2/3 box).
+# Spherical truncation uses the same retained-mode mask as the Torch tier.
 
 
 @triton.jit
@@ -237,9 +239,10 @@ def _imhd_stage_kernel(
     G_ptr, sGc,
     U0_ptr, Sout_ptr, sSc,
     A_ptr, sAc,
-    kx_ptr, ky_ptr, kz_ptr, P_ptr,
+    kx_ptr, ky_ptr, kz_ptr, P_ptr, Keep_ptr,
     total, Kx, Ky,
-    MHD: tl.constexpr, FIRST: tl.constexpr, FINAL: tl.constexpr, BLOCK: tl.constexpr,
+    MHD: tl.constexpr, FIRST: tl.constexpr, FINAL: tl.constexpr, HYPER: tl.constexpr,
+    SPHERICAL: tl.constexpr, BLOCK: tl.constexpr,
 ):
     # int32 scalar arguments: multiples of them overflow past 2**31 elements.
     sGc = sGc.to(tl.int64)
@@ -257,14 +260,29 @@ def _imhd_stage_kernel(
     inv_n = tl.load(P_ptr)
     nu = tl.load(P_ptr + 1)
     eta = tl.load(P_ptr + 2)
-    kcut2 = tl.load(P_ptr + 3)
-    wa = tl.load(P_ptr + 4)
-    wn = tl.load(P_ptr + 5)
-    tau0 = tl.load(P_ptr + 6)
-    taun = tl.load(P_ptr + 7)
-    taua = tl.load(P_ptr + 8)
+    wa = tl.load(P_ptr + 3)
+    wn = tl.load(P_ptr + 4)
+    tau0 = tl.load(P_ptr + 5)
+    taun = tl.load(P_ptr + 6)
+    taua = tl.load(P_ptr + 7)
     k2 = kx * kx + ky * ky + kz * kz
-    scale = tl.where(k2 <= kcut2, inv_n, 0.0)  # flux spectra come from an unnormalized transform
+    du = nu * k2
+    db = eta * k2
+    if HYPER > 0:
+        if HYPER == 2:
+            k2p = k2 * k2
+        elif HYPER == 3:
+            k2p = k2 * k2 * k2
+        elif HYPER == 4:
+            k2p = (k2 * k2) * (k2 * k2)
+        else:
+            k2p = (k2 * k2) * (k2 * k2) * k2
+        du = du + tl.load(P_ptr + 8) * k2p
+        db = db + tl.load(P_ptr + 9) * k2p
+    scale = inv_n  # flux spectra come from an unnormalized transform
+    if SPHERICAL:
+        keep = tl.load(Keep_ptr + offs, mask=mask, other=False)
+        scale = tl.where(keep, scale, 0.0)
     inv_k2 = tl.where(k2 == 0.0, 0.0, 1.0 / tl.where(k2 == 0.0, 1.0, k2))
     off = 2 * offs
 
@@ -282,9 +300,9 @@ def _imhd_stage_kernel(
     nzi = -scale * (kx * g3r + ky * g4r)
     cr = (kx * nxr + ky * nyr + kz * nzr) * inv_k2
     ci = (kx * nxi + ky * nyi + kz * nzi) * inv_k2
-    e0 = tl.exp(-nu * k2 * tau0)
-    en = tl.exp(-nu * k2 * taun)
-    ea = tl.exp(-nu * k2 * taua)
+    e0 = tl.exp(-du * tau0)
+    en = tl.exp(-du * taun)
+    ea = tl.exp(-du * taua)
     _imhd_update(0, nxr - kx * cr, nxi - kx * ci, e0, en, ea, U0_ptr, Sout_ptr, A_ptr, off, sSc, sAc,
                  mask, wa, wn, FIRST, FINAL)
     _imhd_update(1, nyr - ky * cr, nyi - ky * ci, e0, en, ea, U0_ptr, Sout_ptr, A_ptr, off, sSc, sAc,
@@ -303,9 +321,9 @@ def _imhd_stage_kernel(
         byi = scale * (kz * ayzr - kx * axyr)
         bzr = scale * (kx * axzi + ky * ayzi)
         bzi = -scale * (kx * axzr + ky * ayzr)
-        f0 = tl.exp(-eta * k2 * tau0)
-        fn = tl.exp(-eta * k2 * taun)
-        fa = tl.exp(-eta * k2 * taua)
+        f0 = tl.exp(-db * tau0)
+        fn = tl.exp(-db * taun)
+        fa = tl.exp(-db * taua)
         _imhd_update(3, bxr, bxi, f0, fn, fa, U0_ptr, Sout_ptr, A_ptr, off, sSc, sAc, mask, wa, wn,
                      FIRST, FINAL)
         _imhd_update(4, byr, byi, f0, fn, fa, U0_ptr, Sout_ptr, A_ptr, off, sSc, sAc, mask, wa, wn,
@@ -314,13 +332,20 @@ def _imhd_stage_kernel(
                      FIRST, FINAL)
 
 
-def imhd_stage(G, U0, Sout, acc, waves, params, mhd, first, final, block=256, num_warps=4):
+HYPER_POWERS = (2, 3, 4, 5)  # Laplacian powers the kernel has a branch for (orders 4 to 10)
+
+
+def imhd_stage(G, U0, Sout, acc, waves, params, mhd, first, final, hyper=0, block=256, num_warps=4, keep=None):
     """Launch one stage on compact contiguous spectra ``(C, Kz, nky, Kx)``.
 
-    ``G`` holds the unnormalized product spectra, ``params`` the nine scalars
-    listed above as a tensor of the real dtype.  ``Sout`` may be ``U0`` in the
-    final stage.
+    ``G`` holds the unnormalized product spectra, ``params`` the ten
+    scalars listed above as a tensor of the real dtype.  ``Sout`` may be
+    ``U0`` in the final stage.  ``hyper`` is the Laplacian power of the
+    hyperdissipation (0 for none).  ``keep`` is the spherical truncation
+    mask, or None for the full 2/3 box.
     """
+    if hyper and hyper not in HYPER_POWERS:
+        raise ValueError(f"the Triton stage kernel has no branch for hyperdissipation order {2 * hyper}")
     Gr, U0r, Sr, Ar = (torch.view_as_real(x) for x in (G, U0, Sout, acc))
     assert U0r.stride() == Sr.stride() == Ar.stride()
     assert G.is_contiguous() and U0.is_contiguous() and Sout.is_contiguous() and acc.is_contiguous()
@@ -331,7 +356,8 @@ def imhd_stage(G, U0, Sout, acc, waves, params, mhd, first, final, block=256, nu
         Gr, Gr.stride(0),
         U0r, Sr, Sr.stride(0),
         Ar, Ar.stride(0),
-        kx, ky, kz, params,
+        kx, ky, kz, params, keep if keep is not None else kx,
         total, Kx, Ky,
-        MHD=bool(mhd), FIRST=bool(first), FINAL=bool(final), BLOCK=block, num_warps=num_warps,
+        MHD=bool(mhd), FIRST=bool(first), FINAL=bool(final), HYPER=int(hyper),
+        SPHERICAL=keep is not None, BLOCK=block, num_warps=num_warps,
     )

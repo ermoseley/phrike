@@ -6,6 +6,11 @@ Equations, with unit density and the magnetic field in Alfven units
     du/dt = -div(u u - b b) - grad(p + b^2/2) + nu lap(u) + f,   div u = 0
     db/dt =  curl(u x b)                      + eta lap(b),      div b = 0
 
+Hyperdissipation of even order ``2p`` (``hyper_order``) may replace or join
+the Laplacians: ``-nu_h (-lap)^p u`` and ``-eta_h (-lap)^p b``, so a mode
+decays at ``nu k^2 + nu_h k^(2p)``.  Sixth-order hyperdissipation is
+``hyper_order = 6`` (``nu_h k^6``).
+
 A uniform mean field is the ``k = 0`` mode of ``b``; it needs no special
 treatment and may be zero.  With ``mhd=False`` the magnetic field is dropped
 and the same code is incompressible Navier-Stokes.
@@ -22,9 +27,10 @@ Method
   fields carry it (``Tzz`` is subtracted from the diagonal); the induction
   tensor ``A = u b - b u`` is antisymmetric (3 fields), which makes ``db/dt``
   solenoidal to round-off.  Pressure is eliminated by the Leray projection.
-* Viscosity and resistivity are integrated exactly by an integrating factor
-  (Lawson RK): there is no diffusive time-step limit for any ``nu``, ``eta``
-  or their ratio.  The explicit part is RK2 (midpoint), RK3 (Heun) or RK4.
+* Viscosity, resistivity and hyperdissipation are integrated exactly by an
+  integrating factor (Lawson RK): there is no diffusive time-step limit for
+  any coefficient, order or ratio.  The explicit part is RK2 (midpoint), RK3
+  (Heun) or RK4.
 * The step is ``dt = cfl / max_x sum_i (|u_i| + |b_i|) / dx_i``, evaluated on
   the fields the first stage transforms anyway (the stage-0 products do not
   depend on ``dt``), so the CFL condition costs no extra transform.
@@ -61,7 +67,7 @@ def lawson_coefficients(table, dt: float):
 
     ``tau_0`` multiplies the base state in the stage (or final) state,
     ``tau_n`` the slope in the next stage and ``tau_a`` the slope in the final
-    update, each as ``exp(-D k^2 tau)``.
+    update, each as ``exp(-D(k) tau)`` with ``D = nu k^2 + nu_h k^(2p)``.
     """
     out, c = [], 0.0
     for wa, wn in table:
@@ -90,7 +96,8 @@ class IncompressibleSlabStepper:
 
     def __init__(self, grid: SlabGrid3D, nu: float, eta: float = 0.0, mhd: bool = True,
                  scheme: str = "rk4", cfl: float = 0.5, triton: Optional[bool] = None,
-                 spherical_truncation: bool = False, forcing: Optional[BandForcing] = None):
+                 spherical_truncation: bool = False, forcing: Optional[BandForcing] = None,
+                 hyper_nu: float = 0.0, hyper_eta: float = 0.0, hyper_order: int = 6):
         self.grid = grid
         self.comm = grid.comm
         self.mhd = bool(mhd)
@@ -99,6 +106,14 @@ class IncompressibleSlabStepper:
         self.nu, self.eta = float(nu), float(eta) if self.mhd else 0.0
         if self.nu < 0.0 or self.eta < 0.0:
             raise ValueError("viscosity and resistivity must be non-negative")
+        self.nu_h, self.eta_h = float(hyper_nu), float(hyper_eta) if self.mhd else 0.0
+        if self.nu_h < 0.0 or self.eta_h < 0.0:
+            raise ValueError("hyperviscosity and hyperresistivity must be non-negative")
+        self.hyper_order = int(hyper_order)
+        if self.hyper_order != hyper_order or self.hyper_order < 4 or self.hyper_order % 2:
+            raise ValueError(f"hyper_order must be an even integer of at least 4, got {hyper_order!r}")
+        # Power of the Laplacian; 0 when no hyperdissipation is in use.
+        self.hyper_p = self.hyper_order // 2 if (self.nu_h > 0.0 or self.eta_h > 0.0) else 0
         scheme = str(scheme).lower()
         if scheme not in LAWSON_TABLES:
             raise ValueError(f"incompressible scheme must be one of {sorted(LAWSON_TABLES)}, got {scheme!r}")
@@ -136,6 +151,7 @@ class IncompressibleSlabStepper:
             try:
                 from . import kernels_triton as kt
 
+                self._triton_spacing = torch.tensor(self.inv_spacing, dtype=grid.rdtype, device=grid.device)
                 self._triton = kt
             except Exception as exc:  # pragma: no cover - depends on toolchain
                 self._note(f"Triton unavailable for the incompressible kernels ({exc}); using torch ops.")
@@ -195,7 +211,9 @@ class IncompressibleSlabStepper:
         tiny = SlabGrid3D(8, 8, 8, g.Lx, g.Ly, g.Lz, comm=Comm.serial(), device=g.device,
                           precision=g.precision, fft_batch=g.fft.batch)
         st = IncompressibleSlabStepper(tiny, self.nu, self.eta, mhd=self.mhd, scheme=self.scheme,
-                                       cfl=self.cfl, triton="force", spherical_truncation=self.spherical)
+                                       cfl=self.cfl, triton="force", spherical_truncation=self.spherical,
+                                       hyper_nu=self.nu_h, hyper_eta=self.eta_h,
+                                       hyper_order=self.hyper_order)
         if st._triton is None:
             raise RuntimeError("the Triton kernel module could not be imported")
         st._strict_kernels = True
@@ -225,7 +243,7 @@ class IncompressibleSlabStepper:
             ky = 2.0 * np.pi * np.asarray(g.ny_modes, dtype=np.float64) / g.Ly
             kz = 2.0 * np.pi * np.asarray(g.nz_modes, dtype=np.float64) / g.Lz
             k2 = kz[:, None, None] ** 2 + ky[None, :, None] ** 2 + kx[None, None, :] ** 2
-            mask = torch.as_tensor(k2 <= self.kcut2, device=g.device).to(g.rdtype)
+            mask = torch.as_tensor(k2 <= self.kcut2, device=g.device)
             self._keep_mask = mask
         return mask
 
@@ -237,15 +255,27 @@ class IncompressibleSlabStepper:
         X[1] -= g.ky3 * c
         X[2] -= g.kz3 * c
 
+    def damping(self, k2: torch.Tensor, magnetic: bool = False) -> torch.Tensor:
+        """Decay rate ``D(k) = nu k^2 + nu_h k^(2p)`` of a mode (``eta``, ``eta_h`` for ``b``)."""
+        lap, hyp = (self.eta, self.eta_h) if magnetic else (self.nu, self.nu_h)
+        rate = lap * k2
+        if hyp > 0.0:
+            rate = rate + hyp * k2 ** self.hyper_p
+        return rate
+
+    @property
+    def dissipative(self) -> bool:
+        return self.nu > 0.0 or self.eta > 0.0 or self.hyper_p > 0
+
     def _decay(self, tau: float) -> Optional[torch.Tensor]:
-        """exp(-D k^2 tau) per component, (ncomp, Kz, nky, Kx), or None for the identity."""
-        if tau == 0.0 or (self.nu == 0.0 and self.eta == 0.0):
+        """exp(-D(k) tau) per component, (ncomp, Kz, nky, Kx), or None for the identity."""
+        if tau == 0.0 or not self.dissipative:
             return None
         k2 = self.grid.k2()
-        e = torch.exp(-(self.nu * float(tau)) * k2).expand(3, *k2.shape)
+        e = torch.exp(-float(tau) * self.damping(k2)).expand(3, *k2.shape)
         if not self.mhd:
             return e
-        return torch.cat((e, torch.exp(-(self.eta * float(tau)) * k2).expand(3, *k2.shape)), dim=0)
+        return torch.cat((e, torch.exp(-float(tau) * self.damping(k2, True)).expand(3, *k2.shape)), dim=0)
 
     # --- state --------------------------------------------------------------
 
@@ -302,7 +332,7 @@ class IncompressibleSlabStepper:
         kt = self._triton
         if kt is not None:
             try:
-                return kt.imhd_products(V, self.inv_spacing, self.mhd, stats)
+                return kt.imhd_products(V, self._triton_spacing, self.mhd, stats)
             except Exception as exc:  # pragma: no cover - depends on toolchain
                 self._disable_triton(exc)
         return self._products_torch(V, stats)
@@ -344,20 +374,24 @@ class IncompressibleSlabStepper:
             self.acc.add_(update)
         self.shat.copy_(scaled(tau0, self.uhat) + wn * scaled(taun, N))
 
-    def _stage(self, G: torch.Tensor, coef, first: bool, final: bool) -> None:
+    def _triton_stage_params(self, coefs) -> torch.Tensor:
+        """Pack a step's Lawson parameters in one asynchronous copy to the device."""
+        g = self.grid
+        params = torch.tensor(
+            [[self.inv_n, self.nu, self.eta, *coef, self.nu_h, self.eta_h] for coef in coefs],
+            dtype=g.rdtype, device="cpu")
+        return params.to(device=g.device, non_blocking=True)
+
+    def _stage(self, G: torch.Tensor, coef, params: Optional[torch.Tensor], first: bool, final: bool) -> None:
         """Transform the products and apply one RK stage."""
         g = self.grid
         Gh = g.forward(G, normalized=False)
         kt = self._triton
         if kt is not None:
             try:
-                wa, wn, tau0, taun, taua = coef
-                huge = 1e300 if g.rdtype == torch.float64 else 3e38
-                params = torch.tensor(
-                    [self.inv_n, self.nu, self.eta, min(self.kcut2, huge), wa, wn, tau0, taun, taua],
-                    dtype=g.rdtype, device=g.device)
                 kt.imhd_stage(Gh, self.uhat, self.uhat if final else self.shat, self.acc,
-                              (g.kx, g.ky, g.kz), params, self.mhd, first, final)
+                              (g.kx, g.ky, g.kz), params, self.mhd, first, final,
+                              hyper=self.hyper_p, keep=self._keep())
                 return
             except Exception as exc:  # pragma: no cover - depends on toolchain
                 # A kernel variant that fails to build has written nothing.
@@ -371,15 +405,15 @@ class IncompressibleSlabStepper:
             return
         f = self.forcing
         wa, wn, _, taun, taua = coef
-        idx, k2 = f.index, f.local_k2
+        idx, rate = f.index, self.damping(f.local_k2)
         acc = self.acc.reshape(self.ncomp, -1)
         if final:
             out = self.uhat.reshape(self.ncomp, -1)
-            out[:3, idx] += (wa * torch.exp(-self.nu * taua * k2)) * values
+            out[:3, idx] += (wa * torch.exp(-taua * rate)) * values
             return
-        acc[:3, idx] += (wa * torch.exp(-self.nu * taua * k2)) * values
+        acc[:3, idx] += (wa * torch.exp(-taua * rate)) * values
         out = self.shat.reshape(self.ncomp, -1)
-        out[:3, idx] += (wn * torch.exp(-self.nu * taun * k2)) * values
+        out[:3, idx] += (wn * torch.exp(-taun * rate)) * values
 
     # --- time stepping ------------------------------------------------------
 
@@ -414,13 +448,14 @@ class IncompressibleSlabStepper:
             with g.timers("forcing"):
                 frozen = forcing.frozen(self.uhat)
         coefs = lawson_coefficients(self.table, dt)
+        params = self._triton_stage_params(coefs) if self._triton is not None else (None,) * len(coefs)
         last = len(coefs) - 1
-        for i, coef in enumerate(coefs):
+        for i, (coef, stage_params) in enumerate(zip(coefs, params)):
             if i > 0:
                 V = g.inverse(self.shat)
                 G = self._products(V, False)
                 del V
-            self._stage(G, coef, i == 0, i == last)
+            self._stage(G, coef, stage_params, i == 0, i == last)
             del G
             self._add_forcing(frozen, coef, i == last)
         if forcing is not None:
@@ -450,9 +485,13 @@ class IncompressibleSlabStepper:
         """Global energies, dissipation rates and derived turbulence numbers."""
         g = self.grid
         w, k2 = g.weight3, g.k2()
+        # sum_k k^(2p) |.|^2 of the hyperdissipation, accumulated in float64.
+        k2p = (k2.to(torch.float64) ** self.hyper_p) if self.hyper_p else None
         u = self.uhat[0:3]
         eu = (u.real ** 2 + u.imag ** 2).sum(dim=0)
         sums = [float((w * eu).sum().item()), float((w * k2 * eu).sum().item())]
+        hyper_u = float((k2p * (w * eu)).sum().item()) if self.hyper_p else 0.0
+        hyper_b = 0.0
         div = (g.kx3 * u[0] + g.ky3 * u[1] + g.kz3 * u[2]).abs().max()
         maxima = [float(div.item())]
         if self.mhd:
@@ -471,11 +510,14 @@ class IncompressibleSlabStepper:
                      float((w * cross).sum().item()), float((w * hel).sum().item()),
                      float(mean_e.item())] + [float(v) for v in mean.tolist()]
             maxima.append(float((g.kx3 * b[0] + g.ky3 * b[1] + g.kz3 * b[2]).abs().max().item()))
+            if self.hyper_p:
+                hyper_b = float((k2p * (w * eb)).sum().item())
+        del k2p
         forcing = self.forcing
         power = 0.0
         if forcing is not None and forcing.kind != "white":
             power = forcing.local_power(self.uhat, forcing._to_local(forcing.f) if forcing.n_local else None)
-        sums += [power, self.injected]
+        sums += [hyper_u, hyper_b, power, self.injected]
         sums = self.comm.allreduce(sums, "sum")
         maxima = self.comm.allreduce(maxima, "max")
 
@@ -505,17 +547,35 @@ class IncompressibleSlabStepper:
         out["total_energy"] = ke + (out.get("magnetic_energy", 0.0))
         out["forcing_power"] = float(sums[-2])
         out["injected_energy"] = float(sums[-1])
-        eps = out["viscous_dissipation"]
+        if self.hyper_p:
+            out["hyperviscous_dissipation"] = self.nu_h * float(sums[-4])
+            if self.mhd:
+                out["hyperresistive_dissipation"] = self.eta_h * float(sums[-3])
+        # Total rate at which the dissipative terms remove energy.
+        eps = out["viscous_dissipation"] + out.get("hyperviscous_dissipation", 0.0)
+        out["dissipation"] = (eps + out.get("resistive_dissipation", 0.0)
+                              + out.get("hyperresistive_dissipation", 0.0))
+        kmax = math.sqrt(g.k2_max / 3.0) if not self.spherical else math.sqrt(self.kcut2)
         if self.nu > 0.0 and eps > 0.0:
-            kmax = math.sqrt(g.k2_max / 3.0) if not self.spherical else math.sqrt(self.kcut2)
             eta_k = (self.nu ** 3 / eps) ** 0.25
             out["kolmogorov_scale"] = eta_k
             out["kmax_eta"] = kmax * eta_k
+        if self.nu_h > 0.0 and eps > 0.0:
+            # Dissipation scale of the hyperviscous operator: (nu_h^3 / eps)^(1 / (6p - 2)).
+            eta_h = (self.nu_h ** 3 / eps) ** (1.0 / (6.0 * self.hyper_p - 2.0))
+            out["hyper_kolmogorov_scale"] = eta_h
+            out["kmax_eta_hyper"] = kmax * eta_h
+        if eps > 0.0 and wu > 0.0:
+            # Taylor scale from the enstrophy; the viscosity is the one that would
+            # dissipate at the measured rate, eps / <omega^2> (nu itself without hyperviscosity).
             uprime = urms / math.sqrt(3.0)
-            lam = math.sqrt(15.0 * self.nu * uprime * uprime / eps)
-            out["taylor_reynolds"] = uprime * lam / self.nu
+            lam = math.sqrt(15.0 * uprime * uprime / wu)
+            out["taylor_microscale"] = lam
+            out["taylor_reynolds"] = uprime * lam * wu / eps
         if self.mhd and self.eta > 0.0:
             out["magnetic_prandtl"] = self.nu / self.eta
+        if self.mhd and self.eta_h > 0.0:
+            out["hyper_magnetic_prandtl"] = self.nu_h / self.eta_h
         if self.rate is not None:
             out["cfl_rate"] = self.rate
         return out
