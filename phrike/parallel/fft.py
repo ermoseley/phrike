@@ -182,7 +182,8 @@ class SlabFFT:
                 band = X[:, :, source:source + nblocks * width, :d.Kx].view(C, nz, nblocks, width, d.Kx)
                 target[:, :, :, offset:offset + width].copy_(band.permute(2, 1, 0, 3, 4))
             del band, X
-            recv = self._buffer(f"recv{slot}", d.Nz * C * d.nky * d.Kx)
+            # A single rank already packed its own complete receive block.
+            recv = send if self.comm.size == 1 else self._buffer(f"recv{slot}", d.Nz * C * d.nky * d.Kx)
         handle = self._exchange(send, [nz * C * c for c in d.ky_counts],
                                 recv, [zc * C * d.nky for zc in d.z_counts])
         return handle, recv, C
@@ -223,7 +224,7 @@ class SlabFFT:
                     block.permute(3, 1, 0, 4, 2))
                 offset += n
             del Q
-            recv = self._buffer(f"recv{slot}", d.Ky * C * d.nz * d.Kx)
+            recv = send if self.comm.size == 1 else self._buffer(f"recv{slot}", d.Ky * C * d.nz * d.Kx)
         handle = self._exchange(send, [nky * C * zc for zc in d.z_counts],
                                 recv, [kc * C * d.nz for kc in d.ky_counts])
         return handle, recv, C
