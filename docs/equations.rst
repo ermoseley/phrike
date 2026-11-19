@@ -262,9 +262,12 @@ alias). Its units are length squared over time per :math:`B^2`, so that
 :math:`\eta B^2` is a diffusivity. The time discretization is a frozen
 midpoint resolvent, Strang-split around the ideal Runge–Kutta step, not a
 forward-Euler evaluation of this term. Total energy is updated with the
-discrete Poynting flux of that electric field. The open-:math:`y` closure
-sets the tangential diffusive electric field to zero. Details of the
-resolvent and the boundary tensor are in :doc:`validation`.
+discrete Poynting flux of that electric field. On open-:math:`y` faces the
+closure is the summation-by-parts adjoint, as for Ohmic resistivity: no
+tangential diffusive electric field or Poynting flux leaves the box (weakly),
+every current, the face values included, is dissipated, and the magnetic
+projection removes the divergence this leaves in the face rows. Details of the
+resolvent are in :doc:`validation`.
 
 Plasma beta
 -----------

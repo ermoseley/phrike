@@ -396,12 +396,15 @@ truncation itself. At fixed :math:`N` the attainable accuracy is therefore
 set by the retained Fourier band, as for the rest of the solver, not by the
 time step.
 
-At open y faces the diffusive closure sets tangential ambipolar electric field
-to zero. This differs from transparent diffusion and from the ideal-MHD open
-flux. The boundary tensor is projected on both sides to preserve weighted
-symmetry and dissipation; its constitutive accuracy can be lower at endpoints
-with nonzero normal magnetic field. Localized modes require a wider-domain
-control before interpreting their growth.
+At open y faces the operator is ``-curl^T K curl`` with the curl's SBP adjoint,
+so no tangential diffusive electric field or Poynting flux leaves the box
+(weakly). This differs from transparent diffusion and from the ideal-MHD open
+flux. The operator is weighted-symmetric and dissipative, and its magnetic work
+equals the ambipolar heating of every current, face values included; a strong
+face mask of the electric field, used before, left fields whose SBP current
+lives only on the face rows undamped. The face rows gain a divergence that the
+magnetic projection removes. Localized modes require a wider-domain control
+before interpreting their growth.
 
 The focused tests check the SBP identity, outgoing acoustic-pulse recurrence,
 projection, explicit diffusion stability, weighted ambipolar dissipation and

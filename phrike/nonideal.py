@@ -86,10 +86,9 @@ def _ifft(F, dim, like):
 class MidpointAmbipolar:
     """Second-order coefficient prediction and an H-weighted SPD resolvent.
 
-    Open-y grids use zero tangential *diffusive* electric field. This is a
-    natural flux closure, separate from the ideal-MHD outflow condition. The
-    boundary tensor is R K R, so endpoint constitutive accuracy can be lower
-    than the interior stencil accuracy when the normal field is nonzero.
+    On open-y grids the adjoint curl imposes zero tangential diffusive
+    electric field weakly. Face currents enter the same tensor as interior
+    currents. The Poynting flux uses the same zero-flux SBP divergence.
 
     The electric field E = eta (|B|^2 J - B (B.J)) is a diffusion of J_perp with
     effective diffusivity eta_eff = eta |B|^2. ``eta_max`` caps it by the factor
@@ -128,18 +127,14 @@ class MidpointAmbipolar:
                              if _tensor(B) else w.astype(B.dtype))
         return self._weights
 
-    def _mask(self, V):
-        if not getattr(self.grid, "_mixed_open_y", False):
-            return V
-        result = _copy(V)
-        result[0, 0] = result[0, -1] = 0
-        result[2, 0] = result[2, -1] = 0
-        return result
-
-    def _curl(self, B):
-        # Exact constants should not create roundoff currents in SBP closures.
-        B = B - B[:, :1, :1]
-        dx, dy = self.grid.dx1(B), self.grid.dy1(B)
+    def _curl(self, B, *, adjoint=False):
+        if adjoint and getattr(self.grid, "_mixed_open_y", False):
+            # Even a constant electric field contributes to the adjoint's face terms.
+            dx, dy = self.grid.dx1(B), -self.grid.dy_adjoint(B)
+        else:
+            # Exact constants should not create roundoff currents in SBP closures.
+            B = B - B[:, :1, :1]
+            dx, dy = self.grid.dx1(B), self.grid.dy1(B)
         return _stack([dy[2], -dx[2], dx[1]-dy[0]])
 
     def _coupling(self, b2):
@@ -149,16 +144,16 @@ class MidpointAmbipolar:
 
     def _electric(self, B, reference):
         B = self.grid.project_dealiased(B)
-        J = self._mask(self._curl(B))
+        J = self._curl(B)
         b2 = (reference * reference).sum(axis=0)
         dot = (reference * J).sum(axis=0)
         E = self.eta * (b2 * J - reference * dot)
         if self.eta_max is not None:
             E = E * self._coupling(b2)
-        return self.grid.project_dealiased(self._mask(E))
+        return self.grid.project_dealiased(E)
 
     def _operator(self, B, reference):
-        return -self._curl(self._electric(B, reference))
+        return -self._curl(self._electric(B, reference), adjoint=True)
 
     def _precondition(self, reference, h):
         if self.preconditioner != "fourier_tensor":
@@ -300,7 +295,10 @@ class MidpointAmbipolar:
         flux_x = E[1]*Bmid[2]-E[2]*Bmid[1]
         flux_y = E[2]*Bmid[0]-E[0]*Bmid[2]
         result = _copy(U)
-        result[4] = U[4]-h*(self.grid.dx1(flux_x)+self.grid.dy1(flux_y))
+        div_x = self.grid.dx1(flux_x)
+        div_y = (-self.grid.dy_adjoint(flux_y) if getattr(self.grid, "_mixed_open_y", False)
+                 else self.grid.dy1(flux_y))
+        result[4] = U[4]-h*(div_x+div_y)
         result[5:8] = Bn
         return result
 

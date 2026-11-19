@@ -87,6 +87,9 @@ All notable changes to PHRIKE are recorded here. The format follows
   positivity limiter had just clamped is no longer projected onto the retained
   band, and the fast path caches it only once it is band-limited again. Before,
   the restarted run differed from the uninterrupted one.
+- Mixed-grid ambipolar diffusion uses the summation-by-parts adjoint at the
+  open-y faces, as Ohmic resistivity does: fields whose current lives only on
+  the face rows are now dissipated (the strong face mask left them undamped).
 
 - `phrike.parallel` compressible MHD: after the accepted-state positivity
   limiter clamps, the next step now follows the reference (the clamped state's
