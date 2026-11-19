@@ -1,0 +1,19 @@
+# Run A, with vorticity and current saved around the two enstrophy peaks.
+problem: imhd_orszag_tang
+
+grid: {Nx: 256, Ny: 256, Nz: 256, precision: double}
+physics: {viscosity: 0.005, resistivity: 0.005}
+initial_conditions: {beta: 0.8}
+integration: {t_end: 2.6, cfl: 0.3, scheme: rk4, output_interval: 0.65}
+
+io:
+  outdir: runs/orszag-tang-fields
+  format: hdf5
+  snapshots: false
+  slices: false
+  spectra: false
+  diagnostics: {enabled: false}
+  fields: {enabled: true, every: 1, precision: single, variables: [omega, j]}
+
+monitoring: {enabled: false}
+parallel: {transpose: auto, fft_batch: 1, overlap: true}

@@ -1,0 +1,17 @@
+# Brandenburg & Chen (2020), Table 1. The launcher holds u fixed at every stage.
+problem: imhd_abc_kinematic
+
+grid: {Nx: 64, Ny: 64, Nz: 64, precision: double}
+physics: {viscosity: 0.0, resistivity: 0.097}
+initial_conditions: {b_rms: 1.0e-8, b_seed: 42, b_kmax: 4.0}
+integration: {t_end: 400.0, cfl: 0.5, scheme: rk4, output_interval: 1.0}
+
+io:
+  outdir: runs/abc-growing
+  snapshots: false
+  slices: false
+  spectra: false
+  diagnostics: {enabled: false}
+
+monitoring: {enabled: false}
+parallel: {fft_batch: 1, overlap: true}
