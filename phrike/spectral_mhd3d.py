@@ -357,12 +357,24 @@ class MHD3DSpectral:
         self._cache = None
         self._pending = None
 
-    def seed(self, U):
-        """Cache the spectrum of a solenoidal state; returns its dealiased version."""
+    def seed(self, U, *, restored: bool = False):
+        """Cache a solenoidal state and return its dealiased version on a fresh start.
+
+        A restart keeps the physical state exactly as stored. Its masked spectrum
+        can be used for the next step only if it reproduces that state to round-off.
+        """
         uhat, _ = self._buffers()
         self._pending = None
         torch.mul(self._rfftn_fwd(U), self.M3, out=uhat)
         Un = self._irfftn(uhat)
+        if restored:
+            # Each conserved field has its own scale for FFT round-off.
+            scale = U.abs().amax(dim=self._dims)
+            residual = Un.sub_(U).abs_().amax(dim=self._dims)
+            if not (residual <= 32 * torch.finfo(U.dtype).eps * scale).all():
+                self.invalidate()
+                return U
+            Un = U
         self._cache = (Un, Un._version)
         return Un
 

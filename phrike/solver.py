@@ -1009,7 +1009,10 @@ class SpectralSolver1D(_SpectralFastPathMixin):
         on_output: Optional[Callable[[float, Array], None]] = None,
         on_step: Optional[Callable[[int, float, Array], None]] = None,
         tracers: Optional[Any] = None,
+        *,
+        restored: bool = False,
     ) -> Dict[str, List[float]]:
+        """Euler limits stages before the final projection, so ``restored`` has no effect."""
         from .io import save_solution_snapshot
 
         if _TORCH_AVAILABLE and isinstance(U0, (torch.Tensor,)):
@@ -1394,7 +1397,10 @@ class SpectralSolver2D(_SpectralFastPathMixin):
         on_output: Optional[Callable[[float, Array], None]] = None,
         on_step: Optional[Callable[[int, float, Array], None]] = None,
         tracers: Optional[Any] = None,
+        *,
+        restored: bool = False,
     ) -> Dict[str, List[float]]:
+        """Euler limits stages before the final projection, so ``restored`` has no effect."""
         from .io import save_solution_snapshot
 
         if _TORCH_AVAILABLE and isinstance(U0, (torch.Tensor,)):
@@ -2317,21 +2323,27 @@ class SpectralSolverMHD:
             outdir: Optional[str] = None,
             on_output: Optional[Callable[[float, Array], None]] = None,
             on_step: Optional[Callable[[int, float, Array], None]] = None,
-            tracers: Optional[Any] = None) -> Dict[str, List[float]]:
+            tracers: Optional[Any] = None, *, restored: bool = False) -> Dict[str, List[float]]:
+        """Advance fresh initial data or resume the exact accepted state with ``restored=True``."""
         from .io import save_solution_snapshot
 
         if _TORCH_AVAILABLE and isinstance(U0, (torch.Tensor,)):
             self.U = U0.clone()
         else:
             self.U = U0.copy()
-        # Project the initial state so div(B)=0 from the first stored step.
-        self.U = self._project_B(self.U)
-        self.U = self.grid.project_dealiased(self.U)
+        if not restored:
+            self.U = self._project_B(self.U)
+            self.U = self.grid.project_dealiased(self.U)
         fast = self._fast()
         if fast is not None and self.divergence_clean == "projection":
-            self.U = fast.seed(self.U)
+            self.U = fast.seed(self.U, restored=restored)
         if self.dim == 1 or getattr(self.grid, "_mixed_open_y", False):
-            self.U = self.grid.initialize_boundary_conditions(self.U, self.equations)
+            if restored:
+                # Initialize the far field. The accepted step already imposed
+                # fixed endpoint values and reconstructed their energy.
+                self.grid.initialize_boundary_conditions(self.U, self.equations)
+            else:
+                self.U = self.grid.initialize_boundary_conditions(self.U, self.equations)
         _begin_run(self, t0, t_end)
         next_output = self.t + output_interval
         next_checkpoint = (
@@ -2684,7 +2696,10 @@ class SpectralSolver3D(_SpectralFastPathMixin):
         on_output: Optional[Callable[[float, Array], None]] = None,
         on_step: Optional[Callable[[int, float, Array], None]] = None,
         tracers: Optional[Any] = None,
+        *,
+        restored: bool = False,
     ) -> Dict[str, List[float]]:
+        """Euler limits stages before the final projection, so ``restored`` has no effect."""
         from .io import save_solution_snapshot
 
         if _TORCH_AVAILABLE and isinstance(U0, (torch.Tensor,)):
