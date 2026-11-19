@@ -1957,6 +1957,7 @@ class BaseProblem(ABC):
                 on_output=combined_output_callback,
                 on_step=monitoring_callback,
                 tracers=tracers,
+                restored=self.restart_data is not None,
             )
         else:
             # Legacy solver interface
@@ -1966,6 +1967,7 @@ class BaseProblem(ABC):
                 t_end=self.t_end,
                 output_interval=self.output_interval,
                 outdir=self.outdir,
+                restored=self.restart_data is not None,
             )
 
         # Final visualization

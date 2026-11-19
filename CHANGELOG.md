@@ -82,6 +82,12 @@ All notable changes to PHRIKE are recorded here. The format follows
 
 ### Fixed
 
+- Serial MHD restarts resume the stored accepted state exactly
+  (`run(..., restored=True)`, passed by the problem driver): a state the
+  positivity limiter had just clamped is no longer projected onto the retained
+  band, and the fast path caches it only once it is band-limited again. Before,
+  the restarted run differed from the uninterrupted one.
+
 - `phrike.parallel` compressible MHD: after the accepted-state positivity
   limiter clamps, the next step now follows the reference (the clamped state's
   out-of-band content is damped, enters every stage and is removed at the end
