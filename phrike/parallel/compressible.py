@@ -40,6 +40,8 @@ from __future__ import annotations
 import copy
 import math
 import os
+import sys
+import traceback
 import warnings
 from typing import Dict, Optional, Tuple
 
@@ -48,7 +50,9 @@ import torch
 
 from ..spectral3d import _RK_TABLES, euler3d_symmetric_fluxes
 from ..spectral3d import _count_below as _euler_count_below
-from ..spectral_mhd3d import _mhd_count_below, mhd3d_fluxes
+from ..spectral_mhd3d import (_mhd_count_below, derivative_spectra, mhd3d_fluxes,
+                              mhd3d_transport_fluxes, mhd_temperature)
+from ..transport import Transport, flux_buffer_rows
 from .comm import Comm
 from .grid import SlabGrid3D
 
@@ -108,7 +112,8 @@ class _ScratchFFT:
     def __init__(self, grid: SlabGrid3D, nvar: int, gamma: float):
         d = grid.decomp
         self.d, self.cdtype, self.device = d, grid.cdtype, grid.device
-        U = torch.zeros((nvar,) + d.physical_shape, dtype=grid.rdtype, device=grid.device)
+        # Rows past nvar stand for the transport derivative fields (up to 9 go back at once).
+        U = torch.zeros((max(nvar, 12),) + d.physical_shape, dtype=grid.rdtype, device=grid.device)
         U[0] = 1.0
         U[4] = 1.0 / (gamma - 1.0)
         if nvar == 8:
@@ -140,14 +145,17 @@ class CompressibleSlabStepper:
     """
 
     def __init__(self, grid: SlabGrid3D, system: str, gamma: float, rho_min: float,
-                 p_min: float, eta: float = 0.0, nu: float = 0.0,
+                 p_min: float, transport: Optional[Transport] = None,
                  triton: Optional[bool] = None, strict_clamp: bool = True):
         """``strict_clamp``: also count floor violations of the final state
         before the modal dissipation, as the reference limiter does (the default).
         It costs one more inverse transform of the state per step and only
         matters when split-step dissipation is on and the undissipated state
         dips below a floor that the dissipated one stays above.  ``False``
-        skips that count: faster, but a step the reference would limit can pass."""
+        skips that count: faster, but a step the reference would limit can pass.
+
+        ``transport``: viscosity, resistivity and conduction of the MHD system
+        (``phrike.transport``); the Euler system is inviscid."""
         if system not in ("euler", "mhd"):
             raise ValueError("system must be 'euler' or 'mhd'")
         self.grid = grid
@@ -158,9 +166,9 @@ class CompressibleSlabStepper:
         self.kind = "mhd3d" if self.mhd else "euler3d"
         self.gamma = float(gamma)
         self.rho_min, self.p_min = float(rho_min), float(p_min)
-        self.eta, self.nu = float(eta), float(nu)
-        if not self.mhd and (self.eta != 0.0 or self.nu != 0.0):
-            raise ValueError("explicit viscosity/resistivity belong to the MHD system")
+        self.transport = transport if transport is not None else Transport()
+        if not self.mhd and self.transport.active:
+            raise ValueError("viscosity, resistivity and conduction belong to the MHD system")
         self.strict_clamp = bool(strict_clamp)
         self.dissipation = bool(grid.spectral_dissipation_enabled)
         self.inv_n = grid.inv_n
@@ -168,6 +176,7 @@ class CompressibleSlabStepper:
         self.uhat = grid.zeros_spectral(self.nvar)
         self.shat = grid.zeros_spectral(self.nvar)
         self.unew = grid.zeros_spectral(self.nvar)
+        self._has_state = False  # set by seed/set_spectrum; warm_up may borrow the buffers before
         self.U: Optional[torch.Tensor] = None
         self.speed: Optional[float] = None  # global max wave speed of the current state
         self._residual: Optional[torch.Tensor] = None  # out-of-band part after a clamp (5, nz, Ny, Nx)
@@ -205,6 +214,19 @@ class CompressibleSlabStepper:
     # --- kernel tier --------------------------------------------------------
 
     def warm_up(self, embedded: bool = False) -> bool:
+        """See ``_warm_up``.  A stepper with no state yet (the driver warms up before it
+        seeds) lends its three spectral buffers to the full-size scratch stepper."""
+        fresh = not self._has_state
+        if fresh:
+            self.uhat = self.shat = self.unew = None
+        try:
+            return self._warm_up(embedded)
+        finally:
+            if fresh:
+                g = self.grid
+                self.uhat, self.shat, self.unew = (g.zeros_spectral(self.nvar) for _ in range(3))
+
+    def _warm_up(self, embedded: bool) -> bool:
         """Build the Triton kernels this stepper uses and settle the tier for all ranks.
 
         A kernel that failed on one rank in the middle of a distributed step
@@ -218,9 +240,14 @@ class CompressibleSlabStepper:
         raises (the driver aborts all ranks) instead of switching one rank to
         torch ops.  Returns whether the Triton tier is in use.
         """
+        comm = self.comm
+        # Settle which modules every rank has before anyone returns or enters a barrier.
+        if comm.min(0.0 if self._triton is None else 1.0) < 1.0:
+            self._triton = None
+        if comm.min(0.0 if self._stats_kernel is None else 1.0) < 1.0:
+            self._stats_kernel = None
         if self._triton is None and self._stats_kernel is None:
             return False
-        comm = self.comm
         problem = [""]
 
         def run() -> float:
@@ -267,14 +294,12 @@ class CompressibleSlabStepper:
         shim.comm = Comm.serial()
         shim.fft = _ScratchFFT(g, self.nvar, self.gamma)
         st = CompressibleSlabStepper(shim, self.system, self.gamma, self.rho_min, self.p_min,
-                                     eta=self.eta, nu=self.nu, triton="force",
+                                     transport=self.transport, triton="force",
                                      strict_clamp=self.strict_clamp)
-        if (st._triton is None) != (self._triton is None) or (st._stats_kernel is None) != (
-                self._stats_kernel is None):
-            raise RuntimeError("the Triton kernel modules could not be imported")
+        self._match_tiers(st)
         st._strict_kernels = True
         st.set_spectrum(st.uhat)
-        dt = 1e-3 * g.min_spacing
+        dt = self._warm_up_dt(g, 1.0, 1.0)
         for scheme in ("rk2", "rk4"):
             st.step(dt, scheme)
         if embedded:
@@ -291,11 +316,9 @@ class CompressibleSlabStepper:
         tiny = SlabGrid3D(8, 8, 8, g.Lx, g.Ly, g.Lz, comm=Comm.serial(), device=g.device,
                           precision=g.precision, filter_params=g.filter_params, fft_batch=g.fft.batch)
         st = CompressibleSlabStepper(tiny, self.system, self.gamma, self.rho_min, self.p_min,
-                                     eta=self.eta, nu=self.nu, triton="force",
+                                     transport=self.transport, triton="force",
                                      strict_clamp=self.strict_clamp)
-        if (st._triton is None) != (self._triton is None) or (st._stats_kernel is None) != (
-                self._stats_kernel is None):
-            raise RuntimeError("the Triton kernel modules could not be imported")
+        self._match_tiers(st)
         st._strict_kernels = True
         X, Y, Z = tiny.xyz_mesh()
         kx, ky, kz = 2.0 * np.pi / g.Lx, 2.0 * np.pi / g.Ly, 2.0 * np.pi / g.Lz
@@ -310,7 +333,7 @@ class CompressibleSlabStepper:
         else:
             fields = fields + [energy]
         st.seed(torch.stack(fields))
-        dt = 1e-3 * tiny.min_spacing
+        dt = self._warm_up_dt(tiny, 0.9, 1.1)
         for scheme in ("rk2", "rk4"):
             st.step(dt, scheme)
         if embedded:
@@ -322,6 +345,23 @@ class CompressibleSlabStepper:
         if st.events:
             raise RuntimeError("the warm-up state needed the positivity limiter")
 
+    def _match_tiers(self, st: "CompressibleSlabStepper") -> None:
+        """Give a scratch stepper this stepper's kernel modules: a module that the collective
+        check removed on every rank stays off, and one that the scratch could not import fails."""
+        if self._triton is None:
+            st._triton = None
+        if self._stats_kernel is None:
+            st._stats_kernel = None
+        if (st._triton is None) != (self._triton is None) or (st._stats_kernel is None) != (
+                self._stats_kernel is None):
+            raise RuntimeError("the Triton kernel modules could not be imported")
+
+    def _warm_up_dt(self, grid: SlabGrid3D, rho_min: float, rho_max: float) -> float:
+        """A step the warm-up state takes without the limiter: below its diffusive bound too."""
+        dt = 1e-3 * grid.min_spacing
+        rate = self.transport.max_diffusivity(self.gamma, rho_min, rho_max) * grid.k2_max
+        return min(dt, 0.1 / rate) if rate > 0.0 else dt
+
     # --- small helpers ------------------------------------------------------
 
     def _note(self, message: str) -> None:
@@ -329,6 +369,16 @@ class CompressibleSlabStepper:
             warnings.warn(message, RuntimeWarning, stacklevel=3)
 
     def _disable_triton(self, exc: Exception) -> None:
+        if isinstance(exc, FloatingPointError):
+            raise exc  # a non-finite state, judged on reduced statistics: the same on every rank
+        if self.comm.size > 1:
+            # The other ranks are in, or about to enter, this stage's transposes: one rank that
+            # switched to torch ops (or raised) alone would leave them waiting or mismatched.
+            sys.stderr.write(f"[phrike.parallel] rank {self.comm.rank}: a kernel failed during a "
+                             f"distributed step ({exc!r}); aborting all ranks\n")
+            traceback.print_exception(type(exc), exc, exc.__traceback__)
+            sys.stderr.flush()
+            self.comm.abort(1)
         if isinstance(exc, torch.OutOfMemoryError) or self._strict_kernels:
             raise exc
         self._note(f"Triton kernels failed on the distributed path ({exc!r}); using torch ops.")
@@ -351,8 +401,14 @@ class CompressibleSlabStepper:
         st = self._triton
         if st is not None:
             return st.fluxes(self.kind, U, self.gamma, self.rho_min, self.p_min, count=count)
-        F = mhd3d_fluxes(U, self.gamma) if self.mhd else euler3d_symmetric_fluxes(U, self.gamma)
+        F = self._fluxes_torch(U)
         return (F, self._count(U)) if count else F
+
+    @staticmethod
+    def _planes(n: int):
+        """Slices of the local z planes for pointwise torch-tier passes: bounded temporaries."""
+        step = max(1, -(-n // 8))
+        return [slice(i, min(n, i + step)) for i in range(0, n, step)]
 
     def _local_stats(self, U: torch.Tensor) -> Tuple[float, float, float, float]:
         """This rank's (values below a floor, non-finite state values, non-finite
@@ -438,19 +494,146 @@ class CompressibleSlabStepper:
                 d(Fh[0], Fh[3], Fh[4]), d(Fh[3], Fh[1], Fh[5]), d(Fh[4], Fh[5], Fh[2]),
                 d(Fh[6], Fh[7], Fh[8]),
             ])
-        k2 = g.k2()
         T, H, A = Fh[0:6], Fh[6:9], Fh[9:12]
-        nu, eta = self.nu, self.eta
-        return torch.stack([
+        k = [
             d(S[1], S[2], S[3]),
-            d(T[0], T[3], T[4]) - nu * k2 * S[1],
-            d(T[3], T[1], T[5]) - nu * k2 * S[2],
-            d(T[4], T[5], T[2]) - nu * k2 * S[3],
+            d(T[0], T[3], T[4]), d(T[3], T[1], T[5]), d(T[4], T[5], T[2]),
             d(H[0], H[1], H[2]),
-            d(None, -A[0], -A[1]) - eta * k2 * S[5],
-            d(A[0], None, -A[2]) - eta * k2 * S[6],
-            d(A[1], A[2], None) - eta * k2 * S[7],
-        ])
+            d(None, -A[0], -A[1]), d(A[0], None, -A[2]), d(A[1], A[2], None),
+        ]
+        eta = self.transport.eta
+        if eta > 0.0:  # -curl(eta J) = -eta (k^2 B - k (k . B))
+            k2 = g.k2()
+            kb = g.kx3 * S[5] + g.ky3 * S[6] + g.kz3 * S[7]
+            k[5] = k[5] - eta * (k2 * S[5] - g.kx3 * kb)
+            k[6] = k[6] - eta * (k2 * S[6] - g.ky3 * kb)
+            k[7] = k[7] - eta * (k2 * S[7] - g.kz3 * kb)
+        return torch.stack(k)
+
+    # --- transport (viscosity, resistivity, conduction) ---------------------
+
+    def _stage_fluxes(self, Us: torch.Tensor, Sspec: torch.Tensor, count: bool, kernels: bool = True):
+        """``(F, count or None, T spectrum or None)`` of a stage, transport terms included.
+
+        ``Us`` is the full stage state (the out-of-band residual included),
+        ``Sspec`` its retained spectrum (for the current).  With viscosity the
+        velocity is transformed (3 forward), the trace-free strain (5, plus
+        div u with bulk viscosity) and the current (3) are built on the retained
+        modes and transformed back into the flux buffer, and one pass turns them
+        into the 12 fluxes in place.  The T spectrum (normalized) carries the heat
+        flux, added by ``_conduct``.  ``kernels=False`` keeps to torch ops.
+        """
+        tr = self.transport
+        if not (self.mhd and tr.active):
+            if kernels:
+                F, c = self._fluxes(Us, True) if count else (self._fluxes(Us, False), None)
+            else:
+                F, c = self._fluxes_torch(Us), (self._count(Us) if count else None)
+            return F, c, None
+        g = self.grid
+        if not tr.gradients:  # conduction alone: the ideal fluxes and T
+            if kernels:
+                F, c = self._fluxes(Us, True) if count else (self._fluxes(Us, False), None)
+            else:
+                F, c = self._fluxes_torch(Us), (self._count(Us) if count else None)
+            T = mhd_temperature(Us, self.gamma).unsqueeze(0)
+            return F, c, g.forward(T, normalized=True)[0]
+        F = torch.empty((12,) + tuple(Us.shape[1:]), dtype=Us.dtype, device=Us.device)
+        That = uh = None
+        if tr.viscous or tr.conductive:
+            # T (row 8) and the velocity (rows 9-11) are transformed first (flux_buffer_rows).
+            if tr.viscous:
+                torch.div(Us[1:4], Us[0], out=F[9:12])
+            if tr.conductive:
+                F[8] = mhd_temperature(Us, self.gamma)
+            spec = g.forward(F[8 if tr.conductive else 9:12 if tr.viscous else 9], normalized=True)
+            if tr.conductive:  # a copy, so the velocity spectra are freed once consumed
+                That = spec[0].clone() if tr.viscous else spec[0]
+            if tr.viscous:
+                uh = spec[-3:]
+            del spec
+        # One inverse transform (one batch of transposes) for all the derivative fields.
+        X = derivative_spectra(uh, Sspec[5:8] if tr.resistive else None, g.kx3, g.ky3, g.kz3, tr)
+        del uh
+        g.inverse(X, out=F[0:X.shape[0]])
+        del X
+        st = self._triton
+        if kernels and st is not None:
+            c = st.transport_fluxes(Us, F, self.gamma, self.rho_min, self.p_min, tr, count=count)
+            return F, c, That
+        for sl in self._planes(Us.shape[1]):  # in place, as the fused kernel: inputs read first
+            F[:, sl] = mhd3d_transport_fluxes(Us[:, sl], F[:, sl], self.gamma, tr)
+        return F, (self._count(Us) if count else None), That
+
+    def _conduct(self, Fh: torch.Tensor, That: Optional[torch.Tensor], scale: float) -> None:
+        """Heat flux ``-kappa grad T`` added to the energy-flux spectra (in place)."""
+        if That is None:
+            return
+        g = self.grid
+        c = -self.transport.kappa * scale
+        Fh[6] += (c * 1j) * g.kx3 * That
+        Fh[7] += (c * 1j) * g.ky3 * That
+        Fh[8] += (c * 1j) * g.kz3 * That
+
+    def _stage_rhs(self, Us: torch.Tensor, Sh: torch.Tensor, count: bool = False, kernels: bool = True):
+        """Torch-tier spectral RHS of a stage and its floor count (or None)."""
+        F, c, That = self._stage_fluxes(Us, Sh, count, kernels)
+        Fh = self.grid.forward(F, normalized=True)
+        del F
+        self._conduct(Fh, That, 1.0)
+        return self._rhs_hat(Fh, Sh), c
+
+    def min_density(self) -> float:
+        """Global minimum density of the current state (collective)."""
+        return self.density_extrema()[0]
+
+    def density_extrema(self) -> Tuple[float, float]:
+        """Global minimum and maximum density of the current state (one collective)."""
+        low, high = torch.aminmax(self.physical()[0])
+        worst = self.comm.allreduce(torch.stack((-low, high)).tolist(), "max")
+        return -float(worst[0]), float(worst[1])
+
+    def dissipation_rates(self) -> Dict[str, float]:
+        """Volume means of the viscous and Ohmic heating of the current state (collective).
+
+        ``transport.heating``, summed a few derivative rows at a time so that the
+        diagnostics fit beside the buffers of a step at the largest sizes.
+        """
+        tr = self.transport
+        if not (self.mhd and tr.gradients):
+            return {}
+        g = self.grid
+        U = self.physical()
+        rho = U[0]
+        uh = g.forward(U[1:4] / rho, normalized=True) if tr.viscous else None
+        X = derivative_spectra(uh, self.uhat[5:8] if tr.resistive else None, g.kx3, g.ky3, g.kz3, tr)
+        del uh
+        rowD, rowT, rowJ, _ = flux_buffer_rows(tr)
+        f64 = torch.float64
+        viscous = torch.zeros((), dtype=f64, device=g.device)
+        ohmic = torch.zeros((), dtype=f64, device=g.device)
+        if tr.shear:  # 2 rho nu D:D with Dzz = -Dxx - Dyy
+            P = g.inverse(X[rowD:rowD + 2])
+            viscous += 2.0 * tr.nu * (rho * (P[0] * P[0] + P[1] * P[1] + (P[0] + P[1]) ** 2)).sum(dtype=f64)
+            P = g.inverse(X[rowD + 2:rowD + 5])
+            viscous += 4.0 * tr.nu * (rho * (P * P).sum(dim=0)).sum(dtype=f64)
+            del P
+        if tr.bulk:
+            P = g.inverse(X[rowT:rowT + 1])[0]
+            viscous += tr.nu_bulk * (rho * P * P).sum(dtype=f64)
+            del P
+        if tr.resistive:
+            P = g.inverse(X[rowJ:rowJ + 3])
+            ohmic += tr.eta * (P * P).sum(dtype=f64)
+            del P
+        del X
+        mean = self.comm.allreduce(torch.stack((viscous, ohmic)).tolist(), "sum") / float(g.n_points)
+        out = {}
+        if tr.viscous:
+            out["viscous_dissipation"] = float(mean[0])
+        if tr.resistive:
+            out["resistive_dissipation"] = float(mean[1])
+        return out
 
     def _leray(self, X: torch.Tensor) -> torch.Tensor:
         """Leray-project the magnetic components of a spectrum (new tensor)."""
@@ -499,6 +682,7 @@ class CompressibleSlabStepper:
 
     def set_spectrum(self, uhat: torch.Tensor) -> torch.Tensor:
         """Adopt a retained spectrum (normalized by 1/N) as the band-limited state."""
+        self._has_state = True
         if uhat is not self.uhat:
             self.uhat.copy_(uhat)
         self._drop_residual()
@@ -654,15 +838,16 @@ class CompressibleSlabStepper:
         count = torch.zeros((), dtype=torch.int64, device=g.device)
         high = None
         for i, (wa, wn) in enumerate(table):
-            if i > 0:
-                F, c = self._fluxes(Us, True)
+            F, c, That = self._stage_fluxes(Us, Sh, i > 0)
+            if c is not None:
                 count = count + c
-            else:
-                F = self._fluxes(Us, False)
+            if i == 0:
                 self.U = None  # rebuilt from uhat if the step has to be repeated
             Us = None
             Fh = g.forward(F, normalized=True)
             del F
+            self._conduct(Fh, That, 1.0)
+            del That
             k = self._rhs_hat(Fh, Sh)
             del Fh
             if wn is None:
@@ -683,7 +868,7 @@ class CompressibleSlabStepper:
             self._acc = torch.empty((self.nvar, modes.total), dtype=g.cdtype, device=g.device)
         acc = self._acc
         self._pending = None
-        head = [self.inv_n, self.eta, self.nu] if self.mhd else [self.inv_n]
+        head = [self.inv_n, self.transport.eta] if self.mhd else [self.inv_n]
         w = torch.tensor(head + [c * dt for wa, wn in table for c in (wa, 0.0 if wn is None else wn)],
                          dtype=g.rdtype, device=g.device)
         base = len(head)
@@ -692,19 +877,22 @@ class CompressibleSlabStepper:
         Us, Sin = self.physical(), uhat
         last = len(table) - 1
         for i in range(len(table)):
-            if i > 0:
-                F, c = self._fluxes(Us, True)
+            F, c, That = self._stage_fluxes(Us, Sin, i > 0)
+            if c is not None:
                 count += c
-            else:
-                F = self._fluxes(Us, False)
+            if i == 0:
                 self.U = None  # rebuilt from uhat if the step has to be repeated
             Us = None
             Fh = g.forward(F, normalized=False)
             del F
+            self._conduct(Fh, That, 1.0 / self.inv_n)
+            del That
             final = i == last
             launch = st.mhd_stage if self.mhd else st.stage
+            extra = {"resistive": self.transport.resistive} if self.mhd else {}
             launch(Fh, Sin, unew if final else shat, uhat, acc, w, base + 2 * i, base + 1 + 2 * i,
-                   self._waves, modes, first=(i == 0), final=final, high=shat, final_factors=factors)
+                   self._waves, modes, first=(i == 0), final=final, high=shat, final_factors=factors,
+                   **extra)
             del Fh
             if final:
                 break
@@ -732,14 +920,13 @@ class CompressibleSlabStepper:
         back so the mass flux and the diffusion terms see the limited state on
         the retained modes, as the reference's masked derivatives do.
         """
-        g = self.grid
         U0h = self.uhat
         acc = torch.zeros_like(U0h)
         Sh, Us = U0h, self.physical()
         self.U = None
         high = None
         for wa, wn in table:
-            k = self._rhs_hat(g.forward(self._fluxes_torch(Us), normalized=True), Sh)
+            k, _ = self._stage_rhs(Us, Sh, kernels=False)
             if wn is None:
                 high = U0h + acc + (wa * dt) * k
                 break
@@ -750,7 +937,12 @@ class CompressibleSlabStepper:
         self._finish_limited(high, h)
 
     def _fluxes_torch(self, U: torch.Tensor) -> torch.Tensor:
-        return mhd3d_fluxes(U, self.gamma) if self.mhd else euler3d_symmetric_fluxes(U, self.gamma)
+        """The flux fields with torch ops, a few z planes at a time (the same values as one pass)."""
+        fn = mhd3d_fluxes if self.mhd else euler3d_symmetric_fluxes
+        F = torch.empty((self.nflux,) + tuple(U.shape[1:]), dtype=U.dtype, device=U.device)
+        for sl in self._planes(U.shape[1]):
+            F[:, sl] = fn(U[:, sl], self.gamma)
+        return F
 
     def _finish_limited(self, high: torch.Tensor, h: float) -> None:
         g = self.grid
@@ -856,7 +1048,7 @@ class CompressibleSlabStepper:
                 Us = self._inverse_full(Sh)
                 if not self.mhd:  # Euler stages are limited in the reference; MHD ones are not
                     count = count + self._count(Us)
-            ks.append(self._rhs_hat(g.forward(self._fluxes(Us, False), normalized=True), Sh))
+            ks.append(self._stage_rhs(Us, Sh)[0])
         Eh = sum(dt * float(b_high[i] - b_low[i]) * ks[i] for i in range(s) if b_high[i] != b_low[i])
         high = U0h + sum(dt * float(b_high[i]) * ks[i] for i in range(s) if b_high[i] != 0.0)
         del ks
@@ -882,7 +1074,7 @@ class CompressibleSlabStepper:
             self._kbuf = torch.empty((s, self.nvar, modes.total), dtype=g.cdtype, device=g.device)
         K = self._kbuf
         b_high = np.asarray(b_high, dtype=float)
-        coefs = [self.inv_n, self.eta, self.nu] if self.mhd else [self.inv_n]
+        coefs = [self.inv_n, self.transport.eta] if self.mhd else [self.inv_n]
         offsets = [0]
         for i in range(1, s):
             offsets.append(len(coefs))
@@ -900,17 +1092,17 @@ class CompressibleSlabStepper:
                 st.combine(K, i, uhat, shat, w, offsets[i], None, modes, masked=False)
                 S = shat
                 Us = self._inverse_full(shat)
-            if i > 0 and not self.mhd:
-                F, c = self._fluxes(Us, True)
+            F, c, That = self._stage_fluxes(Us, S, i > 0 and not self.mhd)
+            if c is not None:
                 count += c
-            else:
-                F = self._fluxes(Us, False)
             Us = None
             Fh = g.forward(F, normalized=False)
             del F
+            self._conduct(Fh, That, 1.0 / self.inv_n)
+            del That
             if self.mhd:
                 st.mhd_stage(Fh, S, S, S, K[i], w, 0, 0, self._waves, modes, first=False,
-                             final=False, rhs_only=True)
+                             final=False, rhs_only=True, resistive=self.transport.resistive)
             else:
                 st.rhs(Fh, S, K[i], w, self._waves, modes)
             del Fh
@@ -949,7 +1141,7 @@ class CompressibleSlabStepper:
                 Us = self._inverse_full(Sh)
                 if not self.mhd:
                     Us, Sh, _ = self._limit(Us, Sh)
-            ks.append(self._rhs_hat(g.forward(self._fluxes_torch(Us), normalized=True), Sh))
+            ks.append(self._stage_rhs(Us, Sh, kernels=False)[0])
         high = U0h + sum(dt * float(b_high[i]) * ks[i] for i in range(s) if b_high[i] != 0.0)
         if self.mhd:
             Eh = sum(dt * float(b_high[i] - b_low[i]) * ks[i] for i in range(s) if b_high[i] != b_low[i])
@@ -1018,6 +1210,7 @@ class CompressibleSlabStepper:
                             U[3].sum(dtype=f64), U[4].sum(dtype=f64), kin.sum(dtype=f64),
                             mag.sum(dtype=f64), cross.sum(dtype=f64), p.sum(dtype=f64)]).tolist()
         mins = torch.stack([rho.min().to(f64), p.min().to(f64)]).tolist()
+        del rho, kin, mag, cross, p  # dissipation_rates needs the memory
         sums = self.comm.allreduce(sums, "sum") / float(self.grid.n_points)
         mins = self.comm.allreduce(mins, "min")
         out = {
@@ -1037,6 +1230,7 @@ class CompressibleSlabStepper:
             out["plasma_beta"] = sums[8] / sums[6] if sums[6] > 0.0 else float("inf")
         if self.speed is not None:
             out["max_wave_speed"] = float(self.speed)
+        out.update(self.dissipation_rates())
         return out
 
     def spectra(self) -> Dict[str, np.ndarray]:

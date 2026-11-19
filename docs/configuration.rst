@@ -171,9 +171,18 @@ is required.
 ``physics.mhd.enabled`` is not read; the problem class selects the MHD
 solver. Keys, all optional:
 
-* ``resistivity`` — default 0. Magnetic diffusivity. Units and the
-  Laplacian it multiplies are in :doc:`equations`.
-* ``viscosity`` — default 0. Diffusivity applied to momentum density.
+* ``resistivity`` — default 0. Magnetic diffusivity :math:`\eta_m`; the Ohmic
+  term and its energy flux are in :doc:`equations`.
+* ``viscosity`` — default 0. Kinematic shear viscosity :math:`\nu` of the
+  Newtonian stress (dynamic viscosity :math:`\rho\nu`).
+* ``bulk_viscosity`` — default 0. Kinematic bulk viscosity.
+* ``thermal_conductivity`` — default 0. Heat flux :math:`-\kappa\nabla T`,
+  :math:`T = p/\rho`.
+* ``viscous_step_bound`` — default ``density_ratio``. The viscous time-step
+  bound multiplies :math:`\tfrac{4}{3}\nu + \nu_b` by
+  :math:`\rho_{\max}/\rho_{\min}`, which bounds the variable-density stress
+  operator. ``uniform`` drops that factor: larger steps when the density
+  contrast is large, not guaranteed stable.
 * ``cfl_diff`` — default 1. Parabolic timestep factor.
 * ``divergence_clean`` — default ``projection``. ``none`` skips the
   Helmholtz projection. Mixed open-:math:`y` MHD requires ``projection``.

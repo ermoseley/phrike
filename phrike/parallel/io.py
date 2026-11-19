@@ -286,8 +286,22 @@ class History:
             self.columns = list(row)
             with open(self.path, "w", encoding="utf-8") as handle:
                 handle.write(",".join(self.columns) + "\n")
+        elif any(c not in self.columns for c in row):
+            self._extend([c for c in row if c not in self.columns])
         with open(self.path, "a", encoding="utf-8") as handle:
             handle.write(",".join(repr(float(row.get(c, float("nan")))) for c in self.columns) + "\n")
+
+    def _extend(self, new: List[str]) -> None:
+        """Add columns to an appended history (a restart that now records more), padding with NaN."""
+        with open(self.path, "r", encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+        self.columns = self.columns + new
+        pad = ",nan" * len(new)
+        with open(self.path, "w", encoding="utf-8") as handle:
+            handle.write(",".join(self.columns) + "\n")
+            for line in lines[1:]:
+                if line:
+                    handle.write(line + pad + "\n")
 
 
 def h5_attr(value: Any) -> Any:

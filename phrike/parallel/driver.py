@@ -25,6 +25,7 @@ import numpy as np
 import torch
 
 from ..adaptive import create_adaptive_stepper
+from ..transport import Transport, viscous_step_bound
 from .comm import Comm, Timers
 from .compressible import CompressibleSlabStepper
 from .forcing import BandForcing
@@ -55,7 +56,8 @@ _FIELDS_ALLOWED = {"enabled", "every", "precision", "coarsen", "variables"}
 _DIAG_ALLOWED = {"enabled", "every", "chunk_modes", "current_helicity", "anisotropy", "transfer"}
 _ANISO_ALLOWED = {"enabled", "axis"}
 _TRANSFER_ALLOWED = {"enabled", "every", "matrix", "shells", "cache_fields", "batch"}
-_MHD_ALLOWED = {"resistivity", "viscosity", "project_each_substage", "divergence_clean", "rho_min",
+_MHD_ALLOWED = {"resistivity", "viscosity", "bulk_viscosity", "thermal_conductivity",
+                "viscous_step_bound", "project_each_substage", "divergence_clean", "rho_min",
                 "p_min", "resistivity_max", "cfl_diff", "ambipolar", "hall", "shearing_sheet"}
 _TOP_LEVEL = set(_ALLOWED) | {"problem", "initial_conditions", "runtime", "video", "tracers",
                               "artificial_viscosity", "gravity", "initial_conditions_smoothing"}
@@ -229,27 +231,27 @@ class Simulation:
             if float((config.get("physics") or {}).get(name, 0.0)) != 0.0:
                 raise NotImplementedError(f"physics.{name} is available for the incompressible solvers only")
         mhd = (config.get("physics") or {}).get("mhd") or {}
-        eta = nu = 0.0
+        transport = Transport()
         rho_min, p_min = 1e-10, 1e-12
         self.cfl_diff = 1.0
+        self.viscous_bound = "density_ratio"
         if self.system == "mhd":
             for name in ("hall", "ambipolar", "shearing_sheet"):
                 if _enabled(mhd.get(name)) or (name == "shearing_sheet" and mhd.get(name)):
                     raise NotImplementedError(f"physics.mhd.{name} is not available on the distributed path")
             if str(mhd.get("divergence_clean", "projection")) != "projection":
                 raise ValueError("The distributed MHD path needs divergence_clean: projection")
-            eta = float(mhd.get("resistivity", 0.0))
-            if mhd.get("resistivity_max") is not None:
-                eta = min(eta, float(mhd["resistivity_max"]))
-            nu = float(mhd.get("viscosity", 0.0))
+            transport = Transport.from_config(mhd)
+            self.viscous_bound = viscous_step_bound(mhd)
             rho_min, p_min = float(mhd.get("rho_min", 1e-10)), float(mhd.get("p_min", 1e-12))
             self.cfl_diff = float(mhd.get("cfl_diff", 1.0))
         for name in ("artificial_viscosity", "gravity"):
             if _enabled(config.get(name)):
                 raise NotImplementedError(f"{name} is not available on the distributed path")
-        self.eta, self.nu = eta, nu
+        self.transport = transport
+        self.eta, self.nu = transport.eta, transport.nu
         self.stepper = CompressibleSlabStepper(
-            self.grid, self.system, self.gamma, rho_min, p_min, eta=eta, nu=nu,
+            self.grid, self.system, self.gamma, rho_min, p_min, transport=transport,
             triton=triton, strict_clamp=bool(par.get("strict_clamp", True)))
         nested, top = integ.get("adaptive"), config.get("adaptive")
         if nested is not None and top is not None:
@@ -334,6 +336,11 @@ class Simulation:
         if not self.compressible:
             self.stepper.t = self.t
             self.stepper.steps = self.step_count
+        if self.compressible and self.system == "mhd" and self.transport.gradients:
+            model = (meta.get("physics") or {}).get("viscosity_model")
+            if model != "newtonian":
+                self.log("[phrike.parallel] restart file predates the Newtonian viscosity and Ohmic "
+                         "energy flux; the run continues with them, so it is not the old run's continuation")
         if self.forcing is not None:
             state = meta.get("forcing")
             if state is None:
@@ -352,6 +359,8 @@ class Simulation:
                  "physics": dict({"viscosity": self.nu, "resistivity": self.eta}, **self.hyper)}
         if self.compressible:
             extra["physics"]["gamma"] = self.gamma
+            extra["physics"].update(self.transport.as_dict())
+            extra["physics"]["viscosity_model"] = "newtonian"
         if self.forcing is not None:
             extra["forcing"] = self.forcing.state_dict()
         return extra
@@ -483,8 +492,15 @@ class Simulation:
                 f"Non-finite maximum wave speed ({speed}) at step {self.step_count}, t={self.t}")
         if speed > 0.0:
             bounds.append(self.cfl * self.grid.min_spacing / speed)
-        rate = max(self.eta, self.nu) * self.grid.k2_max
+        tr = self.transport
+        ratio = tr.viscous and self.viscous_bound == "density_ratio"
+        rho_min = rho_max = None
+        if ratio or tr.conductive:
+            rho_min, rho_max = self.stepper.density_extrema()  # one collective
+        rate = tr.max_diffusivity(self.gamma, rho_min, rho_max if ratio else None) * self.grid.k2_max
         if rate > 0.0:
+            if not math.isfinite(rate):
+                raise FloatingPointError(f"Non-finite diffusive rate ({rate}) at step {self.step_count}, t={self.t}")
             bounds.append(self.cfl_diff / rate)
         return min(bounds) if bounds else float("inf")
 
@@ -507,6 +523,10 @@ class Simulation:
         choices = [v for v in (proposal, limit, horizon) if math.isfinite(v)]
         if self.dt_fixed is not None:
             choices = [min(float(self.dt_fixed), horizon)]
+            if choices[0] > limit and not getattr(self, "_warned_fixed_dt", False):
+                self._warned_fixed_dt = True  # every rank has the same limit
+                self.log(f"WARNING: integration.dt = {float(self.dt_fixed):g} exceeds the CFL and "
+                         f"diffusive stability limit {limit:.4g} at t={self.t:g}; the run may be unstable")
         if not choices or min(choices) <= 0.0:
             raise RuntimeError(f"No finite positive time step at step {self.step_count}, t={self.t}")
         dt = min(choices)

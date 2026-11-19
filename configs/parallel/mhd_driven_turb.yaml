@@ -1,8 +1,9 @@
 # Driven compressible visco-resistive MHD turbulence on the distributed fast path.
 #   srun -n 8 python -m phrike.parallel mhd_turb3d --config configs/parallel/mhd_driven_turb.yaml
 #
-# Explicit viscosity and resistivity act as Laplacians of momentum and B and
-# bound the step by cfl_diff / (max(nu, eta) k_max^2).  Subsonic and
+# Newtonian shear viscosity (kinematic nu) and Ohmic resistivity, with their
+# viscous-work and Poynting energy fluxes (docs/equations.rst).  They bound the
+# step by cfl_diff / (max(4/3 nu rho_max/rho_min, eta) k_max^2).  Subsonic and
 # super-Alfvenic for these values (sonic Mach about 0.3, mean-field M_A = 3).
 problem: mhd_turb3d
 

@@ -27,6 +27,7 @@ from .equations import (
 from .adaptive import AdaptiveTimeStepper, create_adaptive_stepper
 from .spectral3d import Euler1DSpectral, Euler2DSpectral, Euler3DSpectral
 from .spectral_mhd3d import MHD1DSpectral, MHD2DSpectral, MHD3DSpectral
+from .transport import Transport, flux_additions, strain_from_gradient, viscous_step_bound
 from .artificial_viscosity import SpectralArtificialViscosity, ArtificialViscosityConfig
 
 
@@ -625,12 +626,6 @@ def conserved_diagnostics(grid, equations, U) -> Dict[str, float]:
         "magnetic_energy": integral(0.5 * b2),
         "cross_helicity": integral(ux * Bx + uy * By + uz * Bz),
     }
-
-
-def _diffusion(grid, f: Array) -> Array:
-    """Diffusion operator: zero-flux endpoint closure on 1D polynomial grids."""
-    diffusion = getattr(grid, "diffusion", None)
-    return diffusion(f) if diffusion is not None else grid.laplacian(f)
 
 
 def _compute_rhs(grid: Grid1D, eqs: EulerEquations1D, U: Array, 
@@ -1517,17 +1512,135 @@ class SpectralSolver2D(_SpectralFastPathMixin):
 # The RHS is the same conservative flux-divergence structure as Euler; the
 # magnetic solenoidal constraint div(B)=0 is enforced by Helmholtz (Leray)
 # projection of B after every RK substage and (last) after spectral dissipation.
-# Optional explicit resistivity/viscosity are applied as
-# spectral Laplacians on the B and momentum rows; the energy row is left to the
-# ideal flux so that dissipated magnetic/kinetic energy is converted to thermal
-# energy through the pressure recovery (total energy conserving, div(B)-safe
-# since div(laplacian B) = laplacian(div B) = 0).
+# Transport (phrike.transport) is compressible visco-resistive MHD: the
+# Newtonian stress (kinematic shear and bulk viscosity, mu = rho nu) in the
+# momentum flux, the viscous work, the Ohmic Poynting flux eta J x B and the heat
+# flux -kappa grad T in the energy flux, and -curl(eta J) in the induction
+# equation, so the dissipated energy is deposited locally as
+# 2 rho nu D:D + rho nu_bulk (div u)^2 + eta J^2 and total energy and momentum
+# stay in flux form.
+
+
+def _stack_like(U: Array, parts) -> Array:
+    if _TORCH_AVAILABLE and isinstance(U, torch.Tensor):
+        return torch.stack(list(parts))
+    return np.stack(list(parts))
+
+
+def _zeros_like(U: Array) -> Array:
+    if _TORCH_AVAILABLE and isinstance(U, torch.Tensor):
+        return torch.zeros_like(U)
+    return np.zeros_like(U)
 
 
 def _mhd_clone(U: Array) -> Array:
     if _TORCH_AVAILABLE and isinstance(U, torch.Tensor):
         return U.clone()
     return U.copy()
+
+
+def _density_extrema(rho: Array) -> Tuple[float, float]:
+    """(min, max) of a density field with one device synchronization."""
+    if _TORCH_AVAILABLE and isinstance(rho, torch.Tensor):
+        low, high = torch.stack(torch.aminmax(rho)).tolist()  # no float64 on the device (Metal)
+        return float(low), float(high)
+    return float(np.min(rho)), float(np.max(rho))
+
+
+class _PolynomialTransport:
+    """Gradient and flux divergence for the transport terms on a 1D Chebyshev/Legendre grid.
+
+    The pair is a diagonal-norm summation-by-parts (SBP) operator in the grid's
+    quadrature ``W``: the gradient is ``G`` and the divergence of a flux is
+    ``-W^-1 G^T W F``.  That divergence drops the boundary flux (no viscous
+    traction, viscous work, heat flux or Ohmic Poynting flux through the
+    endpoints) and satisfies ``sum_i w_i v_i (div F)_i = -sum_i w_i (G v)_i F_i``
+    for every state.  Total momentum and energy are therefore conserved and the
+    discrete heating is nonnegative, at any resolution.
+
+    Legendre-Lobatto collocation is SBP itself, so ``G = D`` there. The Chebyshev
+    collocation derivative is not SBP in the Clenshaw-Curtis weights, and its
+    weighted adjoint converges only at first order. ``G`` is then the SBP
+    operator in those weights that is exact for polynomials of the largest
+    degree ``p`` the quadrature allows (``2p - 1`` within its exactness, about
+    ``N / 2``), and equal to the collocation derivative's skew part on the
+    remaining modes. It converges spectrally, at about half the collocation rate.
+    """
+
+    def __init__(self, grid) -> None:
+        basis = grid._basis
+        if getattr(basis, "precision", "double") != "double":
+            basis = type(basis)(grid.N, grid.Lx, precision="double")
+        x = np.asarray(basis.nodes(), dtype=np.float64)
+        w = np.asarray(basis.quadrature_weights(), dtype=np.float64)
+        n = x.size
+        M = np.asarray(basis.dx(np.eye(n)), dtype=np.float64)
+        probe = np.sin(2.3 * x / (x[-1] - x[0]) + 0.4)
+        D = M.T if np.allclose(M.T @ probe, np.asarray(basis.dx(probe)), atol=1e-8 * n * n) else M
+        W = np.diag(w)
+        Bm = np.zeros((n, n))
+        Bm[0, 0], Bm[-1, -1] = -1.0, 1.0
+        scale = float(np.max(np.abs(D)))
+        if np.max(np.abs(W @ D + D.T @ W - Bm)) <= 1e-9 * max(1.0, scale * float(np.max(w))):
+            G = D
+        else:
+            G = self._sbp_gradient(x, w, D, Bm)
+        self.G = G
+        self.w = w
+        r = np.sqrt(w)
+        # Spectral radius of the diffusion operator -W^-1 G^T W G (the parabolic CFL "k^2").
+        self.k2_max = float(np.linalg.norm(r[:, None] * G / r[None, :], 2) ** 2)
+        self._cache = {}
+
+    @staticmethod
+    def _sbp_gradient(x, w, D, Bm):
+        from numpy.polynomial import legendre as npl
+
+        n = x.size
+        t = (2.0 * x - (x[0] + x[-1])) / (x[-1] - x[0])
+        # Orthonormal Legendre polynomials and their x derivatives (P'_{k+1} = P'_{k-1} + (2k+1) P_k).
+        P = npl.legvander(t, n - 1)
+        dP = np.zeros_like(P)
+        for k in range(1, n):
+            dP[:, k] = (dP[:, k - 2] if k >= 2 else 0.0) + (2 * k - 1) * P[:, k - 1]
+        c = np.sqrt((2.0 * np.arange(n) + 1.0) / 2.0)
+        V, Vx = P * c, dP * c * (2.0 / (x[-1] - x[0]))
+        W = np.diag(w)
+        # Integration by parts holds for degrees <= p when the quadrature is exact to 2p - 1.
+        compat = V.T @ W @ Vx + Vx.T @ W @ V - V.T @ Bm @ V
+        tol = 1e-10 * float(np.max(np.abs(V.T @ Bm @ V)))
+        p = 0
+        while p + 1 < n and np.max(np.abs(compat[:p + 2, :p + 2])) <= tol:
+            p += 1
+        V, Vx = V[:, :p + 1], Vx[:, :p + 1]
+        R = W @ Vx - 0.5 * Bm @ V  # S V = R for the skew-symmetric part S of W G
+        Q, R1 = np.linalg.qr(V, mode="complete")
+        AC = np.linalg.solve(R1[:p + 1].T, (Q.T @ R).T).T
+        A, C = AC[:p + 1], AC[p + 1:]
+        Q2 = Q[:, p + 1:]
+        E = Q2.T @ (0.5 * (W @ D - D.T @ W)) @ Q2
+        S = Q @ np.block([[0.5 * (A - A.T), -C.T], [C, 0.5 * (E - E.T)]]) @ Q.T
+        return np.linalg.solve(W, S + 0.5 * Bm)
+
+    def _arrays(self, ref):
+        if _TORCH_AVAILABLE and isinstance(ref, torch.Tensor):
+            key = (str(ref.device), ref.dtype)
+            if key not in self._cache:
+                self._cache[key] = (torch.as_tensor(self.G, dtype=ref.dtype, device=ref.device),
+                                    torch.as_tensor(self.w, dtype=ref.dtype, device=ref.device))
+            return self._cache[key]
+        dtype = np.result_type(ref, np.float32)
+        return self.G.astype(dtype, copy=False), self.w.astype(dtype, copy=False)
+
+    def grad(self, f: Array) -> Array:
+        """``G f``; the constant part is removed first, so a uniform field has exactly zero
+        gradient in single precision too (G 1 = 0 holds only to round-off times |G|)."""
+        G, _ = self._arrays(f)
+        return (f - f[..., :1]) @ G.T
+
+    def div(self, F: Array) -> Array:
+        G, w = self._arrays(F)
+        return -((w * F) @ G) / w
 
 
 def shearing_sheet_axes(vertical: int, radial: int) -> Tuple[int, int]:
@@ -1589,13 +1702,11 @@ class SpectralSolverMHD:
 
         # MHD runtime options (from grid.mhd_config, with safe defaults)
         cfg = getattr(grid, "mhd_config", None) or {}
-        self.resistivity = float(cfg.get("resistivity", 0.0))   # eta
-        if cfg.get("resistivity_max") is not None:
-            resistivity_max = float(cfg["resistivity_max"])
-            if not (np.isfinite(resistivity_max) and resistivity_max > 0.0):
-                raise ValueError("MHD resistivity_max must be finite and positive")
-            self.resistivity = min(self.resistivity, resistivity_max)
-        self.viscosity = float(cfg.get("viscosity", 0.0))       # nu
+        transport = Transport.from_config(cfg)  # validates every coefficient
+        self.resistivity = transport.eta             # magnetic diffusivity
+        self.viscosity = transport.nu                # kinematic shear viscosity
+        self.bulk_viscosity = transport.nu_bulk      # kinematic bulk viscosity
+        self.thermal_conductivity = transport.kappa  # heat flux -kappa grad(p/rho)
         self.project_each_substage = bool(cfg.get("project_each_substage", True))
         self.divergence_clean = str(cfg.get("divergence_clean", "projection"))
         if getattr(grid, "_mixed_open_y", False) and self.divergence_clean != "projection":
@@ -1645,7 +1756,10 @@ class SpectralSolverMHD:
         # Parabolic-CFL safety factor for explicit diffusion (RK4 stable region on
         # the negative real axis extends to ~2.78; 1.0 leaves a comfortable margin).
         self.cfl_diff = float(cfg.get("cfl_diff", 1.0))
-        self._k2_max = self._grid_k2_max()
+        self.viscous_bound = viscous_step_bound(cfg)
+        self._polynomial = self.dim == 1 and getattr(grid, "_basis_name", "fourier") != "fourier"
+        self._poly_cache = None
+        self._k2_max = self._grid_k2_max()  # None on a 1D polynomial grid (see _diffusive_k2)
         self.artificial_viscosity = None
         if artificial_viscosity_config and artificial_viscosity_config.get("enabled", False):
             if self.dim != 1:
@@ -1673,15 +1787,12 @@ class SpectralSolverMHD:
             and not getattr(grid, "_mixed_open_y", False)
         )
         if eligible and self.dim == 3 and type(equations) is MHDEquations3D:
-            self.spectral = MHD3DSpectral(grid, equations, self.rho_min, self.p_min,
-                                          self.resistivity, self.viscosity)
+            self.spectral = MHD3DSpectral(grid, equations, self.rho_min, self.p_min, transport)
         elif eligible and self.dim == 2 and periodic_2d and type(equations) is MHDEquations2D:
-            self.spectral = MHD2DSpectral(grid, equations, self.rho_min, self.p_min,
-                                          self.resistivity, self.viscosity)
+            self.spectral = MHD2DSpectral(grid, equations, self.rho_min, self.p_min, transport)
         elif (eligible and self.dim == 1 and getattr(grid, "_basis_name", "") == "fourier"
               and type(equations) is MHDEquations1D):
-            self.spectral = MHD1DSpectral(grid, equations, self.rho_min, self.p_min,
-                                          self.resistivity, self.viscosity)
+            self.spectral = MHD1DSpectral(grid, equations, self.rho_min, self.p_min, transport)
 
     def _fast(self) -> Optional[MHD3DSpectral]:
         """The fast path when the run's options allow it (they may change after construction)."""
@@ -1693,8 +1804,14 @@ class SpectralSolverMHD:
                 or self.shearing_sheet is not None):
             fast.invalidate()
             return None
-        fast.eta, fast.nu = float(self.resistivity), float(self.viscosity)
+        fast.transport = self.transport
         return fast
+
+    @property
+    def transport(self) -> Transport:
+        """The transport coefficients of the run (they may change after construction)."""
+        return Transport(nu=self.viscosity, nu_bulk=self.bulk_viscosity, eta=self.resistivity,
+                         kappa=self.thermal_conductivity)
 
     def _note_accepted_state(self) -> None:
         """``_note_accepted`` with the finite check fused into the wave-speed pass."""
@@ -1707,31 +1824,45 @@ class SpectralSolverMHD:
         self._accepted_steps = int(getattr(self, "_accepted_steps", 0)) + 1
         self._speed_cache = (self.U, self.U._version, speed)
 
-    def _grid_k2_max(self) -> float:
-        """Max squared wavenumber on the grid (for the parabolic diffusion CFL).
+    def _grid_k2_max(self) -> Optional[float]:
+        """Largest squared wavenumber that is evolved (for the parabolic diffusion CFL).
 
-        A missing multi-D wavenumber array uses ``sum 4/dx_i**2``. Any other
-        failure propagates; returning 0 would silently drop the diffusive CFL.
+        Fourier directions take the largest mode the tensor-product 2/3 mask keeps,
+        ``(N - 1) // 3`` (``N // 2`` without dealiasing), as the distributed
+        solver does. A missing multi-D wavenumber array uses ``sum 4/dx_i**2``.
+        A 1D Chebyshev/Legendre grid returns None: its bound is the spectral
+        radius of the transport operator, built on first use. Any other failure
+        propagates; returning 0 would silently drop the diffusive CFL.
         """
         g = self.grid
+        dealias = bool(getattr(g, "dealias", True))
+
+        def axis(n, length):
+            cut = (int(n) - 1) // 3 if dealias else int(n) // 2
+            return (2.0 * np.pi * cut / float(length)) ** 2
+
         if getattr(g, "_mixed_open_y", False):
             D = g._sbp_dy(np.eye(g.Ny))
             root = np.sqrt(g.wy)
             D = root[:, None]*D/root[None, :]
             ky2_bound = np.linalg.norm(D, 1)*np.linalg.norm(D, np.inf)
-            kx = g.kx.detach().cpu().numpy() if g._use_torch else g.kx
-            return float(np.max(kx*kx)+ky2_bound)
+            return float(axis(g.Nx, g.Lx) + ky2_bound)
         if self.dim == 1:
-            if getattr(g, "_basis_name", "fourier") != "fourier":
-                return 4.0 / float(g.dx) ** 2
-            k2 = g.k * g.k
-        else:
-            k2 = getattr(g, "k2", None)
-            if k2 is None:
-                return _spacing_wavenumber_bound(g)
-        if _TORCH_AVAILABLE and isinstance(k2, torch.Tensor):
-            return float(torch.max(k2).item())
-        return float(np.max(np.asarray(k2)))
+            return None if self._polynomial else axis(g.N, g.Lx)
+        if getattr(g, "k2", None) is None:
+            return _spacing_wavenumber_bound(g)
+        if self.dim == 2:
+            return axis(g.Nx, g.Lx) + axis(g.Ny, g.Ly)
+        return axis(g.Nx, g.Lx) + axis(g.Ny, g.Ly) + axis(g.Nz, g.Lz)
+
+    @property
+    def _poly_ops(self) -> _PolynomialTransport:
+        if self._poly_cache is None:
+            self._poly_cache = _PolynomialTransport(self.grid)
+        return self._poly_cache
+
+    def _diffusive_k2(self) -> float:
+        return self._poly_ops.k2_max if self._k2_max is None else self._k2_max
 
     # --- physics helpers ---
     def _flux_divergence(self, U: Array) -> Array:
@@ -1764,19 +1895,135 @@ class SpectralSolverMHD:
             for i, term in enumerate(terms):
                 if i != 5:  # Preserve the longitudinal magnetic field in 1D.
                     rhs[i] += term
-        eta = self.resistivity
-        nu = self.viscosity
-        if eta != 0.0:
-            rhs[5] = rhs[5] + eta * _diffusion(self.grid, U[5])
-            rhs[6] = rhs[6] + eta * _diffusion(self.grid, U[6])
-            rhs[7] = rhs[7] + eta * _diffusion(self.grid, U[7])
-        if nu != 0.0:
-            rhs[1] = rhs[1] + nu * _diffusion(self.grid, U[1])
-            rhs[2] = rhs[2] + nu * _diffusion(self.grid, U[2])
-            rhs[3] = rhs[3] + nu * _diffusion(self.grid, U[3])
+        transport = self.transport
+        if transport.active:
+            if not getattr(self, "_nyquist_noted", False):
+                self._note_free_nyquist()
+            rhs = rhs + self._transport_rhs(U, transport)
         if self.shearing_sheet is not None:
             self._add_shearing_sheet(U, rhs)
         return rhs
+
+    def _note_free_nyquist(self) -> None:
+        """Warn once when an even Fourier axis is not dealiased: its Nyquist mode has no first
+        derivative, so the stress, the current and the mixed-grid x heat flux leave it undamped."""
+        self._nyquist_noted = True
+        g = self.grid
+        if self._polynomial or bool(getattr(g, "dealias", True)):
+            return
+        if self.dim == 1:
+            sizes = [g.N]
+        elif self.dim == 2:
+            sizes = [g.Nx] + ([g.Ny] if getattr(g, "basis_y", "fourier") == "fourier"
+                              and not getattr(g, "_mixed_open_y", False) else [])
+        else:
+            sizes = [g.Nx, g.Ny, g.Nz]
+        if any(int(n) % 2 == 0 for n in sizes):
+            warnings.warn("MHD transport on an even Fourier axis without dealiasing: the Nyquist "
+                          "mode has no first derivative, so viscosity and resistivity do not damp "
+                          "it. Use dealias: true or an odd number of points.", RuntimeWarning, stacklevel=3)
+
+    # --- transport (viscosity, resistivity, conduction) ---------------------
+
+    def _derivative(self, axis: int):
+        """Derivative along grid axis ``axis`` (x, y, z), or None for an absent axis."""
+        if axis >= self.dim:
+            return None
+        if self._polynomial:
+            return self._poly_ops.grad
+        return getattr(self.grid, ("dx1", "dy1", "dz1")[axis])
+
+    def _flux_divergence_axis(self, axis: int, F: Array) -> Array:
+        """``d_axis F`` of a dissipative flux, with no flux through closed faces.
+
+        Periodic Fourier axes take the masked spectral derivative. A 1D
+        Chebyshev/Legendre grid takes the adjoint of its SBP gradient and the
+        SBP y axis of a mixed grid ``-dy_adjoint``: walls and outflow faces carry
+        no viscous traction, viscous work, heat flux or Ohmic Poynting flux.
+        """
+        if self._polynomial:
+            return self._poly_ops.div(F)
+        if axis == 1 and getattr(self.grid, "_mixed_open_y", False):
+            return -self.grid.dy_adjoint(F)
+        return self._derivative(axis)(F)
+
+    def _transport_rhs(self, U: Array, transport: Transport) -> Array:
+        """RHS of the transport terms (see ``phrike.transport``) on the reference grid ops.
+
+        Gradients and the current use the grid's masked derivatives, as the
+        ideal fluxes do, so the GPU fast paths reproduce this to round-off.
+        Closed faces carry no transport flux (see ``_flux_divergence_axis``).
+        """
+        g = self.grid
+        mixed = bool(getattr(g, "_mixed_open_y", False))
+        rho = U[0]
+        u = [U[1] / rho, U[2] / rho, U[3] / rho]
+        B = [U[5], U[6], U[7]]
+        zero = 0.0 * rho
+
+        def d(axis, f):
+            op = self._derivative(axis)
+            return zero if op is None else op(f)
+
+        D = theta = J = E = None
+        if transport.viscous:
+            # A mixed grid's SBP y derivative sees every x mode: differentiate the retained
+            # band, as the masked x derivative does, so the viscous work pairs with the
+            # x-projected RHS and is dissipative. The stress and its work use the stage u.
+            ug = list(g.project_dealiased(_stack_like(U, u))) if mixed else u
+            G = [[d(a, ug[b]) for b in range(3)] for a in range(3)]
+            sheet = self.shearing_sheet
+            if sheet is not None:  # sigma acts on the total velocity u + v0, d_r v0_phi = -a S
+                r, f = sheet["radial"], sheet["azimuthal"]
+                G[r][f] = G[r][f] - sheet["sign"] * sheet["shear"]
+            D, theta = strain_from_gradient(G)
+        if transport.resistive:
+            Bg = list(g.project_dealiased(_stack_like(U, B))) if mixed else B  # retained x band, as u
+            J = [d(1, Bg[2]) - d(2, Bg[1]), d(2, Bg[0]) - d(0, Bg[2]), d(0, Bg[1]) - d(1, Bg[0])]
+            E = [transport.eta * Jc for Jc in J]
+        dT, dH = flux_additions(rho, u, B, transport, D=D, theta=theta, J=J)
+        out = _zeros_like(U)
+        if transport.conductive:
+            T = self.equations.primitive(U)[4] / rho
+            if self._polynomial or mixed:  # heat flux -kappa grad T, none through closed faces
+                if mixed:
+                    T = g.project_dealiased(T)
+                for a in range(self.dim):
+                    q = -transport.kappa * d(a, T)
+                    dH[a] = q if dH[a] is None else dH[a] + q
+            else:  # periodic: the masked spectral Laplacian (two real first derivatives drop Nyquist)
+                out[4] = out[4] + transport.kappa * g.laplacian(T)
+        # (axis, momentum component) -> index of the symmetric stress in dT
+        sym = {(0, 0): 0, (1, 1): 1, (2, 2): 2, (0, 1): 3, (1, 0): 3, (0, 2): 4, (2, 0): 4,
+               (1, 2): 5, (2, 1): 5}
+        for a in range(self.dim):
+            for b in range(3):
+                flux = dT[sym[(a, b)]]
+                if flux is not None:
+                    out[1 + b] = out[1 + b] - self._flux_divergence_axis(a, flux)
+            if dH[a] is not None:
+                out[4] = out[4] - self._flux_divergence_axis(a, dH[a])
+        if transport.resistive:
+            # -curl E, with E the flux of B: its derivatives are the flux divergences (the SBP
+            # adjoints on closed axes). The magnetic energy lost is then the Ohmic heating of
+            # every current, face values included, and no E crosses a closed face (weakly). On a
+            # mixed grid this leaves div B nonzero in the face rows, which the magnetic
+            # projection that mixed grids require removes.
+            def fd(axis, f):
+                return zero if axis >= self.dim else self._flux_divergence_axis(axis, f)
+
+            out[5] = out[5] - (fd(1, E[2]) - fd(2, E[1]))
+            out[6] = out[6] - (fd(2, E[0]) - fd(0, E[2]))
+            out[7] = out[7] - (fd(0, E[1]) - fd(1, E[0]))
+        if self.shearing_sheet is not None and transport.viscous:
+            # Work of the stress on the background shear: -a S sigma_{r phi} (relative energy).
+            sheet = self.shearing_sheet
+            r, f = sheet["radial"], sheet["azimuthal"]
+            stress = dT[sym[(r, f)]]
+            out[4] = out[4] + sheet["sign"] * sheet["shear"] * stress  # dT = -sigma
+        if mixed:
+            out = g.project_dealiased(out)
+        return out
 
     def _add_shearing_sheet(self, U: Array, rhs: Array) -> None:
         """Axisymmetric shearing-sheet terms for the velocity u relative to v0 = -S r phi.
@@ -1897,9 +2144,19 @@ class SpectralSolverMHD:
             rate_shear = 2.0 * abs(self.shearing_sheet["omega"]) + abs(self.shearing_sheet["shear"])
             if rate_shear > 0.0:
                 bounds.append(self.cfl / rate_shear)
-        # Parabolic CFL for explicit resistivity/viscosity: dt <= cfl_diff/(D k^2_max)
-        diff = max(self.resistivity, self.viscosity)
-        rate = diff * self._k2_max
+        # Parabolic CFL for the explicit transport terms: dt <= cfl_diff/(D k^2_max), D the
+        # largest diffusivity (4 nu/3 + nu_bulk for longitudinal modes, times rho_max/rho_min
+        # unless viscous_step_bound is uniform; eta; conduction (gamma-1) kappa/rho_min).
+        transport = self.transport
+        rate = 0.0
+        if transport.active:
+            ratio = transport.viscous and self.viscous_bound == "density_ratio"
+            rho_min = rho_max = None
+            if ratio or transport.conductive:
+                rho_min, rho_max = _density_extrema(U[0])
+            rate = (transport.max_diffusivity(self.equations.gamma, rho_min, rho_max if ratio else None,
+                                              commuting=not getattr(self.grid, "_mixed_open_y", False))
+                    * self._diffusive_k2())
         if getattr(self.grid, "_mixed_open_y", False):
             rate += self.grid.sbp_dissipation_rate_bound(speed)
         if rate > 0.0:

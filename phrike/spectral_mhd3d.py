@@ -4,8 +4,17 @@ The same restructuring as ``spectral3d`` for the 8-component MHD state:
 real-to-complex FFTs, divergence and RK stages in spectral space, and 12
 transformed flux fields per stage instead of 24.  Those are the symmetric
 Maxwell-stress momentum flux (6), the energy flux (3) and the antisymmetric
-induction tensor (3); the mass flux is the stage momentum.  Resistive and
-viscous Laplacians enter the spectral RHS directly.
+induction tensor (3); the mass flux is the stage momentum.
+
+Transport (``phrike.transport``) adds the Newtonian stress to the momentum
+flux and the viscous work and Ohmic Poynting flux to the energy flux, both
+evaluated at every stage: the velocity is transformed (3 forward), the
+trace-free strain (5, plus div u with bulk viscosity) and the current (3) are
+built spectrally and transformed back into the flux buffer, and one pass then
+turns them into the 12 fluxes in place, so the extra memory is the spectra
+only.  Resistivity enters the induction rows as ``-eta (k^2 B - k (k . B))``
+and heat conduction as ``-kappa k^2 T`` through the energy-flux spectra (1
+forward transform of T).
 
 The reference step (``SpectralSolverMHD._fixed_step`` without Hall or
 ambipolar terms) projects B after every substage and clamps every substage.
@@ -42,6 +51,7 @@ except Exception:  # pragma: no cover - torch may not be installed
 
 from .grid import _build_exponential_filter_rate, _build_filter_mask, _spectral_dissipation_settings
 from .spectral3d import _RK_TABLES, _compile_default, _ref_tensor, _to_numpy
+from .transport import Transport, flux_additions, flux_buffer_rows
 
 
 # --- pointwise kernels (compiled with torch.compile on CUDA/MPS) ---------------
@@ -79,6 +89,63 @@ def mhd3d_fluxes(U, gamma):
         Ep * ux - Bx * uB, Ep * uy - By * uB, Ep * uz - Bz * uB,
         ux * By - uy * Bx, ux * Bz - uz * Bx, uy * Bz - uz * By,
     ])
+
+
+def mhd3d_transport_fluxes(U, G, gamma, transport):
+    """The 12 fluxes with the transport terms; ``G`` holds the derivative fields in the
+    rows of ``transport.flux_buffer_rows`` (Torch tier: the result is a new tensor)."""
+    rho, ux, uy, uz, _, Bx, By, Bz, _, _ = _mhd_primitive(U, gamma)
+    F = mhd3d_fluxes(U, gamma)
+    rowD, rowT, rowJ, _ = flux_buffer_rows(transport)
+    dT, dH = flux_additions(rho, (ux, uy, uz), (Bx, By, Bz), transport,
+                            D=G[rowD:rowD + 5] if transport.shear else None,
+                            theta=G[rowT] if transport.bulk else None,
+                            J=G[rowJ:rowJ + 3] if transport.resistive else None)
+    for i, d in enumerate(dT):
+        if d is not None:
+            F[i] = F[i] + d
+    for i, d in enumerate(dH):
+        if d is not None:
+            F[6 + i] = F[6 + i] + d
+    return F
+
+
+def mhd_temperature(U, gamma):
+    """T = p / rho (gas constant one)."""
+    rho, _, _, _, _, _, _, _, p, _ = _mhd_primitive(U, gamma)
+    return p / rho
+
+
+def derivative_spectra(uh, Bh, kx, ky, kz, transport):
+    """Spectra of the derivative fields the transport fluxes need, in one new tensor.
+
+    ``uh``: velocity spectra (with viscosity), ``Bh``: magnetic spectra (with
+    resistivity).  The rows follow ``transport.flux_buffer_rows``: the trace-free
+    strain ``(Dxx, Dyy, Dxy, Dxz, Dyz)`` with shear viscosity, div u with bulk
+    viscosity and ``J = i k x B`` with resistivity.  The rows are filled in
+    place, so the only other full-size temporary is div u.
+    """
+    rowD, rowT, rowJ, n = flux_buffer_rows(transport)
+    ref = uh if uh is not None else Bh
+    out = torch.empty((n,) + tuple(ref.shape[1:]), dtype=ref.dtype, device=ref.device)
+    ikx, iky, ikz = 1j * kx, 1j * ky, 1j * kz  # broadcast factors, not full fields
+    if transport.viscous:
+        th = out[rowT] if transport.bulk else torch.empty_like(ref[0])
+        torch.mul(uh[0], ikx, out=th)
+        th.addcmul_(uh[1], iky).addcmul_(uh[2], ikz)
+        if transport.shear:
+            third = 1.0 / 3.0
+            torch.mul(uh[0], ikx, out=out[rowD]).sub_(th, alpha=third)
+            torch.mul(uh[1], iky, out=out[rowD + 1]).sub_(th, alpha=third)
+            torch.mul(uh[1], 0.5 * ikx, out=out[rowD + 2]).addcmul_(uh[0], 0.5 * iky)
+            torch.mul(uh[2], 0.5 * ikx, out=out[rowD + 3]).addcmul_(uh[0], 0.5 * ikz)
+            torch.mul(uh[2], 0.5 * iky, out=out[rowD + 4]).addcmul_(uh[1], 0.5 * ikz)
+        del th
+    if transport.resistive:
+        torch.mul(Bh[2], iky, out=out[rowJ]).addcmul_(Bh[1], -ikz)
+        torch.mul(Bh[0], ikz, out=out[rowJ + 1]).addcmul_(Bh[2], -ikx)
+        torch.mul(Bh[1], ikx, out=out[rowJ + 2]).addcmul_(Bh[0], -iky)
+    return out
 
 
 def _mhd_count_below(U, gamma, rho_min, p_min):
@@ -119,12 +186,12 @@ class MHD3DSpectral:
 
     _speed_fn = staticmethod(lambda U, gamma: _mhd_finite_and_speed(U, gamma))
 
-    def __init__(self, grid, equations, rho_min: float, p_min: float, eta: float, nu: float,
-                 compile: Optional[bool] = None):
+    def __init__(self, grid, equations, rho_min: float, p_min: float,
+                 transport: Optional[Transport] = None, compile: Optional[bool] = None):
         self.grid = grid
         self.gamma = float(equations.gamma)
         self.rho_min, self.p_min = float(rho_min), float(p_min)
-        self.eta, self.nu = float(eta), float(nu)
+        self.transport = transport if transport is not None else Transport()
         self.shape = self._grid_shape(grid)
         self._dims = tuple(range(-len(self.shape), 0))
         self._kshape = (1,) * (3 - len(self.shape)) + self.shape
@@ -308,10 +375,17 @@ class MHD3DSpectral:
         uhat, _ = self._buffers()
         self._pending = None
         factors = self._factors(h, project=False)
+        done = False
         if self._triton is not None:  # only the retained modes are nonzero
-            w = torch.tensor([self._inv_n], dtype=self.rdtype, device=uhat.device)
-            self._triton.combine(None, 0, self._k(uhat), self._k(uhat), w, 0, factors, self._modes, masked=True)
-        else:
+            try:
+                w = torch.tensor([self._inv_n], dtype=self.rdtype, device=uhat.device)
+                self._triton.combine(None, 0, self._k(uhat), self._k(uhat), w, 0, factors, self._modes,
+                                     masked=True)
+                done = True
+            except Exception as exc:  # pragma: no cover - depends on toolchain
+                self._disable_triton(exc)
+                self._respectrum(U)  # the kernel may have scaled part of the spectrum
+        if not done:
             uhat.mul_(self._full(factors))
         Un = self._irfftn(uhat)
         self._cache = (Un, Un._version)
@@ -338,15 +412,80 @@ class MHD3DSpectral:
         T, H, A = Fh[0:6], Fh[6:9], Fh[9:12]
         k = [
             d(S[1], S[2], S[3]),
-            d(T[0], T[3], T[4]) - self.nu * k2m * S[1],
-            d(T[3], T[1], T[5]) - self.nu * k2m * S[2],
-            d(T[4], T[5], T[2]) - self.nu * k2m * S[3],
+            d(T[0], T[3], T[4]),
+            d(T[3], T[1], T[5]),
+            d(T[4], T[5], T[2]),
             d(H[0], H[1], H[2]),
-            d(None, -A[0], -A[1]) - self.eta * k2m * S[5],
-            d(A[0], None, -A[2]) - self.eta * k2m * S[6],
-            d(A[1], A[2], None) - self.eta * k2m * S[7],
+            d(None, -A[0], -A[1]),
+            d(A[0], None, -A[2]),
+            d(A[1], A[2], None),
         ]
+        eta = self.transport.eta
+        if eta > 0.0:  # -curl(eta J) = -eta (k^2 B - k (k . B))
+            kb = (self.kx3 * S[5] + self.ky3 * S[6] + self.kz3 * S[7]) * M
+            k[5] = k[5] - eta * (k2m * S[5] - self.kx3 * kb)
+            k[6] = k[6] - eta * (k2m * S[6] - self.ky3 * kb)
+            k[7] = k[7] - eta * (k2m * S[7] - self.kz3 * kb)
         return torch.stack(k)
+
+    # --- transport ------------------------------------------------------------
+
+    def _stage_fluxes(self, Us, Sspec, count: bool):
+        """``(F, count or None, T spectrum or None)`` of a stage: the 12 flux fields with the
+        transport terms; ``Sspec`` is the stage spectrum (normalized), for the current.
+
+        The temperature spectrum is normalized; ``_conduct`` adds its heat flux to
+        the flux spectra.
+        """
+        tr = self.transport
+        if not tr.gradients:
+            if count:
+                F, c = self.fluxes_and_count(Us)
+            else:
+                F, c = self.fluxes(Us), None
+            That = self._rfftn_fwd(mhd_temperature(Us, self.gamma)) if tr.conductive else None
+            return F, c, That
+        F = torch.empty((12,) + tuple(Us.shape[1:]), dtype=Us.dtype, device=Us.device)
+        That = uh = None
+        if tr.viscous or tr.conductive:
+            # T (row 8) and the velocity (rows 9-11) are transformed first (flux_buffer_rows).
+            if tr.viscous:
+                torch.div(Us[1:4], Us[0], out=F[9:12])
+            if tr.conductive:
+                F[8] = mhd_temperature(Us, self.gamma)
+            spec = self._rfftn_fwd(F[8 if tr.conductive else 9:12 if tr.viscous else 9])
+            if tr.conductive:  # a copy, so the velocity spectra are freed once consumed
+                That = spec[0].clone() if tr.viscous else spec[0]
+            if tr.viscous:
+                uh = spec[-3:] * self.M3
+            del spec
+        # The stage spectrum is masked, so the current needs no mask; one inverse for all.
+        X = derivative_spectra(uh, Sspec[5:8] if tr.resistive else None, self.kx3, self.ky3, self.kz3, tr)
+        del uh
+        self._irfftn_into(X, F[0:X.shape[0]])
+        del X
+        if self._triton is not None and Us.is_cuda:
+            # A kernel failure propagates: rk_step repeats the step on the Torch tier.
+            c = self._triton.transport_fluxes(Us, F, self.gamma, self.rho_min, self.p_min, tr, count=count)
+            return F, c, That
+        F = mhd3d_transport_fluxes(Us, F, self.gamma, tr)
+        return F, (self.count_below(Us) if count else None), That
+
+    def _conduct(self, Fh, That, scale: float) -> None:
+        """Heat flux ``-kappa grad T`` added to the energy-flux spectra (in place).
+
+        ``scale`` puts the normalized T spectrum on the scale of ``Fh``; the
+        divergence (with the dealias mask) is taken with the other fluxes.
+        """
+        if That is None:
+            return
+        c = -self.transport.kappa * scale
+        Fh[6] += (c * 1j) * self.kx3 * That
+        Fh[7] += (c * 1j) * self.ky3 * That
+        Fh[8] += (c * 1j) * self.kz3 * That
+
+    def _irfftn_into(self, X, out) -> None:
+        torch.fft.irfftn(X, s=self.shape, dim=self._dims, norm="forward", out=out)
 
     def _leray(self, X):
         kx, ky, kz = self.kx3, self.ky3, self.kz3
@@ -371,7 +510,14 @@ class MHD3DSpectral:
                 return self._rk_step_triton(U, dt, table, h, check_stages)
             except Exception as exc:  # pragma: no cover - depends on toolchain
                 self._disable_triton(exc)
+                self._respectrum(U)  # the final stage may already have overwritten the spectrum
         return self._rk_step_generic(U, dt, table, h, check_stages)
+
+    def _respectrum(self, U) -> None:
+        """Rebuild the cached spectrum from the (band-limited, solenoidal) physical ``U``."""
+        uhat, _ = self._buffers()
+        torch.mul(self._rfftn_fwd(U), self.M3, out=uhat)
+        self._cache = (U, U._version)
 
     def _disable_triton(self, exc):
         if isinstance(exc, torch.OutOfMemoryError):
@@ -386,12 +532,14 @@ class MHD3DSpectral:
         Sh, Us = U0h, U
         violations = torch.zeros((), dtype=torch.int64, device=U.device)
         for i, (wa, wn) in enumerate(table):
-            if i > 0 and check_stages:
-                F, c = self.fluxes_and_count(Us)
+            F, c, That = self._stage_fluxes(Us, Sh, i > 0 and check_stages)
+            if c is not None:
                 violations += c
-            else:
-                F = self.fluxes(Us)
-            k = self._rhs_hat(self._rfftn(F) * self._inv_n, Sh)
+            Fh = self._rfftn(F) * self._inv_n
+            del F
+            self._conduct(Fh, That, 1.0)
+            k = self._rhs_hat(Fh, Sh)
+            del Fh
             if wn is None:
                 high = U0h + acc + (wa * dt) * k
                 return self._finish(high, h, violations)
@@ -424,7 +572,7 @@ class MHD3DSpectral:
         self._pending = None
         self._cache = None
         w = torch.tensor(
-            [self._inv_n, self.eta, self.nu]
+            [self._inv_n, self.transport.eta]
             + [c * dt for wa, wn in table for c in (wa, 0.0 if wn is None else wn)],
             dtype=U.dtype, device=U.device,
         )
@@ -433,18 +581,18 @@ class MHD3DSpectral:
         Us, Sin = U, uhat
         last = len(table) - 1
         for i in range(len(table)):
-            if i > 0 and check_stages:
-                F, c = self.fluxes_and_count(Us)
+            F, c, That = self._stage_fluxes(Us, Sin, i > 0 and check_stages)
+            if c is not None:
                 violations += c
-            else:
-                F = self.fluxes(Us)
             Fh = self._rfftn(F)
             del F
+            self._conduct(Fh, That, 1.0 / self._inv_n)
+            del That
             final = i == last
             k = self._k
-            st.mhd_stage(k(Fh), k(Sin), k(uhat if final else shat), k(uhat), acc, w, 3 + 2 * i, 4 + 2 * i,
+            st.mhd_stage(k(Fh), k(Sin), k(uhat if final else shat), k(uhat), acc, w, 2 + 2 * i, 3 + 2 * i,
                          self._waves, modes, first=(i == 0), final=final,
-                         high=k(shat), final_factors=fin)
+                         high=k(shat), final_factors=fin, resistive=self.transport.resistive)
             del Fh
             Us = None
             if final:
@@ -469,8 +617,14 @@ class MHD3DSpectral:
         """(accepted state candidate, max|U_high - U_low|) or ``None`` when the
         accepted-state clamp would act.  Call ``commit`` if it is accepted."""
         assert self._is_cached(U)
-        if self._triton is None:
-            return self._embedded_generic(U, dt, a, b_high, b_low, h)
+        if self._triton is not None:
+            try:  # the Triton attempt writes only scratch buffers, so a retry starts clean
+                return self._embedded_triton(U, dt, a, b_high, b_low, h)
+            except Exception as exc:  # pragma: no cover - depends on toolchain
+                self._disable_triton(exc)
+        return self._embedded_generic(U, dt, a, b_high, b_low, h)
+
+    def _embedded_triton(self, U, dt, a, b_high, b_low, h):
         st = self._triton
         uhat, shat = self._buffers()
         modes = self._modes
@@ -479,7 +633,7 @@ class MHD3DSpectral:
             self._kbuf = torch.empty((s, 8, modes.total), dtype=self.cdtype, device=U.device)
         K = self._kbuf
         b_high = np.asarray(b_high, dtype=float)
-        coefs = [self._inv_n, self.eta, self.nu]
+        coefs = [self._inv_n, self.transport.eta]
         offsets = [0]
         for i in range(1, s):
             offsets.append(len(coefs))
@@ -495,10 +649,14 @@ class MHD3DSpectral:
                 st.combine(K, i, self._k(uhat), self._k(shat), w, offsets[i], None, modes, masked=False)
                 S = shat
                 Us = self._irfftn(shat)
-            Fh = self._rfftn(self.fluxes(Us))
+            F, _, That = self._stage_fluxes(Us, S, False)
+            Fh = self._rfftn(F)
+            del F
+            self._conduct(Fh, That, 1.0 / self._inv_n)
+            del That
             Sk = self._k(S)
             st.mhd_stage(self._k(Fh), Sk, Sk, Sk, K[i], w, 0, 0, self._waves, modes, first=False,
-                         final=False, rhs_only=True)
+                         final=False, rhs_only=True, resistive=self.transport.resistive)
             del Fh
             Us = None
         st.combine(K, s, None, self._k(shat), w, off_err, None, modes, masked=False)
@@ -527,7 +685,12 @@ class MHD3DSpectral:
             if i > 0:
                 Sh = U0h + sum(dt * float(a[i][j]) * k[j] for j in range(i) if a[i][j] != 0.0)
                 Us = self._irfftn(Sh)
-            k.append(self._rhs_hat(self._rfftn(self.fluxes(Us)) * self._inv_n, Sh))
+            F, _, That = self._stage_fluxes(Us, Sh, False)
+            Fh = self._rfftn(F) * self._inv_n
+            del F
+            self._conduct(Fh, That, 1.0)
+            k.append(self._rhs_hat(Fh, Sh))
+            del Fh
         Eh = sum(dt * float(b_high[i] - b_low[i]) * k[i] for i in range(s) if b_high[i] != b_low[i])
         high = U0h + sum(dt * float(b_high[i]) * k[i] for i in range(s) if b_high[i] != 0.0)
         c, err = _mhd_embedded_checks(self._irfftn(high), self._irfftn(Eh),

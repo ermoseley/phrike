@@ -37,8 +37,20 @@ Systems and problems
 The compressible steppers take the reference solver's step: with one rank the
 result equals ``SpectralSolverMHD3D`` and ``SpectralSolver3D`` to round-off,
 and with any number of ranks it equals the one-rank result to round-off
-(``tests/test_parallel_compressible.py``).  Hall, ambipolar, shearing-sheet,
-gravity and artificial-viscosity terms are not available here and raise.
+(``tests/test_parallel_compressible.py``).  Compressible MHD has the
+Newtonian viscosity (shear and bulk), Ohmic resistivity and heat conduction of
+:doc:`equations` (``physics.mhd`` keys ``viscosity``, ``bulk_viscosity``,
+``resistivity``, ``thermal_conductivity``), evaluated at every stage.  With
+viscosity a stage also transforms the velocity (3 forward) and the trace-free
+strain back (5 inverse, 6 with bulk viscosity); resistivity adds the current
+(3 inverse) and conduction the temperature (1 forward): with viscosity and
+resistivity a stage moves 31 fields instead of 20, and the derivative fields go
+back in one batch of inverse transforms.  They are written into the flux buffer,
+which the Triton kernel (and the Torch tier, a few planes at a time) turns into
+the fluxes in place.
+The diffusive step bound takes the global density extrema in one reduction.  Euler stays inviscid.  Hall, ambipolar,
+shearing-sheet, gravity and artificial-viscosity terms are not available here
+and raise.
 
 Decomposition and transforms
 ----------------------------
@@ -198,7 +210,16 @@ Parallel options
 Memory per grid point is about 27 real fields for incompressible MHD and 44
 for compressible MHD at ``fft_batch: 4``, that is roughly 110 and 180 bytes
 in single precision: an 80 GB device holds about :math:`900^3` and
-:math:`760^3` points.  Set ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True``
+:math:`760^3` points.  Compressible viscosity, resistivity and conduction keep the
+stage state, the 12-field flux buffer and the derivative spectra alive while
+those spectra are transformed back, which adds about 14 real fields per point
+at ``fft_batch: 4`` and 6 at ``fft_batch: 1`` (single precision, one B200: step
+peaks of 59.5 and 83.7 GiB at :math:`768^3` with ``fft_batch: 4``, 119.8 and
+145.4 GiB at :math:`1024^3` with ``fft_batch: 1``, ideal and with viscosity and
+resistivity).  A smaller ``fft_batch`` is the way to fit a large grid.  With
+viscosity and resistivity a step takes about 1.65 times the ideal time there,
+and about 1.9 times with all four coefficients, in line with the extra
+transforms.  Set ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True``
 for large grids (unverified with a CUDA-aware MPI, whose CUDA IPC may not work
 with expandable segments; ``nccl`` is not affected as far as is known).
 
@@ -557,7 +578,11 @@ rank count may differ, and so may the resolution: modes are matched by integer
 wavenumber, so a run can be spun up coarse and refined.  The out-of-band
 residual of a clamped state is stored per rank in physical space, so it is read
 back only when the grid and the rank count are unchanged, and then the restart
-reproduces the uninterrupted run exactly.  After a restart on another rank
+reproduces the uninterrupted run exactly.  A compressible MHD checkpoint written
+before the Newtonian viscosity and Ohmic energy flux (no ``viscosity_model`` in
+its metadata) resumes with them and a logged notice, so with nonzero
+coefficients it does not continue the old run; ``history.csv`` gains the new
+heating columns, padded with ``nan`` for the earlier rows.  After a restart on another rank
 count or resolution it is dropped with a ``RuntimeWarning`` and the first step
 differs from the uninterrupted run by that residual.  A restart continues
 the output numbering (fields, slices, spectra and diagnostics included) and
@@ -569,16 +594,6 @@ from the field outputs up to the restart point.
 Differences from the serial solvers
 -----------------------------------
 
-* The explicit diffusive limit of the compressible MHD stepper,
-  ``cfl_diff / (max(nu, eta) k_max^2)``, takes :math:`k_\mathrm{max}` from the
-  largest retained mode, :math:`(N - 1) // 3`, not from the grid's Nyquist mode
-  :math:`N/2` as the serial solver does.  The retained modes are the only ones
-  the Laplacian acts on, so this is the limit that applies.  The step it
-  allows is larger by :math:`(N/2)^2 / ((N - 1)//3)^2`: 2.25 for large grids,
-  up to 3 for small ones.  A diffusion-limited run therefore takes fewer,
-  larger steps than the serial solver and its results agree with it to the
-  time-stepping error, not to round-off; set ``cfl_diff`` 2.25 times smaller
-  to reproduce the serial step.
 * When the MHD accepted-state limiter clamps, the clamped state has content
   above the cutoff.  The reference keeps it through the next step: the
   dissipation half-step damps the whole spectrum, every stage is evaluated on

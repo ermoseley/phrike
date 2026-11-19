@@ -19,6 +19,7 @@ from phrike.parallel.driver import Simulation
 from phrike.parallel.grid import SlabGrid3D
 from phrike.problems.problem_list.orszag_tang3d import orszag_tang_3d
 from phrike.solver import SpectralSolver3D, SpectralSolverMHD3D
+from phrike.transport import Transport
 
 SHAPES = [(16, 12, 10), (15, 9, 11), (20, 18, 14)]
 
@@ -35,7 +36,7 @@ def _euler_state(shape, noise=1e-2):
     return torch.as_tensor(EulerEquations3D(gamma=1.4).conservative(rho, ux, uy, uz, p))
 
 
-def _reference(system, shape, dissipation, eta=0.0, nu=0.0, noise=1e-2, **solver_kwargs):
+def _reference(system, shape, dissipation, transport=Transport(), noise=1e-2, **solver_kwargs):
     """(reference grid, equations, solver, initial state) on the whole grid."""
     Nx, Ny, Nz = shape
     L = 1.0 if system == "mhd" else 2 * np.pi
@@ -43,7 +44,7 @@ def _reference(system, shape, dissipation, eta=0.0, nu=0.0, noise=1e-2, **solver
                   filter_params=DISSIPATION if dissipation else None,
                   backend="torch", torch_device="cpu", precision="double")
     if system == "mhd":
-        grid.mhd_config = {"resistivity": eta, "viscosity": nu, "divergence_clean": "projection"}
+        grid.mhd_config = dict(transport.as_dict(), divergence_clean="projection")
         eqs = MHDEquations3D(gamma=5.0 / 3.0)
         U0 = orszag_tang_3d(*grid.xyz_mesh(), gamma=eqs.gamma, epsilon=0.2)
         if noise:
@@ -57,12 +58,12 @@ def _reference(system, shape, dissipation, eta=0.0, nu=0.0, noise=1e-2, **solver
     return grid, eqs, solver, U0
 
 
-def _distributed(system, shape, eqs, dissipation, eta=0.0, nu=0.0, **kwargs):
+def _distributed(system, shape, eqs, dissipation, transport=Transport(), **kwargs):
     Nx, Ny, Nz = shape
     L = 1.0 if system == "mhd" else 2 * np.pi
     grid = SlabGrid3D(Nx, Ny, Nz, L, L, L, comm=COMM, device="cpu", precision="double",
                       filter_params=DISSIPATION if dissipation else None, fft_batch=3)
-    return grid, CompressibleSlabStepper(grid, system, eqs.gamma, 1e-10, 1e-12, eta=eta, nu=nu, **kwargs)
+    return grid, CompressibleSlabStepper(grid, system, eqs.gamma, 1e-10, 1e-12, transport=transport, **kwargs)
 
 
 def _local(U, grid):
@@ -74,18 +75,24 @@ def _rel(A, B):
     return gmax((A - B).abs().max().item()) / float(B.abs().max().item())
 
 
+TRANSPORTS = [Transport(nu=5e-3, eta=4e-3), Transport(nu=5e-3), Transport(eta=4e-3),
+              Transport(nu=5e-3, nu_bulk=3e-3, eta=4e-3, kappa=6e-3), Transport(nu_bulk=3e-3),
+              Transport(kappa=6e-3)]
+FULL = TRANSPORTS[3]
+
+
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("scheme", ["rk2", "rk4"])
-@pytest.mark.parametrize("system,dissipation,eta,nu", [
-    ("mhd", True, 0.0, 0.0), ("mhd", False, 0.0, 0.0), ("mhd", True, 2e-3, 1e-3),
-    ("euler", True, 0.0, 0.0), ("euler", False, 0.0, 0.0),
-])
-def test_fixed_step_matches_reference(shape, scheme, system, dissipation, eta, nu):
+@pytest.mark.parametrize("system,dissipation,transport", [
+    ("mhd", True, Transport()), ("mhd", False, Transport()), ("euler", True, Transport()),
+    ("euler", False, Transport())] + [("mhd", True, tr) for tr in TRANSPORTS],
+    ids=lambda v: v.describe() if isinstance(v, Transport) else str(v))
+def test_fixed_step_matches_reference(shape, scheme, system, dissipation, transport):
     if not fits(shape):
         pytest.skip("grid too small for this rank count")
-    ref_grid, eqs, ref, U0 = _reference(system, shape, dissipation, eta, nu, scheme=scheme)
+    ref_grid, eqs, ref, U0 = _reference(system, shape, dissipation, transport, scheme=scheme)
     Ur = ref_grid.project_dealiased(ref._project_B(U0) if system == "mhd" else U0)
-    grid, st = _distributed(system, shape, eqs, dissipation, eta, nu)
+    grid, st = _distributed(system, shape, eqs, dissipation, transport)
     assert _rel(st.seed(_local(U0, grid).clone()), _local(Ur, grid)) < 1e-12
     for _ in range(4):
         Ur = ref.step(Ur, 2e-3)
@@ -112,17 +119,17 @@ def test_strict_clamp_changes_nothing_without_violations(system):
     assert torch.equal(states[0], states[1])
 
 
-@pytest.mark.parametrize("system", ["mhd", "euler"])
-def test_positivity_limiter_matches_reference(system):
+@pytest.mark.parametrize("system,transport", [("mhd", Transport()), ("mhd", FULL), ("euler", Transport())])
+def test_positivity_limiter_matches_reference(system, transport):
     """A state that needs the limiter takes the reference's limited step."""
     shape = (16, 12, 10)
     if not fits(shape):
         pytest.skip("grid too small for this rank count")
-    ref_grid, eqs, ref, U0 = _reference(system, shape, False, noise=0.0)
+    ref_grid, eqs, ref, U0 = _reference(system, shape, False, transport, noise=0.0)
     U0 = U0.clone()
     U0[4, :3, :3, :3] = -1.0  # negative thermal pressure: the limiter must act
     U_in = ref_grid.project_dealiased(ref._project_B(U0) if system == "mhd" else U0)
-    grid, st = _distributed(system, shape, eqs, False)
+    grid, st = _distributed(system, shape, eqs, False, transport)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
         st.set_spectrum(grid.forward(_local(U_in, grid).clone(), normalized=True))
@@ -160,19 +167,22 @@ def _record(stepper):
     return flags
 
 
-@pytest.mark.parametrize("dissipation", [False, True])
-def test_adaptive_mhd_run_matches_reference(tmp_path, dissipation):
+@pytest.mark.parametrize("dissipation,transport", [(False, Transport()), (True, Transport()), (True, FULL)])
+def test_adaptive_mhd_run_matches_reference(tmp_path, dissipation, transport):
     shape = (16, 12, 10)
     if not fits(shape):
         pytest.skip("grid too small for this rank count")
     adaptive = {"enabled": True, "scheme": "rk45", "rtol": 1e-8, "atol": 1e-12}
-    ref_grid, eqs, ref, U0 = _reference("mhd", shape, dissipation, noise=0.0, adaptive_config=adaptive)
+    ref_grid, eqs, ref, U0 = _reference("mhd", shape, dissipation, transport, noise=0.0,
+                                        adaptive_config=adaptive)
     ref_flags = _record(ref.adaptive_stepper)
     ref.run(U0, t0=0.0, t_end=0.03, output_interval=1.0)
 
     config = _adaptive_config(tmp_path, "orszag_tang3d", shape, cfl=0.3)
     if dissipation:
         config["integration"]["spectral_dissipation"] = DISSIPATION
+    if transport.active:
+        config["physics"]["mhd"] = transport.as_dict()
     sim = Simulation("orszag_tang3d", config, comm=COMM, backend="cpu", quiet=True)
     flags = _record(sim.adaptive)
     sim.run()
@@ -255,28 +265,29 @@ def test_kick_adds_the_kinetic_energy_change():
 # --- the state after an accepted-state clamp ------------------------------------
 
 
-def _clamped_start(dissipation, scheme, patch=0.0, extent=3):
+def _clamped_start(dissipation, scheme, patch=0.0, extent=3, transport=Transport()):
     """Reference solver, its start state and a stepper seeded with it; a hot-spot of low pressure
     makes the limiter act."""
     shape = (16, 12, 10)
-    ref_grid, eqs, ref, U0 = _reference("mhd", shape, dissipation, noise=0.0, scheme=scheme)
+    ref_grid, eqs, ref, U0 = _reference("mhd", shape, dissipation, transport, noise=0.0, scheme=scheme)
     U0 = U0.clone()
     p = (eqs.gamma - 1.0) * (U0[4] - 0.5 * (U0[1:4] ** 2).sum(0) / U0[0] - 0.5 * (U0[5:8] ** 2).sum(0))
     e = extent
     U0[4, :e, :e, :e] -= (p[:e, :e, :e] - patch) / (eqs.gamma - 1.0)
     U_in = ref_grid.project_dealiased(ref._project_B(U0))
-    grid, st = _distributed("mhd", shape, eqs, dissipation)
+    grid, st = _distributed("mhd", shape, eqs, dissipation, transport)
     st.set_spectrum(grid.forward(_local(U_in, grid).clone(), normalized=True))
     return ref_grid, eqs, ref, U_in, grid, st
 
 
 @pytest.mark.parametrize("scheme", ["rk2", "rk4"])
 @pytest.mark.parametrize("dissipation", [False, True])
-def test_steps_after_an_accepted_state_clamp_match_reference(scheme, dissipation):
+@pytest.mark.parametrize("transport", [Transport(), FULL], ids=["ideal", "transport"])
+def test_steps_after_an_accepted_state_clamp_match_reference(scheme, dissipation, transport):
     """The clamped state keeps its out-of-band part for one more step, as in the reference."""
     if not fits((16, 12, 10)):
         pytest.skip("grid too small for this rank count")
-    _, _, ref, Ur, grid, st = _clamped_start(dissipation, scheme)
+    _, _, ref, Ur, grid, st = _clamped_start(dissipation, scheme, transport=transport)
     worst, residual_steps = 0.0, 0
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
@@ -320,13 +331,14 @@ def _reference_embedded(ref, U, dt, method):
 
 
 @pytest.mark.parametrize("dissipation", [False, True])
-def test_embedded_steps_and_rejects_after_a_clamp_match_reference(dissipation):
+@pytest.mark.parametrize("transport", [Transport(), FULL], ids=["ideal", "transport"])
+def test_embedded_steps_and_rejects_after_a_clamp_match_reference(dissipation, transport):
     if not fits((16, 12, 10)):
         pytest.skip("grid too small for this rank count")
     from phrike.adaptive import create_adaptive_method
 
     method = create_adaptive_method("rk45")
-    _, _, ref, Ur, grid, st = _clamped_start(dissipation, "rk4")
+    _, _, ref, Ur, grid, st = _clamped_start(dissipation, "rk4", transport=transport)
     worst, residual_steps = 0.0, 0
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
@@ -499,7 +511,36 @@ def test_warm_up_runs_on_the_real_shapes_and_makes_kernels_strict():
         assert torch.equal(st.uhat, before) and torch.equal(st.physical(), U_before)
         assert st.events == events and st._acc is None and st._kbuf is None
         assert (grid.fft.forward_fields, grid.fft.inverse_fields) == counters
-        boom = RuntimeError("kernel failed")
-        with pytest.raises(RuntimeError, match="kernel failed"):
-            st._disable_triton(boom)
-        assert st._triton is not None
+        if COMM.size == 1:  # with more ranks a kernel failure aborts the job (not testable here)
+            boom = RuntimeError("kernel failed")
+            with pytest.raises(RuntimeError, match="kernel failed"):
+                st._disable_triton(boom)
+            assert st._triton is not None
+
+
+def test_circular_modes_decay_exactly_with_transport():
+    """Parallel circular u and B modes along z are an exact decaying solution with uniform heating."""
+    shape = (8, 8, 16)
+    if not fits(shape):
+        pytest.skip("grid too small for this rank count")
+    tr = Transport(nu=0.03, nu_bulk=0.02, eta=0.05, kappa=0.04)
+    gamma, U0, B0, p0 = 5.0 / 3.0, 0.2, 0.3, 1.0
+    grid = SlabGrid3D(*shape, 2 * np.pi, 2 * np.pi, 2 * np.pi, comm=COMM, device="cpu", precision="double")
+    st = CompressibleSlabStepper(grid, "mhd", gamma, 1e-10, 1e-12, transport=tr)
+    _, _, Z = grid.xyz_mesh()
+    one = torch.ones_like(Z)
+    eqs = MHDEquations3D(gamma=gamma)
+    st.seed(eqs.conservative(one, U0 * torch.cos(Z), U0 * torch.sin(Z), 0 * one, p0 * one,
+                             B0 * torch.cos(Z), B0 * torch.sin(Z), 0 * one))
+    for _ in range(50):
+        st.step(0.01, "rk4")
+    fu, fb = np.exp(-tr.nu * 0.5), np.exp(-tr.eta * 0.5)
+    p = p0 + (gamma - 1.0) * (0.5 * U0 ** 2 * (1.0 - fu * fu) + 0.5 * B0 ** 2 * (1.0 - fb * fb))
+    rho, ux, uy, uz, pn, Bx, By, Bz = eqs.primitive(st.physical())
+    worst = max(float((rho - 1.0).abs().max()), float((ux - U0 * fu * torch.cos(Z)).abs().max()),
+                float((uy - U0 * fu * torch.sin(Z)).abs().max()), float((Bx - B0 * fb * torch.cos(Z)).abs().max()),
+                float((By - B0 * fb * torch.sin(Z)).abs().max()), float((pn - p).abs().max()))
+    assert gmax(worst) < 1e-10
+    rates = st.dissipation_rates()  # collective
+    assert rates["viscous_dissipation"] == pytest.approx(U0 ** 2 * fu * fu * tr.nu, rel=1e-9)
+    assert rates["resistive_dissipation"] == pytest.approx(B0 ** 2 * fb * fb * tr.eta, rel=1e-9)

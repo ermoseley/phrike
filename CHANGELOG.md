@@ -5,6 +5,38 @@ All notable changes to PHRIKE are recorded here. The format follows
 
 ## Unreleased
 
+### Changed (physics)
+
+- Compressible MHD viscosity and resistivity are now the standard
+  visco-resistive MHD on every compressible path (serial reference, GPU fast
+  paths and `phrike.parallel`). `viscosity` is the kinematic shear viscosity of
+  the Newtonian stress (dynamic viscosity `rho nu`, with the `-2/3 div u` part),
+  which enters the momentum flux; the energy flux gains the viscous work
+  `-sigma.u` and the Ohmic Poynting flux `eta J x B`, so viscous and Ohmic
+  heating are deposited where the energy is dissipated; induction uses
+  `-curl(eta J)`. The old `nu lap(rho u)` momentum term, which was not Galilean
+  invariant and heated the gas in the wrong place, is removed (the incompressible
+  solvers keep `nu lap u`, exact there). New optional keys: `bulk_viscosity`
+  and `thermal_conductivity` (heat flux `-kappa grad(p/rho)`). The diffusive
+  time step uses `(4/3 nu + nu_bulk) rho_max/rho_min` (new key
+  `viscous_step_bound: uniform` drops the density ratio) and the largest
+  retained wavenumber in serial runs too; on 1D polynomial grids it uses the
+  spectral radius of the actual operator, and on mixed Fourier/SBP grids
+  `2 nu + nu_bulk`. On 1D Chebyshev grids the transport terms use a
+  summation-by-parts gradient in the Clenshaw-Curtis weights, so they conserve
+  energy and are dissipative. On mixed open-y grids every transport flux,
+  including the induction term's electric field, uses the SBP adjoint at the
+  faces, so face currents are dissipated too. A fixed distributed
+  `integration.dt` above the stability limit now logs a warning, and an unmasked
+  even Fourier axis with transport warns that its Nyquist mode is not damped.
+  Results of runs with nonzero `viscosity` or `resistivity` change.
+- `phrike.parallel`: the warm-up settles the kernel tier collectively, and a
+  kernel failure during a multi-rank step aborts all ranks instead of letting
+  one rank switch tiers; the Torch-tier fluxes are formed a few planes at a
+  time and the heating diagnostics a few rows at a time (lower peak memory);
+  restarts from checkpoints written before this change log a notice, and
+  `history.csv` gains the new columns when appended.
+
 ### Added
 
 - `phrike.parallel`: the 3D Euler and MHD spectral fast path on many GPUs
