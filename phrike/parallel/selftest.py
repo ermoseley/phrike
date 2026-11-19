@@ -32,6 +32,7 @@ import torch
 
 from .comm import Comm, TRANSPORTS
 from .compressible import CompressibleSlabStepper
+from ..transport import Transport
 from .fields import random_vector_spectrum
 from .grid import SlabGrid3D
 from .incompressible import IncompressibleSlabStepper, lawson_coefficients, LAWSON_TABLES
@@ -211,25 +212,76 @@ def check_triton_kernels(report: Report, grid: SlabGrid3D, tight: float) -> None
                 report.check(name, error, tight)
 
 
+def _transport_state(grid: SlabGrid3D, gamma: float) -> torch.Tensor:
+    """``_compressible_state`` (MHD) with velocity and field content halfway to the cutoff,
+    which the transport terms change by a few percent per step."""
+    U = _compressible_state(grid, "mhd", gamma)
+    X, Y, Z = grid.xyz_mesh()
+    m = float(max(1, min(grid.decomp.cx, grid.decomp.cy, grid.decomp.cz) // 2))
+    du = [0.1 * torch.sin(m * Y), 0.1 * torch.sin(m * Z), 0.1 * torch.sin(m * X)]
+    dB = [0.1 * torch.cos(m * Z), 0.1 * torch.cos(m * X), 0.1 * torch.cos(m * Y)]
+    rho = U[0]
+    u = [U[1 + i] / rho + du[i] for i in range(3)]
+    B = [U[5 + i] + dB[i] for i in range(3)]
+    kinetic = 0.5 * rho * (u[0] ** 2 + u[1] ** 2 + u[2] ** 2)
+    magnetic = 0.5 * (B[0] ** 2 + B[1] ** 2 + B[2] ** 2)
+    p = (gamma - 1.0) * (U[4] - 0.5 * (U[1:4] ** 2).sum(0) / rho - 0.5 * (U[5:8] ** 2).sum(0))
+    return torch.stack([rho] + [rho * c for c in u] + [p / (gamma - 1.0) + kinetic + magnetic] + B)
+
+
 def check_tiers(report: Report, grid: SlabGrid3D, tight: float, loose: float, triton=True) -> None:
-    """Whole steps: the Triton tier against the Torch tier on the same state."""
+    """Whole steps: the Triton tier against the Torch tier on the same state.
+
+    With transport the increment over the ideal run is compared as well, relative
+    to its own size, so a wrong coefficient cannot hide under the state's size.
+    The coefficients are scaled to the grid (a fixed fraction of the diffusive
+    step limit) and the state has content halfway to the cutoff, so the increment
+    is about a percent of the state at any self-test size (the check asks for 0.1%).
+    """
     comm = grid.comm
-    for system, gamma, eta, nu in (("euler", 1.4, 0.0, 0.0), ("mhd", 5.0 / 3.0, 2e-3, 1e-3)):
-        states = []
+    ideal = Transport()
+    dt = 2e-3
+    c = 0.3 / (grid.k2_max * dt)
+    cases = (("euler", 1.4, ideal),
+             ("mhd", 5.0 / 3.0, Transport(nu=c, eta=c)),
+             ("mhd", 5.0 / 3.0, Transport(nu=c, nu_bulk=0.5 * c, eta=c, kappa=0.5 * c)))
+
+    def run(system, gamma, transport, tier, state):
+        st = CompressibleSlabStepper(grid, system, gamma, 1e-10, 1e-12, transport=transport, triton=tier)
+        # The collective warm-up settles the tier on every rank (a missing kernel on one rank
+        # would otherwise send the ranks into different transforms) and makes later kernel
+        # failures abort all ranks.
+        if tier and not st.warm_up():
+            return None
+        st.seed(state.clone())
+        for _ in range(3):
+            st.step(dt, "rk4")
+        stayed = comm.min(1.0 if st._triton is not None and st._stats_kernel is not None else 0.0)
+        return st.physical(), stayed
+
+    for system, gamma, transport in cases:
+        label = system if not transport.active else f"{system}, {transport.describe()}"
+        state = _transport_state(grid, gamma) if transport.active else _compressible_state(grid, system, gamma)
+        results = {}
         for tier in (triton, False):
-            st = CompressibleSlabStepper(grid, system, gamma, 1e-10, 1e-12, eta=eta, nu=nu, triton=tier)
-            if tier and st._triton is None:
-                report.check(f"step[{system}]: Triton tier available", 1.0, 0.0)
-                return
-            st.seed(_compressible_state(grid, system, gamma))
-            for _ in range(3):
-                st.step(1e-3, "rk4")
-            if tier:
-                report.check(f"step[{system}]: Triton tier stayed active",
-                             0.0 if st._triton is not None and st._stats_kernel is not None else 1.0, 0.0)
-            states.append(st.physical())
-        scale = comm.max(states[1].abs().max().item())
-        report.check(f"step[{system}]: Triton vs Torch, 3 RK4 steps", (states[0] - states[1]).abs().max().item() / scale, loose)
+            for tr in ((transport, ideal) if transport.active else (transport,)):
+                out = run(system, gamma, tr, tier, state)
+                if out is None:
+                    report.check(f"step[{label}]: Triton tier available", 1.0, 0.0)
+                    return
+                if tier and tr is transport:
+                    report.check(f"step[{label}]: Triton tier stayed active", 1.0 - out[1], 0.0)
+                results[(bool(tier), tr.active)] = out[0]
+        fast, ref = results[(bool(triton), transport.active)], results[(False, transport.active)]
+        scale = comm.max(ref.abs().max().item())
+        report.check(f"step[{label}]: Triton vs Torch, 3 RK4 steps", (fast - ref).abs().max().item() / scale, loose)
+        if transport.active:
+            inc_fast = fast - results[(bool(triton), False)]
+            inc_ref = ref - results[(False, False)]
+            size = comm.max(inc_ref.abs().max().item())
+            report.check(f"step[{label}]: transport increment / state", 1e-3 * scale / size, 1.0)
+            report.check(f"step[{label}]: Triton vs Torch transport increment",
+                         (inc_fast - inc_ref).abs().max().item() / size, loose)
 
     for mhd, hyper in ((True, {}), (False, {}), (True, HYPER)):
         spectra = []

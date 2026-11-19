@@ -23,6 +23,8 @@ ensure_triton_compiler()  # before Triton reads CC
 import triton  # noqa: E402
 import triton.language as tl  # noqa: E402
 
+from .transport import flux_buffer_rows  # noqa: E402
+
 
 @triton.jit
 def _ld(ptr, off, mask):
@@ -385,11 +387,14 @@ def _mhd3d_stage_kernel(
     w_ptr, ia, inx,
     total, Kx, Kyr, Kzr, cy, cz, Ny, Nz,
     MODE: tl.constexpr, FIRST: tl.constexpr, FINAL: tl.constexpr, BLOCK: tl.constexpr,
+    OHM: tl.constexpr = True,
 ):
     """One MHD RK stage (MODE 0) or the compact spectral RHS (MODE 1) over the visited modes.
 
-    w = [1/N, eta, nu, ...]; the final stage writes the pre-projection state to
-    H and f * (Leray-projected state) to Sout.
+    w = [1/N, eta, ...]; the final stage writes the pre-projection state to
+    H and f * (Leray-projected state) to Sout.  Viscosity and the Ohmic energy
+    flux are in the flux spectra (``transport_fluxes``); resistivity enters the
+    induction rows as ``-eta (k^2 B - k (k . B))`` (``-curl(eta J)``).
     """
     # int32 scalar arguments: multiples of them overflow past 2**31 elements.
     sFc = sFc.to(tl.int64)
@@ -403,7 +408,6 @@ def _mhd3d_stage_kernel(
     kx, ky, kz, m = _waves(kx_ptr, ky_ptr, kz_ptr, mx_ptr, my_ptr, mz_ptr, ix, iy, iz, mask)
     inv_n = tl.load(w_ptr)
     eta = tl.load(w_ptr + 1)
-    nu = tl.load(w_ptr + 2)
     wa = tl.load(w_ptr + ia)
     wn = tl.load(w_ptr + inx)
     mf = m * inv_n
@@ -423,22 +427,16 @@ def _mhd3d_stage_kernel(
 
     # density
     k0r, k0i = _div(kx, ky, kz, m, m1r, m1i, m2r, m2i, m3r, m3i)
-    # momentum (+ viscosity)
+    # momentum (the viscous stress is part of the flux spectra)
     f0r, f0i = _ld(F_ptr, offF, mask)
     f3r, f3i = _ld(F_ptr, offF + 3 * sFc, mask)
     f4r, f4i = _ld(F_ptr, offF + 4 * sFc, mask)
     k1r, k1i = _div(kx, ky, kz, mf, f0r, f0i, f3r, f3i, f4r, f4i)
-    k1r -= nu * k2m * m1r
-    k1i -= nu * k2m * m1i
     f1r, f1i = _ld(F_ptr, offF + sFc, mask)
     f5r, f5i = _ld(F_ptr, offF + 5 * sFc, mask)
     k2r, k2i = _div(kx, ky, kz, mf, f3r, f3i, f1r, f1i, f5r, f5i)
-    k2r -= nu * k2m * m2r
-    k2i -= nu * k2m * m2i
     f2r, f2i = _ld(F_ptr, offF + 2 * sFc, mask)
     k3r, k3i = _div(kx, ky, kz, mf, f4r, f4i, f5r, f5i, f2r, f2i)
-    k3r -= nu * k2m * m3r
-    k3i -= nu * k2m * m3i
     # energy
     f6r, f6i = _ld(F_ptr, offF + 6 * sFc, mask)
     f7r, f7i = _ld(F_ptr, offF + 7 * sFc, mask)
@@ -451,12 +449,15 @@ def _mhd3d_stage_kernel(
     k5r, k5i = _div(kx, ky, kz, mf, zero, zero, -axyr, -axyi, -axzr, -axzi)
     k6r, k6i = _div(kx, ky, kz, mf, axyr, axyi, zero, zero, -ayzr, -ayzi)
     k7r, k7i = _div(kx, ky, kz, mf, axzr, axzi, ayzr, ayzi, zero, zero)
-    k5r -= eta * k2m * b1r
-    k5i -= eta * k2m * b1i
-    k6r -= eta * k2m * b2r
-    k6i -= eta * k2m * b2i
-    k7r -= eta * k2m * b3r
-    k7i -= eta * k2m * b3i
+    if OHM:  # -curl(eta J) = -eta (k^2 B - k (k . B)): solenoidal by construction, no transform
+        kbr = (kx * b1r + ky * b2r + kz * b3r) * m
+        kbi = (kx * b1i + ky * b2i + kz * b3i) * m
+        k5r -= eta * (k2m * b1r - kx * kbr)
+        k5i -= eta * (k2m * b1i - kx * kbi)
+        k6r -= eta * (k2m * b2r - ky * kbr)
+        k6i -= eta * (k2m * b2i - ky * kbi)
+        k7r -= eta * (k2m * b3r - kz * kbr)
+        k7i -= eta * (k2m * b3i - kz * kbi)
 
     if FINAL:
         f = _factor(fx_ptr, fy_ptr, fz_ptr, ix, iy, iz, mask)
@@ -531,8 +532,10 @@ def _leray_scale_kernel(
 
 def mhd_stage(F, Sin, Sout, U0, acc, w, ia, inx, waves, modes: RetainedModes, first: bool,
               final: bool, rhs_only: bool = False, high=None, final_factors=None,
-              block: int = 256, num_warps: int = 4) -> None:
-    """Launch one MHD stage; with ``rhs_only`` the compact k goes to ``acc``."""
+              block: int = 256, num_warps: int = 4, resistive: bool = True) -> None:
+    """Launch one MHD stage; with ``rhs_only`` the compact k goes to ``acc``.
+
+    ``resistive=False`` compiles the Ohmic term out (w[1] = eta is then ignored)."""
     Fr = torch.view_as_real(F)
     Sinr, Soutr, U0r = (torch.view_as_real(x) for x in (Sin, Sout, U0))
     Ar = torch.view_as_real(acc)
@@ -548,6 +551,7 @@ def mhd_stage(F, Sin, Sout, U0, acc, w, ia, inx, waves, modes: RetainedModes, fi
         w, ia, inx,
         modes.total, modes.Kx, modes.Kyr, modes.Kzr, modes.cy, modes.cz, modes.Ny, modes.Nz,
         MODE=1 if rhs_only else 0, FIRST=first, FINAL=final, BLOCK=block, num_warps=num_warps,
+        OHM=bool(resistive),
     )
 
 
@@ -778,6 +782,124 @@ def _mhd3d_flux_kernel(U_ptr, F_ptr, cnt_ptr, n, P_ptr,
     tl.store(F_ptr + 10 * n + offs, ux * Bz - uz * Bx, mask=mask)
     tl.store(F_ptr + 11 * n + offs, uy * Bz - uz * By, mask=mask)
     _count_store(cnt_ptr, rho, p, rho_min, p_min, mask, COUNT)
+
+
+@triton.jit
+def _mhd3d_transport_flux_kernel(U_ptr, F_ptr, cnt_ptr, n, P_ptr, oD, oT, oJ,
+                                 COUNT: tl.constexpr, SHEAR: tl.constexpr, BULK: tl.constexpr,
+                                 OHM: tl.constexpr, BLOCK: tl.constexpr):
+    """Ideal MHD fluxes plus the Newtonian stress and the Ohmic flux, in place.
+
+    On entry F holds the derivative fields of this stage: the trace-free strain
+    (Dxx, Dyy, Dxy, Dxz, Dyz) from element offset ``oD`` (SHEAR), div u at ``oT``
+    (BULK) and J = curl B from ``oJ`` (OHM); the offsets are row times n.  Every program reads all of
+    its cells' inputs before it writes their 12 fluxes over them.
+    P = [gamma, rho_min, p_min, nu, nu_bulk, eta], as ``transport.flux_additions``.
+    """
+    n = n.to(tl.int64)
+    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    gamma = tl.load(P_ptr)
+    rho_min = tl.load(P_ptr + 1)
+    p_min = tl.load(P_ptr + 2)
+    nu = tl.load(P_ptr + 3)
+    nu_b = tl.load(P_ptr + 4)
+    eta = tl.load(P_ptr + 5)
+    rho = tl.load(U_ptr + offs, mask=mask, other=1.0)
+    mx = tl.load(U_ptr + n + offs, mask=mask, other=0.0)
+    my = tl.load(U_ptr + 2 * n + offs, mask=mask, other=0.0)
+    mz = tl.load(U_ptr + 3 * n + offs, mask=mask, other=0.0)
+    E = tl.load(U_ptr + 4 * n + offs, mask=mask, other=1.0)
+    Bx = tl.load(U_ptr + 5 * n + offs, mask=mask, other=0.0)
+    By = tl.load(U_ptr + 6 * n + offs, mask=mask, other=0.0)
+    Bz = tl.load(U_ptr + 7 * n + offs, mask=mask, other=0.0)
+    ux = mx / rho
+    uy = my / rho
+    uz = mz / rho
+    b2h = 0.5 * (Bx * Bx + By * By + Bz * Bz)
+    p = (gamma - 1.0) * (E - 0.5 * rho * (ux * ux + uy * uy + uz * uz) - b2h)
+    pstar = p + b2h
+    uB = ux * Bx + uy * By + uz * Bz
+    Ep = E + pstar
+    txx = mx * ux + pstar - Bx * Bx
+    tyy = my * uy + pstar - By * By
+    tzz = mz * uz + pstar - Bz * Bz
+    txy = mx * uy - Bx * By
+    txz = mx * uz - Bx * Bz
+    tyz = my * uz - By * Bz
+    hx = Ep * ux - Bx * uB
+    hy = Ep * uy - By * uB
+    hz = Ep * uz - Bz * uB
+    if SHEAR or BULK:
+        if SHEAR:
+            mu2 = 2.0 * nu * rho
+            sxx = mu2 * tl.load(F_ptr + oD + offs, mask=mask, other=0.0)
+            syy = mu2 * tl.load(F_ptr + oD + n + offs, mask=mask, other=0.0)
+            szz = -(sxx + syy)
+            sxy = mu2 * tl.load(F_ptr + oD + 2 * n + offs, mask=mask, other=0.0)
+            sxz = mu2 * tl.load(F_ptr + oD + 3 * n + offs, mask=mask, other=0.0)
+            syz = mu2 * tl.load(F_ptr + oD + 4 * n + offs, mask=mask, other=0.0)
+            if BULK:
+                lam = nu_b * rho * tl.load(F_ptr + oT + offs, mask=mask, other=0.0)
+                sxx += lam
+                syy += lam
+                szz += lam
+        else:
+            lam = nu_b * rho * tl.load(F_ptr + oT + offs, mask=mask, other=0.0)
+            sxx = lam
+            syy = lam
+            szz = lam
+            sxy = lam * 0.0
+            sxz = lam * 0.0
+            syz = lam * 0.0
+        txx -= sxx
+        tyy -= syy
+        tzz -= szz
+        txy -= sxy
+        txz -= sxz
+        tyz -= syz
+        hx -= sxx * ux + sxy * uy + sxz * uz
+        hy -= sxy * ux + syy * uy + syz * uz
+        hz -= sxz * ux + syz * uy + szz * uz
+    if OHM:
+        jx = tl.load(F_ptr + oJ + offs, mask=mask, other=0.0)
+        jy = tl.load(F_ptr + oJ + n + offs, mask=mask, other=0.0)
+        jz = tl.load(F_ptr + oJ + 2 * n + offs, mask=mask, other=0.0)
+        hx += eta * (jy * Bz - jz * By)
+        hy += eta * (jz * Bx - jx * Bz)
+        hz += eta * (jx * By - jy * Bx)
+    tl.store(F_ptr + offs, txx, mask=mask)
+    tl.store(F_ptr + n + offs, tyy, mask=mask)
+    tl.store(F_ptr + 2 * n + offs, tzz, mask=mask)
+    tl.store(F_ptr + 3 * n + offs, txy, mask=mask)
+    tl.store(F_ptr + 4 * n + offs, txz, mask=mask)
+    tl.store(F_ptr + 5 * n + offs, tyz, mask=mask)
+    tl.store(F_ptr + 6 * n + offs, hx, mask=mask)
+    tl.store(F_ptr + 7 * n + offs, hy, mask=mask)
+    tl.store(F_ptr + 8 * n + offs, hz, mask=mask)
+    tl.store(F_ptr + 9 * n + offs, ux * By - uy * Bx, mask=mask)
+    tl.store(F_ptr + 10 * n + offs, ux * Bz - uz * Bx, mask=mask)
+    tl.store(F_ptr + 11 * n + offs, uy * Bz - uz * By, mask=mask)
+    _count_store(cnt_ptr, rho, p, rho_min, p_min, mask, COUNT)
+
+
+def transport_fluxes(U, F, gamma, rho_min, p_min, transport, count=False, block=1024, num_warps=8):
+    """In place: the derivative fields in ``F`` (``transport.flux_buffer_rows``) become the 12 MHD fluxes.
+
+    Returns the floor-violation count with ``count``.
+    """
+    U = U.contiguous()
+    assert F.is_contiguous() and F.shape[0] == 12 and F.shape[1:] == U.shape[1:]
+    n = U[0].numel()
+    cnt = torch.zeros((), dtype=torch.int64, device=U.device)
+    params = torch.tensor([gamma, rho_min, p_min, transport.nu, transport.nu_bulk, transport.eta],
+                          dtype=U.dtype, device=U.device)
+    rowD, rowT, rowJ, _ = flux_buffer_rows(transport)
+    _mhd3d_transport_flux_kernel[(triton.cdiv(n, block),)](
+        U, F, cnt, n, params, rowD * n, rowT * n, rowJ * n, COUNT=count, SHEAR=transport.shear,
+        BULK=transport.bulk,
+        OHM=transport.resistive, BLOCK=block, num_warps=num_warps)
+    return cnt if count else None
 
 
 _FLUX_KERNELS = {"euler2d": (_euler2d_flux_kernel, 5), "euler3d": (_euler3d_flux_kernel, 9),

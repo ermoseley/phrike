@@ -95,10 +95,12 @@ def test_euler1d_adaptive_matches_reference(device):
 
 @pytest.mark.skipif(torch is None, reason="torch not installed")
 @pytest.mark.parametrize("device", _DEVICES)
-@pytest.mark.parametrize("eta", [0.0, 2e-3])
-def test_mhd1d_fast_matches_reference(device, eta):
+@pytest.mark.parametrize("transport", [{}, {"resistivity": 2e-3},
+                                       {"viscosity": 5e-3, "bulk_viscosity": 3e-3, "resistivity": 4e-3,
+                                        "thermal_conductivity": 6e-3}], ids=["ideal", "eta", "all"])
+def test_mhd1d_fast_matches_reference(device, transport):
     grid = _grid(256, backend="torch", device=device)
-    grid.mhd_config = {"resistivity": eta, "divergence_clean": "projection", "project_each_substage": True}
+    grid.mhd_config = dict({"divergence_clean": "projection", "project_each_substage": True}, **transport)
     eqs = MHDEquations1D(gamma=5.0 / 3.0)
     x = grid.x
     U0 = eqs.conservative(1.0 + 0.1 * torch.sin(2 * np.pi * x), 0.1 * torch.cos(2 * np.pi * x),

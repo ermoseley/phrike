@@ -241,8 +241,7 @@ class SlabFFT:
             if d.ty > 0:
                 W[:, :, d.Ny - d.ty:, :d.Kx] = R[:, :, d.hy:]
         with self.timers("fft_xy"):
-            result = torch.fft.irfft2(W, s=(d.Ny, d.Nx), norm="forward")
             if out is None:
-                return result
-            out.copy_(result)
+                return torch.fft.irfft2(W, s=(d.Ny, d.Nx), norm="forward")
+            torch.fft.irfft2(W, s=(d.Ny, d.Nx), norm="forward", out=out)  # no extra batch-sized copy
         return None

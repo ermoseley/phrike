@@ -126,12 +126,26 @@ Further limits are applied only where the solver implements them.
   speed is positive, also takes :math:`1/r_{\mathrm{SBP}}`. The factor
   in front of that bound is 1, not ``cfl``.
 * 3D Euler has no parabolic limit in ``compute_dt``.
-* MHD explicit resistivity or viscosity, and SBP dissipation on a mixed
+* MHD viscosity, resistivity or conduction, and SBP dissipation on a mixed
   open-:math:`y` grid, use
 
   .. math::
 
-     r = \max(\eta_m, \nu)\, k^2_{\max} + r_{\mathrm{SBP}},
+     r = \max\!\left(\left(\tfrac{4}{3}\nu + \nu_b\right)\frac{\rho_{\max}}{\rho_{\min}},\ \eta_m,\
+         \frac{(\gamma - 1)\kappa}{\rho_{\min}}\right) k^2_{\max} + r_{\mathrm{SBP}},
+
+  the decay rates of longitudinal velocity, magnetic and temperature modes at
+  the largest retained wavenumber (the dealias mask's, on Fourier axes). The
+  stress operator on :math:`\mathbf{u}` is
+  :math:`\rho^{-1}\nabla\cdot(\rho\nu\ldots)`, and the density ratio bounds
+  its largest decay rate for any density field; ``physics.mhd.viscous_step_bound:
+  uniform`` drops the ratio (not guaranteed stable when the contrast is large).
+  On a mixed open-:math:`y` grid :math:`\tfrac{4}{3}\nu` becomes :math:`2\nu`: the
+  SBP boundary closure breaks the identity behind the longitudinal 4/3. In
+  operator norms, :math:`\sum 2\nu|D|^2 \le 2\nu\|G\mathbf{u}\|^2` and
+  :math:`\|\nabla\cdot\mathbf{u}\|^2 \le k^2_{\max}\|\mathbf{u}\|^2` (Cauchy-Schwarz
+  across the axes) hold for any discrete gradient :math:`G`, so
+  :math:`(2\nu + \nu_b)k^2_{\max}` bounds the viscous decay rate there.
 
   .. math::
 
@@ -140,8 +154,9 @@ Further limits are applied only where the solver implements them.
   and the step is the minimum of the hyperbolic and diffusive values.
   :math:`r_{\mathrm{SBP}}` is included only on mixed open-:math:`y` grids.
   ``cfl_diff`` defaults to 1. :math:`k^2_{\max}` is the largest squared
-  Fourier wavenumber on a periodic grid, :math:`4/\Delta x^2` on a 1D
-  polynomial grid, and a matrix-norm bound on the SBP derivative for mixed
+  retained Fourier wavenumber on a periodic grid, the spectral radius of the
+  diffusion operator :math:`W^{-1}G^TWG` of the summation-by-parts pair below on
+  a 1D polynomial grid, and a matrix-norm bound on the SBP derivative for mixed
   open-:math:`y` grids. Ambipolar diffusion is not part of this explicit
   limit.
 
@@ -154,14 +169,71 @@ timestep bound.
 Viscosity, resistivity, and ambipolar diffusion
 -----------------------------------------------
 
-Explicit MHD resistivity ``physics.mhd.resistivity``
-(:math:`\eta_m`, units of length squared over time) adds
-:math:`\eta_m\nabla^2\mathbf{B}` to the three magnetic components. Explicit
-viscosity ``physics.mhd.viscosity`` (:math:`\nu`, the same units) adds
-:math:`\nu\nabla^2(\rho\mathbf{u})` to the three momentum components. Both
-operators act through the grid Laplacian. Neither term is added to the
-total-energy component, so a loss of kinetic or magnetic energy reappears
-as thermal pressure when :math:`p` is recovered from :math:`E`.
+The compressible MHD solvers (serial, GPU fast paths and ``phrike.parallel``)
+are visco-resistive in the standard form, with constant coefficients in
+``physics.mhd`` (all default 0, units of length squared over time except
+:math:`\kappa`):
+
+* ``viscosity`` :math:`\nu`, the kinematic shear viscosity (dynamic viscosity
+  :math:`\rho\nu`), and ``bulk_viscosity`` :math:`\nu_b`, the kinematic bulk
+  viscosity;
+* ``resistivity`` :math:`\eta_m`, the magnetic diffusivity (capped by
+  ``resistivity_max``);
+* ``thermal_conductivity`` :math:`\kappa`, with heat flux
+  :math:`-\kappa\nabla T` and :math:`T = p/\rho` (gas constant one).
+
+With :math:`D = (\nabla\mathbf{u} + \nabla\mathbf{u}^T)/2 -
+(\nabla\cdot\mathbf{u})\,I/3` and the Newtonian stress
+:math:`\sigma = 2\rho\nu D + \rho\nu_b(\nabla\cdot\mathbf{u})\,I`,
+
+.. math::
+
+   \partial_t(\rho\mathbf{u}) + \nabla\cdot(\ldots - \sigma) &= 0, \\
+   \partial_t E + \nabla\cdot(\ldots - \sigma\cdot\mathbf{u}
+       + \eta_m\,\mathbf{J}\times\mathbf{B} - \kappa\nabla T) &= 0, \\
+   \partial_t\mathbf{B} = \ldots - \nabla\times(\eta_m\mathbf{J}),
+   \qquad \mathbf{J} = \nabla\times\mathbf{B},
+
+where the dots are the ideal fluxes (magnetic pressure :math:`B^2/2`,
+:math:`\mu_0 = 1`). Momentum and total energy stay in flux form, and the
+internal energy receives the viscous and Ohmic heating
+:math:`2\rho\nu D{:}D + \rho\nu_b(\nabla\cdot\mathbf{u})^2 + \eta_m J^2`
+where it is dissipated. Discretely that holds pointwise for modes whose
+products stay inside the retained band; for an underresolved state only the
+volume integrals agree (the masked derivative has no product rule), and the
+local heating need not be nonnegative cell by cell. The 1/3 holds in 1D and 2D too, since those solvers
+evolve all three velocity components. The terms are evaluated at every
+Runge-Kutta stage; derivatives are the masked spectral derivatives of the
+ideal fluxes (the velocity is :math:`\mathbf{m}/\rho` of the stage), so the GPU
+fast paths and the distributed solver reproduce the reference step to
+round-off. No viscous traction, heat or Ohmic Poynting flux passes a closed
+face. On a 1D Chebyshev or Legendre grid the gradient is a diagonal-norm
+summation-by-parts operator :math:`G` in the grid's quadrature :math:`W` and
+the flux divergence its adjoint :math:`-W^{-1}G^TW`, so momentum and energy are
+conserved and the integrated heating equals the quadrature of
+:math:`2\rho\nu D{:}D + \rho\nu_b(\nabla\cdot\mathbf{u})^2 + \eta_m J^2` at any
+resolution, hence is nonnegative; the heating at a single node can still be
+negative. This holds for ``wall`` and ``outflow`` ends; ``fixed`` ends are reset
+after every stage, which is a boundary source of its own. Legendre
+collocation is such an operator. The Chebyshev derivative is not one in the
+Clenshaw-Curtis weights, so there :math:`G` is the SBP operator exact for
+polynomials up to about half the grid's degree: it converges spectrally, at
+about half the collocation rate. On a mixed open-:math:`y` grid the velocity,
+magnetic field and temperature are projected onto the retained :math:`x` band
+before their :math:`y` derivative, and the :math:`y` divergence of every
+transport flux is the SBP adjoint ``-dy_adjoint``. That includes the induction
+term, :math:`-\nabla\times\mathbf{E}` with :math:`\mathbf{E} = \eta_m\mathbf{J}`
+treated as the flux of :math:`\mathbf{B}`: every current, the face values
+included, is dissipated and no Poynting flux leaves the box, while the face rows
+gain a small :math:`\nabla\cdot\mathbf{B}` that the magnetic projection mixed
+grids require removes. On periodic grids conduction is the masked spectral
+Laplacian :math:`\kappa\nabla^2 T`. Without dealiasing, the Nyquist mode of an
+even Fourier axis has no first derivative, so viscosity and resistivity (and
+conduction along :math:`x` on a mixed grid) leave it undamped; the solver warns
+once. With the shearing sheet the stress acts on
+the total velocity, background shear included, and its work on the background
+flow, :math:`-aS\sigma_{r\phi}`, heats the gas (:math:`\rho\nu S^2` for a
+uniform flow).
 
 Artificial-viscosity coefficients ``nu_constant`` and ``nu_max`` have those
 same units of length squared over time. On a 1D polynomial grid in constant

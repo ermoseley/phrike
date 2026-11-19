@@ -171,6 +171,9 @@ _NESTED_CONFIG_KEYS = {
     ("physics", "mhd"): {
         "resistivity",
         "viscosity",
+        "bulk_viscosity",
+        "thermal_conductivity",
+        "viscous_step_bound",
         "project_each_substage",
         "divergence_clean",
         "rho_min",

@@ -15,15 +15,18 @@ from phrike.solver import SpectralSolverMHD2D  # noqa: E402
 _DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 
 
-def _setup(device, shape=(48, 40), dissipation=True, eta=0.0, nu=0.0, precision="double"):
+FULL = {"viscosity": 5e-3, "bulk_viscosity": 3e-3, "resistivity": 4e-3, "thermal_conductivity": 6e-3}
+
+
+def _setup(device, shape=(48, 40), dissipation=True, eta=0.0, nu=0.0, precision="double", extra=None):
     Nx, Ny = shape
     grid = Grid2D(
         Nx=Nx, Ny=Ny, Lx=1.0, Ly=1.0, dealias=True,
         filter_params={"enabled": True, "p": 8, "rate": 300.0, "onset_fraction": 0.5} if dissipation else None,
         backend="torch", torch_device=device, precision=precision,
     )
-    grid.mhd_config = {"resistivity": eta, "viscosity": nu, "divergence_clean": "projection",
-                       "project_each_substage": True}
+    grid.mhd_config = dict({"resistivity": eta, "viscosity": nu, "divergence_clean": "projection",
+                            "project_each_substage": True}, **(extra or {}))
     eqs = MHDEquations2D(gamma=5.0 / 3.0)
     X, Y = grid.xy_mesh()
     U0 = orszag_tang_2d(X, Y, gamma=eqs.gamma).to(grid.kx.dtype)
@@ -47,9 +50,10 @@ def _assert_close(A, B, rtol):
 
 @pytest.mark.parametrize("device", _DEVICES)
 @pytest.mark.parametrize("scheme", ["rk2", "rk4"])
-@pytest.mark.parametrize("dissipation,eta,nu", [(True, 0.0, 0.0), (False, 2e-3, 1e-3)])
-def test_fast_step_matches_reference(device, scheme, dissipation, eta, nu):
-    grid, eqs, U0 = _setup(device, dissipation=dissipation, eta=eta, nu=nu)
+@pytest.mark.parametrize("dissipation,eta,nu,extra", [(True, 0.0, 0.0, None), (False, 2e-3, 1e-3, None),
+                                                    (True, 0.0, 0.0, FULL)])
+def test_fast_step_matches_reference(device, scheme, dissipation, eta, nu, extra):
+    grid, eqs, U0 = _setup(device, dissipation=dissipation, eta=eta, nu=nu, extra=extra)
     fast = SpectralSolverMHD2D(grid, eqs, scheme=scheme, spectral_fast_path=True)
     ref = SpectralSolverMHD2D(grid, eqs, scheme=scheme, spectral_fast_path=False)
     assert fast.spectral is not None
@@ -60,8 +64,9 @@ def test_fast_step_matches_reference(device, scheme, dissipation, eta, nu):
 
 
 @pytest.mark.parametrize("device", _DEVICES)
-def test_adaptive_run_matches_reference(device):
-    grid, eqs, U0 = _setup(device)
+@pytest.mark.parametrize("extra", [None, FULL], ids=["ideal", "transport"])
+def test_adaptive_run_matches_reference(device, extra):
+    grid, eqs, U0 = _setup(device, extra=extra)
     cfg = {"enabled": True, "scheme": "rk45", "rtol": 1e-8, "atol": 1e-12}
     out = []
     for fast in (True, False):
@@ -73,8 +78,9 @@ def test_adaptive_run_matches_reference(device):
 
 
 @pytest.mark.parametrize("device", _DEVICES)
-def test_embedded_step_matches_reference(device):
-    grid, eqs, U0 = _setup(device)
+@pytest.mark.parametrize("extra", [None, FULL], ids=["ideal", "transport"])
+def test_embedded_step_matches_reference(device, extra):
+    grid, eqs, U0 = _setup(device, extra=extra)
     solver = SpectralSolverMHD2D(grid, eqs, spectral_fast_path=True)
     fast = solver.spectral
     U = fast.seed(grid.project_dealiased(solver._project_B(U0)))

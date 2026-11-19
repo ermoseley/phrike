@@ -77,7 +77,8 @@ def test_every_problem_runs(tmp_path, problem):
 
 
 def test_fft_count_per_step_is_minimal(tmp_path):
-    """14 transforms per stage for incompressible MHD (6 inverse + 8 forward), 20 for compressible."""
+    """14 transforms per stage for incompressible MHD (6 inverse + 8 forward), 20 for ideal compressible
+    MHD and 31 with viscosity and resistivity (velocity 3 forward, strain 5 and current 3 inverse)."""
     outdir = shared_dir(tmp_path)
     quiet_io = {"snapshots": False, "slices": False, "spectra": False}
     sim, summary = _run("imhd_turb", _config(os.path.join(outdir, "a"), io=quiet_io))
@@ -85,7 +86,7 @@ def test_fft_count_per_step_is_minimal(tmp_path):
     sim, summary = _run("ins_turb", _config(os.path.join(outdir, "b"), io=quiet_io))
     assert summary["fft_fields_per_step"] == pytest.approx(4 * 8)
     sim, summary = _run("mhd_turb3d", _config(os.path.join(outdir, "c"), io=quiet_io))
-    assert summary["fft_fields_per_step"] == pytest.approx(4 * 20)
+    assert summary["fft_fields_per_step"] == pytest.approx(4 * 31)
     sim, summary = _run("turb3d", _config(os.path.join(outdir, "d"), io=quiet_io))
     assert summary["fft_fields_per_step"] == pytest.approx(4 * 14)
 

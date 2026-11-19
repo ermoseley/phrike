@@ -18,16 +18,19 @@ _CUDA = torch.cuda.is_available()
 _DEVICES = ["cpu"] + (["cuda"] if _CUDA else [])
 
 
+FULL = {"viscosity": 5e-3, "bulk_viscosity": 3e-3, "resistivity": 4e-3, "thermal_conductivity": 6e-3}
+
+
 def _setup(device, shape=(16, 12, 10), dissipation=True, eta=0.0, nu=0.0, substage=True,
-           precision="double", noise=0.0):
+           precision="double", noise=0.0, extra=None):
     Nx, Ny, Nz = shape
     grid = Grid3D(
         Nx=Nx, Ny=Ny, Nz=Nz, Lx=1.0, Ly=1.0, Lz=1.0, dealias=True,
         filter_params={"enabled": True, "p": 8, "rate": 300.0, "onset_fraction": 0.5} if dissipation else None,
         backend="torch", torch_device=device, precision=precision,
     )
-    grid.mhd_config = {"resistivity": eta, "viscosity": nu, "divergence_clean": "projection",
-                       "project_each_substage": substage}
+    grid.mhd_config = dict({"resistivity": eta, "viscosity": nu, "divergence_clean": "projection",
+                            "project_each_substage": substage}, **(extra or {}))
     eqs = MHDEquations3D(gamma=5.0 / 3.0)
     U0 = orszag_tang_3d(*grid.xyz_mesh(), gamma=eqs.gamma, epsilon=0.2).to(grid.kx.dtype)
     if noise:
@@ -59,13 +62,17 @@ def _rtol(precision):
 
 @pytest.mark.parametrize("device", _DEVICES)
 @pytest.mark.parametrize("scheme", ["rk2", "rk4"])
-@pytest.mark.parametrize("dissipation,eta,nu,substage", [
-    (True, 0.0, 0.0, True),
-    (False, 0.0, 0.0, True),
-    (True, 2e-3, 1e-3, False),
+@pytest.mark.parametrize("dissipation,eta,nu,substage,extra", [
+    (True, 0.0, 0.0, True, None),
+    (False, 0.0, 0.0, True, None),
+    (True, 2e-3, 1e-3, False, None),
+    (True, 0.0, 0.0, True, FULL),
+    (True, 0.0, 0.0, True, {"bulk_viscosity": 3e-3}),
+    (True, 0.0, 0.0, True, {"thermal_conductivity": 6e-3}),
 ])
-def test_fast_step_matches_reference(device, scheme, dissipation, eta, nu, substage):
-    grid, eqs, U0 = _setup(device, dissipation=dissipation, eta=eta, nu=nu, substage=substage, noise=1e-2)
+def test_fast_step_matches_reference(device, scheme, dissipation, eta, nu, substage, extra):
+    grid, eqs, U0 = _setup(device, dissipation=dissipation, eta=eta, nu=nu, substage=substage, noise=1e-2,
+                           extra=extra)
     fast = _solver(grid, eqs, True, scheme=scheme)
     ref = _solver(grid, eqs, False, scheme=scheme)
     assert fast.spectral is not None
@@ -84,8 +91,9 @@ def test_fast_step_matches_reference_fp32():
 
 
 @pytest.mark.parametrize("device", _DEVICES)
-def test_run_and_adaptive_match_reference(device):
-    grid, eqs, U0 = _setup(device)
+@pytest.mark.parametrize("extra", [None, FULL], ids=["ideal", "transport"])
+def test_run_and_adaptive_match_reference(device, extra):
+    grid, eqs, U0 = _setup(device, extra=extra)
     cfg = {"enabled": True, "scheme": "rk45", "rtol": 1e-8, "atol": 1e-12}
     out = []
     for fast in (True, False):
