@@ -469,6 +469,7 @@ def test_warm_up_keeps_the_triton_tier_with_transport(transport, L):
         assert st.warm_up(embedded=True)
 
 
+@pytest.mark.skipif(torch is None, reason="phrike.parallel needs torch")
 def test_appended_history_gains_new_columns(tmp_path):
     from phrike.parallel.io import History
 
