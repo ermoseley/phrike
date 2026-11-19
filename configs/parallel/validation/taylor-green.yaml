@@ -1,0 +1,17 @@
+# Pouquet et al. (2010), insulating magnetic Taylor–Green vortex I1.
+problem: imhd_magnetic_taylor_green
+
+grid: {Nx: 128, Ny: 128, Nz: 128, precision: double}
+physics: {viscosity: 0.002, resistivity: 0.002}
+integration: {t_end: 20.0, cfl: 0.4, scheme: rk4, output_interval: 0.05}
+
+io:
+  outdir: runs/taylor-green
+  format: hdf5
+  snapshots: false
+  slices: false
+  spectra: false
+  diagnostics: {enabled: true, every: 10}
+
+monitoring: {enabled: false}
+parallel: {fft_batch: 1, overlap: true}

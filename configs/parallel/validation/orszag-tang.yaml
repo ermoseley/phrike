@@ -1,0 +1,18 @@
+# Politano, Pouquet & Sulem (1995), run A. Ordinary Laplacian diffusion.
+problem: imhd_orszag_tang
+
+grid: {Nx: 128, Ny: 128, Nz: 128, precision: double}
+physics: {viscosity: 0.005, resistivity: 0.005}
+initial_conditions: {beta: 0.8}
+integration: {t_end: 4.4, cfl: 0.3, scheme: rk4, output_interval: 0.04}
+
+io:
+  outdir: runs/orszag-tang-128-fp64
+  format: hdf5
+  snapshots: false
+  slices: false
+  spectra: false
+  diagnostics: {enabled: true, every: 5}
+
+monitoring: {enabled: false}
+parallel: {transpose: auto, fft_batch: 1, overlap: true}
